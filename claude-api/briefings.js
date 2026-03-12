@@ -205,6 +205,7 @@ function buildPrompt(stockData, weatherData, jobsData, cfg) {
     instructions += `${step++}. **Jobs** — USE WEB SEARCH to find real Product Management job postings from the last ${jobsData.timeframe}. Search for:\n`;
     instructions += `Roles: ${jobsData.titles.join(', ')}\n`;
     instructions += `Locations: ${jobsData.locations.join(', ')}\n`;
+    instructions += `SENIORITY: Senior, Staff, Director, VP, or Head of Product ONLY. The user has 10+ years of experience. Do NOT include Associate PM, APM, junior PM, entry-level, or mid-level roles. If a title doesn't say Senior/Staff/Director/VP/Head, SKIP IT.\n`;
     instructions += `Company categories to search:\n`;
     for (const cat of jobsData.companyCategories) {
       instructions += `- ${cat}\n`;
@@ -215,7 +216,7 @@ function buildPrompt(stockData, weatherData, jobsData, cfg) {
 
   // Mindfulness — keep it to 2 lines
   if (cfg.motivation.enabled && cfg.motivation.userContext) {
-    instructions += `${step++}. **Mindfulness** — ONE specific exercise in 2 lines max. E.g., "Box breathing: 4 in, 4 hold, 4 out, 4 hold — 4 rounds before opening your laptop." Rotate techniques daily.\n\n`;
+    instructions += `${step++}. **Mindfulness** — ONLY a breathing exercise, body scan, grounding technique, or meditation. NO news, NO AI articles, NO tech content, NO links. Just ONE specific exercise in 2 lines max. E.g., "Box breathing: 4 in, 4 hold, 4 out, 4 hold — 4 rounds before opening your laptop." Rotate techniques daily. This section is STRICTLY wellness only.\n\n`;
   }
 
   instructions += 'End with a one-line sign-off in character. THE ENTIRE BRIEFING SHOULD FIT IN ~3 DISCORD MESSAGES MAX.';

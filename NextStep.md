@@ -36,10 +36,9 @@ Discord message → Discord.js bot (claude-api container) → Claude CLI → rep
 - If Claude still writes too much, tighten the brevity instructions or add a character limit
 - If `error_max_turns` returns, bump maxTurns above 15
 
-### 2. Fix briefing section bleed & job seniority
-- **AI articles showing up under Mindfulness** — Claude is mixing news content into the mindfulness section. Need to make section boundaries clearer in the prompt, e.g. "Mindfulness must ONLY contain a breathing/meditation/grounding exercise — NO news, NO AI, NO articles"
-- **APM/junior jobs showing up** — User has 10 years of experience. Update `briefing-config.js` jobs section to explicitly exclude junior/associate roles, and strengthen the prompt to say "Senior+ roles ONLY, no entry-level, no APM, no Associate PM"
-- Files to edit: `claude-api/briefings.js` (prompt instructions), `claude-api/briefing-config.js` (job titles/exclusions)
+### 2. ~~Fix briefing section bleed & job seniority~~ FIXED
+- Mindfulness section now strictly wellness only — explicitly blocks news/AI/tech/links
+- Jobs section now requires Senior/Staff/Director/VP/Head level only — explicitly skips APM, Associate, junior, entry-level, mid-level
 
 ### 3. Evaluate n8n
 - n8n container is running but unused — consider removing from `docker-compose.yml` to save resources
