@@ -185,9 +185,12 @@ function buildPrompt(stockData, weatherData, jobsData, cfg) {
     instructions += `${step++}. **Weather** — Reformat the weather data above into 1-2 lines. Just the key info: temp range, conditions, rain risk. Skip hourly breakdown.\n\n`;
   }
 
-  // Stocks — compact table
-  if (stockData) {
-    instructions += `${step++}. **Stocks** — YOU MUST INCLUDE THIS SECTION. Present the pre-fetched stock data above in a compact format. One line per ticker. Portfolio total at end. No commentary needed unless something moved more than 3%. Do NOT skip this section.\n\n`;
+  // Stocks — compact table (always included, fallback to web search if no pre-fetched data)
+  if (stockData && stockData.length > 0) {
+    instructions += `${step++}. **Stocks** — Present the pre-fetched stock data above in a compact format. One line per ticker. Portfolio total at end. No commentary needed unless something moved more than 3%.\n\n`;
+  } else {
+    const tickers = config.stocks.tickers.join(', ');
+    instructions += `${step++}. **Stocks** — Pre-fetched data unavailable. USE WEB SEARCH to get current prices for: ${tickers}. Show price and % change for each. One line per ticker.\n\n`;
   }
 
   // News — this is the big one, needs web search
