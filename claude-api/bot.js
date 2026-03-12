@@ -1,4 +1,4 @@
-const { Client, GatewayIntentBits } = require('discord.js');
+const { Client, GatewayIntentBits, AttachmentBuilder } = require('discord.js');
 const { spawn } = require('child_process');
 const fs = require('fs');
 const path = require('path');
@@ -136,31 +136,52 @@ function askClaude(prompt, { sessionId = null, personalityFile = null, identity 
   });
 }
 
-async function sendLongMessage(message, text) {
+function extractImageAttachments(text) {
+  // Match absolute or relative file paths ending in image extensions
+  const imageRegex = /(?:^|\s|["'`(])((\/[^\s"'`()]+|[^\s"'`()]+)\.(?:png|jpg|jpeg|gif|webp))/gim;
+  const found = new Set();
+  let match;
+  while ((match = imageRegex.exec(text)) !== null) {
+    const p = match[1].trim();
+    if (fs.existsSync(p)) found.add(p);
+  }
+  return [...found].slice(0, 10); // Discord max 10 attachments
+}
+
+async function sendLongMessage(message, text, cwd = DEFAULT_WORKSPACE) {
   if (!text || text.length === 0) {
     await message.reply('*(No output)*');
     return;
   }
 
-  if (text.length <= 1900) {
-    await message.reply(text);
-    return;
-  }
+  // Resolve relative paths against cwd before scanning
+  const resolvedText = text.replace(/(?:^|\s)([\w./][^\s"'`()]*\.(?:png|jpg|jpeg|gif|webp))/gim, (m, p) => {
+    const abs = path.isAbsolute(p) ? p : path.join(cwd, p);
+    return m.replace(p, abs);
+  });
+
+  const imagePaths = extractImageAttachments(resolvedText);
+  const files = imagePaths.map(p => new AttachmentBuilder(p));
 
   const chunks = [];
-  let remaining = text;
-  while (remaining.length > 0) {
-    if (remaining.length <= 1900) {
-      chunks.push(remaining);
-      break;
+  let remaining = text.length <= 1900 ? text : (() => {
+    let r = text, out = [];
+    while (r.length > 0) {
+      if (r.length <= 1900) { out.push(r); break; }
+      let splitAt = r.lastIndexOf('\n', 1900);
+      if (splitAt < 500) splitAt = 1900;
+      out.push(r.substring(0, splitAt));
+      r = r.substring(splitAt);
     }
-    let splitAt = remaining.lastIndexOf('\n', 1900);
-    if (splitAt < 500) splitAt = 1900;
-    chunks.push(remaining.substring(0, splitAt));
-    remaining = remaining.substring(splitAt);
-  }
+    return out;
+  })();
 
-  await message.reply(chunks[0]);
+  if (typeof remaining === 'string') chunks.push(remaining);
+  else chunks.push(...remaining);
+
+  // Send first chunk with any image attachments
+  await message.reply({ content: chunks[0], files: files.length ? files : undefined });
+
   for (let i = 1; i < chunks.length && i < 8; i++) {
     await message.channel.send(chunks[i]);
   }
@@ -460,7 +481,7 @@ client.on('messageCreate', async (message) => {
     }
 
     if (!result.stopped) {
-      await sendLongMessage(message, result.text);
+      await sendLongMessage(message, result.text, state.cwd);
 
       // Show cost and turns info
       const meta = [];
