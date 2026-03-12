@@ -1,0 +1,16 @@
+# Secrets
+.env
+
+# Docker
+n8n_data/
+
+# Dependencies
+claude-api/node_modules/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/

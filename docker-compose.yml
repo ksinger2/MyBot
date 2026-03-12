@@ -1,0 +1,57 @@
+services:
+  n8n:
+    image: n8nio/n8n:latest
+    restart: unless-stopped
+    ports:
+      - "5678:5678"
+    environment:
+      - N8N_BASIC_AUTH_ACTIVE=${N8N_BASIC_AUTH_ACTIVE}
+      - N8N_BASIC_AUTH_USER=${N8N_BASIC_AUTH_USER}
+      - N8N_BASIC_AUTH_PASSWORD=${N8N_BASIC_AUTH_PASSWORD}
+      - N8N_HOST=${N8N_HOST}
+      - N8N_PORT=5678
+      - N8N_PROTOCOL=${N8N_PROTOCOL}
+      - GENERIC_TIMEZONE=${GENERIC_TIMEZONE}
+    volumes:
+      - n8n_data:/home/node/.n8n
+    networks:
+      - bot-network
+    depends_on:
+      claude-api:
+        condition: service_healthy
+
+  claude-api:
+    build: ./claude-api
+    restart: unless-stopped
+    environment:
+      - DISCORD_BOT_TOKEN=${DISCORD_BOT_TOKEN}
+      # API keys available to Claude Code when building projects
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - GEMINI_API_KEY=${GEMINI_API_KEY:-}
+      - VIDEO_GEN_API_KEY=${VIDEO_GEN_API_KEY:-}
+      - VIDEO_GEN_PROVIDER=${VIDEO_GEN_PROVIDER:-}
+      - ELEVENLABS_API_KEY=${ELEVENLABS_API_KEY:-}
+      - REPLICATE_API_TOKEN=${REPLICATE_API_TOKEN:-}
+      - STRIPE_SECRET_KEY=${STRIPE_SECRET_KEY:-}
+    volumes:
+      - ${HOME}/.claude:/home/node/.claude
+      - ${HOME}/.claude.json:/home/node/.claude.json
+      - ${HOME}/.gitconfig:/home/node/.gitconfig:ro
+      - ${HOME}/.ssh:/home/node/.ssh:ro
+      - ${HOME}/.config/gh:/home/node/.config/gh:ro
+      - /mnt/c/Users/karen/Desktop/Github Projects:/workspace
+    healthcheck:
+      test: ["CMD", "node", "-e", "require('http').get('http://localhost:3400/health', r => { process.exit(r.statusCode === 200 ? 0 : 1) })"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+    networks:
+      - bot-network
+
+volumes:
+  n8n_data:
+
+networks:
+  bot-network:
+    driver: bridge
