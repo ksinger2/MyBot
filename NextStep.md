@@ -13,70 +13,64 @@
 - `!restart` command — bot restarts itself, notifies the channel when it's back up
 - `!email` command — drafts 3 professional email options in different tones
 - `!processes` command — shows active Claude processes and resource usage
-- `!btw` command — peek at Claude's progress (runtime, PID, recent stderr) without interrupting
+- `!btw` command — structured progress peek: current tool, file path, turn count, listening ports, other CLI sessions
 - `!startproject` wizard — creates new project with Claude Code template, agents, skills, commands, and optional git/GitHub setup
 - `!cancel` command — cancel an active wizard mid-flow
 - Generic wizard system for multi-step interactive commands
 - Docker control — Claude has full Docker access inside the container (socket mounted)
+- Error alerting — all errors posted to `#bot-errors` channel with dedup (5min per error type)
 
 ## Architecture
 ```
-Discord message → Discord.js bot (claude-api container) → Claude CLI → reply to Discord
+Discord message → Discord.js bot (claude-api container) → Claude CLI (stream-json) → reply to Discord
 ```
 - `claude-api/` container: Express server (port 3400) + Discord.js bot
 - n8n removed (was unused — no Discord nodes in n8n 2.11.2)
 - Claude CLI authenticates via mounted credentials from host
+- Claude CLI uses `--output-format stream-json --verbose` for structured progress tracking
 - Docker socket mounted + `group_add: ["989"]` gives Claude container management access
 
 ## What Was Done This Session
 
 ### New Features
-- **`!btw` command** — Non-destructive progress peek while Claude is working. Shows runtime, PID, and last ~500 chars of stderr activity. Says "Nothing running" when idle.
-- **`!processes` command** — Shows active Claude processes and resource usage across all channels
-- **`!startproject` wizard** — Interactive project creation: asks for name, location, git setup (new private GitHub repo / existing / none). Copies full Claude Code project template with agents, commands, skills, and CLAUDE.md.
-- **Sunday weekly preview** — Auto-sends at noon on Sundays with upcoming events, tasks, and goals. Also available on-demand via `!weekly`.
-- **Generic wizard system** (`wizard.js`) — Reusable multi-step interaction engine with conditional steps, validation, and defaults. Powers `!startproject` and evening check-in.
+- **Error alerting** (`error-alerting.js`) — All errors (CLI failures, timeouts, briefing failures, wizard errors) posted to `#bot-errors` Discord channel. 5-minute dedup per error type prevents spam. Shows error source, channel link, message, and relative timestamp.
+- **`!btw` rewrite** — Switched from raw stderr to stream-json NDJSON parsing. Now shows: current tool + file path (e.g. "Editing `bot.js`"), turn count, tool history breadcrumb trail, listening ports, and other active Claude CLI sessions.
+- **Stream-json migration** — `askClaude()` switched from `--output-format json` to `--output-format stream-json --verbose`. Parses structured events in real-time for progress tracking while preserving the same return contract.
+- **n8n removed** — Unused n8n service stripped from docker-compose.yml, container stopped, volume deleted.
+- **Brevity improvements** — Tightened system prompt with hard sentence limits (2-4 simple, 6-8 complex). Personality is "seasoning not the dish" (10-20%). Trimmed personality file examples.
 
-### Project Template (`project-template/`)
-- Generic `CLAUDE.md` and `NextSteps.md` with `{{PROJECT_NAME}}` placeholders
-- 12 genericized agent definitions (product, engineering, design, QA, data science)
-- 3 commands: `/reinit`, `/qa`, `/fix` (team-based QA and fix workflows)
-- Verification skill: evidence-before-claims discipline
-
-### Briefing Fixes
-- **Embed suppression fixed** — Switched from `<>` URL wrapping to Discord's native `MessageFlags.SuppressEmbeds` flag
-- **Evening check-in refactored** — Now uses wizard system instead of one-off `awaitingTasks` boolean
+### Previous Session Features (already committed)
+- `!btw`, `!processes`, `!startproject` wizard, Sunday weekly preview, generic wizard system
+- Project template with 12 agents, 3 commands, verification skill
+- Embed suppression fix, evening check-in refactored to wizard system
 
 ## Likely Next Steps
 
 ### 1. Test new features in Discord
-- Run `!btw` while Claude is working — verify runtime and stderr output display
-- Run `!processes` — verify it shows active Claude instances
-- Run `!startproject` — test full wizard flow (name → location → git setup → template copy)
-- Run `!weekly` — verify weekly preview content
-- Test `!cancel` during a wizard
+- Send a message, then run `!btw` — verify it shows tool name, file path, turn count
+- Trigger an error — verify it appears in `#bot-errors`
+- Confirm responses are shorter with updated brevity rules
 
-### 2. Evaluate n8n
-- n8n container is running but unused — consider removing from `docker-compose.yml` to save resources
-
-### 3. More personalities
+### 2. More personalities
 - Add new personality files in `claude-api/personalities/`
 
-### 4. Monitoring & reliability
-- Add error alerting (post to a Discord channel when briefing fails)
+### 3. Additional monitoring
+- Track briefing success/failure rate over time
+- Add health check alerts if container goes unhealthy
 
 ## Key Files
 | File | Purpose |
 |------|---------|
-| `claude-api/bot.js` | Discord bot — message handling, Claude CLI spawn, commands, wizard integration |
+| `claude-api/bot.js` | Discord bot — message handling, Claude CLI spawn (stream-json), commands, wizard integration |
+| `claude-api/error-alerting.js` | Error alerting — posts errors to #bot-errors with dedup |
 | `claude-api/wizard.js` | Generic multi-step wizard engine |
 | `claude-api/wizards/startproject.js` | `!startproject` wizard definition |
 | `claude-api/briefings.js` | Briefing system — data fetchers, prompt builder, scheduler, weekly preview |
-| `claude-api/briefing-config.js` | Briefing config — tickers, weather, news topics, job search, schedules |
+| `claude-api/briefing-config.js` | Briefing config — tickers, weather, news topics, job search, schedules, error channel |
 | `claude-api/tasks-storage.js` | Task persistence — save/load/clear tasks for briefing |
 | `claude-api/project-template/` | Full Claude Code project template (CLAUDE.md, agents, commands, skills) |
 | `claude-api/personalities/tiffany_pollard.md` | Main personality file |
 | `claude-api/server.js` | Express server + bot startup |
 | `claude-api/Dockerfile` | Node 20, Claude CLI, Docker CLI, copies all .js + wizards + template |
-| `docker-compose.yml` | Services, networks, volumes, healthcheck, Docker socket mount |
+| `docker-compose.yml` | Single service (claude-api), healthcheck, Docker socket mount |
 | `.env` | Secrets (not committed) |

@@ -4,6 +4,7 @@ const path = require('path');
 const { MessageFlags } = require('discord.js');
 const config = require('./briefing-config');
 const { loadTasks, clearTasks } = require('./tasks-storage');
+const { sendErrorAlert } = require('./error-alerting');
 
 const PERSONALITIES_DIR = path.join(__dirname, 'personalities');
 const DEFAULT_PERSONALITY = 'tiffany_pollard';
@@ -294,6 +295,7 @@ async function sendBriefing(client) {
   const channel = await client.channels.fetch(config.channelId).catch(() => null);
   if (!channel) {
     console.error(`Briefing failed: cannot access channel ${config.channelId}`);
+    sendErrorAlert(new Error(`Cannot access channel ${config.channelId}`), { source: 'sendBriefing', detail: 'Channel fetch failed' });
     return;
   }
 
@@ -331,6 +333,7 @@ async function sendBriefing(client) {
   } catch (err) {
     console.error('Briefing Claude call failed:', err.message);
     await channel.send('*(Morning briefing failed to generate — check the logs)*').catch(() => {});
+    sendErrorAlert(err, { source: 'sendBriefing', detail: 'Claude call failed' });
   }
 }
 
@@ -393,6 +396,7 @@ async function sendWeeklyPreview(client) {
   const channel = await client.channels.fetch(config.channelId).catch(() => null);
   if (!channel) {
     console.error(`Weekly preview failed: cannot access channel ${config.channelId}`);
+    sendErrorAlert(new Error(`Cannot access channel ${config.channelId}`), { source: 'sendWeeklyPreview', detail: 'Channel fetch failed' });
     return;
   }
 
@@ -421,6 +425,7 @@ async function sendWeeklyPreview(client) {
   } catch (err) {
     console.error('Weekly preview failed:', err.message);
     await channel.send('*(Weekly preview failed to generate — check the logs)*').catch(() => {});
+    sendErrorAlert(err, { source: 'sendWeeklyPreview', detail: 'Claude call failed' });
   }
 }
 
@@ -459,7 +464,10 @@ function startScheduler(client) {
       { rule: config.eveningCheckin.schedule, tz: config.timezone },
       async () => {
         const channel = await client.channels.fetch(config.channelId).catch(() => null);
-        if (!channel) return;
+        if (!channel) {
+          sendErrorAlert(new Error(`Cannot access channel ${config.channelId}`), { source: 'eveningCheckin', detail: 'Channel fetch failed' });
+          return;
+        }
         const { getChannelState } = require('./bot');
         const { startWizard } = require('./wizard');
         const { saveTasks } = require('./tasks-storage');

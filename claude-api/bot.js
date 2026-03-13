@@ -3,6 +3,7 @@ const { spawn, execSync } = require('child_process');
 const fs = require('fs');
 const path = require('path');
 const { handleWizardMessage, cancelWizard } = require('./wizard');
+const { init: initErrorAlerting, sendErrorAlert } = require('./error-alerting');
 
 const PERSONALITIES_DIR = path.join(__dirname, 'personalities');
 const DEFAULT_PERSONALITY = 'tiffany_pollard';
@@ -14,8 +15,33 @@ const DEFAULT_IDENTITY = {
   description: 'a fabulous cow named Bianca (aka Bianca Da Cow). You are a cow and you know it — work in cow puns, references to being a cow, mooing, grazing, etc. when it feels natural, but don\'t overdo it.'
 };
 
+// Tool labels for !btw progress display
+const TOOL_LABELS = {
+  Read: 'Reading', Write: 'Writing', Edit: 'Editing',
+  Bash: 'Running command', Glob: 'Finding files', Grep: 'Searching code',
+  WebSearch: 'Searching web', WebFetch: 'Fetching URL',
+  Agent: 'Running sub-agent', Skill: 'Using skill',
+};
+
+function summarizeToolInput(name, jsonStr) {
+  try {
+    const input = JSON.parse(jsonStr);
+    switch (name) {
+      case 'Read': case 'Write': case 'Edit': return input.file_path || '';
+      case 'Bash': return (input.command || '').substring(0, 80);
+      case 'Glob': return input.pattern || '';
+      case 'Grep': return input.pattern || '';
+      default: return '';
+    }
+  } catch { return ''; }
+}
+
+function freshProgress() {
+  return { currentTool: null, toolDetail: '', toolHistory: [], turnCount: 0, activeBlocks: new Map() };
+}
+
 // Per-channel state
-const channels = new Map(); // channelId -> { sessionId, personality, identity, cwd, process, busy }
+const channels = new Map();
 
 const client = new Client({
   intents: [
@@ -36,7 +62,7 @@ function getChannel(channelId) {
       busy: false,    // is Claude currently working
       wizard: null,   // active wizard state (multi-step interactions)
       startedAt: null, // timestamp when Claude started working
-      stderrBuf: '',   // accumulated stderr for !btw progress peeking
+      progress: freshProgress(), // structured progress for !btw
     });
   }
   return channels.get(channelId);
@@ -61,7 +87,8 @@ function askClaude(prompt, { sessionId = null, personalityFile = null, identity 
   return new Promise((resolve, reject) => {
     const args = [
       '-p', prompt,
-      '--output-format', 'json',
+      '--output-format', 'stream-json',
+      '--verbose',
       '--model', 'sonnet',
       '--max-turns', String(maxTurns),
       '--dangerously-skip-permissions',
@@ -74,7 +101,12 @@ function askClaude(prompt, { sessionId = null, personalityFile = null, identity 
     // Combine identity + personality into a single system prompt
     // (Claude CLI only allows one of --append-system-prompt or --append-system-prompt-file)
     const systemParts = [];
-    systemParts.push(`CRITICAL RULE — BREVITY: Keep responses SHORT. Use bullet points, not paragraphs. 1-3 sentences per point MAX. No walls of text. No long intros or outros. Get to the point FAST. Your responses should be EASY TO SKIM. If you can say it in one sentence, do NOT use three. This is a Discord chat, not an essay.
+    systemParts.push(`CRITICAL RULE — BREVITY: This is Discord, NOT an essay. Your #1 priority is being SHORT.
+- MAX 2-4 sentences for simple questions. MAX 6-8 sentences for complex ones.
+- NO long intros, NO dramatic buildups, NO monologues, NO sign-offs unless asked.
+- Get to the answer IMMEDIATELY. Personality flavor is 10-20% of the message, not 80%.
+- If you catch yourself writing more than 5 lines, CUT IT IN HALF.
+- Bullet points over paragraphs. Always.
 
 CRITICAL RULE — IMAGE ATTACHMENTS: Whenever you generate, save, or display any image files, you MUST include their full absolute file paths in your text response (e.g. /workspace/BookFactory/output/book_id/page_01.png). This is required so the Discord bot can attach the images to the message. List every image path on its own line. Do NOT rely on tool output alone — the path must appear in your final text response.
 
@@ -100,16 +132,98 @@ NOTE — DOCKER ACCESS: You have full Docker access. You can run \`docker ps\`, 
       channelState.process = child;
       channelState.busy = true;
       channelState.startedAt = Date.now();
-      channelState.stderrBuf = '';
+      channelState.progress = freshProgress();
     }
 
-    let stdout = '';
+    // Stream-json result accumulators
+    let resultText = null;
+    let resultSessionId = null;
+    let resultCost = null;
+    let resultNumTurns = 0;
+    let accumulatedText = '';
+    let stdoutBuf = '';  // buffer for incomplete NDJSON lines
     let stderr = '';
-    child.stdout.on('data', (d) => { stdout += d; });
-    child.stderr.on('data', (d) => {
-      stderr += d;
-      if (channelState) channelState.stderrBuf += d;
+    let currentToolInput = ''; // accumulate input_json_delta for active tool
+
+    child.stdout.on('data', (d) => {
+      stdoutBuf += d;
+      const lines = stdoutBuf.split('\n');
+      stdoutBuf = lines.pop(); // keep incomplete last line
+
+      for (const line of lines) {
+        if (!line.trim()) continue;
+        try {
+          const event = JSON.parse(line);
+
+          // Final result event from Claude CLI
+          if (event.type === 'result') {
+            resultText = event.result || '';
+            resultSessionId = event.session_id || resultSessionId;
+            resultCost = event.total_cost_usd || resultCost;
+            resultNumTurns = event.num_turns || resultNumTurns;
+            continue;
+          }
+
+          // Track session ID from any event
+          if (event.session_id) resultSessionId = event.session_id;
+
+          // New assistant turn
+          if (event.type === 'assistant') {
+            if (channelState) channelState.progress.turnCount++;
+            continue;
+          }
+
+          // Content block events (tool use + text tracking)
+          const inner = event.type === 'stream_event' ? event.event : event;
+          if (!inner) continue;
+
+          if (inner.type === 'content_block_start') {
+            const block = inner.content_block;
+            if (block?.type === 'tool_use' && channelState) {
+              channelState.progress.currentTool = block.name;
+              channelState.progress.toolDetail = '';
+              channelState.progress.activeBlocks.set(inner.index, { type: 'tool_use', name: block.name });
+              currentToolInput = '';
+            } else if (block?.type === 'text' && channelState) {
+              channelState.progress.activeBlocks.set(inner.index, { type: 'text' });
+            }
+          }
+
+          if (inner.type === 'content_block_delta') {
+            if (inner.delta?.type === 'text_delta') {
+              accumulatedText += inner.delta.text;
+            }
+            if (inner.delta?.type === 'input_json_delta') {
+              currentToolInput += inner.delta.partial_json;
+              // Try to extract detail early for !btw
+              if (channelState && channelState.progress.currentTool) {
+                const detail = summarizeToolInput(channelState.progress.currentTool, currentToolInput);
+                if (detail) channelState.progress.toolDetail = detail;
+              }
+            }
+          }
+
+          if (inner.type === 'content_block_stop' && channelState) {
+            const block = channelState.progress.activeBlocks.get(inner.index);
+            if (block?.type === 'tool_use') {
+              const detail = summarizeToolInput(block.name, currentToolInput);
+              channelState.progress.toolHistory.push({ name: block.name, detail });
+              if (channelState.progress.toolHistory.length > 10) {
+                channelState.progress.toolHistory.shift();
+              }
+              channelState.progress.currentTool = null;
+              channelState.progress.toolDetail = '';
+              currentToolInput = '';
+            }
+            channelState.progress.activeBlocks.delete(inner.index);
+          }
+        } catch {
+          // Skip unparseable lines
+        }
+      }
     });
+
+    child.stderr.on('data', (d) => { stderr += d; });
 
     const timeout = setTimeout(() => {
       child.kill();
@@ -117,9 +231,11 @@ NOTE — DOCKER ACCESS: You have full Docker access. You can run \`docker ps\`, 
         channelState.process = null;
         channelState.busy = false;
         channelState.startedAt = null;
-        channelState.stderrBuf = '';
+        channelState.progress = freshProgress();
       }
-      reject(new Error(`Claude CLI timed out after ${MAX_TIMEOUT / 60000} minutes`));
+      const timeoutErr = new Error(`Claude CLI timed out after ${MAX_TIMEOUT / 60000} minutes`);
+      sendErrorAlert(timeoutErr, { source: 'askClaude timeout' });
+      reject(timeoutErr);
     }, MAX_TIMEOUT);
 
     child.on('close', (code) => {
@@ -128,7 +244,7 @@ NOTE — DOCKER ACCESS: You have full Docker access. You can run \`docker ps\`, 
         channelState.process = null;
         channelState.busy = false;
         channelState.startedAt = null;
-        channelState.stderrBuf = '';
+        channelState.progress = freshProgress();
       }
 
       // code 143 = killed by !stop, not an error
@@ -139,20 +255,18 @@ NOTE — DOCKER ACCESS: You have full Docker access. You can run \`docker ps\`, 
       if (code !== 0) {
         console.error('Claude CLI exited with code:', code);
         if (stderr) console.error('stderr:', stderr.substring(0, 500));
-        if (stdout) console.error('stdout:', stdout.substring(0, 500));
-        return reject(new Error(`Claude CLI exited with code ${code}\n${(stderr || stdout).substring(0, 300)}`));
+        const exitErr = new Error(`Claude CLI exited with code ${code}\n${stderr.substring(0, 300)}`);
+        sendErrorAlert(exitErr, { source: 'askClaude', detail: `Exit code ${code}` });
+        return reject(exitErr);
       }
 
-      try {
-        const parsed = JSON.parse(stdout);
-        const text = parsed.result || parsed.text || stdout.trim();
-        const newSessionId = parsed.session_id || null;
-        const numTurns = parsed.num_turns || 0;
-        const cost = parsed.total_cost_usd || 0;
-        resolve({ text, sessionId: newSessionId, cost, numTurns, stopped: false });
-      } catch {
-        resolve({ text: stdout.trim(), sessionId: null, cost: null, stopped: false });
-      }
+      resolve({
+        text: resultText || accumulatedText || '',
+        sessionId: resultSessionId,
+        cost: resultCost,
+        numTurns: resultNumTurns,
+        stopped: false,
+      });
     });
   });
 }
@@ -459,6 +573,7 @@ async function handleCommand(message) {
       } catch (err) {
         const errorMsg = err.message.length > 500 ? err.message.substring(0, 500) + '...' : err.message;
         await message.reply(`Error: ${errorMsg}`).catch(() => {});
+        sendErrorAlert(err, { source: 'email command', channel: message.channel.id });
       } finally {
         clearInterval(typingInterval);
       }
@@ -475,21 +590,64 @@ async function handleCommand(message) {
       const secs = elapsed % 60;
       const runtime = mins > 0 ? `${mins}m ${secs}s` : `${secs}s`;
 
-      // Get last ~500 chars of stderr, trimmed to last complete line
-      let activity = state.stderrBuf || '';
-      if (activity.length > 500) {
-        activity = activity.substring(activity.length - 500);
-        const firstNewline = activity.indexOf('\n');
-        if (firstNewline > 0) activity = activity.substring(firstNewline + 1);
+      const p = state.progress;
+      const lines = [`**Running for ${runtime}**${p.turnCount > 0 ? ` | Turn ${p.turnCount}` : ''}`];
+
+      // What's happening right now
+      if (p.currentTool) {
+        const label = TOOL_LABELS[p.currentTool] || `Using ${p.currentTool}`;
+        lines.push(`**Now:** ${label}${p.toolDetail ? ` — \`${p.toolDetail}\`` : '...'}`);
+      } else {
+        lines.push(`**Now:** Thinking...`);
       }
-      activity = activity.trim();
 
-      const pid = state.process.pid || 'unknown';
-      const activityBlock = activity
-        ? `\n**Recent activity:**\n\`\`\`\n${activity}\n\`\`\``
-        : '\n*(No stderr output yet — still starting up)*';
+      // Recent tool history breadcrumb
+      if (p.toolHistory.length > 0) {
+        const recent = p.toolHistory.slice(-5).map(t => {
+          const label = TOOL_LABELS[t.name] || t.name;
+          return t.detail ? `${label} \`${t.detail.split('/').pop()}\`` : label;
+        });
+        lines.push(`**Recent:** ${recent.join(' → ')}`);
+      }
 
-      await message.reply(`**Running for ${runtime}** | PID ${pid}${activityBlock}`);
+      // Detect listening ports in the project directory
+      try {
+        const portOutput = execSync(
+          `ss -tlnp 2>/dev/null | grep LISTEN | awk '{print $4}' | grep -oP '\\d+$' | sort -un`,
+          { encoding: 'utf-8', timeout: 3000 }
+        ).trim();
+        if (portOutput) {
+          const ports = portOutput.split('\n').filter(p => p !== '3400'); // exclude bot's own port
+          if (ports.length > 0) {
+            lines.push(`**Ports:** ${ports.join(', ')}`);
+          }
+        }
+      } catch {}
+
+      // Check for other Claude CLI sessions attached to this project
+      try {
+        const cwdEscaped = state.cwd.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        const cliOutput = execSync(
+          `ps aux 2>/dev/null | grep -v grep | grep "[c]laude" || true`,
+          { encoding: 'utf-8', timeout: 3000 }
+        ).trim();
+        if (cliOutput) {
+          // Count claude processes, subtract our own bot-spawned one
+          const allClaude = cliOutput.split('\n').filter(l => l.trim());
+          const botPid = state.process?.pid;
+          const otherSessions = allClaude.filter(l => {
+            // Check if this line contains our bot's child PID
+            const pidMatch = l.match(/^\S+\s+(\d+)/);
+            if (!pidMatch) return true;
+            return String(pidMatch[1]) !== String(botPid);
+          });
+          if (otherSessions.length > 0) {
+            lines.push(`**Claude CLI:** ${otherSessions.length} other session(s) active`);
+          }
+        }
+      } catch {}
+
+      await message.reply(lines.join('\n'));
       break;
     }
 
@@ -591,6 +749,9 @@ client.on('ready', () => {
     } catch {}
   }
 
+  // Initialize error alerting
+  initErrorAlerting(client);
+
   // Start scheduled briefings
   const briefings = require('./briefings');
   briefings.startScheduler(client);
@@ -675,6 +836,7 @@ client.on('messageCreate', async (message) => {
     console.error('Error handling message:', err.message);
     const errorMsg = err.message.length > 500 ? err.message.substring(0, 500) + '...' : err.message;
     await message.reply(`Error: ${errorMsg}`).catch(() => {});
+    sendErrorAlert(err, { source: 'message handler', channel: message.channel.id, detail: message.content.substring(0, 100) });
   } finally {
     clearInterval(typingInterval);
   }

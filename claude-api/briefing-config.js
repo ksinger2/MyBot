@@ -27,6 +27,9 @@ module.exports = {
   // Right-click a channel > Copy Channel ID (enable Developer Mode in Discord settings)
   channelId: '1481550166501626039',
 
+  // Channel for error alerts
+  errorChannelId: '1481852862634918066',
+
   // Identity and personality for the briefing (null = use bot defaults)
   identity: null,
   personality: null,
