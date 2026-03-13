@@ -16,6 +16,9 @@ RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg -o 
     && echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" > /etc/apt/sources.list.d/github-cli.list \
     && apt-get update && apt-get install -y gh && rm -rf /var/lib/apt/lists/*
 
+# Install Docker CLI (for container management from inside the container)
+RUN apt-get update && apt-get install -y docker.io && rm -rf /var/lib/apt/lists/*
+
 # Install Claude Code CLI globally
 RUN npm install -g @anthropic-ai/claude-code
 
@@ -24,8 +27,10 @@ WORKDIR /app
 COPY package.json ./
 RUN npm install
 
-COPY server.js bot.js briefings.js briefing-config.js ./
+COPY *.js ./
+COPY wizards/ ./wizards/
 COPY personalities/ ./personalities/
+COPY project-template/ ./project-template/
 
 # Create .claude directory with correct ownership before switching user
 RUN mkdir -p /home/node/.claude && chown node:node /home/node/.claude

@@ -11,6 +11,18 @@ module.exports = {
   schedule: '0 9 * * *',
   timezone: 'America/Los_Angeles',
 
+  // Evening check-in: ask for tomorrow's tasks at 10 PM
+  eveningCheckin: {
+    enabled: true,
+    schedule: '0 22 * * *',
+  },
+
+  // Sunday weekly preview: "what's coming this week" at noon on Sundays
+  weeklyPreview: {
+    enabled: true,
+    schedule: '0 12 * * 0',  // noon every Sunday
+  },
+
   // Discord channel ID where the briefing is posted
   // Right-click a channel > Copy Channel ID (enable Developer Mode in Discord settings)
   channelId: '1481550166501626039',

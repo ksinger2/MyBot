@@ -1,7 +1,8 @@
 const { Client, GatewayIntentBits, AttachmentBuilder } = require('discord.js');
-const { spawn } = require('child_process');
+const { spawn, execSync } = require('child_process');
 const fs = require('fs');
 const path = require('path');
+const { handleWizardMessage, cancelWizard } = require('./wizard');
 
 const PERSONALITIES_DIR = path.join(__dirname, 'personalities');
 const DEFAULT_PERSONALITY = 'tiffany_pollard';
@@ -33,9 +34,16 @@ function getChannel(channelId) {
       cwd: DEFAULT_WORKSPACE,
       process: null,  // active child process
       busy: false,    // is Claude currently working
+      wizard: null,   // active wizard state (multi-step interactions)
+      startedAt: null, // timestamp when Claude started working
+      stderrBuf: '',   // accumulated stderr for !btw progress peeking
     });
   }
   return channels.get(channelId);
+}
+
+function getChannelState(channelId) {
+  return getChannel(channelId);
 }
 
 function getPersonalityFile(name) {
@@ -66,7 +74,11 @@ function askClaude(prompt, { sessionId = null, personalityFile = null, identity 
     // Combine identity + personality into a single system prompt
     // (Claude CLI only allows one of --append-system-prompt or --append-system-prompt-file)
     const systemParts = [];
-    systemParts.push(`CRITICAL RULE — BREVITY: Keep responses SHORT. Use bullet points, not paragraphs. 1-3 sentences per point MAX. No walls of text. No long intros or outros. Get to the point FAST. Your responses should be EASY TO SKIM. If you can say it in one sentence, do NOT use three. This is a Discord chat, not an essay.`);
+    systemParts.push(`CRITICAL RULE — BREVITY: Keep responses SHORT. Use bullet points, not paragraphs. 1-3 sentences per point MAX. No walls of text. No long intros or outros. Get to the point FAST. Your responses should be EASY TO SKIM. If you can say it in one sentence, do NOT use three. This is a Discord chat, not an essay.
+
+CRITICAL RULE — IMAGE ATTACHMENTS: Whenever you generate, save, or display any image files, you MUST include their full absolute file paths in your text response (e.g. /workspace/BookFactory/output/book_id/page_01.png). This is required so the Discord bot can attach the images to the message. List every image path on its own line. Do NOT rely on tool output alone — the path must appear in your final text response.
+
+NOTE — DOCKER ACCESS: You have full Docker access. You can run \`docker ps\`, \`docker restart\`, \`docker compose up -d --build\`, etc. When you make code changes that need a rebuild, just do it yourself — don't tell the user to do it. The project docker-compose.yml is at /workspace/MyBot/docker-compose.yml.`);
     if (identity) {
       systemParts.push(`Your name is ${identity.name}. You are ${identity.description}.`);
     }
@@ -87,18 +99,25 @@ function askClaude(prompt, { sessionId = null, personalityFile = null, identity 
     if (channelState) {
       channelState.process = child;
       channelState.busy = true;
+      channelState.startedAt = Date.now();
+      channelState.stderrBuf = '';
     }
 
     let stdout = '';
     let stderr = '';
     child.stdout.on('data', (d) => { stdout += d; });
-    child.stderr.on('data', (d) => { stderr += d; });
+    child.stderr.on('data', (d) => {
+      stderr += d;
+      if (channelState) channelState.stderrBuf += d;
+    });
 
     const timeout = setTimeout(() => {
       child.kill();
       if (channelState) {
         channelState.process = null;
         channelState.busy = false;
+        channelState.startedAt = null;
+        channelState.stderrBuf = '';
       }
       reject(new Error(`Claude CLI timed out after ${MAX_TIMEOUT / 60000} minutes`));
     }, MAX_TIMEOUT);
@@ -108,6 +127,8 @@ function askClaude(prompt, { sessionId = null, personalityFile = null, identity 
       if (channelState) {
         channelState.process = null;
         channelState.busy = false;
+        channelState.startedAt = null;
+        channelState.stderrBuf = '';
       }
 
       // code 143 = killed by !stop, not an error
@@ -304,6 +325,19 @@ async function handleCommand(message) {
       break;
     }
 
+    case '!restart': {
+      await message.reply('Restarting... be right back.');
+      // Save channel ID so we can notify when we're back
+      try { fs.writeFileSync(path.join(__dirname, '.restart-channel'), message.channel.id); } catch {}
+      // Kill all active processes first
+      for (const [, s] of channels) {
+        if (s.process) s.process.kill();
+      }
+      // Exit cleanly — Docker restart policy will bring the container back up
+      setTimeout(() => process.exit(0), 500);
+      break;
+    }
+
     case '!killall': {
       for (const [, s] of channels) {
         if (s.process) s.process.kill();
@@ -321,18 +355,26 @@ async function handleCommand(message) {
         `\`!clear\` — Clear conversation context (wipe memory, keep working dir)\n` +
         `\`!kill\` — Hard kill: stop process + destroy session (full reset)\n` +
         `\`!killall\` — Kill everything across all channels\n` +
+        `\`!restart\` — Restart the bot container (applies code changes)\n` +
         `\`!status\` — Show what's running and session info\n\n` +
+        `\`!processes\` — Show active Claude processes and resource usage\n` +
+        `\`!btw\` — Peek at Claude's progress while it's working (non-destructive)\n` +
+        `\`!cancel\` — Cancel an active wizard\n\n` +
         `**Workspace:**\n` +
         `\`!cd <path>\` — Change project directory\n` +
         `\`!cd\` — Show current directory\n` +
-        `\`!ls [path]\` — List files\n\n` +
+        `\`!ls [path]\` — List files\n` +
+        `\`!startproject\` — Create a new project with Claude Code template + git setup\n\n` +
         `**Identity & Personality:**\n` +
         `\`!name [name]\` — Show or set bot name\n` +
         `\`!identity [Name is description]\` — Show or set full identity\n` +
         `\`!personality <name>\` — Switch personality (voice/style)\n` +
         `\`!personalities\` — List available\n\n` +
         `**Briefing:**\n` +
-        `\`!briefing\` — Send the morning briefing now (stocks, weather, news, motivation)\n\n` +
+        `\`!briefing\` — Send the morning briefing now (stocks, weather, news, motivation)\n` +
+        `\`!weekly\` — Send the weekly preview now (week ahead, goals, events)\n\n` +
+        `**Email:**\n` +
+        `\`!email <who and what>\` — Draft 3 professional email options (e.g. \`!email my boss about taking Friday off\`)\n\n` +
         `**How it works:**\n` +
         `Just type what you want built. Claude Code runs autonomously in your workspace — it reads files, writes code, runs commands, commits, pushes.\n\n` +
         `Each message continues the same session, so Claude remembers everything. Use \`!stop\` to interrupt, \`!clear\` to start over.\n\n` +
@@ -379,14 +421,132 @@ async function handleCommand(message) {
       break;
     }
 
+    case '!weekly': {
+      const briefings = require('./briefings');
+      await message.reply('Running weekly preview now...');
+      briefings.sendWeeklyPreview(client).catch(err => {
+        message.reply(`Weekly preview failed: ${err.message}`).catch(() => {});
+      });
+      break;
+    }
+
+    case '!email': {
+      if (!arg) {
+        await message.reply('Usage: `!email <who and what>` — e.g. `!email my manager about needing Friday off`');
+        break;
+      }
+      // Don't treat this as a command — fall through to Claude with email-drafting instructions
+      const emailPrompt = `Draft 3 email options for the following request. Each option should be a different tone/approach (e.g. direct, warm, formal). For each option:\n- Subject line\n- Body\n\nKeep them professional, clear, and concise. No fluff.\n\nRequest: ${arg}`;
+      // Send to Claude like a normal message
+      const emailState = getChannel(message.channel.id);
+      if (emailState.busy) {
+        await message.reply('Claude is still working. Use `!stop` first.');
+        break;
+      }
+      const personalityFile = getPersonalityFile(emailState.personality);
+      await message.channel.sendTyping();
+      const typingInterval = setInterval(() => { message.channel.sendTyping().catch(() => {}); }, 8000);
+      try {
+        const result = await askClaude(emailPrompt, {
+          sessionId: emailState.sessionId,
+          personalityFile,
+          identity: emailState.identity,
+          cwd: emailState.cwd,
+          channelState: emailState,
+        });
+        if (result.sessionId) emailState.sessionId = result.sessionId;
+        if (!result.stopped) await sendLongMessage(message, result.text, emailState.cwd);
+      } catch (err) {
+        const errorMsg = err.message.length > 500 ? err.message.substring(0, 500) + '...' : err.message;
+        await message.reply(`Error: ${errorMsg}`).catch(() => {});
+      } finally {
+        clearInterval(typingInterval);
+      }
+      break;
+    }
+
+    case '!btw': {
+      if (!state.busy || !state.process) {
+        await message.reply('Nothing running right now.');
+        break;
+      }
+      const elapsed = state.startedAt ? Math.round((Date.now() - state.startedAt) / 1000) : 0;
+      const mins = Math.floor(elapsed / 60);
+      const secs = elapsed % 60;
+      const runtime = mins > 0 ? `${mins}m ${secs}s` : `${secs}s`;
+
+      // Get last ~500 chars of stderr, trimmed to last complete line
+      let activity = state.stderrBuf || '';
+      if (activity.length > 500) {
+        activity = activity.substring(activity.length - 500);
+        const firstNewline = activity.indexOf('\n');
+        if (firstNewline > 0) activity = activity.substring(firstNewline + 1);
+      }
+      activity = activity.trim();
+
+      const pid = state.process.pid || 'unknown';
+      const activityBlock = activity
+        ? `\n**Recent activity:**\n\`\`\`\n${activity}\n\`\`\``
+        : '\n*(No stderr output yet — still starting up)*';
+
+      await message.reply(`**Running for ${runtime}** | PID ${pid}${activityBlock}`);
+      break;
+    }
+
+    case '!cancel': {
+      await cancelWizard(state, message);
+      break;
+    }
+
+    case '!processes': {
+      try {
+        const output = execSync(
+          'ps aux --sort=-%mem | head -1; ps aux --sort=-%mem | grep "[c]laude" || echo "No Claude processes running"',
+          { encoding: 'utf-8', timeout: 5000 }
+        ).trim();
+
+        const activeChannels = [];
+        for (const [chId, s] of channels) {
+          if (s.busy && s.process) {
+            const ch = client.channels.cache.get(chId);
+            const chName = ch ? `#${ch.name}` : chId;
+            activeChannels.push(`${chName}: PID ${s.process.pid}`);
+          }
+        }
+
+        const channelInfo = activeChannels.length
+          ? `\n\n**Active bot tasks:**\n${activeChannels.join('\n')}`
+          : '\n\n**No active bot tasks**';
+
+        await message.reply(`**System Processes:**\n\`\`\`\n${output}\n\`\`\`${channelInfo}`);
+      } catch (err) {
+        await message.reply(`Error checking processes: ${err.message}`);
+      }
+      break;
+    }
+
+    case '!startproject': {
+      if (state.busy) {
+        await message.reply('Claude is still working. Use `!stop` first.');
+        break;
+      }
+      if (state.wizard) {
+        await message.reply('A wizard is already active. Use `!cancel` to cancel it first.');
+        break;
+      }
+      const { startProjectWizard } = require('./wizards/startproject');
+      await startProjectWizard(state, message);
+      break;
+    }
+
     case '!commands': {
       await message.reply(
         `**Available Commands:**\n` +
-        `\`!stop\` \`!clear\` \`!kill\` \`!killall\`\n` +
-        `\`!status\` \`!cd\` \`!ls\`\n` +
-        `\`!name\` \`!identity\`\n` +
+        `\`!stop\` \`!clear\` \`!kill\` \`!killall\` \`!restart\` \`!cancel\`\n` +
+        `\`!status\` \`!processes\` \`!btw\` \`!cd\` \`!ls\`\n` +
+        `\`!startproject\` \`!name\` \`!identity\`\n` +
         `\`!personality\` \`!personalities\`\n` +
-        `\`!briefing\` \`!help\` \`!commands\`\n\n` +
+        `\`!briefing\` \`!weekly\` \`!email\` \`!help\` \`!commands\`\n\n` +
         `Use \`!help\` for detailed descriptions.`
       );
       break;
@@ -420,6 +580,17 @@ client.on('ready', () => {
   console.log(`Workspace: ${DEFAULT_WORKSPACE}`);
   console.log(`Max turns: ${DEFAULT_MAX_TURNS} | Timeout: ${MAX_TIMEOUT / 60000}min`);
 
+  // Notify channel if we're coming back from a !restart
+  const restartFile = path.join(__dirname, '.restart-channel');
+  if (fs.existsSync(restartFile)) {
+    try {
+      const channelId = fs.readFileSync(restartFile, 'utf-8').trim();
+      fs.unlinkSync(restartFile);
+      const ch = client.channels.cache.get(channelId);
+      if (ch) ch.send("I'm back! Restart complete.").catch(() => {});
+    } catch {}
+  }
+
   // Start scheduled briefings
   const briefings = require('./briefings');
   briefings.startScheduler(client);
@@ -428,13 +599,22 @@ client.on('ready', () => {
 client.on('messageCreate', async (message) => {
   if (message.author.bot) return;
 
-  // Handle commands
+  const state = getChannel(message.channel.id);
+
+  // Handle commands — also cancel any active wizard when a command is issued
   if (message.content.startsWith('!')) {
+    if (state.wizard && message.content.trim().toLowerCase() !== '!cancel') {
+      state.wizard = null; // silently cancel wizard on any command
+    }
     const handled = await handleCommand(message);
     if (handled) return;
   }
 
-  const state = getChannel(message.channel.id);
+  // If a wizard is active, let it handle the message
+  if (state.wizard) {
+    const handled = await handleWizardMessage(state, message);
+    if (handled) return;
+  }
 
   // If Claude is already working, queue message as info
   if (state.busy) {
@@ -509,4 +689,4 @@ function start() {
   client.login(token);
 }
 
-module.exports = { start, askClaude, client };
+module.exports = { start, askClaude, client, getChannelState };

@@ -1,28 +1,9 @@
 services:
-  n8n:
-    image: n8nio/n8n:latest
-    restart: unless-stopped
-    ports:
-      - "5678:5678"
-    environment:
-      - N8N_BASIC_AUTH_ACTIVE=${N8N_BASIC_AUTH_ACTIVE}
-      - N8N_BASIC_AUTH_USER=${N8N_BASIC_AUTH_USER}
-      - N8N_BASIC_AUTH_PASSWORD=${N8N_BASIC_AUTH_PASSWORD}
-      - N8N_HOST=${N8N_HOST}
-      - N8N_PORT=5678
-      - N8N_PROTOCOL=${N8N_PROTOCOL}
-      - GENERIC_TIMEZONE=${GENERIC_TIMEZONE}
-    volumes:
-      - n8n_data:/home/node/.n8n
-    networks:
-      - bot-network
-    depends_on:
-      claude-api:
-        condition: service_healthy
-
   claude-api:
     build: ./claude-api
     restart: unless-stopped
+    group_add:
+      - "989"
     environment:
       - DISCORD_BOT_TOKEN=${DISCORD_BOT_TOKEN}
       # API keys available to Claude Code when building projects
@@ -40,18 +21,14 @@ services:
       - ${HOME}/.ssh:/home/node/.ssh:ro
       - ${HOME}/.config/gh:/home/node/.config/gh:ro
       - /mnt/c/Users/karen/Desktop/Github Projects:/workspace
+      - /var/run/docker.sock:/var/run/docker.sock
     healthcheck:
       test: ["CMD", "node", "-e", "require('http').get('http://localhost:3400/health', r => { process.exit(r.statusCode === 200 ? 0 : 1) })"]
       interval: 30s
       timeout: 10s
       retries: 3
       start_period: 15s
-    networks:
-      - bot-network
-
-volumes:
-  n8n_data:
 
 networks:
-  bot-network:
+  default:
     driver: bridge

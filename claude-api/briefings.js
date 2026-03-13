@@ -1,7 +1,9 @@
 const schedule = require('node-schedule');
 const https = require('https');
 const path = require('path');
+const { MessageFlags } = require('discord.js');
 const config = require('./briefing-config');
+const { loadTasks, clearTasks } = require('./tasks-storage');
 
 const PERSONALITIES_DIR = path.join(__dirname, 'personalities');
 const DEFAULT_PERSONALITY = 'tiffany_pollard';
@@ -124,7 +126,7 @@ function buildJobsSection(jobsConfig) {
 
 // --- Prompt Builder ---
 
-function buildPrompt(stockData, weatherData, jobsData, cfg) {
+function buildPrompt(stockData, weatherData, jobsData, cfg, tasks = null) {
   const sections = [];
 
   sections.push(`You are writing a SHORT morning briefing for Discord. CRITICAL RULES:
@@ -193,6 +195,11 @@ function buildPrompt(stockData, weatherData, jobsData, cfg) {
     instructions += `${step++}. **Stocks** — Pre-fetched data unavailable. USE WEB SEARCH to get current prices for: ${tickers}. Show price and % change for each. One line per ticker.\n\n`;
   }
 
+  // Tasks for today
+  if (tasks) {
+    instructions += `${step++}. **Today's Tasks** — The user set these tasks for today. Format each as a ☐ checkbox on its own line. Do NOT modify or add to the task list — just format what's here:\n${tasks}\n\n`;
+  }
+
   // News — this is the big one, needs web search
   if (cfg.news.enabled) {
     instructions += `${step++}. **News** — USE WEB SEARCH for each topic below. I need SPECIFIC details about what happened, not vague summaries. Each item MUST include a link to the source article.\n\n`;
@@ -200,7 +207,7 @@ function buildPrompt(stockData, weatherData, jobsData, cfg) {
     for (const topic of cfg.news.topics) {
       instructions += `- "${topic.query}" (last ${topic.timeframe})${topic.depth === 'detailed' ? ' — give me specifics: who, what, when, consequences' : ' — 1-2 bullet points'}\n`;
     }
-    instructions += `\nFormat each news item as:\n**Headline** — 1-2 sentence summary of EXACTLY what happened. [Read more](url)\n\n`;
+    instructions += `\nFormat each news item as:\n**Headline** — 1-2 sentence summary of EXACTLY what happened. [Read more](url)\n\nIMPORTANT: All article links MUST be hyperlinked text using [text](url) markdown format. Do NOT paste bare URLs. Do NOT use Discord embed-style links — wrap URLs in < > angle brackets to suppress embeds if needed. Keep it compact.\n\n`;
   }
 
   // Jobs — needs web search
@@ -219,7 +226,19 @@ function buildPrompt(stockData, weatherData, jobsData, cfg) {
 
   // Mindfulness — keep it to 2 lines
   if (cfg.motivation.enabled && cfg.motivation.userContext) {
-    instructions += `${step++}. **Mindfulness** — ONLY a breathing exercise, body scan, grounding technique, or meditation. NO news, NO AI articles, NO tech content, NO links. Just ONE specific exercise in 2 lines max. E.g., "Box breathing: 4 in, 4 hold, 4 out, 4 hold — 4 rounds before opening your laptop." Rotate techniques daily. This section is STRICTLY wellness only.\n\n`;
+    const dayOfWeek = new Date().toLocaleDateString('en-US', { weekday: 'long', timeZone: cfg.timezone || 'America/Los_Angeles' });
+    const dayIndex = new Date().getDay();
+    const techniques = [
+      'body scan (progressive muscle relaxation from toes to head)',
+      '4-7-8 breathing (inhale 4, hold 7, exhale 8)',
+      '5-4-3-2-1 grounding (5 things you see, 4 hear, 3 touch, 2 smell, 1 taste)',
+      'box breathing (4 in, 4 hold, 4 out, 4 hold — 4 rounds)',
+      'mindful walking (focus on each step, feel the ground, no phone)',
+      'loving-kindness meditation (send compassion to yourself, then someone you love, then a stranger)',
+      'alternate nostril breathing (close right nostril inhale left, switch, exhale right, repeat)',
+    ];
+    const todayTechnique = techniques[dayIndex % techniques.length];
+    instructions += `${step++}. **Mindfulness** — Today is ${dayOfWeek}. Use this technique today: "${todayTechnique}". Describe it in 2 lines max with specific instructions. NO news, NO AI articles, NO tech content, NO links. This section is STRICTLY wellness only.\n\n`;
   }
 
   instructions += 'End with a one-line sign-off in character. THE ENTIRE BRIEFING SHOULD FIT IN ~3 DISCORD MESSAGES MAX.';
@@ -241,8 +260,10 @@ async function sendToChannel(channel, text) {
     return;
   }
 
+  const sendOpts = (content) => ({ content, flags: [MessageFlags.SuppressEmbeds] });
+
   if (text.length <= 1900) {
-    await channel.send(text);
+    await channel.send(sendOpts(text));
     return;
   }
 
@@ -260,7 +281,7 @@ async function sendToChannel(channel, text) {
   }
 
   for (let i = 0; i < chunks.length && i < 8; i++) {
-    await channel.send(chunks[i]);
+    await channel.send(sendOpts(chunks[i]));
   }
   if (chunks.length > 8) {
     await channel.send(`*(${chunks.length - 8} more sections truncated)*`);
@@ -283,7 +304,8 @@ async function sendBriefing(client) {
   ]);
 
   const jobsData = buildJobsSection(config.jobs);
-  const prompt = buildPrompt(stockData, weatherData, jobsData, config);
+  const tasks = loadTasks();
+  const prompt = buildPrompt(stockData, weatherData, jobsData, config, tasks);
 
   // Resolve identity and personality
   const { askClaude } = require('./bot');
@@ -301,6 +323,7 @@ async function sendBriefing(client) {
 
     if (result.text) {
       await sendToChannel(channel, result.text);
+      clearTasks(); // consumed — clear for tomorrow
       console.log(`Briefing sent to #${channel.name || config.channelId}${result.cost ? ` ($${result.cost.toFixed(4)})` : ''}`);
     } else {
       await channel.send('*(Morning briefing came back empty — Claude might be having a slow morning too)*');
@@ -308,6 +331,96 @@ async function sendBriefing(client) {
   } catch (err) {
     console.error('Briefing Claude call failed:', err.message);
     await channel.send('*(Morning briefing failed to generate — check the logs)*').catch(() => {});
+  }
+}
+
+// --- Weekly Preview (Sunday) ---
+
+function buildWeeklyPreviewPrompt(tasks) {
+  const sections = [];
+
+  sections.push(`You are writing a SHORT weekly preview for Discord. CRITICAL RULES:
+- Use Discord markdown (bold, emoji, ## headers)
+- Keep it SCANNABLE — bullet points, not paragraphs
+- NO fluff, NO filler, NO long intros
+- USE WEB SEARCH if needed for current info`);
+
+  let instructions = `## YOUR TASK
+Write a "Week Ahead" preview. Keep it SHORT and SCANNABLE.\n\n`;
+  let step = 1;
+
+  // Greeting
+  instructions += `${step++}. **Greeting** — ONE sentence. Sunday vibes. In character.\n\n`;
+
+  // Tasks
+  if (tasks) {
+    instructions += `${step++}. **Carry-over Tasks** — These tasks were saved and haven't been completed yet. Format each as ☐ on its own line:\n${tasks}\n\n`;
+  }
+
+  // Weekly goals
+  instructions += `${step++}. **Weekly Goals** — Suggest 3-4 realistic, actionable goals for the week. Mix professional development (job search, skill building) and personal wellness (exercise, mindfulness, social). Keep each to one line. Base these on the user context below.\n\n`;
+
+  // Week ahead prep
+  instructions += `${step++}. **Week Ahead Prep** — USE WEB SEARCH to find:\n`;
+  instructions += `- Any major events, holidays, or observances this week\n`;
+  instructions += `- Key earnings reports or market events this week (relevant to user's portfolio: ${config.stocks.tickers.join(', ')})\n`;
+  instructions += `- Any notable tech/AI conferences, announcements, or launches scheduled this week\n`;
+  instructions += `Keep it to items that are actually relevant. Skip if nothing notable.\n\n`;
+
+  // Weather outlook
+  if (config.weather.enabled) {
+    instructions += `${step++}. **Weather This Week** — USE WEB SEARCH to get the week's weather outlook for ${config.weather.location}. Just the highlights: any rain days, temperature trend, best days to be outside. 2-3 lines max.\n\n`;
+  }
+
+  // Motivation / intention setting
+  if (config.motivation.enabled && config.motivation.userContext) {
+    instructions += `${step++}. **Weekly Intention** — Suggest ONE intention or theme for the week. Keep it grounded and practical, tied to the user context below. One sentence, then a specific action they can take Monday morning to start the week right.\n\n`;
+  }
+
+  instructions += 'End with a one-line sign-off in character. THE ENTIRE MESSAGE SHOULD FIT IN ~2-3 DISCORD MESSAGES MAX.';
+
+  if (config.motivation.userContext) {
+    instructions += `\n\nUser context: ${config.motivation.userContext}`;
+  }
+
+  sections.push(instructions);
+  return sections.join('\n\n');
+}
+
+async function sendWeeklyPreview(client) {
+  console.log('Running Sunday weekly preview...');
+
+  const channel = await client.channels.fetch(config.channelId).catch(() => null);
+  if (!channel) {
+    console.error(`Weekly preview failed: cannot access channel ${config.channelId}`);
+    return;
+  }
+
+  const tasks = loadTasks();
+  const prompt = buildWeeklyPreviewPrompt(tasks);
+
+  const { askClaude } = require('./bot');
+  const identity = config.identity || DEFAULT_IDENTITY;
+  const personalityName = config.personality || DEFAULT_PERSONALITY;
+  const personalityFile = path.join(PERSONALITIES_DIR, `${personalityName}.md`);
+
+  try {
+    const result = await askClaude(prompt, {
+      personalityFile,
+      identity,
+      cwd: '/app',
+      maxTurns: 15,
+    });
+
+    if (result.text) {
+      await sendToChannel(channel, result.text);
+      console.log(`Weekly preview sent to #${channel.name || config.channelId}${result.cost ? ` ($${result.cost.toFixed(4)})` : ''}`);
+    } else {
+      await channel.send('*(Weekly preview came back empty)*');
+    }
+  } catch (err) {
+    console.error('Weekly preview failed:', err.message);
+    await channel.send('*(Weekly preview failed to generate — check the logs)*').catch(() => {});
   }
 }
 
@@ -330,6 +443,42 @@ function startScheduler(client) {
   );
 
   console.log(`Briefing scheduled: "${config.schedule}" (${config.timezone}) → channel ${config.channelId}`);
+
+  // Sunday weekly preview
+  if (config.weeklyPreview?.enabled) {
+    schedule.scheduleJob(
+      { rule: config.weeklyPreview.schedule, tz: config.timezone },
+      () => sendWeeklyPreview(client)
+    );
+    console.log(`Weekly preview scheduled: "${config.weeklyPreview.schedule}" (${config.timezone})`);
+  }
+
+  // Evening check-in
+  if (config.eveningCheckin?.enabled) {
+    schedule.scheduleJob(
+      { rule: config.eveningCheckin.schedule, tz: config.timezone },
+      async () => {
+        const channel = await client.channels.fetch(config.channelId).catch(() => null);
+        if (!channel) return;
+        const { getChannelState } = require('./bot');
+        const { startWizard } = require('./wizard');
+        const { saveTasks } = require('./tasks-storage');
+        const state = getChannelState(config.channelId);
+        await startWizard(state, { reply: (msg) => channel.send(msg), channel }, {
+          type: 'eveningTasks',
+          steps: [{
+            key: 'tasks',
+            prompt: "Hey girl 🐄 What do you need to get done tomorrow? Drop your task list and I'll make sure it's front and center in your morning briefing. (Just reply right here — I'm listening!)",
+          }],
+          onComplete: async (data, msg) => {
+            saveTasks(data.tasks);
+            await msg.reply("Locked in girl! I've got your tasks saved. They'll be front and center in tomorrow's morning briefing 🐄");
+          },
+        });
+      }
+    );
+    console.log(`Evening check-in scheduled: "${config.eveningCheckin.schedule}" (${config.timezone})`);
+  }
 }
 
-module.exports = { startScheduler, sendBriefing };
+module.exports = { startScheduler, sendBriefing, sendWeeklyPreview };
