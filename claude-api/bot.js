@@ -1,9 +1,11 @@
-const { Client, GatewayIntentBits, AttachmentBuilder } = require('discord.js');
+const { Client, GatewayIntentBits, Partials, AttachmentBuilder } = require('discord.js');
 const { spawn, execSync } = require('child_process');
 const fs = require('fs');
 const path = require('path');
-const { handleWizardMessage, cancelWizard } = require('./wizard');
+const { handleWizardMessage, cancelWizard, startWizard } = require('./wizard');
 const { init: initErrorAlerting, sendErrorAlert } = require('./error-alerting');
+const { addSchedule, removeSchedule, getUserSchedules, formatScheduleList } = require('./schedules-storage');
+const { startAllSchedules, registerJob, cancelJob } = require('./scheduler');
 
 const PERSONALITIES_DIR = path.join(__dirname, 'personalities');
 const DEFAULT_PERSONALITY = 'tiffany_pollard';
@@ -48,7 +50,9 @@ const client = new Client({
     GatewayIntentBits.Guilds,
     GatewayIntentBits.GuildMessages,
     GatewayIntentBits.MessageContent,
+    GatewayIntentBits.DirectMessages,
   ],
+  partials: [Partials.Channel],
 });
 
 function getChannel(channelId) {
@@ -325,6 +329,82 @@ async function sendLongMessage(message, text, cwd = DEFAULT_WORKSPACE) {
   }
 }
 
+/**
+ * Parse natural-language frequency into a cron expression
+ * Supports: "daily at 9am", "every 2 hours", "weekdays at 8:30am", "monday at 10am", raw cron
+ */
+function parseFrequency(input) {
+  const s = input.trim().toLowerCase();
+
+  // Raw cron expression (5 fields)
+  if (/^[\d*\/,-]+\s+[\d*\/,-]+\s+[\d*\/,-]+\s+[\d*\/,-]+\s+[\d*\/,-]+$/.test(s)) {
+    return { cron: s, description: `Cron: ${s}` };
+  }
+
+  // "every N hours" or "every N minutes"
+  const intervalMatch = s.match(/^every\s+(\d+)\s+(hour|minute|min)s?$/);
+  if (intervalMatch) {
+    const n = parseInt(intervalMatch[1], 10);
+    const unit = intervalMatch[2];
+    if (unit === 'hour') {
+      return { cron: `0 */${n} * * *`, description: `Every ${n} hour(s)` };
+    } else {
+      return { cron: `*/${n} * * * *`, description: `Every ${n} minute(s)` };
+    }
+  }
+
+  // Parse time from strings like "at 9am", "at 8:30pm", "at 14:00"
+  function parseTime(str) {
+    const timeMatch = str.match(/(\d{1,2})(?::(\d{2}))?\s*(am|pm)?/i);
+    if (!timeMatch) return null;
+    let hour = parseInt(timeMatch[1], 10);
+    const minute = timeMatch[2] ? parseInt(timeMatch[2], 10) : 0;
+    const ampm = timeMatch[3]?.toLowerCase();
+    if (ampm === 'pm' && hour < 12) hour += 12;
+    if (ampm === 'am' && hour === 12) hour = 0;
+    return { hour, minute };
+  }
+
+  // "daily at TIME"
+  const dailyMatch = s.match(/^daily\s+at\s+(.+)$/);
+  if (dailyMatch) {
+    const time = parseTime(dailyMatch[1]);
+    if (time) return { cron: `${time.minute} ${time.hour} * * *`, description: `Daily at ${dailyMatch[1].trim()}` };
+  }
+
+  // "weekdays at TIME"
+  const weekdayMatch = s.match(/^weekdays?\s+at\s+(.+)$/);
+  if (weekdayMatch) {
+    const time = parseTime(weekdayMatch[1]);
+    if (time) return { cron: `${time.minute} ${time.hour} * * 1-5`, description: `Weekdays at ${weekdayMatch[1].trim()}` };
+  }
+
+  // "weekends at TIME"
+  const weekendMatch = s.match(/^weekends?\s+at\s+(.+)$/);
+  if (weekendMatch) {
+    const time = parseTime(weekendMatch[1]);
+    if (time) return { cron: `${time.minute} ${time.hour} * * 0,6`, description: `Weekends at ${weekendMatch[1].trim()}` };
+  }
+
+  // "DAYNAME at TIME" (e.g. "monday at 10am", "tuesday at 3:30pm")
+  const days = { sunday: 0, monday: 1, tuesday: 2, wednesday: 3, thursday: 4, friday: 5, saturday: 6 };
+  const dayMatch = s.match(/^(sunday|monday|tuesday|wednesday|thursday|friday|saturday)s?\s+at\s+(.+)$/);
+  if (dayMatch) {
+    const dayNum = days[dayMatch[1]];
+    const time = parseTime(dayMatch[2]);
+    if (time) return { cron: `${time.minute} ${time.hour} * * ${dayNum}`, description: `${dayMatch[1].charAt(0).toUpperCase() + dayMatch[1].slice(1)}s at ${dayMatch[2].trim()}` };
+  }
+
+  // "at TIME" (assume daily)
+  const atMatch = s.match(/^at\s+(.+)$/);
+  if (atMatch) {
+    const time = parseTime(atMatch[1]);
+    if (time) return { cron: `${time.minute} ${time.hour} * * *`, description: `Daily at ${atMatch[1].trim()}` };
+  }
+
+  return null;
+}
+
 async function handleCommand(message) {
   const parts = message.content.trim().split(/\s+/);
   const cmd = parts[0].toLowerCase();
@@ -484,6 +564,14 @@ async function handleCommand(message) {
         `\`!identity [Name is description]\` — Show or set full identity\n` +
         `\`!personality <name>\` — Switch personality (voice/style)\n` +
         `\`!personalities\` — List available\n\n` +
+        `**Tasks:**\n` +
+        `\`!tasks\` — Show active task list\n` +
+        `\`!done <#>\` — Mark a specific task done\n` +
+        `\`!done all\` — Mark all tasks done\n\n` +
+        `**Scheduling:**\n` +
+        `\`!schedule\` — Set up a recurring message (DM'd to you on a schedule)\n` +
+        `\`!schedules\` — View your active schedules\n` +
+        `\`!unschedule <#>\` — Remove a scheduled message\n\n` +
         `**Briefing:**\n` +
         `\`!briefing\` — Send the morning briefing now (stocks, weather, news, motivation)\n` +
         `\`!weekly\` — Send the weekly preview now (week ahead, goals, events)\n\n` +
@@ -651,6 +739,24 @@ async function handleCommand(message) {
       break;
     }
 
+    case '!tasks': {
+      const { loadActiveTasks, formatTaskList } = require('./tasks-storage');
+      const active = loadActiveTasks();
+      if (active.length === 0) {
+        await message.reply('No active tasks. Add some via the evening check-in or they\'ll show up after you chat with me about your plans!');
+      } else {
+        await message.reply(`**Active Tasks:**\n${formatTaskList(active)}\n\nUse \`!done <#>\` to mark done, \`!done all\` to clear all.`);
+      }
+      break;
+    }
+
+    case '!done': {
+      const { markDone } = require('./tasks-storage');
+      const result = markDone(arg || '');
+      await message.reply(result);
+      break;
+    }
+
     case '!cancel': {
       await cancelWizard(state, message);
       break;
@@ -697,6 +803,89 @@ async function handleCommand(message) {
       break;
     }
 
+    case '!schedule': {
+      if (state.busy) {
+        await message.reply('Claude is still working. Use `!stop` first.');
+        break;
+      }
+      if (state.wizard) {
+        await message.reply('A wizard is already active. Use `!cancel` to cancel it first.');
+        break;
+      }
+      await startWizard(state, message, {
+        type: 'schedule',
+        steps: [
+          {
+            key: 'message',
+            prompt: 'What message should I send you? (e.g. "Time to check your stocks!" or "Drink water and stretch")',
+          },
+          {
+            key: 'frequency',
+            prompt: 'How often? Pick one:\n' +
+              '• `daily at 9am` — every day at a specific time\n' +
+              '• `every 2 hours` — repeating interval\n' +
+              '• `weekdays at 8:30am` — Mon-Fri only\n' +
+              '• `monday at 10am` — specific day of week\n' +
+              '• Or a cron expression like `0 */3 * * *`',
+            validate: (input) => {
+              const parsed = parseFrequency(input);
+              if (!parsed) return 'Could not understand that frequency. Try something like `daily at 9am`, `every 3 hours`, `weekdays at 8:30am`, or a cron expression.';
+              return true;
+            },
+          },
+        ],
+        onComplete: async (data, msg) => {
+          const parsed = parseFrequency(data.frequency);
+          const sched = addSchedule({
+            userId: msg.author.id,
+            channelId: msg.channel.id,
+            message: data.message,
+            cronRule: parsed.cron,
+            description: parsed.description,
+            timezone: 'America/Los_Angeles',
+          });
+          registerJob(sched, client);
+          await msg.reply(
+            `Scheduled! **#${sched.id}**\n` +
+            `📝 "${sched.message}"\n` +
+            `⏰ ${parsed.description}\n` +
+            `I'll DM you each time. Use \`!schedules\` to see all, \`!unschedule ${sched.id}\` to remove.`
+          );
+        },
+      });
+      break;
+    }
+
+    case '!schedules': {
+      const userSchedules = getUserSchedules(message.author.id);
+      if (userSchedules.length === 0) {
+        await message.reply('You have no scheduled messages. Use `!schedule` to create one.');
+      } else {
+        await message.reply(`**Your Schedules:**\n${formatScheduleList(userSchedules)}\n\nUse \`!unschedule <#>\` to remove one.`);
+      }
+      break;
+    }
+
+    case '!unschedule': {
+      if (!arg) {
+        await message.reply('Usage: `!unschedule <#>` — e.g. `!unschedule 1`');
+        break;
+      }
+      const id = parseInt(arg, 10);
+      if (isNaN(id)) {
+        await message.reply('Usage: `!unschedule <#>` — provide the schedule number.');
+        break;
+      }
+      const removed = removeSchedule(id, message.author.id);
+      if (!removed) {
+        await message.reply(`No schedule #${id} found for you. Use \`!schedules\` to see your list.`);
+      } else {
+        cancelJob(id);
+        await message.reply(`Removed schedule **#${id}**: "${removed.description}"`);
+      }
+      break;
+    }
+
     case '!commands': {
       await message.reply(
         `**Available Commands:**\n` +
@@ -704,6 +893,8 @@ async function handleCommand(message) {
         `\`!status\` \`!processes\` \`!btw\` \`!cd\` \`!ls\`\n` +
         `\`!startproject\` \`!name\` \`!identity\`\n` +
         `\`!personality\` \`!personalities\`\n` +
+        `\`!tasks\` \`!done\`\n` +
+        `\`!schedule\` \`!schedules\` \`!unschedule\`\n` +
         `\`!briefing\` \`!weekly\` \`!email\` \`!help\` \`!commands\`\n\n` +
         `Use \`!help\` for detailed descriptions.`
       );
@@ -755,6 +946,9 @@ client.on('ready', () => {
   // Start scheduled briefings
   const briefings = require('./briefings');
   briefings.startScheduler(client);
+
+  // Start user-created schedules
+  startAllSchedules(client);
 });
 
 client.on('messageCreate', async (message) => {

@@ -3,7 +3,8 @@ const path = require('path');
 const { execSync } = require('child_process');
 const { startWizard } = require('../wizard');
 
-const TEMPLATE_DIR = path.join(__dirname, '..', 'project-template');
+const STANDALONE_TEMPLATE_DIR = '/workspace/ClaudeCodeTemplate';
+const FALLBACK_TEMPLATE_DIR = path.join(__dirname, '..', 'project-template');
 
 function startProjectWizard(state, message) {
   return startWizard(state, message, {
@@ -71,9 +72,10 @@ async function executeProjectSetup(data, message, channelState) {
     // 1. Create project directory
     fs.mkdirSync(fullPath, { recursive: true });
 
-    // 2. Copy template files
-    if (fs.existsSync(TEMPLATE_DIR)) {
-      copyDirSync(TEMPLATE_DIR, fullPath);
+    // 2. Copy template files (prefer standalone template, fallback to bundled)
+    const templateDir = fs.existsSync(STANDALONE_TEMPLATE_DIR) ? STANDALONE_TEMPLATE_DIR : FALLBACK_TEMPLATE_DIR;
+    if (fs.existsSync(templateDir)) {
+      copyDirSync(templateDir, fullPath);
     } else {
       // Fallback: create minimal structure
       fs.mkdirSync(path.join(fullPath, '.claude', 'agents'), { recursive: true });

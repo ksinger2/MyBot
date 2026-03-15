@@ -3,7 +3,7 @@ const https = require('https');
 const path = require('path');
 const { MessageFlags } = require('discord.js');
 const config = require('./briefing-config');
-const { loadTasks, clearTasks } = require('./tasks-storage');
+const { loadActiveTasks, addTasks, formatTaskList } = require('./tasks-storage');
 const { sendErrorAlert } = require('./error-alerting');
 
 const PERSONALITIES_DIR = path.join(__dirname, 'personalities');
@@ -306,8 +306,9 @@ async function sendBriefing(client) {
   ]);
 
   const jobsData = buildJobsSection(config.jobs);
-  const tasks = loadTasks();
-  const prompt = buildPrompt(stockData, weatherData, jobsData, config, tasks);
+  const activeTasks = loadActiveTasks();
+  const tasksText = formatTaskList(activeTasks);
+  const prompt = buildPrompt(stockData, weatherData, jobsData, config, tasksText);
 
   // Resolve identity and personality
   const { askClaude } = require('./bot');
@@ -325,7 +326,6 @@ async function sendBriefing(client) {
 
     if (result.text) {
       await sendToChannel(channel, result.text);
-      clearTasks(); // consumed — clear for tomorrow
       console.log(`Briefing sent to #${channel.name || config.channelId}${result.cost ? ` ($${result.cost.toFixed(4)})` : ''}`);
     } else {
       await channel.send('*(Morning briefing came back empty — Claude might be having a slow morning too)*');
@@ -400,8 +400,9 @@ async function sendWeeklyPreview(client) {
     return;
   }
 
-  const tasks = loadTasks();
-  const prompt = buildWeeklyPreviewPrompt(tasks);
+  const activeTasks = loadActiveTasks();
+  const tasksText = formatTaskList(activeTasks);
+  const prompt = buildWeeklyPreviewPrompt(tasksText);
 
   const { askClaude } = require('./bot');
   const identity = config.identity || DEFAULT_IDENTITY;
@@ -470,17 +471,17 @@ function startScheduler(client) {
         }
         const { getChannelState } = require('./bot');
         const { startWizard } = require('./wizard');
-        const { saveTasks } = require('./tasks-storage');
+        const { addTasks: addNewTasks } = require('./tasks-storage');
         const state = getChannelState(config.channelId);
         await startWizard(state, { reply: (msg) => channel.send(msg), channel }, {
           type: 'eveningTasks',
           steps: [{
             key: 'tasks',
-            prompt: "Hey girl 🐄 What do you need to get done tomorrow? Drop your task list and I'll make sure it's front and center in your morning briefing. (Just reply right here — I'm listening!)",
+            prompt: "Hey girl 🐄 What do you need to get done tomorrow? Drop your task list and I'll add them to your board. (Just reply right here — I'm listening!)",
           }],
           onComplete: async (data, msg) => {
-            saveTasks(data.tasks);
-            await msg.reply("Locked in girl! I've got your tasks saved. They'll be front and center in tomorrow's morning briefing 🐄");
+            addNewTasks(data.tasks);
+            await msg.reply("Added to your task board! They'll show up in every briefing until you mark them done with `!done <#>` 🐄");
           },
         });
       }
