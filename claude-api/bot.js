@@ -11,7 +11,9 @@ const PERSONALITIES_DIR = path.join(__dirname, 'personalities');
 const DEFAULT_PERSONALITY = 'tiffany_pollard';
 const DEFAULT_WORKSPACE = '/workspace';
 const DEFAULT_MAX_TURNS = 50;       // Let Claude work autonomously for many turns
-const MAX_TIMEOUT = 30 * 60 * 1000; // 30 minutes for big tasks
+const MAX_TIMEOUT = 90 * 60 * 1000; // 90 minutes hard cap
+const STALL_TIMEOUT = 10 * 60 * 1000; // 10 minutes with no output = stalled
+const CHECKIN_INTERVAL = 5 * 60 * 1000; // Progress check-in every 5 minutes
 const DEFAULT_IDENTITY = {
   name: 'Bianca',
   description: 'a fabulous cow named Bianca (aka Bianca Da Cow). You are a cow and you know it — work in cow puns, references to being a cow, mooing, grazing, etc. when it feels natural, but don\'t overdo it.'
@@ -23,6 +25,11 @@ const TOOL_LABELS = {
   Bash: 'Running command', Glob: 'Finding files', Grep: 'Searching code',
   WebSearch: 'Searching web', WebFetch: 'Fetching URL',
   Agent: 'Running sub-agent', Skill: 'Using skill',
+  mcp__playwright_browser_navigate: 'Browsing',
+  mcp__playwright_browser_screenshot: 'Taking screenshot',
+  mcp__playwright_browser_click: 'Clicking',
+  mcp__playwright_browser_type: 'Typing',
+  mcp__playwright_browser_search: 'Searching',
 };
 
 function summarizeToolInput(name, jsonStr) {
@@ -39,7 +46,7 @@ function summarizeToolInput(name, jsonStr) {
 }
 
 function freshProgress() {
-  return { currentTool: null, toolDetail: '', toolHistory: [], turnCount: 0, activeBlocks: new Map() };
+  return { currentTool: null, toolDetail: '', toolHistory: [], turnCount: 0, activeBlocks: new Map(), lastActivity: Date.now() };
 }
 
 // Per-channel state
@@ -67,6 +74,7 @@ function getChannel(channelId) {
       wizard: null,   // active wizard state (multi-step interactions)
       startedAt: null, // timestamp when Claude started working
       progress: freshProgress(), // structured progress for !btw
+      queue: [],      // queued messages while Claude is busy
     });
   }
   return channels.get(channelId);
@@ -87,7 +95,7 @@ function listPersonalities() {
     .map(f => f.replace('.md', ''));
 }
 
-function askClaude(prompt, { sessionId = null, personalityFile = null, identity = null, cwd = DEFAULT_WORKSPACE, maxTurns = DEFAULT_MAX_TURNS, channelState = null } = {}) {
+function askClaude(prompt, { sessionId = null, personalityFile = null, identity = null, cwd = DEFAULT_WORKSPACE, maxTurns = DEFAULT_MAX_TURNS, channelState = null, discordChannel = null } = {}) {
   return new Promise((resolve, reject) => {
     const args = [
       '-p', prompt,
@@ -96,6 +104,7 @@ function askClaude(prompt, { sessionId = null, personalityFile = null, identity 
       '--model', 'sonnet',
       '--max-turns', String(maxTurns),
       '--dangerously-skip-permissions',
+      '--mcp-config', '/home/node/.claude/.mcp.json',
     ];
 
     if (sessionId) {
@@ -113,6 +122,8 @@ function askClaude(prompt, { sessionId = null, personalityFile = null, identity 
 - Bullet points over paragraphs. Always.
 
 CRITICAL RULE — IMAGE ATTACHMENTS: Whenever you generate, save, or display any image files, you MUST include their full absolute file paths in your text response (e.g. /workspace/BookFactory/output/book_id/page_01.png). This is required so the Discord bot can attach the images to the message. List every image path on its own line. Do NOT rely on tool output alone — the path must appear in your final text response.
+
+NOTE — WEB BROWSING: You have a headless Chromium browser available via Playwright MCP tools. You can navigate to websites, take screenshots, click elements, fill forms, and extract content from web pages. When a user asks you to look something up, google something, or check a website, use the browser tools to do it.
 
 NOTE — DOCKER ACCESS: You have full Docker access. You can run \`docker ps\`, \`docker restart\`, \`docker compose up -d --build\`, etc. When you make code changes that need a rebuild, just do it yourself — don't tell the user to do it. The project docker-compose.yml is at /workspace/MyBot/docker-compose.yml.`);
     if (identity) {
@@ -150,6 +161,9 @@ NOTE — DOCKER ACCESS: You have full Docker access. You can run \`docker ps\`, 
     let currentToolInput = ''; // accumulate input_json_delta for active tool
 
     child.stdout.on('data', (d) => {
+      // Update last activity timestamp for stall detection
+      if (channelState) channelState.progress.lastActivity = Date.now();
+
       stdoutBuf += d;
       const lines = stdoutBuf.split('\n');
       stdoutBuf = lines.pop(); // keep incomplete last line
@@ -229,7 +243,8 @@ NOTE — DOCKER ACCESS: You have full Docker access. You can run \`docker ps\`, 
 
     child.stderr.on('data', (d) => { stderr += d; });
 
-    const timeout = setTimeout(() => {
+    // Hard cap timeout — absolute maximum runtime
+    const hardTimeout = setTimeout(() => {
       child.kill();
       if (channelState) {
         channelState.process = null;
@@ -237,13 +252,52 @@ NOTE — DOCKER ACCESS: You have full Docker access. You can run \`docker ps\`, 
         channelState.startedAt = null;
         channelState.progress = freshProgress();
       }
-      const timeoutErr = new Error(`Claude CLI timed out after ${MAX_TIMEOUT / 60000} minutes`);
-      sendErrorAlert(timeoutErr, { source: 'askClaude timeout' });
+      const timeoutErr = new Error(`Claude CLI hit hard timeout after ${MAX_TIMEOUT / 60000} minutes`);
+      sendErrorAlert(timeoutErr, { source: 'askClaude hard timeout' });
       reject(timeoutErr);
     }, MAX_TIMEOUT);
 
+    // Stall detector — kill if no output for STALL_TIMEOUT
+    const stallCheck = setInterval(() => {
+      if (!channelState) return;
+      const idle = Date.now() - channelState.progress.lastActivity;
+      if (idle >= STALL_TIMEOUT) {
+        child.kill();
+        channelState.process = null;
+        channelState.busy = false;
+        channelState.startedAt = null;
+        channelState.progress = freshProgress();
+        const stallErr = new Error(`Claude CLI stalled — no output for ${STALL_TIMEOUT / 60000} minutes`);
+        sendErrorAlert(stallErr, { source: 'askClaude stall detector' });
+        reject(stallErr);
+      }
+    }, 30000); // check every 30 seconds
+
+    // Periodic check-in — send progress to Discord every CHECKIN_INTERVAL
+    let lastCheckin = Date.now();
+    const checkinTimer = setInterval(() => {
+      if (!discordChannel || !channelState || !channelState.startedAt) return;
+      const now = Date.now();
+      if (now - lastCheckin < CHECKIN_INTERVAL) return;
+      lastCheckin = now;
+
+      const elapsed = Math.round((now - channelState.startedAt) / 1000);
+      const mins = Math.floor(elapsed / 60);
+      const secs = elapsed % 60;
+      const p = channelState.progress;
+      const parts = [`⏱️ **${mins}m ${secs}s** elapsed`];
+      if (p.turnCount > 0) parts.push(`${p.turnCount} turns`);
+      if (p.currentTool) {
+        const label = TOOL_LABELS[p.currentTool] || p.currentTool;
+        parts.push(`Currently: ${label}${p.toolDetail ? ` (${p.toolDetail})` : ''}`);
+      }
+      discordChannel.send(`*Still working — ${parts.join(' · ')}*`).catch(() => {});
+    }, 30000); // evaluate every 30s, only send at CHECKIN_INTERVAL
+
     child.on('close', (code) => {
-      clearTimeout(timeout);
+      clearTimeout(hardTimeout);
+      clearInterval(stallCheck);
+      clearInterval(checkinTimer);
       if (channelState) {
         channelState.process = null;
         channelState.busy = false;
@@ -417,7 +471,10 @@ async function handleCommand(message) {
         state.process.kill();
         state.process = null;
         state.busy = false;
-        await message.reply('Stopped. Session preserved — send another message to continue where it left off.');
+        const dropped = state.queue.length;
+        state.queue = [];
+        const extra = dropped ? ` (${dropped} queued message${dropped > 1 ? 's' : ''} cleared)` : '';
+        await message.reply(`Stopped. Session preserved — send another message to continue where it left off.${extra}`);
       } else {
         await message.reply('Nothing is running in this channel.');
       }
@@ -430,6 +487,7 @@ async function handleCommand(message) {
         break;
       }
       state.sessionId = null;
+      state.queue = [];
       await message.reply('Context cleared. Next message starts a fresh conversation (no memory of previous messages).');
       break;
     }
@@ -441,6 +499,7 @@ async function handleCommand(message) {
         state.busy = false;
       }
       state.sessionId = null;
+      state.queue = [];
       await message.reply('Process killed and session destroyed. Full reset — starting from scratch.');
       break;
     }
@@ -535,6 +594,7 @@ async function handleCommand(message) {
     case '!killall': {
       for (const [, s] of channels) {
         if (s.process) s.process.kill();
+        s.queue = [];
       }
       channels.clear();
       await message.reply('All processes killed and all sessions destroyed across every channel.');
@@ -655,6 +715,7 @@ async function handleCommand(message) {
           identity: emailState.identity,
           cwd: emailState.cwd,
           channelState: emailState,
+          discordChannel: message.channel,
         });
         if (result.sessionId) emailState.sessionId = result.sessionId;
         if (!result.stopped) await sendLongMessage(message, result.text, emailState.cwd);
@@ -951,6 +1012,82 @@ client.on('ready', () => {
   startAllSchedules(client);
 });
 
+async function processQueue(state) {
+  if (!state.queue.length) return;
+
+  // Combine all queued messages into one prompt
+  const queued = state.queue.splice(0);
+  const combined = queued.length === 1
+    ? queued[0].content
+    : '[Additional messages from user while you were working]\n' + queued.map(q => `- ${q.content}`).join('\n');
+
+  // Reply threaded to the last queued message
+  const replyTarget = queued[queued.length - 1].message;
+  const personalityFile = getPersonalityFile(state.personality);
+
+  await replyTarget.channel.sendTyping();
+  const typingInterval = setInterval(() => {
+    replyTarget.channel.sendTyping().catch(() => {});
+  }, 8000);
+
+  try {
+    state.busy = true;
+    state.startedAt = Date.now();
+    state.progress = freshProgress();
+
+    let result;
+    try {
+      result = await askClaude(combined, {
+        sessionId: state.sessionId,
+        personalityFile,
+        identity: state.identity,
+        cwd: state.cwd,
+        channelState: state,
+        discordChannel: replyTarget.channel,
+      });
+    } catch (err) {
+      if (state.sessionId) {
+        console.log('Session resume failed in queue, retrying fresh:', err.message);
+        state.sessionId = null;
+        result = await askClaude(combined, {
+          personalityFile,
+          identity: state.identity,
+          cwd: state.cwd,
+          channelState: state,
+          discordChannel: replyTarget.channel,
+        });
+      } else {
+        throw err;
+      }
+    }
+
+    if (result.sessionId) {
+      state.sessionId = result.sessionId;
+    }
+
+    if (!result.stopped) {
+      await sendLongMessage(replyTarget, result.text, state.cwd);
+
+      const meta = [];
+      if (result.numTurns > 1) meta.push(`${result.numTurns} turns`);
+      if (result.cost) meta.push(`$${result.cost.toFixed(4)}`);
+      if (meta.length) console.log(`Queue completed: ${meta.join(' | ')}`);
+    }
+  } catch (err) {
+    console.error('Error processing queued message:', err.message);
+    const errorMsg = err.message.length > 500 ? err.message.substring(0, 500) + '...' : err.message;
+    await replyTarget.reply(`Error: ${errorMsg}`).catch(() => {});
+    sendErrorAlert(err, { source: 'queue handler', channel: replyTarget.channel.id });
+  } finally {
+    clearInterval(typingInterval);
+    state.busy = false;
+    state.startedAt = null;
+    state.progress = freshProgress();
+    // Recursively drain if more messages came in during processing
+    await processQueue(state);
+  }
+}
+
 client.on('messageCreate', async (message) => {
   if (message.author.bot) return;
 
@@ -971,9 +1108,15 @@ client.on('messageCreate', async (message) => {
     if (handled) return;
   }
 
-  // If Claude is already working, queue message as info
+  // If Claude is already working, queue the message
   if (state.busy) {
-    await message.reply('Claude is still working on the previous task. Use `!stop` to interrupt, or wait for it to finish.');
+    state.queue.push({ message, content: message.content });
+    const pos = state.queue.length;
+    if (pos >= 5) {
+      await message.reply(`Queued (#${pos}) — queue is getting long. Use \`!stop\` to interrupt if needed.`);
+    } else {
+      await message.reply(`Queued (#${pos}) — I'll get to that next.`);
+    }
     return;
   }
 
@@ -994,6 +1137,7 @@ client.on('messageCreate', async (message) => {
         identity: state.identity,
         cwd: state.cwd,
         channelState: state,
+        discordChannel: message.channel,
       });
     } catch (err) {
       if (state.sessionId) {
@@ -1004,6 +1148,7 @@ client.on('messageCreate', async (message) => {
           identity: state.identity,
           cwd: state.cwd,
           channelState: state,
+          discordChannel: message.channel,
         });
       } else {
         throw err;
@@ -1033,6 +1178,11 @@ client.on('messageCreate', async (message) => {
     sendErrorAlert(err, { source: 'message handler', channel: message.channel.id, detail: message.content.substring(0, 100) });
   } finally {
     clearInterval(typingInterval);
+    state.busy = false;
+    state.startedAt = null;
+    state.progress = freshProgress();
+    // Drain queued messages
+    await processQueue(state);
   }
 });
 

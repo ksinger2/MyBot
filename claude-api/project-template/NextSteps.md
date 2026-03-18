@@ -22,21 +22,30 @@ WHEN TO UPDATE:
 -->
 
 ## What's Working
-- Fresh project — nothing built yet
+- Three-layer timeout system replacing flat 30min hard kill:
+  - **Stall detector** (10 min no output) — kills only truly stalled sessions, resets on every stdout data event
+  - **Progress check-ins** (every 5 min) — sends elapsed time, turn count, and current tool to Discord automatically
+  - **Hard cap** (90 min) — absolute maximum runtime safety net
+- Long-running agent loops can now run up to 90 min as long as they're producing output
+- `!btw` command still works for on-demand progress checks
 
 ## What's Broken / In Progress
 - N/A
 
 ## Next Steps
-1. Define the project scope and requirements
-2. Set up the development environment
-3. Build the first feature
+1. Monitor stall detector in production — tune STALL_TIMEOUT (10 min) if it's too aggressive or too lenient
+2. Consider making check-in interval configurable per channel or via a command
+3. Consider adding a warning message before the hard cap kills (e.g., at 80 min)
 
 ## Architecture
-[Will be filled in as the project takes shape]
+- `bot.js` constants: `MAX_TIMEOUT` (90 min hard cap), `STALL_TIMEOUT` (10 min), `CHECKIN_INTERVAL` (5 min)
+- `askClaude()` now accepts `discordChannel` param for sending check-in messages
+- `freshProgress()` includes `lastActivity` timestamp, updated on every stdout data event
+- Stall check runs every 30s via `setInterval`, cleared on process close
 
 ## Key Files
 | File | Purpose |
 |------|---------|
 | `CLAUDE.md` | Project conventions and setup instructions |
 | `NextSteps.md` | This file — session handoff document |
+| `bot.js` | Main bot logic — timeout/stall/check-in system lives here |
