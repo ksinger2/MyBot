@@ -19,6 +19,20 @@ RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg -o 
 # Install Docker CLI (for container management from inside the container)
 RUN apt-get update && apt-get install -y docker.io && rm -rf /var/lib/apt/lists/*
 
+# Install Chromium and dependencies for browser automation (Playwright MCP)
+RUN apt-get update && apt-get install -y \
+    chromium \
+    fonts-liberation \
+    libgbm1 \
+    libnss3 \
+    libatk-bridge2.0-0 \
+    libgtk-3-0 \
+    libasound2 \
+    && rm -rf /var/lib/apt/lists/*
+
+ENV CHROME_PATH=/usr/bin/chromium
+ENV PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH=/usr/bin/chromium
+
 # Install Claude Code CLI globally
 RUN npm install -g @anthropic-ai/claude-code
 

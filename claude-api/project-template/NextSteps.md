@@ -23,11 +23,13 @@ WHEN TO UPDATE:
 
 ## What's Working
 - Three-layer timeout system replacing flat 30min hard kill:
-  - **Stall detector** (10 min no output) — kills only truly stalled sessions, resets on every stdout data event
+  - **Stall detector** (10 min no output) — kills only truly stalled sessions, resets on every stdout AND stderr data event
   - **Progress check-ins** (every 5 min) — sends elapsed time, turn count, and current tool to Discord automatically
   - **Hard cap** (90 min) — absolute maximum runtime safety net
 - Long-running agent loops can now run up to 90 min as long as they're producing output
+- Stderr activity (warnings, progress, tool use) now correctly resets the stall timer — no more false stall kills
 - `!btw` command still works for on-demand progress checks
+- Bot ignores messages from all Discord bot accounts (`message.author.bot` guard)
 
 ## What's Broken / In Progress
 - N/A
@@ -40,7 +42,7 @@ WHEN TO UPDATE:
 ## Architecture
 - `bot.js` constants: `MAX_TIMEOUT` (90 min hard cap), `STALL_TIMEOUT` (10 min), `CHECKIN_INTERVAL` (5 min)
 - `askClaude()` now accepts `discordChannel` param for sending check-in messages
-- `freshProgress()` includes `lastActivity` timestamp, updated on every stdout data event
+- `freshProgress()` includes `lastActivity` timestamp, updated on every stdout AND stderr data event
 - Stall check runs every 30s via `setInterval`, cleared on process close
 
 ## Key Files

@@ -46,7 +46,15 @@ function summarizeToolInput(name, jsonStr) {
 }
 
 function freshProgress() {
-  return { currentTool: null, toolDetail: '', toolHistory: [], turnCount: 0, activeBlocks: new Map(), lastActivity: Date.now() };
+  return { currentTool: null, toolDetail: '', toolHistory: [], turnCount: 0, activeBlocks: new Map(), lastActivity: Date.now(), recentOutputs: [] };
+}
+
+// Push a line to recentOutputs, keeping only the last 15
+function pushOutput(progress, line) {
+  if (!line) return;
+  const trimmed = line.length > 200 ? line.substring(0, 197) + '...' : line;
+  progress.recentOutputs.push(trimmed);
+  if (progress.recentOutputs.length > 15) progress.recentOutputs.shift();
 }
 
 // Per-channel state
@@ -229,9 +237,20 @@ NOTE — DOCKER ACCESS: You have full Docker access. You can run \`docker ps\`, 
               if (channelState.progress.toolHistory.length > 10) {
                 channelState.progress.toolHistory.shift();
               }
+              // Log completed tool to recent outputs
+              const label = TOOL_LABELS[block.name] || block.name;
+              pushOutput(channelState.progress, `🔧 ${label}${detail ? `: ${detail}` : ''}`);
               channelState.progress.currentTool = null;
               channelState.progress.toolDetail = '';
               currentToolInput = '';
+            } else if (block?.type === 'text') {
+              // Capture meaningful lines from Claude's text output
+              const textLines = accumulatedText.trim().split('\n').filter(l => l.trim().length > 5);
+              const lastLines = textLines.slice(-3);
+              for (const snippet of lastLines) {
+                pushOutput(channelState.progress, `💬 ${snippet.trim()}`);
+              }
+              accumulatedText = '';
             }
             channelState.progress.activeBlocks.delete(inner.index);
           }
@@ -241,7 +260,10 @@ NOTE — DOCKER ACCESS: You have full Docker access. You can run \`docker ps\`, 
       }
     });
 
-    child.stderr.on('data', (d) => { stderr += d; });
+    child.stderr.on('data', (d) => {
+      stderr += d;
+      if (channelState) channelState.progress.lastActivity = Date.now();
+    });
 
     // Hard cap timeout — absolute maximum runtime
     const hardTimeout = setTimeout(() => {
@@ -573,7 +595,7 @@ async function handleCommand(message) {
       await message.reply(
         `**Bot Status:**\n` +
         (allChannels.length ? allChannels.join('\n') : 'No channels active.') +
-        `\n\nTimeout: ${MAX_TIMEOUT / 60000}min | Max turns: ${DEFAULT_MAX_TURNS}`
+        `\n\nHard cap: ${MAX_TIMEOUT / 60000}min | Stall: ${STALL_TIMEOUT / 60000}min | Check-in: ${CHECKIN_INTERVAL / 60000}min | Max turns: ${DEFAULT_MAX_TURNS}`
       );
       break;
     }
@@ -757,6 +779,15 @@ async function handleCommand(message) {
           return t.detail ? `${label} \`${t.detail.split('/').pop()}\`` : label;
         });
         lines.push(`**Recent:** ${recent.join(' → ')}`);
+      }
+
+      // Last CLI outputs — shows exactly what Claude is doing
+      if (p.recentOutputs.length > 0) {
+        lines.push('');
+        lines.push('**Last activity:**');
+        for (const out of p.recentOutputs.slice(-10)) {
+          lines.push(`> ${out}`);
+        }
       }
 
       // Detect listening ports in the project directory
