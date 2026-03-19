@@ -219,6 +219,18 @@ NOTE — DOCKER ACCESS: You have full Docker access. You can run \`docker ps\`, 
           if (inner.type === 'content_block_delta') {
             if (inner.delta?.type === 'text_delta') {
               accumulatedText += inner.delta.text;
+              // Capture text lines as they stream in (newline-delimited)
+              if (channelState && inner.delta.text.includes('\n')) {
+                const parts = accumulatedText.split('\n');
+                // Keep last partial line in accumulator, flush completed lines
+                accumulatedText = parts.pop();
+                for (const line of parts) {
+                  const trimmed = line.trim();
+                  if (trimmed.length > 5) {
+                    pushOutput(channelState.progress, `💬 ${trimmed}`);
+                  }
+                }
+              }
             }
             if (inner.delta?.type === 'input_json_delta') {
               currentToolInput += inner.delta.partial_json;
@@ -245,11 +257,10 @@ NOTE — DOCKER ACCESS: You have full Docker access. You can run \`docker ps\`, 
               channelState.progress.toolDetail = '';
               currentToolInput = '';
             } else if (block?.type === 'text') {
-              // Capture meaningful lines from Claude's text output
-              const textLines = accumulatedText.trim().split('\n').filter(l => l.trim().length > 5);
-              const lastLines = textLines.slice(-3);
-              for (const snippet of lastLines) {
-                pushOutput(channelState.progress, `💬 ${snippet.trim()}`);
+              // Flush any remaining partial line
+              const remaining = accumulatedText.trim();
+              if (remaining.length > 5) {
+                pushOutput(channelState.progress, `💬 ${remaining}`);
               }
               accumulatedText = '';
             }
@@ -633,20 +644,16 @@ async function handleCommand(message) {
         await message.reply('No OpenAI API key configured.');
         break;
       }
+      const imgParams = { model: 'gpt-image-1', prompt: arg, n: 1, size: '1024x1024', quality: 'low' };
+      await message.reply(`**Sending to OpenAI:**\n\`\`\`json\n${JSON.stringify(imgParams, null, 2)}\n\`\`\``);
       await message.channel.sendTyping();
       try {
         const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
-        const response = await openai.images.generate({
-          model: 'gpt-image-1',
-          prompt: arg,
-          n: 1,
-          size: '1024x1024',
-          quality: 'low',
-        });
+        const response = await openai.images.generate(imgParams);
         const base64 = response.data[0].b64_json;
         const buffer = Buffer.from(base64, 'base64');
         const attachment = new AttachmentBuilder(buffer, { name: 'imagine.png' });
-        await message.reply({ files: [attachment] });
+        await message.channel.send({ files: [attachment] });
       } catch (err) {
         console.error('Image generation error:', err.message);
         await message.reply(`Image generation failed: ${err.message}`);
@@ -837,25 +844,35 @@ async function handleCommand(message) {
         }
       } catch {}
 
-      // Check for other Claude CLI sessions attached to this project
+      // Detect ALL other Claude CLI sessions with details
       try {
-        const cwdEscaped = state.cwd.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
         const cliOutput = execSync(
-          `ps aux 2>/dev/null | grep -v grep | grep "[c]laude" || true`,
+          `ps aux 2>/dev/null | grep -v grep | grep '[c]laude' || true`,
           { encoding: 'utf-8', timeout: 3000 }
         ).trim();
         if (cliOutput) {
-          // Count claude processes, subtract our own bot-spawned one
           const allClaude = cliOutput.split('\n').filter(l => l.trim());
           const botPid = state.process?.pid;
-          const otherSessions = allClaude.filter(l => {
-            // Check if this line contains our bot's child PID
+          const otherSessions = [];
+          for (const l of allClaude) {
             const pidMatch = l.match(/^\S+\s+(\d+)/);
-            if (!pidMatch) return true;
-            return String(pidMatch[1]) !== String(botPid);
-          });
+            if (!pidMatch) continue;
+            const pid = pidMatch[1];
+            if (String(pid) === String(botPid)) continue;
+            // Get working directory and full command for this PID
+            let cwd = '', cmdline = '';
+            try { cwd = execSync(`readlink -f /proc/${pid}/cwd 2>/dev/null`, { encoding: 'utf-8', timeout: 1000 }).trim(); } catch {}
+            try { cmdline = execSync(`cat /proc/${pid}/cmdline 2>/dev/null | tr '\\0' ' '`, { encoding: 'utf-8', timeout: 1000 }).trim(); } catch {}
+            // Extract the project path from cwd for display
+            const shortCwd = cwd.replace(/^\/workspace\//, '').replace(/^\/mnt\/c\/Users\/karen\/Desktop\/Github Projects\//, '') || cwd;
+            otherSessions.push({ pid, cwd: shortCwd, cmdline });
+          }
           if (otherSessions.length > 0) {
-            lines.push(`**Claude CLI:** ${otherSessions.length} other session(s) active`);
+            lines.push('');
+            lines.push(`**Other Claude sessions (${otherSessions.length}):**`);
+            for (const s of otherSessions) {
+              lines.push(`> PID ${s.pid} in \`${s.cwd}\``);
+            }
           }
         }
       } catch {}

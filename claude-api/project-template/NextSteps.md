@@ -28,7 +28,8 @@ WHEN TO UPDATE:
   - **Hard cap** (90 min) — absolute maximum runtime safety net
 - Long-running agent loops can now run up to 90 min as long as they're producing output
 - Stderr activity (warnings, progress, tool use) now correctly resets the stall timer — no more false stall kills
-- `!btw` command still works for on-demand progress checks
+- `!btw` — detailed progress: live-streamed Claude text (e.g. "Now let me commit and push"), tool history, other Claude CLI sessions with PID + working directory
+- `!imagine <prompt>` — generates images via OpenAI `gpt-image-1`, shows the exact API payload before sending, then posts the image
 - Bot ignores messages from all Discord bot accounts (`message.author.bot` guard)
 
 ## What's Broken / In Progress
@@ -38,16 +39,20 @@ WHEN TO UPDATE:
 1. Monitor stall detector in production — tune STALL_TIMEOUT (10 min) if it's too aggressive or too lenient
 2. Consider making check-in interval configurable per channel or via a command
 3. Consider adding a warning message before the hard cap kills (e.g., at 80 min)
+4. Consider higher quality / larger sizes for `!imagine` (currently `quality: 'low'`, `1024x1024`)
 
 ## Architecture
 - `bot.js` constants: `MAX_TIMEOUT` (90 min hard cap), `STALL_TIMEOUT` (10 min), `CHECKIN_INTERVAL` (5 min)
 - `askClaude()` now accepts `discordChannel` param for sending check-in messages
-- `freshProgress()` includes `lastActivity` timestamp, updated on every stdout AND stderr data event
+- `freshProgress()` includes `lastActivity` timestamp + `recentOutputs` array (last 15 lines of Claude's text + tool completions), updated on every stdout AND stderr data event
+- Text deltas captured line-by-line as they stream in (not just at block end)
+- Other Claude sessions detected via `/proc/<pid>/cwd` for directory info
 - Stall check runs every 30s via `setInterval`, cleared on process close
+- `openai` npm package used for `!imagine` (gpt-image-1, base64 response)
 
 ## Key Files
 | File | Purpose |
 |------|---------|
 | `CLAUDE.md` | Project conventions and setup instructions |
 | `NextSteps.md` | This file — session handoff document |
-| `bot.js` | Main bot logic — timeout/stall/check-in system lives here |
+| `bot.js` | Main bot logic — timeout/stall/check-in/imagine system lives here |
