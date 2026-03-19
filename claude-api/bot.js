@@ -16,8 +16,8 @@ const MAX_TIMEOUT = 90 * 60 * 1000; // 90 minutes hard cap
 const STALL_TIMEOUT = 10 * 60 * 1000; // 10 minutes with no output = stalled
 const CHECKIN_INTERVAL = 5 * 60 * 1000; // Progress check-in every 5 minutes
 const DEFAULT_IDENTITY = {
-  name: 'Bianca',
-  description: 'a fabulous cow named Bianca (aka Bianca Da Cow). You are a cow and you know it — work in cow puns, references to being a cow, mooing, grazing, etc. when it feels natural, but don\'t overdo it.'
+  name: 'Claude Bot',
+  description: 'a helpful AI assistant on Discord. You are friendly, concise, and capable.'
 };
 
 // Tool labels for !btw progress display
@@ -142,7 +142,7 @@ YOUR CAPABILITIES — You are a powerful AI assistant with the following tools. 
 
 4. **DOCKER ACCESS**: You can run \`docker ps\`, \`docker restart\`, \`docker compose up -d --build\`, etc. When you make code changes that need a rebuild, just do it yourself — don't tell the user to do it. The project docker-compose.yml is at /workspace/MyBot/docker-compose.yml.
 
-5. **GIT & GITHUB**: You can commit, push, create branches, open PRs, check CI status — full git workflow.
+5. **GIT & GITHUB**: You can commit, push, create branches, open PRs, check CI status — full git workflow. IMPORTANT: When making git commits, ALWAYS add this trailer to your commit messages: "Co-Authored-By: Claude Code (${identity ? identity.name : 'Bot'}) <noreply@anthropic.com>" — this identifies which bot personality pushed the change.
 
 6. **SUB-AGENTS**: You can spawn specialized sub-agents (Agent tool) for parallel research, code exploration, or complex multi-step tasks. Use them for anything that benefits from focused, autonomous work.
 
@@ -408,9 +408,9 @@ async function sendLongMessage(message, text, cwd = DEFAULT_WORKSPACE) {
   let remaining = text.length <= 1900 ? text : (() => {
     let r = text, out = [];
     while (r.length > 0) {
-      if (r.length <= 1900) { out.push(r); break; }
-      let splitAt = r.lastIndexOf('\n', 1900);
-      if (splitAt < 500) splitAt = 1900;
+      if (r.length <= 1990) { out.push(r); break; }
+      let splitAt = r.lastIndexOf('\n', 1990);
+      if (splitAt < 500) splitAt = 1990;
       out.push(r.substring(0, splitAt));
       r = r.substring(splitAt);
     }
@@ -421,10 +421,10 @@ async function sendLongMessage(message, text, cwd = DEFAULT_WORKSPACE) {
   else chunks.push(...remaining);
 
   // Send first chunk with any image attachments
-  await message.reply({ content: chunks[0], files: files.length ? files : undefined });
+  await message.reply({ content: chunks[0], files: files.length ? files : undefined }).catch(e => console.error('Reply failed:', e.message));
 
   for (let i = 1; i < chunks.length && i < 8; i++) {
-    await message.channel.send(chunks[i]);
+    await message.channel.send(chunks[i]).catch(e => console.error('Chunk send failed:', e.message));
   }
   if (chunks.length > 8) {
     await message.channel.send(`*(${chunks.length - 8} more chunks truncated)*`);
@@ -676,48 +676,34 @@ async function handleCommand(message) {
     }
 
     case '!help': {
-      await message.reply(
+      const helpText =
         `**Claude Code Bot — Commands:**\n\n` +
         `**Control:**\n` +
-        `\`!stop\` — Pause Claude mid-task (session preserved, can continue)\n` +
-        `\`!clear\` — Clear conversation context (wipe memory, keep working dir)\n` +
-        `\`!kill\` — Hard kill: stop process + destroy session (full reset)\n` +
+        `\`!stop\` — Pause Claude (session preserved)\n` +
+        `\`!clear\` — Clear conversation context\n` +
+        `\`!kill\` — Hard kill + destroy session\n` +
         `\`!killall\` — Kill everything across all channels\n` +
-        `\`!restart\` — Restart the bot container (applies code changes)\n` +
-        `\`!status\` — Show what's running and session info\n\n` +
-        `\`!processes\` — Show active Claude processes and resource usage\n` +
-        `\`!btw\` — Peek at Claude's progress while it's working (non-destructive)\n` +
+        `\`!restart\` — Restart bot container\n` +
+        `\`!status\` — Show session info\n` +
+        `\`!processes\` — Show active Claude processes\n` +
+        `\`!btw\` — Peek at progress while working\n` +
         `\`!cancel\` — Cancel an active wizard\n\n` +
         `**Workspace:**\n` +
-        `\`!cd <path>\` — Change project directory\n` +
-        `\`!cd\` — Show current directory\n` +
+        `\`!cd [path]\` — Show or change project directory\n` +
         `\`!ls [path]\` — List files\n` +
-        `\`!startproject\` — Create a new project with Claude Code template + git setup\n\n` +
-        `**Identity & Personality:**\n` +
+        `\`!startproject\` — Create a new project with template\n\n` +
+        `**Identity:**\n` +
         `\`!name [name]\` — Show or set bot name\n` +
-        `\`!identity [Name is description]\` — Show or set full identity\n` +
-        `\`!personality <name>\` — Switch personality (voice/style)\n` +
+        `\`!identity [Name is desc]\` — Show or set identity\n` +
+        `\`!personality <name>\` — Switch personality\n` +
         `\`!personalities\` — List available\n\n` +
-        `**Tasks:**\n` +
-        `\`!tasks\` — Show active task list\n` +
-        `\`!done <#>\` — Mark a specific task done\n` +
-        `\`!done all\` — Mark all tasks done\n\n` +
-        `**Scheduling:**\n` +
-        `\`!schedule\` — Set up a recurring message (DM'd to you on a schedule)\n` +
-        `\`!schedules\` — View your active schedules\n` +
-        `\`!unschedule <#>\` — Remove a scheduled message\n\n` +
-        `**Briefing:**\n` +
-        `\`!briefing\` — Send the morning briefing now (stocks, weather, news, motivation)\n` +
-        `\`!weekly\` — Send the weekly preview now (week ahead, goals, events)\n\n` +
-        `**Email:**\n` +
-        `\`!email <who and what>\` — Draft 3 professional email options (e.g. \`!email my boss about taking Friday off\`)\n\n` +
-        `**Image:**\n` +
-        `\`!imagine <description>\` — Generate an image with GPT (e.g. \`!imagine a cow in a spacesuit\`)\n\n` +
-        `**How it works:**\n` +
-        `Just type what you want built. Claude Code runs autonomously in your workspace — it reads files, writes code, runs commands, commits, pushes.\n\n` +
-        `Each message continues the same session, so Claude remembers everything. Use \`!stop\` to interrupt, \`!clear\` to start over.\n\n` +
-        `Current: **${state.identity.name}** | ${state.personality} | \`${state.cwd}\` | ${state.busy ? '🔄 WORKING' : (state.sessionId ? '💤 idle' : '⚫ no session')}`
-      );
+        `**Tasks:** \`!tasks\` · \`!done <#>\` · \`!done all\`\n` +
+        `**Schedule:** \`!schedule\` · \`!schedules\` · \`!unschedule <#>\`\n` +
+        `**Briefing:** \`!briefing\` · \`!weekly\`\n` +
+        `**Other:** \`!email <request>\` · \`!imagine <desc>\`\n\n` +
+        `Just type what you want built. Claude runs autonomously — reads, writes, commits, pushes. Use \`!stop\` to interrupt, \`!clear\` to start over.\n\n` +
+        `Current: **${state.identity.name}** | ${state.personality} | \`${state.cwd}\` | ${state.busy ? '🔄 WORKING' : (state.sessionId ? '💤 idle' : '⚫ no session')}`;
+      await sendLongMessage(message, helpText, state.cwd);
       break;
     }
 
@@ -891,7 +877,7 @@ async function handleCommand(message) {
         }
       } catch {}
 
-      await message.reply(lines.join('\n'));
+      await sendLongMessage(message, lines.join('\n'), state.cwd);
       break;
     }
 
@@ -1077,6 +1063,18 @@ function listWorkspaceDirs() {
   }
 }
 
+client.on('error', (err) => {
+  console.error('Discord client error:', err.message);
+});
+
+process.on('unhandledRejection', (err) => {
+  console.error('Unhandled rejection:', err);
+});
+
+process.on('uncaughtException', (err) => {
+  console.error('Uncaught exception:', err);
+});
+
 client.on('ready', () => {
   console.log(`Discord bot logged in as ${client.user.tag}`);
   console.log(`Bot is in ${client.guilds.cache.size} server(s)`);
@@ -1193,8 +1191,14 @@ client.on('messageCreate', async (message) => {
     if (state.wizard && message.content.trim().toLowerCase() !== '!cancel') {
       state.wizard = null; // silently cancel wizard on any command
     }
-    const handled = await handleCommand(message);
-    if (handled) return;
+    try {
+      const handled = await handleCommand(message);
+      if (handled) return;
+    } catch (err) {
+      console.error('Command error:', err.message);
+      await message.reply(`Command failed: ${err.message}`).catch(() => {});
+      return;
+    }
   }
 
   // If a wizard is active, let it handle the message

@@ -1,7 +1,7 @@
-# MyBot — Session Handoff (2026-03-15)
+# MyBot — Session Handoff (2026-03-18)
 
 ## What's Working
-- Discord bot (**BiancaDaCow**) is live and responding in Discord
+- Discord bot (**MyBot**) is live and responding in Discord
 - Claude Code CLI integration working (subscription-based, not API)
 - Per-channel session persistence, identity/personality switching
 - Morning briefing system (scheduled 9am PT daily + `!briefing` on-demand)
@@ -21,6 +21,7 @@
 - Generic wizard system for multi-step interactive commands
 - Docker control — Claude has full Docker access inside the container (socket mounted)
 - Error alerting — all errors posted to `#bot-errors` channel with dedup (5min per error type)
+- Robust error handling — Discord API errors, unhandled rejections, and uncaught exceptions all caught gracefully
 
 ## Architecture
 ```
@@ -34,14 +35,18 @@ Discord message → Discord.js bot (claude-api container) → Claude CLI (stream
 
 ## What Was Done This Session
 
-### New Features
-- **`!schedule` command** — Wizard-based recurring message scheduler. Supports natural language frequencies: `daily at 9am`, `every 2 hours`, `weekdays at 8:30am`, `monday at 10am`, or raw cron expressions. Messages delivered via DM with channel fallback. Persists across restarts.
-- **`!schedules` command** — View all your active scheduled messages with IDs, cron rules, and message previews.
-- **`!unschedule <#>` command** — Remove a scheduled message by ID.
-- **Schedule storage** (`schedules-storage.js`) — JSON file persistence in `/home/node/.claude/schedules.json`, same pattern as tasks-storage.
-- **Schedule runner** (`scheduler.js`) — Uses `node-schedule` to manage jobs, auto-loads all saved schedules on bot startup.
+### Bug Fixes
+- **Fixed bot crash on oversized messages** — Discord API `DiscordAPIError[50035]` (>2000 chars) was crashing the Node process. Repeated crashes broke the gateway connection, making the bot appear online but unresponsive.
+- **Added `client.on('error')` handler** — Discord client errors now logged instead of crashing.
+- **Added `process.on('unhandledRejection')` and `process.on('uncaughtException')` handlers** — prevents silent crashes from any unhandled errors.
+- **Wrapped `handleCommand()` in try/catch** — command failures now show a clear error message in Discord instead of silently dying.
+- **Fixed `!help` command** — message exceeded 2000 char limit. Condensed text and routed through `sendLongMessage` for auto-chunking.
+- **Fixed `!btw` command** — dynamic output (recent activity lines) could exceed 2000 chars. Now uses `sendLongMessage`.
+- **Raised chunk limit from 1900 to 1990** — maximizes message space while staying under Discord's 2000 char limit.
+- **Added `.catch()` to message sends in `sendLongMessage()`** — reply/chunk failures are logged instead of becoming unhandled rejections.
 
 ### Previous Session Features (already committed)
+- `!schedule` / `!schedules` / `!unschedule` commands, schedule storage and runner
 - Error alerting, `!btw` rewrite, stream-json migration, n8n removal, brevity improvements
 - `!btw`, `!processes`, `!startproject` wizard, Sunday weekly preview, generic wizard system
 - Project template with 12 agents, 3 commands, verification skill
@@ -49,16 +54,10 @@ Discord message → Discord.js bot (claude-api container) → Claude CLI (stream
 
 ## Likely Next Steps
 
-### 1. Test `!schedule` in Discord
-- Run `!schedule` and create a test schedule (e.g. `every 1 minutes` for quick verification)
-- Check `!schedules` shows it
-- Verify DM delivery
-- Remove with `!unschedule`
-
-### 2. More personalities
+### 1. More personalities
 - Add new personality files in `claude-api/personalities/`
 
-### 3. Additional monitoring
+### 2. Additional monitoring
 - Track briefing success/failure rate over time
 - Add health check alerts if container goes unhealthy
 
