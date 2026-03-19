@@ -5,6 +5,7 @@ const path = require('path');
 const { handleWizardMessage, cancelWizard, startWizard } = require('./wizard');
 const { init: initErrorAlerting, sendErrorAlert } = require('./error-alerting');
 const { addSchedule, removeSchedule, getUserSchedules, formatScheduleList } = require('./schedules-storage');
+const OpenAI = require('openai');
 const { startAllSchedules, registerJob, cancelJob } = require('./scheduler');
 
 const PERSONALITIES_DIR = path.join(__dirname, 'personalities');
@@ -623,6 +624,36 @@ async function handleCommand(message) {
       break;
     }
 
+    case '!imagine': {
+      if (!arg) {
+        await message.reply('Usage: `!imagine <description>` — e.g. `!imagine a cow in a spacesuit on the moon`');
+        break;
+      }
+      if (!process.env.OPENAI_API_KEY) {
+        await message.reply('No OpenAI API key configured.');
+        break;
+      }
+      await message.channel.sendTyping();
+      try {
+        const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+        const response = await openai.images.generate({
+          model: 'gpt-image-1',
+          prompt: arg,
+          n: 1,
+          size: '1024x1024',
+          quality: 'low',
+        });
+        const base64 = response.data[0].b64_json;
+        const buffer = Buffer.from(base64, 'base64');
+        const attachment = new AttachmentBuilder(buffer, { name: 'imagine.png' });
+        await message.reply({ files: [attachment] });
+      } catch (err) {
+        console.error('Image generation error:', err.message);
+        await message.reply(`Image generation failed: ${err.message}`);
+      }
+      break;
+    }
+
     case '!help': {
       await message.reply(
         `**Claude Code Bot — Commands:**\n\n` +
@@ -659,6 +690,8 @@ async function handleCommand(message) {
         `\`!weekly\` — Send the weekly preview now (week ahead, goals, events)\n\n` +
         `**Email:**\n` +
         `\`!email <who and what>\` — Draft 3 professional email options (e.g. \`!email my boss about taking Friday off\`)\n\n` +
+        `**Image:**\n` +
+        `\`!imagine <description>\` — Generate an image with GPT (e.g. \`!imagine a cow in a spacesuit\`)\n\n` +
         `**How it works:**\n` +
         `Just type what you want built. Claude Code runs autonomously in your workspace — it reads files, writes code, runs commands, commits, pushes.\n\n` +
         `Each message continues the same session, so Claude remembers everything. Use \`!stop\` to interrupt, \`!clear\` to start over.\n\n` +
