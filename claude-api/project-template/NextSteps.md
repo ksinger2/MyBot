@@ -31,6 +31,8 @@ WHEN TO UPDATE:
 - `!btw` — detailed progress: live-streamed Claude text (e.g. "Now let me commit and push"), tool history, other Claude CLI sessions with PID + working directory
 - `!imagine <prompt>` — generates images via OpenAI `gpt-image-1`, shows the exact API payload before sending, then posts the image
 - Bot ignores messages from all Discord bot accounts (`message.author.bot` guard)
+- Full capabilities injected into system prompt — Claude knows it can generate images, browse the web, use Docker, git, sub-agents, and work across projects
+- Internal `/imagine` HTTP endpoint at `localhost:3400/imagine` so Claude CLI can generate images via curl
 
 ## What's Broken / In Progress
 - N/A
@@ -48,11 +50,13 @@ WHEN TO UPDATE:
 - Text deltas captured line-by-line as they stream in (not just at block end)
 - Other Claude sessions detected via `/proc/<pid>/cwd` for directory info
 - Stall check runs every 30s via `setInterval`, cleared on process close
-- `openai` npm package used for `!imagine` (gpt-image-1, base64 response)
+- `openai` npm package used for `!imagine` and `/imagine` endpoint (gpt-image-1, base64 response)
+- System prompt lists all 7 capability areas so Claude never claims it can't do something it can
 
 ## Key Files
 | File | Purpose |
 |------|---------|
-| `CLAUDE.md` | Project conventions and setup instructions |
+| `CLAUDE.md` | Project-level conventions — capabilities reference for Claude sessions |
 | `NextSteps.md` | This file — session handoff document |
-| `bot.js` | Main bot logic — timeout/stall/check-in/imagine system lives here |
+| `bot.js` | Main bot logic — timeout/stall/check-in/imagine/system prompt |
+| `server.js` | Express server — `/ask`, `/imagine`, `/health` endpoints |
