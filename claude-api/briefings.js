@@ -9,8 +9,8 @@ const { sendErrorAlert } = require('./error-alerting');
 const PERSONALITIES_DIR = path.join(__dirname, 'personalities');
 const DEFAULT_PERSONALITY = 'tiffany_pollard';
 const DEFAULT_IDENTITY = {
-  name: 'Bianca',
-  description: 'a fabulous cow named Bianca (aka Bianca Da Cow). You are a cow and you know it — work in cow puns, references to being a cow, mooing, grazing, etc. when it feels natural, but don\'t overdo it.'
+  name: 'Claude Bot',
+  description: 'a helpful AI assistant on Discord. You are friendly, concise, and capable.'
 };
 
 // --- Data Fetchers ---

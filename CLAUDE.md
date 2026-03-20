@@ -1,7 +1,7 @@
 # MyBot — Claude Code Discord Bot
 
 ## Overview
-Discord bot that wraps Claude Code CLI, giving users a chat interface to an autonomous coding agent. Users talk to a personality (default: Bianca Da Cow) who can build software, browse the web, generate images, and manage infrastructure — all from Discord.
+Discord bot that wraps Claude Code CLI, giving users a chat interface to an autonomous coding agent. Users talk to a configurable personality who can build software, browse the web, generate images, and manage infrastructure — all from Discord.
 
 ## Tech Stack
 - Node.js + Discord.js 14

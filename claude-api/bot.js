@@ -13,10 +13,15 @@ const DEFAULT_PERSONALITY = 'tiffany_pollard';
 const DEFAULT_WORKSPACE = '/workspace';
 const DEFAULT_MAX_TURNS = 50;       // Let Claude work autonomously for many turns
 const MAX_TIMEOUT = 90 * 60 * 1000; // 90 minutes hard cap
-const STALL_TIMEOUT = 10 * 60 * 1000; // 10 minutes with no output = stalled
+const STALL_THRESHOLDS = {
+  thinking: 5 * 60 * 1000,   // 5 min — no tool active, just "thinking"
+  browser:  15 * 60 * 1000,  // 15 min — MCP/Playwright tools
+  bash:     10 * 60 * 1000,  // 10 min — shell commands
+  default:  10 * 60 * 1000,  // 10 min — everything else
+};
 const CHECKIN_INTERVAL = 5 * 60 * 1000; // Progress check-in every 5 minutes
 const DEFAULT_IDENTITY = {
-  name: 'Claude Bot',
+  name: 'My Bot',
   description: 'a helpful AI assistant on Discord. You are friendly, concise, and capable.'
 };
 
@@ -47,7 +52,43 @@ function summarizeToolInput(name, jsonStr) {
 }
 
 function freshProgress() {
-  return { currentTool: null, toolDetail: '', toolHistory: [], turnCount: 0, activeBlocks: new Map(), lastActivity: Date.now(), recentOutputs: [] };
+  return {
+    currentTool: null, toolDetail: '', toolHistory: [], turnCount: 0,
+    activeBlocks: new Map(), lastActivity: Date.now(), recentOutputs: [],
+    rawLog: [],           // rolling buffer of last 30 terminal-style log lines
+    stallWarned: false,   // track whether we've sent a stall warning
+    toolSignatures: [],   // for loop detection — last 10 tool signatures
+  };
+}
+
+function getStallThreshold(currentTool) {
+  if (!currentTool) return STALL_THRESHOLDS.thinking;
+  if (currentTool.startsWith('mcp__playwright')) return STALL_THRESHOLDS.browser;
+  if (currentTool === 'Bash') return STALL_THRESHOLDS.bash;
+  return STALL_THRESHOLDS.default;
+}
+
+function pushRawLog(progress, entry) {
+  const elapsed = Math.round((Date.now() - (progress._startTime || Date.now())) / 1000);
+  const mins = Math.floor(elapsed / 60);
+  const secs = elapsed % 60;
+  const ts = `${String(mins).padStart(2, '0')}:${String(secs).padStart(2, '0')}`;
+  progress.rawLog.push({ ts, text: entry });
+  if (progress.rawLog.length > 30) progress.rawLog.shift();
+}
+
+function detectLoop(progress) {
+  const sigs = progress.toolSignatures;
+  if (sigs.length < 4) return false;
+  // Same signature 3+ times in last 6
+  const last6 = sigs.slice(-6);
+  const counts = {};
+  for (const s of last6) { counts[s] = (counts[s] || 0) + 1; }
+  for (const c of Object.values(counts)) { if (c >= 3) return true; }
+  // A-B-A-B pattern in last 4
+  const last4 = sigs.slice(-4);
+  if (last4[0] === last4[2] && last4[1] === last4[3] && last4[0] !== last4[1]) return true;
+  return false;
 }
 
 // Push a line to recentOutputs, keeping only the last 15
@@ -144,11 +185,15 @@ YOUR CAPABILITIES — You are a powerful AI assistant with the following tools. 
 
 5. **GIT & GITHUB**: You can commit, push, create branches, open PRs, check CI status — full git workflow. IMPORTANT: When making git commits, ALWAYS add this trailer to your commit messages: "Co-Authored-By: Claude Code (${identity ? identity.name : 'Bot'}) <noreply@anthropic.com>" — this identifies which bot personality pushed the change.
 
-6. **SUB-AGENTS**: You can spawn specialized sub-agents (Agent tool) for parallel research, code exploration, or complex multi-step tasks. Use them for anything that benefits from focused, autonomous work.
+6. **SUB-AGENTS**: You have the Agent tool to spawn focused sub-agents. ALWAYS use sub-agents when a task has 3+ independent steps — launch them in parallel. Examples: research multiple topics simultaneously, write multiple files at once, run tests while writing docs. A single message can launch multiple agents. This is your primary way to work fast.
 
 7. **MULTIPLE PROJECTS**: Your workspace is /workspace/ which contains multiple projects. You can cd between them, work on any of them, and even coordinate across projects.
 
-NEVER say you can't do something if one of these capabilities covers it. Try first, explain only if it actually fails.`);
+NEVER say you can't do something if one of these capabilities covers it. Try first, explain only if it actually fails.
+
+AUTONOMY: You are fully autonomous. Never stop to ask the user for confirmation unless it involves spending money, sending emails/messages, or destructive operations (deleting repos, dropping databases). If something fails, try a different approach. If stuck after 3 attempts, summarize what you tried, then move on. The user CANNOT respond while you're running — never wait for input. You have up to ${maxTurns} turns.
+
+ORCHESTRATION RULE: You are an ORCHESTRATOR, not a worker. For any task with multiple independent parts, ALWAYS use the Agent tool to spawn sub-agents in parallel. Do NOT do sequential work yourself when agents can work simultaneously. Example: if asked to "create 3 endpoints and test them," spawn one agent per endpoint, then test. Think like a manager delegating to a team. Only do work directly yourself when it's a single atomic step or when steps are truly sequential dependencies.`);
     if (identity) {
       systemParts.push(`Your name is ${identity.name}. You are ${identity.description}.`);
     }
@@ -171,6 +216,7 @@ NEVER say you can't do something if one of these capabilities covers it. Try fir
       channelState.busy = true;
       channelState.startedAt = Date.now();
       channelState.progress = freshProgress();
+      channelState.progress._startTime = Date.now();
     }
 
     // Stream-json result accumulators
@@ -210,7 +256,10 @@ NEVER say you can't do something if one of these capabilities covers it. Try fir
 
           // New assistant turn
           if (event.type === 'assistant') {
-            if (channelState) channelState.progress.turnCount++;
+            if (channelState) {
+              channelState.progress.turnCount++;
+              pushRawLog(channelState.progress, `── Turn ${channelState.progress.turnCount} ──`);
+            }
             continue;
           }
 
@@ -218,13 +267,20 @@ NEVER say you can't do something if one of these capabilities covers it. Try fir
           const inner = event.type === 'stream_event' ? event.event : event;
           if (!inner) continue;
 
+          // DEBUG: Log event types to understand CLI output structure
+          if (channelState && inner?.type) {
+            console.log('EVENT:', JSON.stringify({ type: event.type, innerType: inner.type, hasBlock: !!inner.content_block }));
+          }
+
           if (inner.type === 'content_block_start') {
             const block = inner.content_block;
             if (block?.type === 'tool_use' && channelState) {
               channelState.progress.currentTool = block.name;
               channelState.progress.toolDetail = '';
               channelState.progress.activeBlocks.set(inner.index, { type: 'tool_use', name: block.name });
+              channelState.progress.stallWarned = false; // reset stall warning on new tool
               currentToolInput = '';
+              pushRawLog(channelState.progress, `⚡ ${block.name}`);
             } else if (block?.type === 'text' && channelState) {
               channelState.progress.activeBlocks.set(inner.index, { type: 'text' });
             }
@@ -242,6 +298,7 @@ NEVER say you can't do something if one of these capabilities covers it. Try fir
                   const trimmed = line.trim();
                   if (trimmed.length > 5) {
                     pushOutput(channelState.progress, `💬 ${trimmed}`);
+                    pushRawLog(channelState.progress, `💭 ${trimmed}`);
                   }
                 }
               }
@@ -264,9 +321,27 @@ NEVER say you can't do something if one of these capabilities covers it. Try fir
               if (channelState.progress.toolHistory.length > 10) {
                 channelState.progress.toolHistory.shift();
               }
-              // Log completed tool to recent outputs
+              // Log completed tool to recent outputs and rawLog
               const label = TOOL_LABELS[block.name] || block.name;
               pushOutput(channelState.progress, `🔧 ${label}${detail ? `: ${detail}` : ''}`);
+              pushRawLog(channelState.progress, `✓ ${block.name} done${detail ? ` (${detail.split('/').pop()})` : ''}`);
+
+              // Loop detection — track tool signatures
+              const sig = `${block.name}:${(detail || '').substring(0, 40)}`;
+              channelState.progress.toolSignatures.push(sig);
+              if (channelState.progress.toolSignatures.length > 10) {
+                channelState.progress.toolSignatures.shift();
+              }
+              if (detectLoop(channelState.progress) && discordChannel) {
+                discordChannel.send('⚠️ **Loop detected** — Claude appears to be repeating the same actions. Auto-killing in 60s if it continues.').catch(() => {});
+                setTimeout(() => {
+                  if (channelState.process && detectLoop(channelState.progress)) {
+                    child.kill();
+                    discordChannel.send('🛑 Killed due to detected loop.').catch(() => {});
+                  }
+                }, 60000);
+              }
+
               channelState.progress.currentTool = null;
               channelState.progress.toolDetail = '';
               currentToolInput = '';
@@ -305,17 +380,47 @@ NEVER say you can't do something if one of these capabilities covers it. Try fir
       reject(timeoutErr);
     }, MAX_TIMEOUT);
 
-    // Stall detector — kill if no output for STALL_TIMEOUT
+    // Stall detector — tiered thresholds based on current tool + warning before kill
     const stallCheck = setInterval(() => {
       if (!channelState) return;
-      const idle = Date.now() - channelState.progress.lastActivity;
-      if (idle >= STALL_TIMEOUT) {
+      const p = channelState.progress;
+      const idle = Date.now() - p.lastActivity;
+      const threshold = getStallThreshold(p.currentTool);
+
+      // At 80% of threshold: send warning (once per stall event)
+      if (idle >= threshold * 0.8 && !p.stallWarned && discordChannel) {
+        p.stallWarned = true;
+        const toolInfo = p.currentTool ? `Tool: ${p.currentTool}` : 'Thinking (no tool active)';
+        discordChannel.send(`⚠️ **Stall warning** — no output for ${Math.round(idle / 60000)}min. ${toolInfo}. Will kill in ${Math.round((threshold - idle) / 60000)}min if no activity.`).catch(() => {});
+      }
+
+      // At 100%: kill with formatted diagnostic
+      if (idle >= threshold) {
         child.kill();
+        const lastEntries = p.rawLog.slice(-5).map(e => `[${e.ts}] ${e.text}`).join('\n');
+
+        // Send formatted stall diagnostic to Discord before rejecting
+        if (discordChannel) {
+          const thresholdLabel = !p.currentTool ? 'thinking'
+            : p.currentTool.startsWith('mcp__playwright') ? 'browser'
+            : p.currentTool === 'Bash' ? 'bash' : 'default';
+          const diagLines = [
+            `🛑 **Stalled and killed** after ${Math.round(idle / 60000)}min of silence`,
+            `**Tool at death:** ${p.currentTool || 'none (thinking)'}`,
+            `**Turns completed:** ${p.turnCount}`,
+            `**Threshold:** ${Math.round(threshold / 60000)}min (${thresholdLabel})`,
+          ];
+          if (p.rawLog.length > 0) {
+            diagLines.push('', '**Last activity before stall:**', '```', lastEntries, '```');
+          }
+          discordChannel.send(diagLines.join('\n')).catch(() => {});
+        }
+
         channelState.process = null;
         channelState.busy = false;
         channelState.startedAt = null;
         channelState.progress = freshProgress();
-        const stallErr = new Error(`Claude CLI stalled — no output for ${STALL_TIMEOUT / 60000} minutes`);
+        const stallErr = new Error(`Claude CLI stalled — no output for ${Math.round(idle / 60000)}min (threshold: ${Math.round(threshold / 60000)}min, tool: ${p.currentTool || 'none'}, turns: ${p.turnCount})`);
         sendErrorAlert(stallErr, { source: 'askClaude stall detector' });
         reject(stallErr);
       }
@@ -621,7 +726,7 @@ async function handleCommand(message) {
       await message.reply(
         `**Bot Status:**\n` +
         (allChannels.length ? allChannels.join('\n') : 'No channels active.') +
-        `\n\nHard cap: ${MAX_TIMEOUT / 60000}min | Stall: ${STALL_TIMEOUT / 60000}min | Check-in: ${CHECKIN_INTERVAL / 60000}min | Max turns: ${DEFAULT_MAX_TURNS}`
+        `\n\nHard cap: ${MAX_TIMEOUT / 60000}min | Stall: ${STALL_THRESHOLDS.thinking / 60000}-${STALL_THRESHOLDS.browser / 60000}min (tiered) | Check-in: ${CHECKIN_INTERVAL / 60000}min | Max turns: ${DEFAULT_MAX_TURNS}`
       );
       break;
     }
@@ -802,80 +907,26 @@ async function handleCommand(message) {
       const runtime = mins > 0 ? `${mins}m ${secs}s` : `${secs}s`;
 
       const p = state.progress;
-      const lines = [`**Running for ${runtime}**${p.turnCount > 0 ? ` | Turn ${p.turnCount}` : ''}`];
+      const lines = [`**Running ${runtime} | Turn ${p.turnCount || 1}/${DEFAULT_MAX_TURNS}**`];
+
+      // Terminal-style activity log from rawLog
+      if (p.rawLog.length > 0) {
+        lines.push('```');
+        for (const entry of p.rawLog) {
+          lines.push(`[${entry.ts}] ${entry.text}`);
+        }
+        lines.push('```');
+      }
 
       // What's happening right now
       if (p.currentTool) {
-        const label = TOOL_LABELS[p.currentTool] || `Using ${p.currentTool}`;
-        lines.push(`**Now:** ${label}${p.toolDetail ? ` — \`${p.toolDetail}\`` : '...'}`);
+        const label = TOOL_LABELS[p.currentTool] || p.currentTool;
+        lines.push(`→ **Now:** ${label}${p.toolDetail ? ` — \`${p.toolDetail}\`` : ''}`);
       } else {
-        lines.push(`**Now:** Thinking...`);
+        lines.push(`→ **Now:** Thinking...`);
       }
 
-      // Recent tool history breadcrumb
-      if (p.toolHistory.length > 0) {
-        const recent = p.toolHistory.slice(-5).map(t => {
-          const label = TOOL_LABELS[t.name] || t.name;
-          return t.detail ? `${label} \`${t.detail.split('/').pop()}\`` : label;
-        });
-        lines.push(`**Recent:** ${recent.join(' → ')}`);
-      }
-
-      // Last CLI outputs — shows exactly what Claude is doing
-      if (p.recentOutputs.length > 0) {
-        lines.push('');
-        lines.push('**Last activity:**');
-        for (const out of p.recentOutputs.slice(-10)) {
-          lines.push(`> ${out}`);
-        }
-      }
-
-      // Detect listening ports in the project directory
-      try {
-        const portOutput = execSync(
-          `ss -tlnp 2>/dev/null | grep LISTEN | awk '{print $4}' | grep -oP '\\d+$' | sort -un`,
-          { encoding: 'utf-8', timeout: 3000 }
-        ).trim();
-        if (portOutput) {
-          const ports = portOutput.split('\n').filter(p => p !== '3400'); // exclude bot's own port
-          if (ports.length > 0) {
-            lines.push(`**Ports:** ${ports.join(', ')}`);
-          }
-        }
-      } catch {}
-
-      // Detect ALL other Claude CLI sessions with details
-      try {
-        const cliOutput = execSync(
-          `ps aux 2>/dev/null | grep -v grep | grep '[c]laude' || true`,
-          { encoding: 'utf-8', timeout: 3000 }
-        ).trim();
-        if (cliOutput) {
-          const allClaude = cliOutput.split('\n').filter(l => l.trim());
-          const botPid = state.process?.pid;
-          const otherSessions = [];
-          for (const l of allClaude) {
-            const pidMatch = l.match(/^\S+\s+(\d+)/);
-            if (!pidMatch) continue;
-            const pid = pidMatch[1];
-            if (String(pid) === String(botPid)) continue;
-            // Get working directory and full command for this PID
-            let cwd = '', cmdline = '';
-            try { cwd = execSync(`readlink -f /proc/${pid}/cwd 2>/dev/null`, { encoding: 'utf-8', timeout: 1000 }).trim(); } catch {}
-            try { cmdline = execSync(`cat /proc/${pid}/cmdline 2>/dev/null | tr '\\0' ' '`, { encoding: 'utf-8', timeout: 1000 }).trim(); } catch {}
-            // Extract the project path from cwd for display
-            const shortCwd = cwd.replace(/^\/workspace\//, '').replace(/^\/mnt\/c\/Users\/karen\/Desktop\/Github Projects\//, '') || cwd;
-            otherSessions.push({ pid, cwd: shortCwd, cmdline });
-          }
-          if (otherSessions.length > 0) {
-            lines.push('');
-            lines.push(`**Other Claude sessions (${otherSessions.length}):**`);
-            for (const s of otherSessions) {
-              lines.push(`> PID ${s.pid} in \`${s.cwd}\``);
-            }
-          }
-        }
-      } catch {}
+      lines.push(`\n[${p.rawLog.length} events buffered]`);
 
       await sendLongMessage(message, lines.join('\n'), state.cwd);
       break;
