@@ -28,26 +28,36 @@ WHEN TO UPDATE:
   - **Hard cap** (90 min) — absolute maximum runtime safety net
 - Long-running agent loops can now run up to 90 min as long as they're producing output
 - Stderr activity (warnings, progress, tool use) now correctly resets the stall timer — no more false stall kills
-- `!btw` — detailed progress: live-streamed Claude text (e.g. "Now let me commit and push"), tool history, other Claude CLI sessions with PID + working directory
+- `!btw` — detailed progress: live-streamed Claude text, tool history, **sub-agent tracking** (spawned/done labels with descriptions), other Claude CLI sessions with PID + working directory
+- Sub-agent events display in raw log with `🤖 Spawned agent:` / `🤖 Agent done:` markers, and active agents shown in `!btw` output
 - `!imagine <prompt>` — generates images via OpenAI `gpt-image-1`, shows the exact API payload before sending, then posts the image
 - Bot ignores messages from all Discord bot accounts (`message.author.bot` guard)
 - Full capabilities injected into system prompt — Claude knows it can generate images, browse the web, use Docker, git, sub-agents, and work across projects
 - Internal `/imagine` HTTP endpoint at `localhost:3400/imagine` so Claude CLI can generate images via curl
 
 ## What's Broken / In Progress
-- N/A
+- `parent_tool_use_id` linking — sub-agent events should carry this field so tool results inside agents are attributed correctly. Currently tracking agents by `block.id` on Agent tool_use blocks and matching on `tool_result.tool_use_id`, but `parent_tool_use_id` on nested events needs real-world verification
 
 ## Next Steps
-1. Monitor stall detector in production — tune STALL_TIMEOUT (10 min) if it's too aggressive or too lenient
-2. Consider making check-in interval configurable per channel or via a command
-3. Consider adding a warning message before the hard cap kills (e.g., at 80 min)
-4. Consider higher quality / larger sizes for `!imagine` (currently `quality: 'low'`, `1024x1024`)
+1. Verify `parent_tool_use_id` behavior in production — confirm sub-agent tool results get attributed to the correct agent label
+2. Add fallback if `parent_tool_use_id` is missing: infer agent context from timing/nesting heuristics
+3. Monitor stall detector in production — tune STALL_TIMEOUT (10 min) if it's too aggressive or too lenient
+4. Consider making check-in interval configurable per channel or via a command
+5. Consider adding a warning message before the hard cap kills (e.g., at 80 min)
+6. Consider higher quality / larger sizes for `!imagine` (currently `quality: 'low'`, `1024x1024`)
 
 ## Architecture
 - `bot.js` constants: `MAX_TIMEOUT` (90 min hard cap), `STALL_TIMEOUT` (10 min), `CHECKIN_INTERVAL` (5 min)
 - `askClaude()` now accepts `discordChannel` param for sending check-in messages
 - `freshProgress()` includes `lastActivity` timestamp + `recentOutputs` array (last 15 lines of Claude's text + tool completions), updated on every stdout AND stderr data event
-- Text deltas captured line-by-line as they stream in (not just at block end)
+- **`activeAgents` Map** (`tool_use_id → description`) in `freshProgress()` — tracks spawned sub-agents, populated on `Agent` tool_use blocks, cleared when matching `tool_result` arrives
+- Sub-agent context detected via `parent_tool_use_id` on events — tool results and text inside agents get prefixed with `↳ [agent-label]` in the raw log
+- Event stream parsed as complete assistant message blocks (not content_block_start/delta/stop) — CLI `stream-json` format emits one assistant event per content block
+- Turn counting uses assistant/non-assistant transition detection (`lastEventWasAssistant` flag) instead of counting every assistant event
+- Loop detection: 5+ identical signatures in last 10, or A-B-A-B-A-B in last 6 (was 3-in-6 / A-B-A-B in 4). 2-minute cooldown between loop warnings
+- Raw log buffer expanded to 50 entries (was 30), `!btw` shows last 25 with "earlier events" count
+- Stderr lines now appear in raw log (filtered for noise like Compressing/Downloading)
+- Tool result previews shown in raw log with cleaned content (system-reminder tags stripped)
 - Other Claude sessions detected via `/proc/<pid>/cwd` for directory info
 - Stall check runs every 30s via `setInterval`, cleared on process close
 - `openai` npm package used for `!imagine` and `/imagine` endpoint (gpt-image-1, base64 response)

@@ -46,6 +46,9 @@ function summarizeToolInput(name, jsonStr) {
       case 'Bash': return (input.command || '').substring(0, 80);
       case 'Glob': return input.pattern || '';
       case 'Grep': return input.pattern || '';
+      case 'Agent': return input.description || input.prompt?.substring(0, 60) || 'sub-agent';
+      case 'WebSearch': return input.query || '';
+      case 'WebFetch': return input.url?.substring(0, 60) || '';
       default: return '';
     }
   } catch { return ''; }
@@ -54,10 +57,12 @@ function summarizeToolInput(name, jsonStr) {
 function freshProgress() {
   return {
     currentTool: null, toolDetail: '', toolHistory: [], turnCount: 0,
-    activeBlocks: new Map(), lastActivity: Date.now(), recentOutputs: [],
+    lastActivity: Date.now(), recentOutputs: [],
     rawLog: [],           // rolling buffer of last 30 terminal-style log lines
     stallWarned: false,   // track whether we've sent a stall warning
-    toolSignatures: [],   // for loop detection — last 10 tool signatures
+    toolSignatures: [],   // for loop detection — last 15 tool signatures
+    lastLoopWarning: 0,   // cooldown timestamp for loop warnings
+    activeAgents: new Map(),  // tool_use_id → description (tracks spawned sub-agents)
   };
 }
 
@@ -74,20 +79,23 @@ function pushRawLog(progress, entry) {
   const secs = elapsed % 60;
   const ts = `${String(mins).padStart(2, '0')}:${String(secs).padStart(2, '0')}`;
   progress.rawLog.push({ ts, text: entry });
-  if (progress.rawLog.length > 30) progress.rawLog.shift();
+  if (progress.rawLog.length > 50) progress.rawLog.shift();
 }
 
 function detectLoop(progress) {
   const sigs = progress.toolSignatures;
-  if (sigs.length < 4) return false;
-  // Same signature 3+ times in last 6
-  const last6 = sigs.slice(-6);
+  if (sigs.length < 8) return false;
+  // Same signature 5+ times in last 10 — very likely a real loop
+  const last10 = sigs.slice(-10);
   const counts = {};
-  for (const s of last6) { counts[s] = (counts[s] || 0) + 1; }
-  for (const c of Object.values(counts)) { if (c >= 3) return true; }
-  // A-B-A-B pattern in last 4
-  const last4 = sigs.slice(-4);
-  if (last4[0] === last4[2] && last4[1] === last4[3] && last4[0] !== last4[1]) return true;
+  for (const s of last10) { counts[s] = (counts[s] || 0) + 1; }
+  for (const c of Object.values(counts)) { if (c >= 5) return true; }
+  // A-B-A-B-A-B pattern — 3 full repetitions in last 6
+  const last6 = sigs.slice(-6);
+  if (last6.length === 6
+    && last6[0] === last6[2] && last6[2] === last6[4]
+    && last6[1] === last6[3] && last6[3] === last6[5]
+    && last6[0] !== last6[1]) return true;
   return false;
 }
 
@@ -228,6 +236,7 @@ ORCHESTRATION RULE: You are an ORCHESTRATOR, not a worker. For any task with mul
     let stdoutBuf = '';  // buffer for incomplete NDJSON lines
     let stderr = '';
     let currentToolInput = ''; // accumulate input_json_delta for active tool
+    let lastEventWasAssistant = false; // track turn boundaries
 
     child.stdout.on('data', (d) => {
       // Update last activity timestamp for stall detection
@@ -242,97 +251,129 @@ ORCHESTRATION RULE: You are an ORCHESTRATOR, not a worker. For any task with mul
         try {
           const event = JSON.parse(line);
 
+          // Log every event type for debugging
+          console.log(`[event] type=${event.type}${event.subtype ? ` subtype=${event.subtype}` : ''}${event.message?.role ? ` role=${event.message.role}` : ''}${event.parent_tool_use_id ? ` parent=${event.parent_tool_use_id}` : ''}`);
+
+          // Detect sub-agent context from parent_tool_use_id
+          const parentId = event.parent_tool_use_id || null;
+          const agentLabel = parentId && channelState ? channelState.progress.activeAgents.get(parentId) : null;
+
           // Final result event from Claude CLI
           if (event.type === 'result') {
             resultText = event.result || '';
             resultSessionId = event.session_id || resultSessionId;
             resultCost = event.total_cost_usd || resultCost;
             resultNumTurns = event.num_turns || resultNumTurns;
+            console.log(`[result] turns=${resultNumTurns} cost=$${resultCost} text_len=${(resultText || '').length}`);
             continue;
           }
 
           // Track session ID from any event
           if (event.session_id) resultSessionId = event.session_id;
 
-          // New assistant turn
-          if (event.type === 'assistant') {
-            if (channelState) {
-              channelState.progress.turnCount++;
-              pushRawLog(channelState.progress, `── Turn ${channelState.progress.turnCount} ──`);
-            }
-            continue;
-          }
-
-          // Content block events (tool use + text tracking)
-          const inner = event.type === 'stream_event' ? event.event : event;
-          if (!inner) continue;
-
-          // DEBUG: Log event types to understand CLI output structure
-          if (channelState && inner?.type) {
-            console.log('EVENT:', JSON.stringify({ type: event.type, innerType: inner.type, hasBlock: !!inner.content_block }));
-          }
-
-          if (inner.type === 'content_block_start') {
-            const block = inner.content_block;
-            if (block?.type === 'tool_use' && channelState) {
-              channelState.progress.currentTool = block.name;
-              channelState.progress.toolDetail = '';
-              channelState.progress.activeBlocks.set(inner.index, { type: 'tool_use', name: block.name });
-              channelState.progress.stallWarned = false; // reset stall warning on new tool
-              currentToolInput = '';
-              pushRawLog(channelState.progress, `⚡ ${block.name}`);
-            } else if (block?.type === 'text' && channelState) {
-              channelState.progress.activeBlocks.set(inner.index, { type: 'text' });
-            }
-          }
-
-          if (inner.type === 'content_block_delta') {
-            if (inner.delta?.type === 'text_delta') {
-              accumulatedText += inner.delta.text;
-              // Capture text lines as they stream in (newline-delimited)
-              if (channelState && inner.delta.text.includes('\n')) {
-                const parts = accumulatedText.split('\n');
-                // Keep last partial line in accumulator, flush completed lines
-                accumulatedText = parts.pop();
-                for (const line of parts) {
-                  const trimmed = line.trim();
-                  if (trimmed.length > 5) {
-                    pushOutput(channelState.progress, `💬 ${trimmed}`);
-                    pushRawLog(channelState.progress, `💭 ${trimmed}`);
+          // Non-assistant events — capture tool results, mark turn boundary
+          if (event.type !== 'assistant') {
+            lastEventWasAssistant = false;
+            // Capture tool result summaries for !btw display
+            if (channelState && event.message?.content) {
+              for (const rb of event.message.content) {
+                if (rb.type === 'tool_result') {
+                  console.log(`[tool-result] id=${rb.tool_use_id || '?'} is_error=${!!rb.is_error} content_type=${typeof rb.content}`);
+                  // Check if this result completes a sub-agent
+                  if (rb.tool_use_id && channelState.progress.activeAgents.has(rb.tool_use_id)) {
+                    const desc = channelState.progress.activeAgents.get(rb.tool_use_id);
+                    channelState.progress.activeAgents.delete(rb.tool_use_id);
+                    pushRawLog(channelState.progress, `🤖 Agent done: ${desc}`);
+                  }
+                  // Extract text from tool result content
+                  let resultText = '';
+                  if (typeof rb.content === 'string') {
+                    resultText = rb.content;
+                  } else if (Array.isArray(rb.content)) {
+                    resultText = rb.content
+                      .filter(c => c.type === 'text')
+                      .map(c => c.text)
+                      .join(' ');
+                  }
+                  if (resultText) {
+                    // Strip system/internal noise from preview
+                    const cleaned = resultText
+                      .replace(/<system-reminder>[\s\S]*?<\/system-reminder>/g, '')
+                      .replace(/<tool_use_error>[\s\S]*?<\/tool_use_error>/g, '(cancelled)')
+                      .replace(/<persisted-output>/g, '')
+                      .replace(/^File content \(\d+ tokens\) exceeds.*$/m, '(file too large — retrying with offset)')
+                      .trim();
+                    if (cleaned) {
+                      const firstLine = cleaned.split('\n').find(l => l.trim().length > 3 && !l.startsWith('<')) || cleaned.substring(0, 120);
+                      const preview = firstLine.length > 120 ? firstLine.substring(0, 117) + '...' : firstLine;
+                      const prefix = agentLabel ? `  ↳ [${agentLabel}] ` : '  ';
+                      pushRawLog(channelState.progress, `${prefix}← ${preview}`);
+                    }
+                  } else if (rb.is_error) {
+                    const prefix = agentLabel ? `  ↳ [${agentLabel}] ` : '  ';
+                    pushRawLog(channelState.progress, `${prefix}← ❌ Error`);
                   }
                 }
               }
             }
-            if (inner.delta?.type === 'input_json_delta') {
-              currentToolInput += inner.delta.partial_json;
-              // Try to extract detail early for !btw
-              if (channelState && channelState.progress.currentTool) {
-                const detail = summarizeToolInput(channelState.progress.currentTool, currentToolInput);
-                if (detail) channelState.progress.toolDetail = detail;
-              }
-            }
+            continue;
           }
 
-          if (inner.type === 'content_block_stop' && channelState) {
-            const block = channelState.progress.activeBlocks.get(inner.index);
-            if (block?.type === 'tool_use') {
-              const detail = summarizeToolInput(block.name, currentToolInput);
-              channelState.progress.toolHistory.push({ name: block.name, detail });
-              if (channelState.progress.toolHistory.length > 10) {
-                channelState.progress.toolHistory.shift();
-              }
-              // Log completed tool to recent outputs and rawLog
-              const label = TOOL_LABELS[block.name] || block.name;
-              pushOutput(channelState.progress, `🔧 ${label}${detail ? `: ${detail}` : ''}`);
-              pushRawLog(channelState.progress, `✓ ${block.name} done${detail ? ` (${detail.split('/').pop()})` : ''}`);
+          // Assistant events — CLI stream-json emits each content block as a separate
+          // assistant event with event.message.content[0] containing the full block.
+          // There are NO content_block_start/delta/stop events in this format.
+          if (!channelState) continue;
 
-              // Loop detection — track tool signatures
-              const sig = `${block.name}:${(detail || '').substring(0, 40)}`;
-              channelState.progress.toolSignatures.push(sig);
-              if (channelState.progress.toolSignatures.length > 10) {
-                channelState.progress.toolSignatures.shift();
-              }
-              if (detectLoop(channelState.progress) && discordChannel) {
+          // Count a new turn when we transition from non-assistant to assistant
+          if (!lastEventWasAssistant) {
+            channelState.progress.turnCount++;
+            pushRawLog(channelState.progress, `── Turn ${channelState.progress.turnCount} ──`);
+            lastEventWasAssistant = true;
+          }
+
+          const content = event.message?.content;
+          if (!Array.isArray(content) || content.length === 0) continue;
+
+          const block = content[0];
+
+          if (block.type === 'tool_use') {
+            const name = block.name;
+            const inputStr = JSON.stringify(block.input || {});
+            const detail = summarizeToolInput(name, inputStr);
+            console.log(`[tool] ${name} | ${detail || inputStr.substring(0, 100)}`);
+
+            // Track Agent spawns
+            if (name === 'Agent') {
+              const agentDesc = block.input?.description || 'sub-agent';
+              channelState.progress.activeAgents.set(block.id, agentDesc);
+              pushRawLog(channelState.progress, `🤖 Spawned agent: ${agentDesc}`);
+            }
+
+            // Log tool start
+            channelState.progress.currentTool = name;
+            channelState.progress.toolDetail = detail;
+            channelState.progress.stallWarned = false;
+            const toolPrefix = agentLabel ? `  ↳ [${agentLabel}] ` : '';
+            pushRawLog(channelState.progress, `${toolPrefix}⚡ ${name}${detail ? ` (${detail.length > 60 ? detail.substring(0, 57) + '...' : detail})` : ''}`);
+
+            // Log tool as completed (CLI gives us the full block at once)
+            channelState.progress.toolHistory.push({ name, detail });
+            if (channelState.progress.toolHistory.length > 10) {
+              channelState.progress.toolHistory.shift();
+            }
+            const label = TOOL_LABELS[name] || name;
+            pushOutput(channelState.progress, `🔧 ${label}${detail ? `: ${detail}` : ''}`);
+
+            // Loop detection
+            const sig = `${name}:${(detail || '').substring(0, 80)}`;
+            channelState.progress.toolSignatures.push(sig);
+            if (channelState.progress.toolSignatures.length > 15) {
+              channelState.progress.toolSignatures.shift();
+            }
+            if (detectLoop(channelState.progress) && discordChannel) {
+              const now = Date.now();
+              if (!channelState.progress.lastLoopWarning || now - channelState.progress.lastLoopWarning > 120000) {
+                channelState.progress.lastLoopWarning = now;
                 discordChannel.send('⚠️ **Loop detected** — Claude appears to be repeating the same actions. Auto-killing in 60s if it continues.').catch(() => {});
                 setTimeout(() => {
                   if (channelState.process && detectLoop(channelState.progress)) {
@@ -341,29 +382,55 @@ ORCHESTRATION RULE: You are an ORCHESTRATOR, not a worker. For any task with mul
                   }
                 }, 60000);
               }
-
-              channelState.progress.currentTool = null;
-              channelState.progress.toolDetail = '';
-              currentToolInput = '';
-            } else if (block?.type === 'text') {
-              // Flush any remaining partial line
-              const remaining = accumulatedText.trim();
-              if (remaining.length > 5) {
-                pushOutput(channelState.progress, `💬 ${remaining}`);
-              }
-              accumulatedText = '';
             }
-            channelState.progress.activeBlocks.delete(inner.index);
+
+            channelState.progress.currentTool = null;
+            channelState.progress.toolDetail = '';
+
+          } else if (block.type === 'text' && block.text) {
+            accumulatedText += block.text;
+            // Flush completed lines for !btw display
+            const textLines = accumulatedText.split('\n');
+            accumulatedText = textLines.pop(); // keep last partial line
+            for (const tl of textLines) {
+              const trimmed = tl.trim();
+              if (trimmed.length > 5) {
+                const txtPrefix = agentLabel ? `  ↳ [${agentLabel}] ` : '';
+                pushOutput(channelState.progress, `💬 ${trimmed}`);
+                pushRawLog(channelState.progress, `${txtPrefix}💭 ${trimmed}`);
+              }
+            }
+
+          } else if (block.type === 'thinking') {
+            // Track thinking as activity but don't expose content
+            const thinkPrefix = agentLabel ? `  ↳ [${agentLabel}] ` : '';
+            pushRawLog(channelState.progress, `${thinkPrefix}🧠 Thinking...`);
           }
-        } catch {
-          // Skip unparseable lines
+        } catch (parseErr) {
+          // Log unparseable lines instead of silently dropping
+          const preview = line.substring(0, 150);
+          console.log(`[parse-error] ${parseErr.message} | line: ${preview}`);
         }
       }
     });
 
     child.stderr.on('data', (d) => {
       stderr += d;
-      if (channelState) channelState.progress.lastActivity = Date.now();
+      if (channelState) {
+        channelState.progress.lastActivity = Date.now();
+        // Show stderr lines in rawLog — this is where errors/diagnostics appear
+        const stderrLines = d.toString().split('\n');
+        for (const sl of stderrLines) {
+          const trimmed = sl.trim();
+          if (trimmed && trimmed.length > 3) {
+            // Skip noisy/repetitive lines
+            if (trimmed.startsWith('Compressing') || trimmed.startsWith('Downloading')) continue;
+            const preview = trimmed.length > 120 ? trimmed.substring(0, 117) + '...' : trimmed;
+            pushRawLog(channelState.progress, `⚠ ${preview}`);
+            console.log(`[stderr] ${preview}`);
+          }
+        }
+      }
     });
 
     // Hard cap timeout — absolute maximum runtime
@@ -451,6 +518,9 @@ ORCHESTRATION RULE: You are an ORCHESTRATOR, not a worker. For any task with mul
       clearTimeout(hardTimeout);
       clearInterval(stallCheck);
       clearInterval(checkinTimer);
+      const turnCount = channelState?.progress?.turnCount || 0;
+      const elapsed = channelState?.startedAt ? Math.round((Date.now() - channelState.startedAt) / 1000) : 0;
+      console.log(`[close] code=${code} turns=${turnCount} elapsed=${elapsed}s stderr_len=${stderr.length}`);
       if (channelState) {
         channelState.process = null;
         channelState.busy = false;
@@ -464,8 +534,7 @@ ORCHESTRATION RULE: You are an ORCHESTRATOR, not a worker. For any task with mul
       }
 
       if (code !== 0) {
-        console.error('Claude CLI exited with code:', code);
-        if (stderr) console.error('stderr:', stderr.substring(0, 500));
+        console.error(`[exit-error] code=${code} stderr:`, stderr.substring(0, 1000));
         const exitErr = new Error(`Claude CLI exited with code ${code}\n${stderr.substring(0, 300)}`);
         sendErrorAlert(exitErr, { source: 'askClaude', detail: `Exit code ${code}` });
         return reject(exitErr);
@@ -909,13 +978,20 @@ async function handleCommand(message) {
       const p = state.progress;
       const lines = [`**Running ${runtime} | Turn ${p.turnCount || 1}/${DEFAULT_MAX_TURNS}**`];
 
-      // Terminal-style activity log from rawLog
+      // Terminal-style activity log — show last 25 entries
       if (p.rawLog.length > 0) {
+        const visible = p.rawLog.slice(-25);
+        if (p.rawLog.length > 25) lines.push(`*(...${p.rawLog.length - 25} earlier events)*`);
         lines.push('```');
-        for (const entry of p.rawLog) {
+        for (const entry of visible) {
           lines.push(`[${entry.ts}] ${entry.text}`);
         }
         lines.push('```');
+      }
+
+      // Show active sub-agents
+      if (p.activeAgents.size > 0) {
+        lines.push(`**Active agents:** ${[...p.activeAgents.values()].join(', ')}`);
       }
 
       // What's happening right now
@@ -925,8 +1001,6 @@ async function handleCommand(message) {
       } else {
         lines.push(`→ **Now:** Thinking...`);
       }
-
-      lines.push(`\n[${p.rawLog.length} events buffered]`);
 
       await sendLongMessage(message, lines.join('\n'), state.cwd);
       break;
