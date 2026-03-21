@@ -42,6 +42,26 @@ const TOOL_LABELS = {
   mcp__playwright_browser_search: 'Searching',
 };
 
+// Discover available agent types from global ~/.claude/agents/ directory
+function loadAvailableAgents() {
+  const agentsDir = '/home/node/.claude/agents';
+  try {
+    if (!fs.existsSync(agentsDir)) return [];
+    return fs.readdirSync(agentsDir)
+      .filter(f => f.endsWith('.md'))
+      .map(f => {
+        const content = fs.readFileSync(path.join(agentsDir, f), 'utf-8');
+        const match = content.match(/^---\n([\s\S]*?)\n---/);
+        if (!match) return null;
+        const nameMatch = match[1].match(/^name:\s*(.+)$/m);
+        const descMatch = match[1].match(/^description:\s*"?(.+?)"?\s*$/m);
+        return nameMatch ? { name: nameMatch[1].trim(), description: descMatch ? descMatch[1].trim() : '' } : null;
+      })
+      .filter(Boolean);
+  } catch { return []; }
+}
+const AVAILABLE_AGENTS = loadAvailableAgents();
+
 function summarizeToolInput(name, jsonStr) {
   try {
     const input = JSON.parse(jsonStr);
@@ -412,7 +432,14 @@ Never report "deployed" without verifying the container is running.
 
 5. **GIT & GITHUB**: You can commit, push, create branches, open PRs, check CI status — full git workflow. IMPORTANT: When making git commits, ALWAYS add this trailer to your commit messages: "Co-Authored-By: Claude Code (${identity ? identity.name : 'Bot'}) <noreply@anthropic.com>" — this identifies which bot personality pushed the change.
 
-6. **SUB-AGENTS**: You have the Agent tool to spawn focused sub-agents. ALWAYS use sub-agents when a task has 3+ independent steps — launch them in parallel. Examples: research multiple topics simultaneously, write multiple files at once, run tests while writing docs. A single message can launch multiple agents. This is your primary way to work fast.
+6. **SUB-AGENTS**: You have the Agent tool to spawn focused sub-agents. ALWAYS use sub-agents when a task has 3+ independent steps — launch them in parallel.
+
+**IMPORTANT: ALWAYS set subagent_type to the most relevant specialist. NEVER use general-purpose when a specialist exists.**
+
+Available agent types:
+${AVAILABLE_AGENTS.map(a => `- \`${a.name}\`: ${a.description}`).join('\n')}
+
+Match the agent type to the task. Examples: frontend work → frontend-engineer, API design → backend-lead-engineer, testing → qa-engineer, security review → security-reviewer.
 
 7. **MULTIPLE PROJECTS**: Your workspace is /workspace/ which contains multiple projects. You can cd between them, work on any of them, and even coordinate across projects.
 
@@ -1287,11 +1314,11 @@ async function handleCommand(message) {
         for (const [, agent] of p.activeAgents) {
           const agentElapsed = Math.round((Date.now() - agent.startedAt) / 1000);
           const toolInfo = agent.lastTool ? `${TOOL_LABELS[agent.lastTool] || agent.lastTool}` : 'Starting...';
-          const typeTag = agent.type && agent.type !== 'general-purpose' ? `\`${agent.type}\` ` : '';
+          const typeTag = agent.type ? `\`${agent.type}\` ` : '';
           lines.push(`  🟢 ${typeTag}"${agent.description}" — ${toolInfo} (${agentElapsed}s)`);
         }
         for (const agent of p.completedAgents.slice(-5)) {
-          const typeTag = agent.type && agent.type !== 'general-purpose' ? `\`${agent.type}\` ` : '';
+          const typeTag = agent.type ? `\`${agent.type}\` ` : '';
           lines.push(`  ✅ ${typeTag}"${agent.description}" — Done`);
         }
       }
