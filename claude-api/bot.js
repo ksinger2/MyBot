@@ -5,6 +5,7 @@ const path = require('path');
 const { handleWizardMessage, cancelWizard, startWizard } = require('./wizard');
 const { init: initErrorAlerting, sendErrorAlert } = require('./error-alerting');
 const { addSchedule, removeSchedule, getUserSchedules, formatScheduleList } = require('./schedules-storage');
+const { addMonitor, removeMonitor, listMonitors, getMonitor, updateMonitor } = require('./monitor-config');
 const OpenAI = require('openai');
 const { startAllSchedules, registerJob, cancelJob } = require('./scheduler');
 const { saveChannelState, loadAllChannelStates, flushPendingWrites } = require('./channel-persistence');
@@ -64,7 +65,8 @@ function freshProgress() {
     stallWarned: false,   // track whether we've sent a stall warning
     toolSignatures: [],   // for loop detection — last 15 tool signatures
     lastLoopWarning: 0,   // cooldown timestamp for loop warnings
-    activeAgents: new Map(),  // tool_use_id → description (tracks spawned sub-agents)
+    activeAgents: new Map(),  // tool_use_id → { description, startedAt, lastTool, lastDetail }
+    completedAgents: [],      // [{ description, completedAt }]
   };
 }
 
@@ -221,6 +223,14 @@ function askClaude(prompt, { sessionId = null, personalityFile = null, identity 
 
 CRITICAL RULE — IMAGE ATTACHMENTS: Whenever you generate, save, or display any image files, you MUST include their full absolute file paths in your text response (e.g. /workspace/BookFactory/output/book_id/page_01.png). This is required so the Discord bot can attach the images to the message. List every image path on its own line. Do NOT rely on tool output alone — the path must appear in your final text response.
 
+CRITICAL — SUB-AGENTS: You MUST use the Agent tool for any task with 2+ independent parts.
+Launch agents IN PARALLEL in a single message. Examples:
+- "Fix the API and update tests" → 1 agent for API fix, 1 agent for tests
+- "Research X and build Y" → 1 agent for research, 1 agent for building
+- "Create 3 endpoints" → 1 agent per endpoint
+Do NOT do sequential work when agents can run simultaneously. Think like a manager with a team.
+If you're about to do step 1 then step 2, STOP — can they run in parallel? If yes, use agents.
+
 YOUR CAPABILITIES — You are a powerful AI assistant with the following tools. USE THEM. Never say "I can't do that" if one of these covers it:
 
 1. **IMAGE GENERATION**: You CAN generate images! Run: curl -s -X POST http://localhost:3400/imagine -H "Content-Type: application/json" -d '{"prompt":"your detailed description here"}' — returns a file path. Include that path in your response so Discord attaches it. Use this when asked to draw, generate, create, or send any image/picture/photo/artwork.
@@ -247,8 +257,6 @@ Never report "deployed" without verifying the container is running.
 NEVER say you can't do something if one of these capabilities covers it. Try first, explain only if it actually fails.
 
 AUTONOMY: You are fully autonomous. Never stop to ask the user for confirmation unless it involves spending money, sending emails/messages, or destructive operations (deleting repos, dropping databases). If something fails, try a different approach. If stuck after 3 attempts, summarize what you tried, then move on. The user CANNOT respond while you're running — never wait for input. You have up to ${maxTurns} turns.
-
-ORCHESTRATION RULE: You are an ORCHESTRATOR, not a worker. For any task with multiple independent parts, ALWAYS use the Agent tool to spawn sub-agents in parallel. Do NOT do sequential work yourself when agents can work simultaneously. Example: if asked to "create 3 endpoints and test them," spawn one agent per endpoint, then test. Think like a manager delegating to a team. Only do work directly yourself when it's a single atomic step or when steps are truly sequential dependencies.
 
 SESSION HANDOFF: When you finish significant work (feature, fix, refactor), update NextSteps.md in the project root with what you did, what's working, what's broken, and specific next steps. Keep it concise — bullet points. This is how your future self picks up context.`);
     if (identity) {
@@ -305,7 +313,13 @@ SESSION HANDOFF: When you finish significant work (feature, fix, refactor), upda
 
           // Detect sub-agent context from parent_tool_use_id
           const parentId = event.parent_tool_use_id || null;
-          const agentLabel = parentId && channelState ? channelState.progress.activeAgents.get(parentId) : null;
+          const agentObj = parentId && channelState ? channelState.progress.activeAgents.get(parentId) : null;
+          const agentLabel = agentObj ? agentObj.description : null;
+          // Update agent's last tool if this is a tool_use event inside an agent
+          if (agentObj && event.type === 'assistant' && event.message?.content?.[0]?.type === 'tool_use') {
+            agentObj.lastTool = event.message.content[0].name;
+            agentObj.lastDetail = summarizeToolInput(event.message.content[0].name, JSON.stringify(event.message.content[0].input || {}));
+          }
 
           // Final result event from Claude CLI
           if (event.type === 'result') {
@@ -330,9 +344,13 @@ SESSION HANDOFF: When you finish significant work (feature, fix, refactor), upda
                   console.log(`[tool-result] id=${rb.tool_use_id || '?'} is_error=${!!rb.is_error} content_type=${typeof rb.content}`);
                   // Check if this result completes a sub-agent
                   if (rb.tool_use_id && channelState.progress.activeAgents.has(rb.tool_use_id)) {
-                    const desc = channelState.progress.activeAgents.get(rb.tool_use_id);
+                    const agentInfo = channelState.progress.activeAgents.get(rb.tool_use_id);
                     channelState.progress.activeAgents.delete(rb.tool_use_id);
-                    pushRawLog(channelState.progress, `🤖 Agent done: ${desc}`);
+                    channelState.progress.completedAgents.push({
+                      description: agentInfo.description,
+                      completedAt: Date.now(),
+                    });
+                    pushRawLog(channelState.progress, `🤖 Agent done: ${agentInfo.description}`);
                   }
                   // Extract text from tool result content
                   let resultText = '';
@@ -394,7 +412,12 @@ SESSION HANDOFF: When you finish significant work (feature, fix, refactor), upda
             // Track Agent spawns
             if (name === 'Agent') {
               const agentDesc = block.input?.description || 'sub-agent';
-              channelState.progress.activeAgents.set(block.id, agentDesc);
+              channelState.progress.activeAgents.set(block.id, {
+                description: agentDesc,
+                startedAt: Date.now(),
+                lastTool: null,
+                lastDetail: '',
+              });
               pushRawLog(channelState.progress, `🤖 Spawned agent: ${agentDesc}`);
             }
 
@@ -961,6 +984,7 @@ async function handleCommand(message) {
         `**Tasks:** \`!tasks\` · \`!done <#>\` · \`!done all\`\n` +
         `**Schedule:** \`!schedule\` · \`!schedules\` · \`!unschedule <#>\` · \`!autoschedule <freq> | <task>\`\n` +
         `**Queue:** \`!queue <task>\` · \`!queued\` · \`!dequeue <#>\`\n` +
+        `**Monitors:** \`!monitor ci <repo>\` · \`!monitor health <url>\` · \`!monitors\` · \`!monitor remove/pause/resume/check <#>\`\n` +
         `**Briefing:** \`!briefing\` · \`!weekly\`\n` +
         `**Other:** \`!email <request>\` · \`!imagine <desc>\`\n\n` +
         `Just type what you want built. Claude runs autonomously — reads, writes, commits, pushes. Use \`!stop\` to interrupt, \`!clear\` to start over.\n\n` +
@@ -1066,30 +1090,43 @@ async function handleCommand(message) {
       const runtime = mins > 0 ? `${mins}m ${secs}s` : `${secs}s`;
 
       const p = state.progress;
-      const lines = [`**Running ${runtime} | Turn ${p.turnCount || 1}/${DEFAULT_MAX_TURNS}**`];
+      const costStr = p._lastCost ? ` | $${p._lastCost.toFixed(4)}` : '';
+      const lines = [`**Running ${runtime} | Turn ${p.turnCount || 1}/${DEFAULT_MAX_TURNS}${costStr}**`];
 
-      // Terminal-style activity log — show last 25 entries
+      // Current main thread activity
+      if (p.currentTool) {
+        const label = TOOL_LABELS[p.currentTool] || p.currentTool;
+        lines.push(`📋 **Main:** ${label}${p.toolDetail ? ` — \`${p.toolDetail}\`` : ''}`);
+      } else {
+        lines.push(`📋 **Main:** Thinking...`);
+      }
+
+      // Agents section — active + completed
+      const activeCount = p.activeAgents.size;
+      const doneCount = p.completedAgents.length;
+      if (activeCount > 0 || doneCount > 0) {
+        lines.push('');
+        lines.push(`🤖 **Agents (${activeCount} active, ${doneCount} done):**`);
+        for (const [, agent] of p.activeAgents) {
+          const agentElapsed = Math.round((Date.now() - agent.startedAt) / 1000);
+          const toolInfo = agent.lastTool ? `${TOOL_LABELS[agent.lastTool] || agent.lastTool}` : 'Starting...';
+          lines.push(`  🟢 "${agent.description}" — ${toolInfo} (${agentElapsed}s ago)`);
+        }
+        for (const agent of p.completedAgents.slice(-5)) {
+          lines.push(`  ✅ "${agent.description}" — Done`);
+        }
+      }
+
+      // Recent activity log — last 10 entries
       if (p.rawLog.length > 0) {
-        const visible = p.rawLog.slice(-25);
-        if (p.rawLog.length > 25) lines.push(`*(...${p.rawLog.length - 25} earlier events)*`);
+        lines.push('');
+        lines.push(`📜 **Recent (last 10):**`);
+        const visible = p.rawLog.slice(-10);
         lines.push('```');
         for (const entry of visible) {
           lines.push(`[${entry.ts}] ${entry.text}`);
         }
         lines.push('```');
-      }
-
-      // Show active sub-agents
-      if (p.activeAgents.size > 0) {
-        lines.push(`**Active agents:** ${[...p.activeAgents.values()].join(', ')}`);
-      }
-
-      // What's happening right now
-      if (p.currentTool) {
-        const label = TOOL_LABELS[p.currentTool] || p.currentTool;
-        lines.push(`→ **Now:** ${label}${p.toolDetail ? ` — \`${p.toolDetail}\`` : ''}`);
-      } else {
-        lines.push(`→ **Now:** Thinking...`);
       }
 
       await sendLongMessage(message, lines.join('\n'), state.cwd);
@@ -1341,6 +1378,133 @@ async function handleCommand(message) {
       break;
     }
 
+    case '!monitor': {
+      const monArgs = parts.slice(1);
+      const subCmd = (monArgs[0] || '').toLowerCase();
+
+      if (subCmd === 'ci') {
+        // !monitor ci [repo] [--branch=X] [--action=fix|notify] [--interval=N]
+        const repo = monArgs[1] || '*';
+        const flags = monArgs.slice(2).join(' ');
+        const branchMatch = flags.match(/--branch[= ](\S+)/);
+        const actionMatch = flags.match(/--action[= ](fix|notify)/);
+        const intervalMatch = flags.match(/--interval[= ](\d+)/);
+        const mon = addMonitor({
+          type: 'github-ci',
+          channelId: message.channel.id,
+          action: actionMatch ? actionMatch[1] : 'notify',
+          config: { repo, branch: branchMatch ? branchMatch[1] : 'main' },
+          pollInterval: intervalMatch ? parseInt(intervalMatch[1], 10) : 5,
+          cwd: state.cwd,
+        });
+        const { scheduleMonitor } = require('./monitor-runner');
+        scheduleMonitor(mon, client);
+        await message.reply(
+          `Monitor **#${mon.id}** created!\n` +
+          `🔄 **github-ci** — ${repo} (${mon.config.branch})\n` +
+          `⚡ Action: ${mon.action} | Every ${mon.pollInterval}min\n` +
+          `Use \`!monitors\` to list, \`!monitor remove ${mon.id}\` to delete.`
+        );
+      } else if (subCmd === 'health') {
+        // !monitor health <url> [--action=fix|notify] [--status=200] [--interval=N]
+        const url = monArgs[1];
+        if (!url) {
+          await message.reply('Usage: `!monitor health <url>` — e.g. `!monitor health http://localhost:3400/health`');
+          break;
+        }
+        const flags = monArgs.slice(2).join(' ');
+        const actionMatch = flags.match(/--action[= ](fix|notify)/);
+        const statusMatch = flags.match(/--status[= ](\d+)/);
+        const intervalMatch = flags.match(/--interval[= ](\d+)/);
+        const mon = addMonitor({
+          type: 'url-health',
+          channelId: message.channel.id,
+          action: actionMatch ? actionMatch[1] : 'notify',
+          config: { url, expectStatus: statusMatch ? parseInt(statusMatch[1], 10) : 200 },
+          pollInterval: intervalMatch ? parseInt(intervalMatch[1], 10) : 5,
+          cwd: state.cwd,
+        });
+        const { scheduleMonitor } = require('./monitor-runner');
+        scheduleMonitor(mon, client);
+        await message.reply(
+          `Monitor **#${mon.id}** created!\n` +
+          `🔄 **url-health** — ${url}\n` +
+          `⚡ Action: ${mon.action} | Every ${mon.pollInterval}min\n` +
+          `Use \`!monitors\` to list, \`!monitor remove ${mon.id}\` to delete.`
+        );
+      } else if (subCmd === 'remove') {
+        const id = parseInt(monArgs[1], 10);
+        if (isNaN(id)) {
+          await message.reply('Usage: `!monitor remove <id>`');
+          break;
+        }
+        const removed = removeMonitor(id);
+        if (!removed) {
+          await message.reply(`No monitor #${id} found.`);
+        } else {
+          const { cancelMonitor } = require('./monitor-runner');
+          cancelMonitor(id);
+          await message.reply(`Removed monitor **#${id}** (${removed.type}).`);
+        }
+      } else if (subCmd === 'pause') {
+        const id = parseInt(monArgs[1], 10);
+        if (isNaN(id)) { await message.reply('Usage: `!monitor pause <id>`'); break; }
+        const mon = updateMonitor(id, { enabled: false });
+        if (!mon) { await message.reply(`No monitor #${id} found.`); break; }
+        const { cancelMonitor } = require('./monitor-runner');
+        cancelMonitor(id);
+        await message.reply(`Paused monitor **#${id}**. Use \`!monitor resume ${id}\` to re-enable.`);
+      } else if (subCmd === 'resume') {
+        const id = parseInt(monArgs[1], 10);
+        if (isNaN(id)) { await message.reply('Usage: `!monitor resume <id>`'); break; }
+        const mon = updateMonitor(id, { enabled: true });
+        if (!mon) { await message.reply(`No monitor #${id} found.`); break; }
+        const { scheduleMonitor } = require('./monitor-runner');
+        scheduleMonitor(mon, client);
+        await message.reply(`Resumed monitor **#${id}**.`);
+      } else if (subCmd === 'check') {
+        const id = parseInt(monArgs[1], 10);
+        if (isNaN(id)) { await message.reply('Usage: `!monitor check <id>`'); break; }
+        const mon = getMonitor(id);
+        if (!mon) { await message.reply(`No monitor #${id} found.`); break; }
+        await message.reply(`Running immediate check for monitor **#${id}**...`);
+        const { runPoll } = require('./monitor-runner');
+        runPoll(id, client).catch(err => {
+          message.reply(`Check failed: ${err.message}`).catch(() => {});
+        });
+      } else {
+        await message.reply(
+          `**Monitor Commands:**\n` +
+          `\`!monitor ci <repo> [--branch=main] [--action=fix|notify]\`\n` +
+          `\`!monitor health <url> [--action=fix|notify]\`\n` +
+          `\`!monitor remove <id>\` · \`!monitor pause <id>\` · \`!monitor resume <id>\`\n` +
+          `\`!monitor check <id>\` — force immediate poll\n` +
+          `\`!monitors\` — list all monitors`
+        );
+      }
+      break;
+    }
+
+    case '!monitors': {
+      const allMonitors = listMonitors();
+      if (allMonitors.length === 0) {
+        await message.reply('No monitors configured. Use `!monitor ci <repo>` or `!monitor health <url>` to set one up.');
+        break;
+      }
+      const lines = allMonitors.map(m => {
+        const status = m.enabled ? '🔄' : '⏸️';
+        const lastAgo = m.lastCheck
+          ? `${Math.round((Date.now() - new Date(m.lastCheck).getTime()) / 60000)}min ago`
+          : 'never';
+        const typeLabel = m.type === 'github-ci'
+          ? `github-ci ${m.config.repo} (${m.config.branch || '*'})`
+          : `url-health ${m.config.url}`;
+        return `**#${m.id}** ${status} ${typeLabel} → ${m.action} | every ${m.pollInterval}min | last: ${lastAgo}`;
+      });
+      await sendLongMessage(message, `**Monitors:**\n${lines.join('\n')}`, state.cwd);
+      break;
+    }
+
     case '!commands': {
       await message.reply(
         `**Available Commands:**\n` +
@@ -1351,6 +1515,7 @@ async function handleCommand(message) {
         `\`!tasks\` \`!done\`\n` +
         `\`!schedule\` \`!schedules\` \`!unschedule\` \`!autoschedule\`\n` +
         `\`!queue\` \`!queued\` \`!dequeue\`\n` +
+        `\`!monitor\` \`!monitors\`\n` +
         `\`!briefing\` \`!weekly\` \`!email\` \`!help\` \`!commands\`\n\n` +
         `Use \`!help\` for detailed descriptions.`
       );
@@ -1432,6 +1597,10 @@ client.on('ready', () => {
   // Start background task queue runner
   const { startQueueRunner } = require('./queue-runner');
   startQueueRunner(client);
+
+  // Start event monitors (CI, health checks)
+  const { startMonitorRunner } = require('./monitor-runner');
+  startMonitorRunner(client);
 });
 
 async function processQueue(state) {

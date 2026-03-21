@@ -20,6 +20,9 @@ docker compose up -d --build
 |------|---------|
 | `claude-api/bot.js` | Main bot — Discord commands, Claude CLI wrapper, system prompt, progress tracking |
 | `claude-api/server.js` | Express server — `/ask`, `/imagine`, `/health` endpoints |
+| `claude-api/monitor-config.js` | Monitor config CRUD — JSON persistence for polling monitors |
+| `claude-api/pollers.js` | Poller functions — GitHub CI (`gh` CLI) and URL health checks |
+| `claude-api/monitor-runner.js` | Timer-based polling loop — dedup, dispatch, rate limiting |
 | `claude-api/personalities/` | Personality files that define voice/style |
 | `claude-api/project-template/` | Template files for `!startproject` (CLAUDE.md, NextSteps.md, agents) |
 | `docker-compose.yml` | Container config, env vars, volume mounts |
@@ -40,7 +43,9 @@ These are the capabilities Claude has when running inside the bot. The system pr
 **Workspace:** `!cd`, `!ls`, `!startproject`
 **Identity:** `!name`, `!identity`, `!personality`, `!personalities`
 **Tasks:** `!tasks`, `!done`
-**Scheduling:** `!schedule`, `!schedules`, `!unschedule`
+**Scheduling:** `!schedule`, `!schedules`, `!unschedule`, `!autoschedule`
+**Queue:** `!queue`, `!queued`, `!dequeue`
+**Monitors:** `!monitor ci <repo>`, `!monitor health <url>`, `!monitors`, `!monitor remove/pause/resume/check <#>`
 **Briefing:** `!briefing`, `!weekly`
 **Other:** `!email`, `!imagine`, `!help`
 
