@@ -26,6 +26,7 @@
 3. Use `/reinit` to re-initialize project context at the start of each session
 4. Use `/qa` after implementing features to run comprehensive QA
 5. Use `/fix` to coordinate a team-based fix workflow for issues found
+6. Use `/audit` for a comprehensive project audit with approval gates
 
 ## Available Agents
 This project includes a full product development team in `.claude/agents/`:

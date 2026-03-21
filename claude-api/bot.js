@@ -111,6 +111,140 @@ function pushOutput(progress, line) {
   if (progress.recentOutputs.length > 15) progress.recentOutputs.shift();
 }
 
+function buildAuditPrompt(focus = 'full', cwd = DEFAULT_WORKSPACE) {
+  const projectName = path.basename(cwd);
+  const agentSections = {
+    design: `### Design Agent
+**Role:** lead-designer
+**Focus:** Visual consistency, spacing, typography, colors, dark mode support, responsive layout, accessibility (WCAG), component states (hover, focus, disabled, error), animation/transitions.`,
+    product: `### Product Agent
+**Role:** principal-product-manager
+**Focus:** Feature completeness vs requirements/CLAUDE.md, user flows end-to-end, empty states, loading states, error states, copy/microcopy review, onboarding experience.`,
+    qa: `### QA Agent
+**Role:** qa-engineer + manual-qa-tester
+**Focus:** Click every button, test every form, submit edge cases (empty, too long, special chars, SQL injection strings), check console for errors, test navigation flows, verify all links, screenshot every bug found.`,
+    security: `### Security Agent
+**Role:** backend-lead-engineer
+**Focus:** Input validation/sanitization, authentication/authorization, XSS/CSRF/injection vulnerabilities, secrets in code or logs, \`npm audit\` / dependency vulnerabilities, API security (rate limiting, CORS), environment variable handling.`,
+    analytics: `### Analytics Agent
+**Role:** data-scientist
+**Focus:** Event tracking coverage (are key actions tracked?), event naming consistency, funnel instrumentation (signup, purchase, etc.), privacy compliance (PII in events, consent), analytics initialization and error handling.`,
+    performance: `### Performance Agent
+**Role:** principal-engineer
+**Focus:** Bundle size analysis, render performance, unnecessary re-renders, network call count and payload sizes, caching strategy, image optimization, lazy loading, lighthouse score if web.`,
+  };
+
+  const selectedAgents = focus === 'full'
+    ? Object.values(agentSections).join('\n\n')
+    : agentSections[focus] || Object.values(agentSections).join('\n\n');
+
+  const focusLabel = focus === 'full' ? 'full audit (all categories)' : `${focus}-focused audit`;
+
+  return `# PROJECT AUDIT MODE — ${projectName}
+
+You are running a **${focusLabel}** of \`${cwd}\`.
+
+## AUDIT MODE RULES (override normal autonomy)
+
+1. **PROPOSE BEFORE ACTING** — Present your plan and findings, then STOP and wait for the user's approval before making any code changes. Do NOT auto-fix anything.
+2. **COST GATING** — If any action costs money (image generation, API calls, paid services), list the estimated costs and WAIT for explicit consent before proceeding.
+3. **ASK QUESTIONS** — If you need clarification about project intent, expected behavior, or priorities, ASK. Don't assume.
+4. **ITERATE UNTIL DONE** — After fixes, re-audit the fixed areas. Don't declare victory after one pass. Keep going until clean.
+5. **SCREENSHOTS MANDATORY** — Use Playwright to take screenshots of every finding. Visual evidence for everything.
+
+---
+
+## Phase 1: Discovery (run immediately — no approval needed)
+
+1. Read CLAUDE.md, NextSteps.md, package.json, and key project files to understand the project
+2. Determine: tech stack, build commands, how to run the project, entry points
+3. Build and launch the project (follow build instructions from CLAUDE.md)
+4. Use Playwright to navigate every screen/page/route you can find:
+   - Take **desktop screenshots** (1280×800 viewport)
+   - Take **mobile screenshots** using viewport emulation:
+     - iPhone 14: 390×844 viewport
+     - Pixel 7: 412×915 viewport
+5. Present to the user:
+   - **Project summary** (stack, structure, entry points)
+   - **Screens found** (list with screenshot references)
+   - **Proposed audit plan** (which agents will run, what they'll check)
+   - **Questions** (anything unclear about the project)
+   - **Cost estimates** (if any actions will cost money)
+
+**⛔ STOP HERE. Wait for user approval before proceeding to Phase 2.**
+
+---
+
+## Phase 2: Parallel Agent Review (after user approves Phase 1)
+
+Launch ALL of the following agents IN PARALLEL (use the Agent tool, one per agent):
+
+${selectedAgents}
+
+Each agent must:
+- Take Playwright screenshots of every issue found
+- Document: location, expected behavior, actual behavior, severity (Critical/High/Medium/Low)
+- Be thorough — check EVERY screen, EVERY component, EVERY state
+
+### Mobile Testing
+Use Playwright viewport emulation for responsive testing:
+- iPhone 14: \`page.setViewportSize({ width: 390, height: 844 })\`
+- Pixel 7: \`page.setViewportSize({ width: 412, height: 915 })\`
+Do NOT use native simulators — viewport emulation only.
+
+---
+
+## Phase 3: Issue Compilation
+
+After all agents complete:
+1. Compile ALL findings into a single prioritized table:
+
+| # | Category | Severity | Location | Description | Screenshot |
+|---|----------|----------|----------|-------------|------------|
+
+2. Group by category (Design, Product, QA, Security, Analytics, Performance)
+3. Sort by severity within each category (Critical → Low)
+4. Include screenshot paths for every issue
+
+**⛔ STOP HERE. Present the full issue table and wait for user to approve which issues to fix.**
+
+---
+
+## Phase 4: Fix Execution (after user approves which issues to fix)
+
+1. Plan the fixes — group related issues into batches
+2. Present the fix plan briefly (which files, what changes)
+3. Get approval, then implement using parallel agents where possible
+4. After each batch:
+   - Rebuild the project
+   - Re-test the fixed areas
+   - Take verification screenshots (before → after)
+
+---
+
+## Phase 5: Verification
+
+1. Re-audit ALL areas that were fixed
+2. Present before/after screenshots for each fix
+3. If new issues are discovered → go back to Phase 3 with the new findings
+4. Continue until all approved fixes are verified clean
+
+---
+
+## Phase 6: Final Report
+
+Present a final summary:
+- **Found:** X issues across Y categories
+- **Fixed:** X issues
+- **Deferred:** X issues (with reasons)
+- **Screenshot gallery:** Before/after for all fixes
+- **Remaining recommendations:** Anything not addressed
+- Update NextSteps.md with audit results
+- Commit all changes with a descriptive message
+
+Begin Phase 1 now.`;
+}
+
 // Per-channel state
 const channels = new Map();
 
@@ -975,7 +1109,8 @@ async function handleCommand(message) {
         `**Workspace:**\n` +
         `\`!cd [path]\` — Show or change project directory\n` +
         `\`!ls [path]\` — List files\n` +
-        `\`!startproject\` — Create a new project with template\n\n` +
+        `\`!startproject\` — Create a new project with template\n` +
+        `\`!audit [focus]\` — Full project audit (design, qa, security, analytics, performance)\n\n` +
         `**Identity:**\n` +
         `\`!name [name]\` — Show or set bot name\n` +
         `\`!identity [Name is desc]\` — Show or set identity\n` +
@@ -1505,12 +1640,53 @@ async function handleCommand(message) {
       break;
     }
 
+    case '!audit': {
+      if (state.busy) {
+        await message.reply('Claude is still working. Use `!stop` first.');
+        break;
+      }
+      const validFocuses = ['full', 'design', 'qa', 'security', 'analytics', 'performance', 'product'];
+      const auditFocus = arg ? arg.toLowerCase() : 'full';
+      if (!validFocuses.includes(auditFocus)) {
+        await message.reply(`Unknown focus: "${arg}". Options: ${validFocuses.join(', ')}`);
+        break;
+      }
+      state.sessionId = null; // audit starts fresh
+      const auditPrompt = buildAuditPrompt(auditFocus, state.cwd);
+      const auditLabel = auditFocus === 'full' ? 'full audit' : `${auditFocus} audit`;
+      await message.reply(`Starting **${auditLabel}** of \`${state.cwd}\`...`);
+      const auditPersonalityFile = getPersonalityFile(state.personality);
+      await message.channel.sendTyping();
+      const auditTypingInterval = setInterval(() => { message.channel.sendTyping().catch(() => {}); }, 8000);
+      try {
+        const auditResult = await runClaudeWithContinuation(auditPrompt, {
+          personalityFile: auditPersonalityFile,
+          identity: state.identity,
+          cwd: state.cwd,
+          channelState: state,
+          discordChannel: message.channel,
+        }, message.channel);
+        if (auditResult.sessionId) {
+          state.sessionId = auditResult.sessionId;
+          saveChannelState(message.channel.id, state);
+        }
+        if (!auditResult.stopped) await sendLongMessage(message, auditResult.text, state.cwd);
+      } catch (err) {
+        const errorMsg = err.message.length > 500 ? err.message.substring(0, 500) + '...' : err.message;
+        await message.reply(`Audit error: ${errorMsg}`).catch(() => {});
+        sendErrorAlert(err, { source: 'audit command', channel: message.channel.id });
+      } finally {
+        clearInterval(auditTypingInterval);
+      }
+      break;
+    }
+
     case '!commands': {
       await message.reply(
         `**Available Commands:**\n` +
         `\`!stop\` \`!clear\` \`!kill\` \`!killall\` \`!restart\` \`!cancel\`\n` +
         `\`!status\` \`!processes\` \`!btw\` \`!cd\` \`!ls\`\n` +
-        `\`!startproject\` \`!name\` \`!identity\`\n` +
+        `\`!startproject\` \`!audit\` \`!name\` \`!identity\`\n` +
         `\`!personality\` \`!personalities\`\n` +
         `\`!tasks\` \`!done\`\n` +
         `\`!schedule\` \`!schedules\` \`!unschedule\` \`!autoschedule\`\n` +
