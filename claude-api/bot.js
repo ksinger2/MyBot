@@ -7,11 +7,13 @@ const { init: initErrorAlerting, sendErrorAlert } = require('./error-alerting');
 const { addSchedule, removeSchedule, getUserSchedules, formatScheduleList } = require('./schedules-storage');
 const OpenAI = require('openai');
 const { startAllSchedules, registerJob, cancelJob } = require('./scheduler');
+const { saveChannelState, loadAllChannelStates, flushPendingWrites } = require('./channel-persistence');
 
 const PERSONALITIES_DIR = path.join(__dirname, 'personalities');
 const DEFAULT_PERSONALITY = 'tiffany_pollard';
 const DEFAULT_WORKSPACE = '/workspace';
 const DEFAULT_MAX_TURNS = 50;       // Let Claude work autonomously for many turns
+const MAX_AUTO_CONTINUES = 3;       // Auto-continue up to 3 times on turn limit
 const MAX_TIMEOUT = 90 * 60 * 1000; // 90 minutes hard cap
 const STALL_THRESHOLDS = {
   thinking: 5 * 60 * 1000,   // 5 min — no tool active, just "thinking"
@@ -122,11 +124,13 @@ const client = new Client({
 
 function getChannel(channelId) {
   if (!channels.has(channelId)) {
+    // Check for persisted state from previous container lifecycle
+    const saved = _savedChannelStates?.[channelId];
     channels.set(channelId, {
-      sessionId: null,
-      personality: DEFAULT_PERSONALITY,
-      identity: { ...DEFAULT_IDENTITY },
-      cwd: DEFAULT_WORKSPACE,
+      sessionId: saved?.sessionId || null,
+      personality: saved?.personality || DEFAULT_PERSONALITY,
+      identity: saved?.identity ? { ...saved.identity } : { ...DEFAULT_IDENTITY },
+      cwd: saved?.cwd || DEFAULT_WORKSPACE,
       process: null,  // active child process
       busy: false,    // is Claude currently working
       wizard: null,   // active wizard state (multi-step interactions)
@@ -137,6 +141,9 @@ function getChannel(channelId) {
   }
   return channels.get(channelId);
 }
+
+// Loaded once on startup, used by getChannel to merge saved state
+let _savedChannelStates = null;
 
 function getChannelState(channelId) {
   return getChannel(channelId);
@@ -155,6 +162,39 @@ function listPersonalities() {
 
 function askClaude(prompt, { sessionId = null, personalityFile = null, identity = null, cwd = DEFAULT_WORKSPACE, maxTurns = DEFAULT_MAX_TURNS, channelState = null, discordChannel = null } = {}) {
   return new Promise((resolve, reject) => {
+    // Auto-load project context on new sessions (CLAUDE.md + NextSteps.md)
+    if (!sessionId) {
+      const contextParts = [];
+
+      // Load CLAUDE.md for project conventions
+      const claudeMdPath = path.join(cwd, 'CLAUDE.md');
+      if (fs.existsSync(claudeMdPath)) {
+        try {
+          let claudeMd = fs.readFileSync(claudeMdPath, 'utf-8');
+          if (claudeMd.trim()) {
+            if (claudeMd.length > 6000) claudeMd = claudeMd.substring(0, 6000) + '\n...(truncated)';
+            contextParts.push(`[Project CLAUDE.md — conventions, stack, how to build/test]:\n${claudeMd}`);
+          }
+        } catch {}
+      }
+
+      // Load NextSteps.md for session handoff
+      const nextStepsPath = path.join(cwd, 'NextSteps.md');
+      if (fs.existsSync(nextStepsPath)) {
+        try {
+          let nextSteps = fs.readFileSync(nextStepsPath, 'utf-8');
+          if (nextSteps.trim()) {
+            if (nextSteps.length > 4000) nextSteps = nextSteps.substring(0, 4000) + '\n...(truncated)';
+            contextParts.push(`[Context from previous session — NextSteps.md]:\n${nextSteps}`);
+          }
+        } catch {}
+      }
+
+      if (contextParts.length > 0) {
+        prompt = contextParts.join('\n\n') + `\n\n[Current request]:\n${prompt}`;
+      }
+    }
+
     const args = [
       '-p', prompt,
       '--output-format', 'stream-json',
@@ -191,6 +231,13 @@ YOUR CAPABILITIES — You are a powerful AI assistant with the following tools. 
 
 4. **DOCKER ACCESS**: You can run \`docker ps\`, \`docker restart\`, \`docker compose up -d --build\`, etc. When you make code changes that need a rebuild, just do it yourself — don't tell the user to do it. The project docker-compose.yml is at /workspace/MyBot/docker-compose.yml.
 
+DEPLOYMENT VERIFICATION: After ANY \`docker compose up -d --build\` or \`docker restart\`:
+1. Wait 10s, then \`docker ps\` — verify status shows "Up", not "Restarting" or "Exit"
+2. If service has a health check: \`docker inspect --format='{{.State.Health.Status}}' <container>\`
+3. If there's an HTTP endpoint: \`curl -sf http://localhost:<port>/health\`
+4. If unhealthy: check \`docker logs --tail 50 <container>\`, diagnose, and fix
+Never report "deployed" without verifying the container is running.
+
 5. **GIT & GITHUB**: You can commit, push, create branches, open PRs, check CI status — full git workflow. IMPORTANT: When making git commits, ALWAYS add this trailer to your commit messages: "Co-Authored-By: Claude Code (${identity ? identity.name : 'Bot'}) <noreply@anthropic.com>" — this identifies which bot personality pushed the change.
 
 6. **SUB-AGENTS**: You have the Agent tool to spawn focused sub-agents. ALWAYS use sub-agents when a task has 3+ independent steps — launch them in parallel. Examples: research multiple topics simultaneously, write multiple files at once, run tests while writing docs. A single message can launch multiple agents. This is your primary way to work fast.
@@ -201,7 +248,9 @@ NEVER say you can't do something if one of these capabilities covers it. Try fir
 
 AUTONOMY: You are fully autonomous. Never stop to ask the user for confirmation unless it involves spending money, sending emails/messages, or destructive operations (deleting repos, dropping databases). If something fails, try a different approach. If stuck after 3 attempts, summarize what you tried, then move on. The user CANNOT respond while you're running — never wait for input. You have up to ${maxTurns} turns.
 
-ORCHESTRATION RULE: You are an ORCHESTRATOR, not a worker. For any task with multiple independent parts, ALWAYS use the Agent tool to spawn sub-agents in parallel. Do NOT do sequential work yourself when agents can work simultaneously. Example: if asked to "create 3 endpoints and test them," spawn one agent per endpoint, then test. Think like a manager delegating to a team. Only do work directly yourself when it's a single atomic step or when steps are truly sequential dependencies.`);
+ORCHESTRATION RULE: You are an ORCHESTRATOR, not a worker. For any task with multiple independent parts, ALWAYS use the Agent tool to spawn sub-agents in parallel. Do NOT do sequential work yourself when agents can work simultaneously. Example: if asked to "create 3 endpoints and test them," spawn one agent per endpoint, then test. Think like a manager delegating to a team. Only do work directly yourself when it's a single atomic step or when steps are truly sequential dependencies.
+
+SESSION HANDOFF: When you finish significant work (feature, fix, refactor), update NextSteps.md in the project root with what you did, what's working, what's broken, and specific next steps. Keep it concise — bullet points. This is how your future self picks up context.`);
     if (identity) {
       systemParts.push(`Your name is ${identity.name}. You are ${identity.description}.`);
     }
@@ -545,10 +594,39 @@ ORCHESTRATION RULE: You are an ORCHESTRATOR, not a worker. For any task with mul
         sessionId: resultSessionId,
         cost: resultCost,
         numTurns: resultNumTurns,
+        hitTurnLimit: resultNumTurns >= maxTurns,
         stopped: false,
       });
     });
   });
+}
+
+async function runClaudeWithContinuation(prompt, opts, discordChannel) {
+  let result = await askClaude(prompt, opts);
+  let continueCount = 0;
+  let totalCost = result.cost || 0;
+  let totalTurns = result.numTurns || 0;
+
+  while (result.hitTurnLimit && continueCount < MAX_AUTO_CONTINUES && !result.stopped) {
+    continueCount++;
+    await discordChannel.send(
+      `*Turn limit reached (${continueCount}/${MAX_AUTO_CONTINUES}) — auto-continuing...*`
+    ).catch(() => {});
+    result = await askClaude(
+      'You hit the turn limit. Continue where you left off. If the task is complete, just summarize what you did.',
+      { ...opts, sessionId: result.sessionId }
+    );
+    totalCost += result.cost || 0;
+    totalTurns += result.numTurns || 0;
+  }
+
+  if (result.hitTurnLimit && continueCount >= MAX_AUTO_CONTINUES) {
+    await discordChannel.send(
+      `*Reached max auto-continuations (${MAX_AUTO_CONTINUES}). Send another message to keep going.*`
+    ).catch(() => {});
+  }
+
+  return { ...result, cost: totalCost, numTurns: totalTurns };
 }
 
 function extractImageAttachments(text) {
@@ -710,6 +788,7 @@ async function handleCommand(message) {
       }
       state.sessionId = null;
       state.queue = [];
+      saveChannelState(message.channel.id, state);
       await message.reply('Context cleared. Next message starts a fresh conversation (no memory of previous messages).');
       break;
     }
@@ -722,6 +801,7 @@ async function handleCommand(message) {
       }
       state.sessionId = null;
       state.queue = [];
+      saveChannelState(message.channel.id, state);
       await message.reply('Process killed and session destroyed. Full reset — starting from scratch.');
       break;
     }
@@ -734,6 +814,7 @@ async function handleCommand(message) {
         if (fs.existsSync(target) && fs.statSync(target).isDirectory()) {
           state.cwd = target;
           state.sessionId = null;
+          saveChannelState(message.channel.id, state);
           await message.reply(`Working directory: \`${target}\`\nSession cleared for new project context.`);
         } else {
           await message.reply(`Directory not found: \`${target}\`\nAvailable in /workspace:\n${listWorkspaceDirs()}`);
@@ -771,6 +852,7 @@ async function handleCommand(message) {
         } else {
           state.personality = arg;
           state.sessionId = null;
+          saveChannelState(message.channel.id, state);
           await message.reply(`Personality switched to **${arg}**! Session cleared.`);
         }
       }
@@ -804,6 +886,8 @@ async function handleCommand(message) {
       await message.reply('Restarting... be right back.');
       // Save channel ID so we can notify when we're back
       try { fs.writeFileSync(path.join(__dirname, '.restart-channel'), message.channel.id); } catch {}
+      // Flush persisted state before shutdown
+      flushPendingWrites();
       // Kill all active processes first
       for (const [, s] of channels) {
         if (s.process) s.process.kill();
@@ -814,10 +898,13 @@ async function handleCommand(message) {
     }
 
     case '!killall': {
-      for (const [, s] of channels) {
+      for (const [chId, s] of channels) {
         if (s.process) s.process.kill();
         s.queue = [];
+        s.sessionId = null;
+        saveChannelState(chId, s);
       }
+      flushPendingWrites();
       channels.clear();
       await message.reply('All processes killed and all sessions destroyed across every channel.');
       break;
@@ -872,7 +959,8 @@ async function handleCommand(message) {
         `\`!personality <name>\` — Switch personality\n` +
         `\`!personalities\` — List available\n\n` +
         `**Tasks:** \`!tasks\` · \`!done <#>\` · \`!done all\`\n` +
-        `**Schedule:** \`!schedule\` · \`!schedules\` · \`!unschedule <#>\`\n` +
+        `**Schedule:** \`!schedule\` · \`!schedules\` · \`!unschedule <#>\` · \`!autoschedule <freq> | <task>\`\n` +
+        `**Queue:** \`!queue <task>\` · \`!queued\` · \`!dequeue <#>\`\n` +
         `**Briefing:** \`!briefing\` · \`!weekly\`\n` +
         `**Other:** \`!email <request>\` · \`!imagine <desc>\`\n\n` +
         `Just type what you want built. Claude runs autonomously — reads, writes, commits, pushes. Use \`!stop\` to interrupt, \`!clear\` to start over.\n\n` +
@@ -887,6 +975,7 @@ async function handleCommand(message) {
       } else {
         state.identity.name = arg.trim();
         state.sessionId = null;
+        saveChannelState(message.channel.id, state);
         await message.reply(`Name changed to **${state.identity.name}**! Session cleared.`);
       }
       break;
@@ -905,6 +994,7 @@ async function handleCommand(message) {
           state.identity.description = arg.trim();
         }
         state.sessionId = null;
+        saveChannelState(message.channel.id, state);
         await message.reply(`Identity updated: **${state.identity.name}** — ${state.identity.description}\nSession cleared.`);
       }
       break;
@@ -1153,6 +1243,104 @@ async function handleCommand(message) {
       break;
     }
 
+    case '!autoschedule': {
+      // Usage: !autoschedule <frequency> | <task prompt>
+      if (!arg || !arg.includes('|')) {
+        await message.reply('Usage: `!autoschedule <frequency> | <task>`\nExample: `!autoschedule daily at 9am | check all projects for failing tests and fix them`');
+        break;
+      }
+      const [freqPart, ...taskParts] = arg.split('|');
+      const freq = freqPart.trim();
+      const task = taskParts.join('|').trim();
+      if (!freq || !task) {
+        await message.reply('Both frequency and task required. Example: `!autoschedule every 2 hours | run the test suite`');
+        break;
+      }
+      const parsed = parseFrequency(freq);
+      if (!parsed) {
+        await message.reply(`Couldn't parse frequency: "${freq}". Try: daily at 9am, every 2 hours, weekdays at 8:30am`);
+        break;
+      }
+      const autoSched = addSchedule({
+        userId: message.author.id,
+        channelId: message.channel.id,
+        message: task,
+        cronRule: parsed.cron,
+        description: parsed.description,
+        type: 'task',
+        cwd: state.cwd,
+        timezone: 'America/Los_Angeles',
+      });
+      registerJob(autoSched, client);
+      await message.reply(
+        `Autonomous task scheduled! **#${autoSched.id}**\n` +
+        `⏰ ${parsed.description}\n` +
+        `📋 "${task.substring(0, 100)}"\n` +
+        `📁 \`${state.cwd}\`\n` +
+        `I'll execute this autonomously each time. Use \`!schedules\` to see all, \`!unschedule ${autoSched.id}\` to remove.`
+      );
+      break;
+    }
+
+    case '!queue': {
+      if (!arg) {
+        await message.reply('Usage: `!queue <task>` — Add work to the background queue.\nExample: `!queue build a hello world express app`');
+        break;
+      }
+      const { addItem } = require('./queue-storage');
+      const item = addItem({
+        prompt: arg,
+        channelId: message.channel.id,
+        userId: message.author.id,
+        cwd: state.cwd,
+        personality: state.personality,
+        identity: { ...state.identity },
+      });
+      await message.reply(
+        `Queued background task **#${item.id}**\n` +
+        `📋 "${arg.substring(0, 100)}"\n` +
+        `📁 \`${state.cwd}\`\n` +
+        `Use \`!queued\` to check status, \`!dequeue ${item.id}\` to remove.`
+      );
+      break;
+    }
+
+    case '!queued': {
+      const { getQueue } = require('./queue-storage');
+      const queue = getQueue();
+      if (queue.length === 0) {
+        await message.reply('Background queue is empty. Use `!queue <task>` to add work.');
+        break;
+      }
+      const lines = queue.map(item => {
+        const status = item.status === 'running' ? '🔄' : item.status === 'done' ? '✅' : item.status === 'failed' ? '❌' : '⏳';
+        const prompt = item.prompt.length > 60 ? item.prompt.substring(0, 57) + '...' : item.prompt;
+        return `${status} **#${item.id}** — ${prompt}\n  Status: ${item.status} | \`${item.cwd}\`${item.resultSummary ? `\n  Result: ${item.resultSummary}` : ''}`;
+      });
+      await sendLongMessage(message, `**Background Queue:**\n${lines.join('\n')}`, state.cwd);
+      break;
+    }
+
+    case '!dequeue': {
+      if (!arg) {
+        await message.reply('Usage: `!dequeue <#>` — Remove a pending item from the queue.');
+        break;
+      }
+      const dequeueId = parseInt(arg, 10);
+      if (isNaN(dequeueId)) {
+        await message.reply('Usage: `!dequeue <#>` — provide the queue item number.');
+        break;
+      }
+      const { removeItem } = require('./queue-storage');
+      const removed = removeItem(dequeueId);
+      if (!removed) {
+        await message.reply(`No pending queue item #${dequeueId} found. Use \`!queued\` to see the list.`);
+      } else {
+        await message.reply(`Removed queue item **#${dequeueId}**: "${removed.prompt.substring(0, 80)}"`);
+      }
+      break;
+    }
+
     case '!commands': {
       await message.reply(
         `**Available Commands:**\n` +
@@ -1161,7 +1349,8 @@ async function handleCommand(message) {
         `\`!startproject\` \`!name\` \`!identity\`\n` +
         `\`!personality\` \`!personalities\`\n` +
         `\`!tasks\` \`!done\`\n` +
-        `\`!schedule\` \`!schedules\` \`!unschedule\`\n` +
+        `\`!schedule\` \`!schedules\` \`!unschedule\` \`!autoschedule\`\n` +
+        `\`!queue\` \`!queued\` \`!dequeue\`\n` +
         `\`!briefing\` \`!weekly\` \`!email\` \`!help\` \`!commands\`\n\n` +
         `Use \`!help\` for detailed descriptions.`
       );
@@ -1208,6 +1397,17 @@ client.on('ready', () => {
   console.log(`Workspace: ${DEFAULT_WORKSPACE}`);
   console.log(`Max turns: ${DEFAULT_MAX_TURNS} | Timeout: ${MAX_TIMEOUT / 60000}min`);
 
+  // Restore persisted channel states from previous container lifecycle
+  _savedChannelStates = loadAllChannelStates();
+  const savedCount = Object.keys(_savedChannelStates).length;
+  if (savedCount > 0) {
+    console.log(`Restored ${savedCount} channel state(s) from persistence`);
+    // Pre-populate channels Map so !status shows them
+    for (const channelId of Object.keys(_savedChannelStates)) {
+      getChannel(channelId);
+    }
+  }
+
   // Notify channel if we're coming back from a !restart
   const restartFile = path.join(__dirname, '.restart-channel');
   if (fs.existsSync(restartFile)) {
@@ -1228,6 +1428,10 @@ client.on('ready', () => {
 
   // Start user-created schedules
   startAllSchedules(client);
+
+  // Start background task queue runner
+  const { startQueueRunner } = require('./queue-runner');
+  startQueueRunner(client);
 });
 
 async function processQueue(state) {
@@ -1254,15 +1458,16 @@ async function processQueue(state) {
     state.progress = freshProgress();
 
     let result;
+    const queueOpts = {
+      sessionId: state.sessionId,
+      personalityFile,
+      identity: state.identity,
+      cwd: state.cwd,
+      channelState: state,
+      discordChannel: replyTarget.channel,
+    };
     try {
-      result = await askClaude(combined, {
-        sessionId: state.sessionId,
-        personalityFile,
-        identity: state.identity,
-        cwd: state.cwd,
-        channelState: state,
-        discordChannel: replyTarget.channel,
-      });
+      result = await runClaudeWithContinuation(combined, queueOpts, replyTarget.channel);
     } catch (err) {
       if (state.sessionId) {
         console.log('Session resume failed in queue, retrying fresh:', err.message);
@@ -1281,10 +1486,33 @@ async function processQueue(state) {
 
     if (result.sessionId) {
       state.sessionId = result.sessionId;
+      saveChannelState(replyTarget.channel.id, state);
     }
 
     if (!result.stopped) {
       await sendLongMessage(replyTarget, result.text, state.cwd);
+
+      // Completion summary for non-trivial tasks
+      const elapsed = state.startedAt ? Math.round((Date.now() - state.startedAt) / 1000) : 0;
+      const completedProgress = state.progress;
+      if (result.numTurns >= 3 || elapsed > 60) {
+        const mins = Math.floor(elapsed / 60);
+        const secs = elapsed % 60;
+        const parts = [];
+        if (mins > 0) parts.push(`${mins}m ${secs}s`);
+        else parts.push(`${secs}s`);
+        if (result.numTurns) parts.push(`${result.numTurns} turns`);
+        if (result.cost) parts.push(`$${result.cost.toFixed(4)}`);
+        const toolCounts = {};
+        for (const t of completedProgress.toolHistory) {
+          const tName = typeof t === 'string' ? t : t.name;
+          toolCounts[tName] = (toolCounts[tName] || 0) + 1;
+        }
+        const topTools = Object.entries(toolCounts).sort((a, b) => b[1] - a[1]).slice(0, 3)
+          .map(([t, c]) => `${c} ${TOOL_LABELS[t] || t}`).join(', ');
+        if (topTools) parts.push(topTools);
+        await replyTarget.channel.send(`*— ${parts.join(' · ')} —*`).catch(() => {});
+      }
 
       const meta = [];
       if (result.numTurns > 1) meta.push(`${result.numTurns} turns`);
@@ -1354,15 +1582,16 @@ client.on('messageCreate', async (message) => {
 
   try {
     let result;
+    const claudeOpts = {
+      sessionId: state.sessionId,
+      personalityFile,
+      identity: state.identity,
+      cwd: state.cwd,
+      channelState: state,
+      discordChannel: message.channel,
+    };
     try {
-      result = await askClaude(message.content, {
-        sessionId: state.sessionId,
-        personalityFile,
-        identity: state.identity,
-        cwd: state.cwd,
-        channelState: state,
-        discordChannel: message.channel,
-      });
+      result = await runClaudeWithContinuation(message.content, claudeOpts, message.channel);
     } catch (err) {
       if (state.sessionId) {
         console.log('Session resume failed, retrying fresh:', err.message);
@@ -1382,10 +1611,34 @@ client.on('messageCreate', async (message) => {
     // Store session for continuity
     if (result.sessionId) {
       state.sessionId = result.sessionId;
+      saveChannelState(message.channel.id, state);
     }
 
     if (!result.stopped) {
       await sendLongMessage(message, result.text, state.cwd);
+
+      // Step 3: Completion summary for non-trivial tasks
+      const elapsed = state.startedAt ? Math.round((Date.now() - state.startedAt) / 1000) : 0;
+      const completedProgress = state.progress;
+      if (result.numTurns >= 3 || elapsed > 60) {
+        const mins = Math.floor(elapsed / 60);
+        const secs = elapsed % 60;
+        const parts = [];
+        if (mins > 0) parts.push(`${mins}m ${secs}s`);
+        else parts.push(`${secs}s`);
+        if (result.numTurns) parts.push(`${result.numTurns} turns`);
+        if (result.cost) parts.push(`$${result.cost.toFixed(4)}`);
+        // Aggregate tool usage from progress.toolHistory
+        const toolCounts = {};
+        for (const t of completedProgress.toolHistory) {
+          const tName = typeof t === 'string' ? t : t.name;
+          toolCounts[tName] = (toolCounts[tName] || 0) + 1;
+        }
+        const topTools = Object.entries(toolCounts).sort((a, b) => b[1] - a[1]).slice(0, 3)
+          .map(([t, c]) => `${c} ${TOOL_LABELS[t] || t}`).join(', ');
+        if (topTools) parts.push(topTools);
+        await message.channel.send(`*— ${parts.join(' · ')} —*`).catch(() => {});
+      }
 
       // Show cost and turns info
       const meta = [];
@@ -1396,9 +1649,40 @@ client.on('messageCreate', async (message) => {
       }
     }
   } catch (err) {
+    // Step 4: Error recovery — retry once with session context
+    if (state.sessionId && !err.message.includes('stalled') && !state._retried) {
+      state._retried = true;
+      await message.reply('*Hit an error — retrying with session context...*').catch(() => {});
+      try {
+        const retryResult = await askClaude(
+          'You were interrupted by an error. Continue where you left off. If you were stuck, try a different approach.',
+          { sessionId: state.sessionId, personalityFile, identity: state.identity, cwd: state.cwd, channelState: state, discordChannel: message.channel }
+        );
+        if (retryResult.sessionId) {
+          state.sessionId = retryResult.sessionId;
+          saveChannelState(message.channel.id, state);
+        }
+        if (!retryResult.stopped) await sendLongMessage(message, retryResult.text, state.cwd);
+        state._retried = false;
+        return;
+      } catch (retryErr) {
+        console.error('Retry also failed:', retryErr.message);
+      }
+    }
+    state._retried = false;
+
+    // Step 3: Richer error messages
     console.error('Error handling message:', err.message);
     const errorMsg = err.message.length > 500 ? err.message.substring(0, 500) + '...' : err.message;
-    await message.reply(`Error: ${errorMsg}`).catch(() => {});
+    const elapsed = state.startedAt ? Math.round((Date.now() - state.startedAt) / 1000) : 0;
+    const errorParts = [];
+    if (elapsed > 0) errorParts.push(`Error after ${Math.floor(elapsed / 60)}m ${elapsed % 60}s`);
+    if (state.progress.turnCount > 0) errorParts.push(`${state.progress.turnCount} turns completed`);
+    errorParts.push(errorMsg);
+    const lastLogs = state.progress.rawLog.slice(-3).map(e => e.text).join('\n');
+    if (lastLogs) errorParts.push(`\nLast activity:\n${lastLogs}`);
+    if (state.sessionId) errorParts.push('\n*Session preserved — send another message to retry.*');
+    await message.reply(errorParts.join(' · ')).catch(() => {});
     sendErrorAlert(err, { source: 'message handler', channel: message.channel.id, detail: message.content.substring(0, 100) });
   } finally {
     clearInterval(typingInterval);
@@ -1419,4 +1703,4 @@ function start() {
   client.login(token);
 }
 
-module.exports = { start, askClaude, client, getChannelState };
+module.exports = { start, askClaude, runClaudeWithContinuation, client, getChannelState, getPersonalityFile, sendLongMessage, freshProgress };

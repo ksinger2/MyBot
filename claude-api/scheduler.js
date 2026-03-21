@@ -27,6 +27,57 @@ function registerJob(sched, client) {
   const job = schedule.scheduleJob(
     { rule: sched.cronRule, tz: sched.timezone },
     async () => {
+      if (sched.type === 'task') {
+        // Autonomous task execution
+        const channel = await client.channels.fetch(sched.channelId).catch(() => null);
+        if (!channel) return;
+        const { runClaudeWithContinuation, getChannelState, getPersonalityFile, sendLongMessage, freshProgress } = require('./bot');
+        const { saveChannelState } = require('./channel-persistence');
+        const state = getChannelState(sched.channelId);
+
+        if (state.busy) {
+          await channel.send(`*Scheduled task skipped — channel busy. Task: "${sched.message.substring(0, 100)}"*`).catch(() => {});
+          return;
+        }
+
+        const personalityFile = getPersonalityFile(state.personality);
+        const typingInterval = setInterval(() => channel.sendTyping().catch(() => {}), 8000);
+
+        try {
+          state.busy = true;
+          state.startedAt = Date.now();
+          state.progress = freshProgress();
+
+          const result = await runClaudeWithContinuation(sched.message, {
+            sessionId: state.sessionId,
+            personalityFile,
+            identity: state.identity,
+            cwd: sched.cwd || state.cwd,
+            channelState: state,
+            discordChannel: channel,
+          }, channel);
+
+          if (result.sessionId) {
+            state.sessionId = result.sessionId;
+            saveChannelState(sched.channelId, state);
+          }
+          if (result.text && !result.stopped) {
+            // Send result to channel using a fake message-like object for sendLongMessage
+            const fakeMsg = { reply: (opts) => channel.send(opts), channel };
+            await sendLongMessage(fakeMsg, result.text, sched.cwd || state.cwd);
+          }
+        } catch (err) {
+          await channel.send(`*Scheduled task failed: ${err.message.substring(0, 200)}*`).catch(() => {});
+        } finally {
+          clearInterval(typingInterval);
+          state.busy = false;
+          state.startedAt = null;
+          state.progress = freshProgress();
+        }
+        return;
+      }
+
+      // Existing reminder logic
       try {
         // Try DM first
         const user = await client.users.fetch(sched.userId).catch(() => null);

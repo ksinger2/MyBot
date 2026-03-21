@@ -20,7 +20,7 @@ function loadSchedules() {
   return readStore().schedules;
 }
 
-function addSchedule({ userId, channelId, message, cronRule, description, timezone }) {
+function addSchedule({ userId, channelId, message, cronRule, description, type, cwd, timezone }) {
   const store = readStore();
   const schedule = {
     id: store.nextId++,
@@ -29,6 +29,8 @@ function addSchedule({ userId, channelId, message, cronRule, description, timezo
     message,
     cronRule,
     description,
+    type: type || 'reminder',
+    cwd: cwd || null,
     timezone: timezone || 'America/Los_Angeles',
     createdAt: new Date().toISOString(),
     active: true,
@@ -54,7 +56,9 @@ function getUserSchedules(userId) {
 function formatScheduleList(schedules) {
   if (!schedules || schedules.length === 0) return null;
   return schedules.map(s => {
-    return `**#${s.id}** — ${s.description}\n  ⏰ \`${s.cronRule}\` | "${s.message.length > 60 ? s.message.substring(0, 60) + '...' : s.message}"`;
+    const typeLabel = s.type === 'task' ? '🤖 Task' : '📝 Reminder';
+    const cwdInfo = s.cwd ? ` | \`${s.cwd}\`` : '';
+    return `**#${s.id}** ${typeLabel} — ${s.description}\n  ⏰ \`${s.cronRule}\` | "${s.message.length > 60 ? s.message.substring(0, 60) + '...' : s.message}"${cwdInfo}`;
   }).join('\n');
 }
 
