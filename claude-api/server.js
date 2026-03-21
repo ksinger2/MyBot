@@ -78,6 +78,23 @@ app.post('/imagine', async (req, res) => {
 
 app.get('/health', (req, res) => res.json({ status: 'ok' }));
 
+// Reports channels with active Claude processes — used by Claude before self-rebuilding
+app.get('/active-sessions', (req, res) => {
+  try {
+    const { channels, client } = require('./bot');
+    const active = [];
+    for (const [channelId, state] of channels) {
+      if (state.busy || state.process) {
+        const ch = client.channels.cache.get(channelId);
+        active.push({ channelId, name: ch ? ch.name : channelId });
+      }
+    }
+    res.json({ active, count: active.length });
+  } catch {
+    res.json({ active: [], count: 0 });
+  }
+});
+
 const PORT = 3400;
 app.listen(PORT, () => {
   console.log(`Claude API wrapper listening on port ${PORT}`);

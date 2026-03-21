@@ -249,6 +249,20 @@ Begin Phase 1 now.`;
 // Per-channel state
 const channels = new Map();
 
+// Graceful shutdown — persist active task state so we can resume after restart
+function gracefulShutdown(signal) {
+  console.log(`[shutdown] Received ${signal}, persisting state...`);
+  for (const [channelId, state] of channels) {
+    if (state.busy && state.activeTask) {
+      saveChannelState(channelId, state);
+    }
+  }
+  flushPendingWrites();
+  process.exit(0);
+}
+process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
+process.on('SIGINT', () => gracefulShutdown('SIGINT'));
+
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
@@ -402,7 +416,7 @@ Never report "deployed" without verifying the container is running.
 
 7. **MULTIPLE PROJECTS**: Your workspace is /workspace/ which contains multiple projects. You can cd between them, work on any of them, and even coordinate across projects.
 
-8. **PREVIEW TUNNELS**: When a user wants to access a local dev server from another device (phone, tablet, etc.), run \`cloudflared tunnel --url http://localhost:PORT\` to create a public URL. Or tell them to use \`!preview PORT\`. The URL works from any device — no setup needed. Always offer this when starting a dev server.
+8. **PREVIEW TUNNELS**: When you finish building a web app or start a dev server, ALWAYS ask: "What device will you view this on? (same PC or phone/mobile?)" before running anything. Then:\n   - **Same PC**: tell them \`http://localhost:PORT\` — that's it, no tunnel needed\n   - **Phone/mobile**: run \`!preview PORT phone\` — the bot will create a Cloudflare tunnel, fetch the public IP, and send a magic link with the IP pre-injected so they can tap it directly with no password. Do NOT tell the user to run \`!preview\` manually for phone — run it yourself.\n   - When building apps that have any kind of IP-based password protection or auth, ALWAYS support a \`?access=<IP>\` URL query parameter that auto-authenticates the request, so the magic link works seamlessly.
 
 NEVER say you can't do something if one of these capabilities covers it. Try first, explain only if it actually fails.
 
@@ -1063,6 +1077,13 @@ async function handleCommand(message) {
       await message.reply('Restarting... be right back.');
       // Save channel ID so we can notify when we're back
       try { fs.writeFileSync(path.join(__dirname, '.restart-channel'), message.channel.id); } catch {}
+      // Mark as clean shutdown so auto-resume doesn't kick in
+      try { fs.writeFileSync(path.join('/home/node/.claude', '.clean-shutdown'), Date.now().toString()); } catch {}
+      // Clear active tasks — this is intentional, not a crash
+      for (const [chId, s] of channels) {
+        s.activeTask = null;
+        saveChannelState(chId, s);
+      }
       // Flush persisted state before shutdown
       flushPendingWrites();
       // Kill all active processes first
@@ -1141,7 +1162,7 @@ async function handleCommand(message) {
         `**Queue:** \`!queue <task>\` · \`!queued\` · \`!dequeue <#>\`\n` +
         `**Monitors:** \`!monitor ci <repo>\` · \`!monitor health <url>\` · \`!monitors\` · \`!monitor remove/pause/resume/check <#>\`\n` +
         `**Briefing:** \`!briefing\` · \`!weekly\`\n` +
-        `**Preview:** \`!preview <port>\` · \`!preview stop\` — expose local server via tunnel\n` +
+        `**Preview:** \`!preview <port>\` — smart preview (asks device) · \`!preview <port> local\` — localhost link · \`!preview <port> phone\` — tunnel + magic link · \`!preview stop\`\n` +
         `**Other:** \`!email <request>\` · \`!imagine <desc>\`\n\n` +
         `Just type what you want built. Claude runs autonomously — reads, writes, commits, pushes. Use \`!stop\` to interrupt, \`!clear\` to start over.\n\n` +
         `Current: **${state.identity.name}** | ${state.personality} | \`${state.cwd}\` | ${state.busy ? '🔄 WORKING' : (state.sessionId ? '💤 idle' : '⚫ no session')}`;
@@ -1342,15 +1363,19 @@ async function handleCommand(message) {
     }
 
     case '!preview': {
-      // !preview <port> — start a Cloudflare Tunnel to expose a local port
+      // !preview <port> — ask what device, then either show localhost or start tunnel
+      // !preview <port> local — show localhost link (same PC)
+      // !preview <port> phone|tunnel|mobile — create Cloudflare tunnel + magic link
       // !preview stop — stop the active tunnel
       // !preview — show current tunnel status
+
       if (arg === 'stop') {
         if (state._tunnel) {
           state._tunnel.kill();
           state._tunnel = null;
           state._tunnelPort = null;
           state._tunnelUrl = null;
+          state._pendingPreview = null;
           await message.reply('Tunnel stopped.');
         } else {
           await message.reply('No tunnel is running.');
@@ -1358,8 +1383,12 @@ async function handleCommand(message) {
         break;
       }
 
-      const port = parseInt(arg, 10);
-      if (!arg) {
+      // Parse args — could be "3000", "3000 local", "3000 phone"
+      const previewParts = arg ? arg.trim().split(/\s+/) : [];
+      const previewPort = parseInt(previewParts[0], 10);
+      const previewMode = previewParts[1] ? previewParts[1].toLowerCase() : null;
+
+      if (!arg || isNaN(previewPort)) {
         if (state._tunnelUrl) {
           await message.reply(`**Active tunnel:** ${state._tunnelUrl} → localhost:${state._tunnelPort}\nUse \`!preview stop\` to close it.`);
         } else {
@@ -1368,59 +1397,93 @@ async function handleCommand(message) {
         break;
       }
 
-      if (isNaN(port) || port < 1 || port > 65535) {
+      if (previewPort < 1 || previewPort > 65535) {
         await message.reply('Provide a valid port number. Usage: `!preview 3000`');
         break;
       }
 
-      // Kill existing tunnel if any
-      if (state._tunnel) {
-        state._tunnel.kill();
-        state._tunnel = null;
+      // If no mode specified, ask what device they're on
+      if (!previewMode) {
+        state._pendingPreview = previewPort;
+        await message.reply(
+          `What device are you viewing on?\n` +
+          `• Reply \`local\` — same PC (I'll give you a localhost link)\n` +
+          `• Reply \`phone\` — mobile/tablet (I'll create a tunnel + magic link)`
+        );
+        break;
       }
 
-      await message.reply(`Starting tunnel to localhost:${port}...`);
+      // Handle local mode
+      if (previewMode === 'local') {
+        state._pendingPreview = null;
+        await message.reply(`**Open on this PC:** http://localhost:${previewPort}`);
+        break;
+      }
 
-      const tunnel = spawn('cloudflared', ['tunnel', '--url', `http://localhost:${port}`], {
-        stdio: ['ignore', 'pipe', 'pipe'],
-      });
+      // Handle phone/tunnel/mobile mode — create Cloudflare tunnel + magic link
+      if (['phone', 'tunnel', 'mobile', 'remote'].includes(previewMode)) {
+        state._pendingPreview = null;
 
-      let urlFound = false;
-      const onData = (data) => {
-        const text = data.toString();
-        // cloudflared prints the URL to stderr
-        const urlMatch = text.match(/https:\/\/[a-z0-9-]+\.trycloudflare\.com/);
-        if (urlMatch && !urlFound) {
-          urlFound = true;
-          state._tunnelUrl = urlMatch[0];
-          state._tunnelPort = port;
-          message.channel.send(
-            `**Your preview is live!**\n${urlMatch[0]}\n\nOpen this URL on any device. Use \`!preview stop\` to close.`
-          ).catch(() => {});
-        }
-      };
-
-      tunnel.stdout.on('data', onData);
-      tunnel.stderr.on('data', onData);
-
-      tunnel.on('close', () => {
-        if (state._tunnel === tunnel) {
+        // Kill existing tunnel if any
+        if (state._tunnel) {
+          state._tunnel.kill();
           state._tunnel = null;
-          state._tunnelPort = null;
-          state._tunnelUrl = null;
         }
-      });
 
-      state._tunnel = tunnel;
+        await message.reply(`Creating tunnel to localhost:${previewPort}...`);
 
-      // Timeout if no URL after 15s
-      setTimeout(() => {
-        if (!urlFound && state._tunnel === tunnel) {
-          tunnel.kill();
-          state._tunnel = null;
-          message.channel.send(`Failed to start tunnel — is anything running on port ${port}?`).catch(() => {});
-        }
-      }, 15000);
+        // Fetch public IP for the magic link bypass
+        let publicIp = null;
+        try {
+          const { execSync } = require('child_process');
+          publicIp = execSync('curl -sf --max-time 5 https://api.ipify.org', { encoding: 'utf8' }).trim();
+        } catch {}
+
+        const tunnel = spawn('cloudflared', ['tunnel', '--url', `http://localhost:${previewPort}`], {
+          stdio: ['ignore', 'pipe', 'pipe'],
+        });
+
+        let urlFound = false;
+        const onData = (data) => {
+          const text = data.toString();
+          const urlMatch = text.match(/https:\/\/[a-z0-9-]+\.trycloudflare\.com/);
+          if (urlMatch && !urlFound) {
+            urlFound = true;
+            state._tunnelUrl = urlMatch[0];
+            state._tunnelPort = previewPort;
+            const baseUrl = urlMatch[0];
+            const magicUrl = publicIp ? `${baseUrl}?access=${publicIp}` : baseUrl;
+            const ipNote = publicIp ? `\nYour public IP \`${publicIp}\` is pre-injected — just tap the link, no password needed.` : '';
+            message.channel.send(
+              `**Tunnel live! Tap this on your phone:**\n${magicUrl}${ipNote}\n\nUse \`!preview stop\` to close.`
+            ).catch(() => {});
+          }
+        };
+
+        tunnel.stdout.on('data', onData);
+        tunnel.stderr.on('data', onData);
+
+        tunnel.on('close', () => {
+          if (state._tunnel === tunnel) {
+            state._tunnel = null;
+            state._tunnelPort = null;
+            state._tunnelUrl = null;
+          }
+        });
+
+        state._tunnel = tunnel;
+
+        setTimeout(() => {
+          if (!urlFound && state._tunnel === tunnel) {
+            tunnel.kill();
+            state._tunnel = null;
+            message.channel.send(`Failed to start tunnel — is anything running on port ${previewPort}?`).catch(() => {});
+          }
+        }, 15000);
+        break;
+      }
+
+      await message.reply(`Unknown mode \`${previewMode}\`. Use \`local\` or \`phone\`.`);
       break;
     }
 
@@ -1838,7 +1901,7 @@ process.on('uncaughtException', (err) => {
   sendErrorAlert(err, { source: 'uncaughtException' });
 });
 
-client.on('ready', () => {
+client.on('clientReady', () => {
   console.log(`Discord bot logged in as ${client.user.tag}`);
   console.log(`Bot is in ${client.guilds.cache.size} server(s)`);
   client.guilds.cache.forEach(g => console.log(` - ${g.name} (${g.id})`));
@@ -1873,12 +1936,34 @@ client.on('ready', () => {
 
   // Check if we recovered from a crash loop via automatic rollback
   const rolledBackMarker = '/tmp/.rolled-back';
+  let wasRolledBack = false;
   if (fs.existsSync(rolledBackMarker)) {
+    wasRolledBack = true;
     try {
       fs.unlinkSync(rolledBackMarker);
       sendErrorAlert(new Error('Automatic rollback triggered — bot crash-looped after a rebuild and was restored to the last known good version. The bad code changes are still in /workspace/MyBot/claude-api/ and need to be fixed.'));
       console.log('[entrypoint] Recovered from crash loop via automatic rollback');
     } catch {}
+  }
+
+  // Check if this was a clean shutdown (!restart) vs a crash
+  const cleanShutdownFile = path.join('/home/node/.claude', '.clean-shutdown');
+  const wasCleanShutdown = fs.existsSync(cleanShutdownFile);
+  if (wasCleanShutdown) {
+    try { fs.unlinkSync(cleanShutdownFile); } catch {}
+  }
+
+  // After crash-loop rollback, clear all active tasks (the task may have caused the crash)
+  if (wasRolledBack) {
+    for (const channelId of Object.keys(_savedChannelStates)) {
+      if (_savedChannelStates[channelId].activeTask) {
+        _savedChannelStates[channelId].activeTask = null;
+        const s = getChannel(channelId);
+        s.activeTask = null;
+        saveChannelState(channelId, s);
+      }
+    }
+    flushPendingWrites();
   }
 
   // Start scheduled briefings
@@ -1895,6 +1980,123 @@ client.on('ready', () => {
   // Start event monitors (CI, health checks)
   const { startMonitorRunner } = require('./monitor-runner');
   startMonitorRunner(client);
+
+  // Auto-resume interrupted work after a crash (not a clean !restart)
+  if (!wasCleanShutdown && !wasRolledBack) {
+    setTimeout(async () => {
+      for (const [channelId, savedState] of Object.entries(_savedChannelStates)) {
+        if (!savedState.activeTask) continue;
+
+        const task = savedState.activeTask;
+        const state = getChannel(channelId);
+
+        // Safety: don't retry more than 2 times
+        if ((task.resumeAttempts || 0) >= 2) {
+          console.log(`[auto-resume] Giving up on channel ${channelId} after ${task.resumeAttempts} attempts`);
+          state.activeTask = null;
+          saveChannelState(channelId, state);
+          const ch = client.channels.cache.get(channelId);
+          if (ch) ch.send('*I crashed while working and failed to resume after 2 attempts. Send your request again if needed.*').catch(() => {});
+          continue;
+        }
+
+        // Increment attempt counter
+        task.resumeAttempts = (task.resumeAttempts || 0) + 1;
+        state.activeTask = task;
+        saveChannelState(channelId, state);
+        flushPendingWrites();
+
+        const ch = client.channels.cache.get(channelId);
+        if (!ch) {
+          console.log(`[auto-resume] Channel ${channelId} not in cache, skipping`);
+          continue;
+        }
+
+        console.log(`[auto-resume] Resuming work in channel ${channelId} (attempt ${task.resumeAttempts}/2)`);
+        await ch.send(`*I crashed while working on your request. Resuming now... (attempt ${task.resumeAttempts}/2)*`).catch(() => {});
+        await ch.sendTyping().catch(() => {});
+        const typingInterval = setInterval(() => ch.sendTyping().catch(() => {}), 8000);
+
+        const pendingQueue = savedState.pendingQueue || [];
+        let resumePrompt = 'You were interrupted by a system crash. Continue where you left off. If you were nearly done, just wrap up and summarize what you accomplished.';
+        if (pendingQueue.length > 0) {
+          resumePrompt += '\n\n[Messages from user while you were working]\n' + pendingQueue.map(q => `- ${q}`).join('\n');
+        }
+
+        const personalityFile = getPersonalityFile(state.personality);
+
+        try {
+          state.busy = true;
+          state.startedAt = Date.now();
+          state.progress = freshProgress();
+
+          let result;
+          try {
+            result = await runClaudeWithContinuation(resumePrompt, {
+              sessionId: state.sessionId,
+              personalityFile,
+              identity: state.identity,
+              cwd: state.cwd,
+              channelState: state,
+              discordChannel: ch,
+            }, ch);
+          } catch (err) {
+            // If session resume fails, try fresh with the original prompt
+            if (state.sessionId) {
+              console.log('[auto-resume] Session resume failed, retrying fresh:', err.message);
+              state.sessionId = null;
+              result = await askClaude(
+                `[Resuming after crash — original request was: "${task.prompt}"]\n\nCheck the current state of the project and continue or complete this work. If it appears already done, just confirm.`,
+                { personalityFile, identity: state.identity, cwd: state.cwd, channelState: state, discordChannel: ch }
+              );
+            } else {
+              throw err;
+            }
+          }
+
+          if (result.sessionId) {
+            state.sessionId = result.sessionId;
+            saveChannelState(channelId, state);
+          }
+
+          if (!result.stopped && result.text) {
+            appendEntry(channelId, {
+              cwd: state.cwd,
+              promptSummary: '[auto-resume] ' + task.prompt,
+              resultSummary: result.text,
+              turnCount: result.numTurns || 0,
+            });
+            // Send result to the channel directly
+            const lines = result.text.split('\n');
+            let chunk = '';
+            for (const line of lines) {
+              if ((chunk + '\n' + line).length > 1990) {
+                await ch.send(chunk).catch(() => {});
+                chunk = line;
+              } else {
+                chunk = chunk ? chunk + '\n' + line : line;
+              }
+            }
+            if (chunk) await ch.send(chunk).catch(() => {});
+          }
+
+          // Success — clear active task
+          state.activeTask = null;
+          saveChannelState(channelId, state);
+          console.log(`[auto-resume] Successfully resumed work in channel ${channelId}`);
+        } catch (err) {
+          console.error(`[auto-resume] Failed for channel ${channelId}:`, err.message);
+          await ch.send(`*Auto-resume failed: ${err.message.substring(0, 200)}. Send another message to retry manually.*`).catch(() => {});
+          sendErrorAlert(err, { source: 'auto-resume', channel: channelId });
+        } finally {
+          clearInterval(typingInterval);
+          state.busy = false;
+          state.startedAt = null;
+          state.progress = freshProgress();
+        }
+      }
+    }, 10000); // 10s delay for Discord cache to populate
+  }
 });
 
 async function processQueue(state) {
@@ -2028,15 +2230,42 @@ client.on('messageCreate', async (message) => {
     }
   }
 
+  // Handle pending preview device selection
+  if (state._pendingPreview) {
+    const reply = message.content.trim().toLowerCase();
+    const port = state._pendingPreview;
+    if (['local', 'localhost', 'pc', 'computer', 'same'].includes(reply)) {
+      state._pendingPreview = null;
+      await message.reply(`**Open on this PC:** http://localhost:${port}`);
+      return;
+    }
+    if (['phone', 'mobile', 'tablet', 'remote', 'tunnel'].includes(reply)) {
+      state._pendingPreview = null;
+      // Reuse the !preview <port> phone flow by simulating the command
+      message.content = `!preview ${port} phone`;
+      await handleCommand(message);
+      return;
+    }
+    // Cancel if they type something unrelated
+    if (reply.startsWith('!')) {
+      state._pendingPreview = null;
+      // fall through to normal command handling (already handled above)
+    }
+  }
+
   // If a wizard is active, let it handle the message
   if (state.wizard) {
     const handled = await handleWizardMessage(state, message);
     if (handled) return;
   }
 
+  // Ignore empty messages (e.g. stickers, attachments with no text)
+  if (!message.content.trim()) return;
+
   // If Claude is already working, queue the message
   if (state.busy) {
     state.queue.push({ message, content: message.content });
+    saveChannelState(message.channel.id, state); // persist queue for crash recovery
     const pos = state.queue.length;
     if (pos >= 5) {
       await message.reply(`Queued (#${pos}) — queue is getting long. Use \`!stop\` to interrupt if needed.`);
@@ -2055,6 +2284,16 @@ client.on('messageCreate', async (message) => {
   }, 8000);
 
   try {
+    // Track active task so we can resume after crash/restart
+    state.activeTask = {
+      prompt: message.content.substring(0, 500),
+      channelId: message.channel.id,
+      startedAt: new Date().toISOString(),
+      resumeAttempts: 0,
+    };
+    saveChannelState(message.channel.id, state);
+    flushPendingWrites();
+
     let result;
     const claudeOpts = {
       sessionId: state.sessionId,
@@ -2177,6 +2416,9 @@ client.on('messageCreate', async (message) => {
     state.busy = false;
     state.startedAt = null;
     state.progress = freshProgress();
+    // Clear active task — work is done (or failed)
+    state.activeTask = null;
+    saveChannelState(message.channel.id, state);
     // Drain queued messages
     await processQueue(state);
   }
@@ -2191,4 +2433,4 @@ function start() {
   client.login(token);
 }
 
-module.exports = { start, askClaude, runClaudeWithContinuation, client, getChannelState, getPersonalityFile, sendLongMessage, freshProgress };
+module.exports = { start, askClaude, runClaudeWithContinuation, client, getChannelState, getPersonalityFile, sendLongMessage, freshProgress, channels };

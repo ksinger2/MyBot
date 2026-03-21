@@ -26,6 +26,8 @@ function saveChannelState(channelId, state) {
     personality: state.personality,
     identity: state.identity,
     cwd: state.cwd,
+    activeTask: state.activeTask || null,
+    pendingQueue: (state.queue || []).map(q => typeof q === 'string' ? q : q.content).filter(Boolean),
   };
 
   // Debounce: schedule write, cancel previous pending write for this channel
