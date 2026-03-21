@@ -19,6 +19,11 @@ RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg -o 
 # Install Docker CLI (for container management from inside the container)
 RUN apt-get update && apt-get install -y docker.io && rm -rf /var/lib/apt/lists/*
 
+# Install cloudflared for exposing local dev servers via tunnel
+RUN curl -fsSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb -o /tmp/cloudflared.deb \
+    && dpkg -i /tmp/cloudflared.deb \
+    && rm /tmp/cloudflared.deb
+
 # Install Chromium and dependencies for browser automation (Playwright MCP)
 RUN apt-get update && apt-get install -y \
     chromium \
@@ -45,6 +50,8 @@ COPY *.js ./
 COPY wizards/ ./wizards/
 COPY personalities/ ./personalities/
 COPY project-template/ ./project-template/
+COPY entrypoint.sh /app/entrypoint.sh
+RUN chmod +x /app/entrypoint.sh
 
 # Create .claude directory with correct ownership before switching user
 RUN mkdir -p /home/node/.claude && chown node:node /home/node/.claude
@@ -53,4 +60,4 @@ RUN mkdir -p /home/node/.claude && chown node:node /home/node/.claude
 USER node
 
 EXPOSE 3400
-CMD ["node", "server.js"]
+CMD ["/app/entrypoint.sh"]

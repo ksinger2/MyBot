@@ -9,6 +9,7 @@ const { addMonitor, removeMonitor, listMonitors, getMonitor, updateMonitor } = r
 const OpenAI = require('openai');
 const { startAllSchedules, registerJob, cancelJob } = require('./scheduler');
 const { saveChannelState, loadAllChannelStates, flushPendingWrites } = require('./channel-persistence');
+const { appendEntry, getJournalContext } = require('./session-journal');
 
 const PERSONALITIES_DIR = path.join(__dirname, 'personalities');
 const DEFAULT_PERSONALITY = 'tiffany_pollard';
@@ -263,6 +264,7 @@ function getChannel(channelId) {
     // Check for persisted state from previous container lifecycle
     const saved = _savedChannelStates?.[channelId];
     channels.set(channelId, {
+      _channelId: channelId, // stored for journal lookups
       sessionId: saved?.sessionId || null,
       personality: saved?.personality || DEFAULT_PERSONALITY,
       identity: saved?.identity ? { ...saved.identity } : { ...DEFAULT_IDENTITY },
@@ -298,7 +300,7 @@ function listPersonalities() {
 
 function askClaude(prompt, { sessionId = null, personalityFile = null, identity = null, cwd = DEFAULT_WORKSPACE, maxTurns = DEFAULT_MAX_TURNS, channelState = null, discordChannel = null } = {}) {
   return new Promise((resolve, reject) => {
-    // Auto-load project context on new sessions (CLAUDE.md + NextSteps.md)
+    // Auto-load project context on new sessions (CLAUDE.md + NextSteps.md + session journal)
     if (!sessionId) {
       const contextParts = [];
 
@@ -324,6 +326,12 @@ function askClaude(prompt, { sessionId = null, personalityFile = null, identity 
             contextParts.push(`[Context from previous session — NextSteps.md]:\n${nextSteps}`);
           }
         } catch {}
+      }
+
+      // Load rolling session journal (last 3 sessions across restarts)
+      if (channelState?._channelId) {
+        const journalContext = getJournalContext(channelState._channelId);
+        if (journalContext) contextParts.push(journalContext);
       }
 
       if (contextParts.length > 0) {
@@ -375,6 +383,12 @@ YOUR CAPABILITIES — You are a powerful AI assistant with the following tools. 
 
 4. **DOCKER ACCESS**: You can run \`docker ps\`, \`docker restart\`, \`docker compose up -d --build\`, etc. When you make code changes that need a rebuild, just do it yourself — don't tell the user to do it. The project docker-compose.yml is at /workspace/MyBot/docker-compose.yml.
 
+**SELF-REBUILD SAFETY** (MUST follow when rebuilding THIS bot's container):
+1. Syntax-check FIRST: \`for f in /workspace/MyBot/claude-api/*.js; do node -c "$f"; done\`
+2. Fix ANY syntax errors before proceeding
+3. Then rebuild: \`docker compose -f /workspace/MyBot/docker-compose.yml up -d --build\`
+The bot has automatic crash-loop recovery — if new code crashes 3x in 2 min, it auto-rollbacks to the last working version and notifies the error channel.
+
 DEPLOYMENT VERIFICATION: After ANY \`docker compose up -d --build\` or \`docker restart\`:
 1. Wait 10s, then \`docker ps\` — verify status shows "Up", not "Restarting" or "Exit"
 2. If service has a health check: \`docker inspect --format='{{.State.Health.Status}}' <container>\`
@@ -387,6 +401,8 @@ Never report "deployed" without verifying the container is running.
 6. **SUB-AGENTS**: You have the Agent tool to spawn focused sub-agents. ALWAYS use sub-agents when a task has 3+ independent steps — launch them in parallel. Examples: research multiple topics simultaneously, write multiple files at once, run tests while writing docs. A single message can launch multiple agents. This is your primary way to work fast.
 
 7. **MULTIPLE PROJECTS**: Your workspace is /workspace/ which contains multiple projects. You can cd between them, work on any of them, and even coordinate across projects.
+
+8. **PREVIEW TUNNELS**: When a user wants to access a local dev server from another device (phone, tablet, etc.), run \`cloudflared tunnel --url http://localhost:PORT\` to create a public URL. Or tell them to use \`!preview PORT\`. The URL works from any device — no setup needed. Always offer this when starting a dev server.
 
 NEVER say you can't do something if one of these capabilities covers it. Try first, explain only if it actually fails.
 
@@ -482,6 +498,7 @@ SESSION HANDOFF: When you finish significant work (feature, fix, refactor), upda
                     channelState.progress.activeAgents.delete(rb.tool_use_id);
                     channelState.progress.completedAgents.push({
                       description: agentInfo.description,
+                      type: agentInfo.type,
                       completedAt: Date.now(),
                     });
                     pushRawLog(channelState.progress, `🤖 Agent done: ${agentInfo.description}`);
@@ -546,13 +563,15 @@ SESSION HANDOFF: When you finish significant work (feature, fix, refactor), upda
             // Track Agent spawns
             if (name === 'Agent') {
               const agentDesc = block.input?.description || 'sub-agent';
+              const agentType = block.input?.subagent_type || 'general-purpose';
               channelState.progress.activeAgents.set(block.id, {
                 description: agentDesc,
+                type: agentType,
                 startedAt: Date.now(),
                 lastTool: null,
                 lastDetail: '',
               });
-              pushRawLog(channelState.progress, `🤖 Spawned agent: ${agentDesc}`);
+              pushRawLog(channelState.progress, `🤖 Spawned [${agentType}]: ${agentDesc}`);
             }
 
             // Log tool start
@@ -925,6 +944,7 @@ async function handleCommand(message) {
   switch (cmd) {
     case '!stop': {
       if (state.process) {
+        state._userStopped = true; // flag so silent-stop check knows user did this
         state.process.kill();
         state.process = null;
         state.busy = false;
@@ -1121,6 +1141,7 @@ async function handleCommand(message) {
         `**Queue:** \`!queue <task>\` · \`!queued\` · \`!dequeue <#>\`\n` +
         `**Monitors:** \`!monitor ci <repo>\` · \`!monitor health <url>\` · \`!monitors\` · \`!monitor remove/pause/resume/check <#>\`\n` +
         `**Briefing:** \`!briefing\` · \`!weekly\`\n` +
+        `**Preview:** \`!preview <port>\` · \`!preview stop\` — expose local server via tunnel\n` +
         `**Other:** \`!email <request>\` · \`!imagine <desc>\`\n\n` +
         `Just type what you want built. Claude runs autonomously — reads, writes, commits, pushes. Use \`!stop\` to interrupt, \`!clear\` to start over.\n\n` +
         `Current: **${state.identity.name}** | ${state.personality} | \`${state.cwd}\` | ${state.busy ? '🔄 WORKING' : (state.sessionId ? '💤 idle' : '⚫ no session')}`;
@@ -1215,7 +1236,7 @@ async function handleCommand(message) {
     }
 
     case '!btw': {
-      if (!state.busy || !state.process) {
+      if (!state.busy && !state.process) {
         await message.reply('Nothing running right now.');
         break;
       }
@@ -1245,10 +1266,12 @@ async function handleCommand(message) {
         for (const [, agent] of p.activeAgents) {
           const agentElapsed = Math.round((Date.now() - agent.startedAt) / 1000);
           const toolInfo = agent.lastTool ? `${TOOL_LABELS[agent.lastTool] || agent.lastTool}` : 'Starting...';
-          lines.push(`  🟢 "${agent.description}" — ${toolInfo} (${agentElapsed}s ago)`);
+          const typeTag = agent.type && agent.type !== 'general-purpose' ? `\`${agent.type}\` ` : '';
+          lines.push(`  🟢 ${typeTag}"${agent.description}" — ${toolInfo} (${agentElapsed}s)`);
         }
         for (const agent of p.completedAgents.slice(-5)) {
-          lines.push(`  ✅ "${agent.description}" — Done`);
+          const typeTag = agent.type && agent.type !== 'general-purpose' ? `\`${agent.type}\` ` : '';
+          lines.push(`  ✅ ${typeTag}"${agent.description}" — Done`);
         }
       }
 
@@ -1315,6 +1338,89 @@ async function handleCommand(message) {
       } catch (err) {
         await message.reply(`Error checking processes: ${err.message}`);
       }
+      break;
+    }
+
+    case '!preview': {
+      // !preview <port> — start a Cloudflare Tunnel to expose a local port
+      // !preview stop — stop the active tunnel
+      // !preview — show current tunnel status
+      if (arg === 'stop') {
+        if (state._tunnel) {
+          state._tunnel.kill();
+          state._tunnel = null;
+          state._tunnelPort = null;
+          state._tunnelUrl = null;
+          await message.reply('Tunnel stopped.');
+        } else {
+          await message.reply('No tunnel is running.');
+        }
+        break;
+      }
+
+      const port = parseInt(arg, 10);
+      if (!arg) {
+        if (state._tunnelUrl) {
+          await message.reply(`**Active tunnel:** ${state._tunnelUrl} → localhost:${state._tunnelPort}\nUse \`!preview stop\` to close it.`);
+        } else {
+          await message.reply('No tunnel running. Usage: `!preview <port>` — e.g. `!preview 3000`');
+        }
+        break;
+      }
+
+      if (isNaN(port) || port < 1 || port > 65535) {
+        await message.reply('Provide a valid port number. Usage: `!preview 3000`');
+        break;
+      }
+
+      // Kill existing tunnel if any
+      if (state._tunnel) {
+        state._tunnel.kill();
+        state._tunnel = null;
+      }
+
+      await message.reply(`Starting tunnel to localhost:${port}...`);
+
+      const tunnel = spawn('cloudflared', ['tunnel', '--url', `http://localhost:${port}`], {
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+
+      let urlFound = false;
+      const onData = (data) => {
+        const text = data.toString();
+        // cloudflared prints the URL to stderr
+        const urlMatch = text.match(/https:\/\/[a-z0-9-]+\.trycloudflare\.com/);
+        if (urlMatch && !urlFound) {
+          urlFound = true;
+          state._tunnelUrl = urlMatch[0];
+          state._tunnelPort = port;
+          message.channel.send(
+            `**Your preview is live!**\n${urlMatch[0]}\n\nOpen this URL on any device. Use \`!preview stop\` to close.`
+          ).catch(() => {});
+        }
+      };
+
+      tunnel.stdout.on('data', onData);
+      tunnel.stderr.on('data', onData);
+
+      tunnel.on('close', () => {
+        if (state._tunnel === tunnel) {
+          state._tunnel = null;
+          state._tunnelPort = null;
+          state._tunnelUrl = null;
+        }
+      });
+
+      state._tunnel = tunnel;
+
+      // Timeout if no URL after 15s
+      setTimeout(() => {
+        if (!urlFound && state._tunnel === tunnel) {
+          tunnel.kill();
+          state._tunnel = null;
+          message.channel.send(`Failed to start tunnel — is anything running on port ${port}?`).catch(() => {});
+        }
+      }, 15000);
       break;
     }
 
@@ -1724,10 +1830,12 @@ client.on('error', (err) => {
 
 process.on('unhandledRejection', (err) => {
   console.error('Unhandled rejection:', err);
+  sendErrorAlert(err instanceof Error ? err : new Error(String(err)), { source: 'unhandledRejection' });
 });
 
 process.on('uncaughtException', (err) => {
   console.error('Uncaught exception:', err);
+  sendErrorAlert(err, { source: 'uncaughtException' });
 });
 
 client.on('ready', () => {
@@ -1762,6 +1870,16 @@ client.on('ready', () => {
 
   // Initialize error alerting
   initErrorAlerting(client);
+
+  // Check if we recovered from a crash loop via automatic rollback
+  const rolledBackMarker = '/tmp/.rolled-back';
+  if (fs.existsSync(rolledBackMarker)) {
+    try {
+      fs.unlinkSync(rolledBackMarker);
+      sendErrorAlert(new Error('Automatic rollback triggered — bot crash-looped after a rebuild and was restored to the last known good version. The bad code changes are still in /workspace/MyBot/claude-api/ and need to be fixed.'));
+      console.log('[entrypoint] Recovered from crash loop via automatic rollback');
+    } catch {}
+  }
 
   // Start scheduled briefings
   const briefings = require('./briefings');
@@ -1834,7 +1952,18 @@ async function processQueue(state) {
       saveChannelState(replyTarget.channel.id, state);
     }
 
-    if (!result.stopped) {
+    if (result.stopped) {
+      if (!state._userStopped) {
+        await replyTarget.channel.send('*Process was interrupted unexpectedly — I stopped without finishing. Send another message to continue.*').catch(() => {});
+      }
+      state._userStopped = false;
+    } else {
+      appendEntry(replyTarget.channel.id, {
+        cwd: state.cwd,
+        promptSummary: combined,
+        resultSummary: result.text,
+        turnCount: result.numTurns || 0,
+      });
       await sendLongMessage(replyTarget, result.text, state.cwd);
 
       // Completion summary for non-trivial tasks
@@ -1959,7 +2088,21 @@ client.on('messageCreate', async (message) => {
       saveChannelState(message.channel.id, state);
     }
 
-    if (!result.stopped) {
+    if (result.stopped) {
+      // If stop was NOT initiated by the user (external kill, OOM, container restart), alert them
+      if (!state._userStopped) {
+        await message.channel.send('*Process was interrupted unexpectedly — I stopped without finishing. Send another message to continue.*').catch(() => {});
+      }
+      state._userStopped = false;
+    } else {
+      // Save journal entry so next session (even after restart) knows what happened
+      appendEntry(message.channel.id, {
+        cwd: state.cwd,
+        promptSummary: message.content,
+        resultSummary: result.text,
+        turnCount: result.numTurns || 0,
+      });
+
       await sendLongMessage(message, result.text, state.cwd);
 
       // Step 3: Completion summary for non-trivial tasks

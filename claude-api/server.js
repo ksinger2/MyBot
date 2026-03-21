@@ -81,6 +81,16 @@ app.get('/health', (req, res) => res.json({ status: 'ok' }));
 const PORT = 3400;
 app.listen(PORT, () => {
   console.log(`Claude API wrapper listening on port ${PORT}`);
+
+  // After 30s of healthy running, snapshot code as last-known-good
+  setTimeout(() => {
+    try {
+      const { snapshotGoodState } = require('./safe-rebuild');
+      snapshotGoodState();
+    } catch (err) {
+      console.error('[safe-rebuild] Snapshot error:', err.message);
+    }
+  }, 30000);
 });
 
 // Start Discord bot
