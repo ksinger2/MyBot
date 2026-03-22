@@ -2009,122 +2009,132 @@ client.on('clientReady', () => {
   startMonitorRunner(client);
 
   // Auto-resume interrupted work after a crash (not a clean !restart)
+  // All channels resume IN PARALLEL so one doesn't block the others
   if (!wasCleanShutdown && !wasRolledBack) {
-    setTimeout(async () => {
-      for (const [channelId, savedState] of Object.entries(_savedChannelStates)) {
-        if (!savedState.activeTask) continue;
+    setTimeout(() => {
+      const channelsToResume = Object.entries(_savedChannelStates).filter(([, s]) => s.activeTask);
+      if (channelsToResume.length === 0) return;
+      console.log(`[auto-resume] Found ${channelsToResume.length} channel(s) with interrupted work`);
 
-        const task = savedState.activeTask;
-        const state = getChannel(channelId);
-
-        // Safety: don't retry more than 2 times
-        if ((task.resumeAttempts || 0) >= 2) {
-          console.log(`[auto-resume] Giving up on channel ${channelId} after ${task.resumeAttempts} attempts`);
-          state.activeTask = null;
-          saveChannelState(channelId, state);
-          const ch = client.channels.cache.get(channelId);
-          if (ch) ch.send('*I crashed while working and failed to resume after 2 attempts. Send your request again if needed.*').catch(() => {});
-          continue;
-        }
-
-        // Increment attempt counter
-        task.resumeAttempts = (task.resumeAttempts || 0) + 1;
-        state.activeTask = task;
-        saveChannelState(channelId, state);
-        flushPendingWrites();
-
-        const ch = client.channels.cache.get(channelId);
-        if (!ch) {
-          console.log(`[auto-resume] Channel ${channelId} not in cache, skipping`);
-          continue;
-        }
-
-        console.log(`[auto-resume] Resuming work in channel ${channelId} (attempt ${task.resumeAttempts}/2)`);
-        await ch.send(`*I crashed while working on your request. Resuming now... (attempt ${task.resumeAttempts}/2)*`).catch(() => {});
-        await ch.sendTyping().catch(() => {});
-        const typingInterval = setInterval(() => ch.sendTyping().catch(() => {}), 8000);
-
-        const pendingQueue = savedState.pendingQueue || [];
-        let resumePrompt = 'You were interrupted by a system crash. Continue where you left off. If you were nearly done, just wrap up and summarize what you accomplished.';
-        if (pendingQueue.length > 0) {
-          resumePrompt += '\n\n[Messages from user while you were working]\n' + pendingQueue.map(q => `- ${q}`).join('\n');
-        }
-
-        const personalityFile = getPersonalityFile(state.personality);
-
-        try {
-          state.busy = true;
-          state.startedAt = Date.now();
-          state.progress = freshProgress();
-
-          let result;
-          try {
-            result = await runClaudeWithContinuation(resumePrompt, {
-              sessionId: state.sessionId,
-              personalityFile,
-              identity: state.identity,
-              cwd: state.cwd,
-              channelState: state,
-              discordChannel: ch,
-            }, ch);
-          } catch (err) {
-            // If session resume fails, try fresh with the original prompt
-            if (state.sessionId) {
-              console.log('[auto-resume] Session resume failed, retrying fresh:', err.message);
-              state.sessionId = null;
-              result = await askClaude(
-                `[Resuming after crash — original request was: "${task.prompt}"]\n\nCheck the current state of the project and continue or complete this work. If it appears already done, just confirm.`,
-                { personalityFile, identity: state.identity, cwd: state.cwd, channelState: state, discordChannel: ch }
-              );
-            } else {
-              throw err;
-            }
-          }
-
-          if (result.sessionId) {
-            state.sessionId = result.sessionId;
-            saveChannelState(channelId, state);
-          }
-
-          if (!result.stopped && result.text) {
-            appendEntry(channelId, {
-              cwd: state.cwd,
-              promptSummary: '[auto-resume] ' + task.prompt,
-              resultSummary: result.text,
-              turnCount: result.numTurns || 0,
-            });
-            // Send result to the channel directly
-            const lines = result.text.split('\n');
-            let chunk = '';
-            for (const line of lines) {
-              if ((chunk + '\n' + line).length > 1990) {
-                await ch.send(chunk).catch(() => {});
-                chunk = line;
-              } else {
-                chunk = chunk ? chunk + '\n' + line : line;
-              }
-            }
-            if (chunk) await ch.send(chunk).catch(() => {});
-          }
-
-          // Success — clear active task
-          state.activeTask = null;
-          saveChannelState(channelId, state);
-          console.log(`[auto-resume] Successfully resumed work in channel ${channelId}`);
-        } catch (err) {
-          console.error(`[auto-resume] Failed for channel ${channelId}:`, err.message);
-          await ch.send(`*Auto-resume failed: ${err.message.substring(0, 200)}. Send another message to retry manually.*`).catch(() => {});
-          sendErrorAlert(err, { source: 'auto-resume', channel: channelId });
-        } finally {
-          clearInterval(typingInterval);
-          state.busy = false;
-          state.startedAt = null;
-          state.progress = freshProgress();
-        }
-      }
+      const resumePromises = channelsToResume.map(([channelId, savedState]) => resumeChannel(channelId, savedState));
+      Promise.allSettled(resumePromises).then(results => {
+        const succeeded = results.filter(r => r.status === 'fulfilled').length;
+        const failed = results.filter(r => r.status === 'rejected').length;
+        console.log(`[auto-resume] Done: ${succeeded} resumed, ${failed} failed`);
+      });
     }, 10000); // 10s delay for Discord cache to populate
   }
 });
+
+async function resumeChannel(channelId, savedState) {
+  const task = savedState.activeTask;
+  const state = getChannel(channelId);
+
+  // Safety: don't retry more than 2 times
+  if ((task.resumeAttempts || 0) >= 2) {
+    console.log(`[auto-resume] Giving up on channel ${channelId} after ${task.resumeAttempts} attempts`);
+    state.activeTask = null;
+    saveChannelState(channelId, state);
+    const ch = client.channels.cache.get(channelId);
+    if (ch) ch.send('*I crashed while working and failed to resume after 2 attempts. Send your request again if needed.*').catch(() => {});
+    return;
+  }
+
+  // Increment attempt counter
+  task.resumeAttempts = (task.resumeAttempts || 0) + 1;
+  state.activeTask = task;
+  saveChannelState(channelId, state);
+  flushPendingWrites();
+
+  const ch = client.channels.cache.get(channelId);
+  if (!ch) {
+    console.log(`[auto-resume] Channel ${channelId} not in cache, skipping`);
+    return;
+  }
+
+  console.log(`[auto-resume] Resuming work in channel ${channelId} (attempt ${task.resumeAttempts}/2)`);
+  await ch.send(`*I crashed while working on your request. Resuming now... (attempt ${task.resumeAttempts}/2)*`).catch(() => {});
+  await ch.sendTyping().catch(() => {});
+  const typingInterval = setInterval(() => ch.sendTyping().catch(() => {}), 8000);
+
+  const pendingQueue = savedState.pendingQueue || [];
+  let resumePrompt = 'You were interrupted by a system crash. Continue where you left off. If you were nearly done, just wrap up and summarize what you accomplished.';
+  if (pendingQueue.length > 0) {
+    resumePrompt += '\n\n[Messages from user while you were working]\n' + pendingQueue.map(q => `- ${q}`).join('\n');
+  }
+
+  const personalityFile = getPersonalityFile(state.personality);
+
+  try {
+    state.busy = true;
+    state.startedAt = Date.now();
+    state.progress = freshProgress();
+
+    let result;
+    try {
+      result = await runClaudeWithContinuation(resumePrompt, {
+        sessionId: state.sessionId,
+        personalityFile,
+        identity: state.identity,
+        cwd: state.cwd,
+        channelState: state,
+        discordChannel: ch,
+      }, ch);
+    } catch (err) {
+      // If session resume fails, try fresh with the original prompt
+      if (state.sessionId) {
+        console.log(`[auto-resume] Session resume failed for ${channelId}, retrying fresh:`, err.message);
+        state.sessionId = null;
+        result = await askClaude(
+          `[Resuming after crash — original request was: "${task.prompt}"]\n\nCheck the current state of the project and continue or complete this work. If it appears already done, just confirm.`,
+          { personalityFile, identity: state.identity, cwd: state.cwd, channelState: state, discordChannel: ch }
+        );
+      } else {
+        throw err;
+      }
+    }
+
+    if (result.sessionId) {
+      state.sessionId = result.sessionId;
+      saveChannelState(channelId, state);
+    }
+
+    if (!result.stopped && result.text) {
+      appendEntry(channelId, {
+        cwd: state.cwd,
+        promptSummary: '[auto-resume] ' + task.prompt,
+        resultSummary: result.text,
+        turnCount: result.numTurns || 0,
+      });
+      // Send result to the channel directly
+      const lines = result.text.split('\n');
+      let chunk = '';
+      for (const line of lines) {
+        if ((chunk + '\n' + line).length > 1990) {
+          await ch.send(chunk).catch(() => {});
+          chunk = line;
+        } else {
+          chunk = chunk ? chunk + '\n' + line : line;
+        }
+      }
+      if (chunk) await ch.send(chunk).catch(() => {});
+    }
+
+    // Success — clear active task
+    state.activeTask = null;
+    saveChannelState(channelId, state);
+    console.log(`[auto-resume] Successfully resumed work in channel ${channelId}`);
+  } catch (err) {
+    console.error(`[auto-resume] Failed for channel ${channelId}:`, err.message);
+    await ch.send(`*Auto-resume failed: ${err.message.substring(0, 200)}. Send another message to retry manually.*`).catch(() => {});
+    sendErrorAlert(err, { source: 'auto-resume', channel: channelId });
+  } finally {
+    clearInterval(typingInterval);
+    state.busy = false;
+    state.startedAt = null;
+    state.progress = freshProgress();
+  }
+}
 
 async function processQueue(state) {
   if (!state.queue.length) return;
