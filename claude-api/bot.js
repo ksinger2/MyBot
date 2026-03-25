@@ -10,6 +10,7 @@ const OpenAI = require('openai');
 const { startAllSchedules, registerJob, cancelJob } = require('./scheduler');
 const { saveChannelState, loadAllChannelStates, flushPendingWrites } = require('./channel-persistence');
 const { appendEntry, getJournalContext } = require('./session-journal');
+const { getSkill, listSkills } = require('./skills/skill-loader');
 
 const PERSONALITIES_DIR = path.join(__dirname, 'personalities');
 const DEFAULT_PERSONALITY = 'tiffany_pollard';
@@ -1877,6 +1878,71 @@ async function handleCommand(message) {
       break;
     }
 
+    case '!bugs': {
+      // Load and run the bug-list orchestration skill
+      const bugSkill = getSkill('bug-list');
+      if (!bugSkill) {
+        await message.reply('Bug list skill not found. Make sure `skills/core/bug-list.md` exists.');
+        break;
+      }
+      if (state.busy) {
+        await message.reply('Already working on something. Use `!stop` first.');
+        break;
+      }
+
+      state.busy = true;
+      state.startedAt = Date.now();
+      state.progress = freshProgress();
+      await message.channel.sendTyping();
+      const bugTypingInterval = setInterval(() => { message.channel.sendTyping().catch(() => {}); }, 8000);
+
+      // Combine skill instructions with any provided context
+      const bugPrompt = `${bugSkill.instructions}\n\n${arg ? `Initial context/bugs to address:\n${arg}` : 'Ready to receive bugs. List them one by one and I will orchestrate agents to fix them.'}`;
+      const personalityFile = getPersonalityFile(state.personality);
+
+      try {
+        const result = await askClaude(bugPrompt, {
+          sessionId: state.sessionId,
+          personalityFile,
+          identity: state.identity,
+          cwd: state.cwd,
+          maxTurns: 100,  // Higher limit for orchestration
+          channelState: state,
+          discordChannel: message.channel,
+        });
+
+        if (result.sessionId) state.sessionId = result.sessionId;
+        if (!result.stopped) {
+          await sendLongMessage(message, result.text, state.cwd);
+        }
+      } catch (err) {
+        const errorMsg = err.message.length > 500 ? err.message.substring(0, 500) + '...' : err.message;
+        await message.reply(`Bug orchestrator error: ${errorMsg}`).catch(() => {});
+        sendErrorAlert(err, { source: 'bugs command', channel: message.channel.id });
+      } finally {
+        clearInterval(bugTypingInterval);
+        state.busy = false;
+        state.startedAt = null;
+        state.progress = freshProgress();
+      }
+      break;
+    }
+
+    case '!skills': {
+      try {
+        const skills = listSkills();
+        if (skills.length === 0) {
+          await message.reply('No skills loaded. Skills are loaded from `skills/core/` directory.');
+        } else {
+          const list = skills.map(s => `• **${s.name}** — ${s.description}`).join('\n');
+          await message.reply(`**Available Skills:**\n${list}`);
+        }
+      } catch (err) {
+        await message.reply(`Error loading skills: ${err.message}`);
+      }
+      break;
+    }
+
     case '!commands': {
       await message.reply(
         `**Available Commands:**\n` +
@@ -1884,7 +1950,7 @@ async function handleCommand(message) {
         `\`!status\` \`!processes\` \`!btw\` \`!cd\` \`!ls\`\n` +
         `\`!startproject\` \`!audit\` \`!name\` \`!identity\`\n` +
         `\`!personality\` \`!personalities\`\n` +
-        `\`!tasks\` \`!done\`\n` +
+        `\`!tasks\` \`!done\` \`!bugs\` \`!skills\`\n` +
         `\`!schedule\` \`!schedules\` \`!unschedule\` \`!autoschedule\`\n` +
         `\`!queue\` \`!queued\` \`!dequeue\`\n` +
         `\`!monitor\` \`!monitors\`\n` +
