@@ -80,6 +80,56 @@ app.post('/imagine', async (req, res) => {
   }
 });
 
+// Internal reminder endpoint — creates a Google Calendar event as a reminder
+// Called by Claude CLI via curl when user asks "remind me..."
+app.post('/remind', async (req, res) => {
+  const { title, datetime, duration_minutes, discord_user_id, description } = req.body;
+  if (!title || !datetime || !discord_user_id) {
+    return res.status(400).json({ error: 'title, datetime (ISO 8601), and discord_user_id are required' });
+  }
+
+  try {
+    const googleAuth = require('./google-auth');
+    const calendar = await googleAuth.getCalendarClient(discord_user_id);
+    if (!calendar) {
+      return res.status(400).json({ error: 'User has not connected Google Calendar. Tell them to run !connect first.' });
+    }
+
+    const startTime = new Date(datetime);
+    const durationMs = (duration_minutes || 15) * 60 * 1000;
+    const endTime = new Date(startTime.getTime() + durationMs);
+
+    const event = await calendar.events.insert({
+      calendarId: 'primary',
+      requestBody: {
+        summary: title,
+        description: description || `Reminder set via Discord bot`,
+        start: { dateTime: startTime.toISOString() },
+        end: { dateTime: endTime.toISOString() },
+        reminders: {
+          useDefault: false,
+          overrides: [
+            { method: 'popup', minutes: 0 },
+            { method: 'popup', minutes: 5 },
+          ],
+        },
+      },
+    });
+
+    res.json({
+      success: true,
+      event_id: event.data.id,
+      title,
+      start: startTime.toISOString(),
+      end: endTime.toISOString(),
+      link: event.data.htmlLink,
+    });
+  } catch (err) {
+    console.error('[remind] Error creating reminder:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 app.get('/health', (req, res) => res.json({ status: 'ok' }));
 
 // Spotify OAuth callback for playlist integration

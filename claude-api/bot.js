@@ -354,7 +354,7 @@ function listPersonalities() {
     .map(f => f.replace('.md', ''));
 }
 
-function askClaude(prompt, { sessionId = null, personalityFile = null, identity = null, cwd = DEFAULT_WORKSPACE, maxTurns = DEFAULT_MAX_TURNS, channelState = null, discordChannel = null } = {}) {
+function askClaude(prompt, { sessionId = null, personalityFile = null, identity = null, cwd = DEFAULT_WORKSPACE, maxTurns = DEFAULT_MAX_TURNS, channelState = null, discordChannel = null, discordUserId = null } = {}) {
   return new Promise((resolve, reject) => {
     // Auto-load project context on new sessions (CLAUDE.md + NextSteps.md + session journal)
     if (!sessionId) {
@@ -475,6 +475,12 @@ Match the agent type to the task. Examples: frontend work → frontend-engineer,
 7. **MULTIPLE PROJECTS**: Your workspace is /workspace/ which contains multiple projects. You can cd between them, work on any of them, and even coordinate across projects.
 
 8. **PREVIEW TUNNELS**: When you finish building a web app or start a dev server, ALWAYS ask: "What device will you view this on? (same PC or phone/mobile?)" before running anything. Then:\n   - **Same PC**: tell them \`http://localhost:PORT\` — that's it, no tunnel needed\n   - **Phone/mobile**: run \`!preview PORT phone\` — the bot will create a Cloudflare tunnel, fetch the public IP, and send a magic link with the IP pre-injected so they can tap it directly with no password. Do NOT tell the user to run \`!preview\` manually for phone — run it yourself.\n   - When building apps that have any kind of IP-based password protection or auth, ALWAYS support a \`?access=<IP>\` URL query parameter that auto-authenticates the request, so the magic link works seamlessly.
+
+9. **REMINDERS**: When the user asks you to remind them about something (e.g. "remind me tomorrow at 3pm to call the vet", "remind me in 2 hours to check the oven", "set a reminder for Friday to submit the report"), create a Google Calendar event by running:
+\`curl -s -X POST http://localhost:3400/remind -H "Content-Type: application/json" -d '{"title":"<what to remember>","datetime":"<ISO 8601 datetime>","discord_user_id":"${discordUserId || 'UNKNOWN'}","duration_minutes":15}'\`
+Convert relative times ("tomorrow", "in 2 hours", "next Friday") to absolute ISO 8601 datetimes using the current time. The current timezone is America/Los_Angeles (Pacific Time). Today is ${new Date().toLocaleDateString('en-US', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric', timeZone: 'America/Los_Angeles' })} and the current time is ${new Date().toLocaleTimeString('en-US', { timeZone: 'America/Los_Angeles', hour: '2-digit', minute: '2-digit' })}.
+If the endpoint returns an error saying the user hasn't connected Google Calendar, tell them to run \`!connect\` first.
+After setting a reminder, confirm with the title and when it's set for. Keep it brief.
 
 NEVER say you can't do something if one of these capabilities covers it. Try first, explain only if it actually fails.
 
@@ -2600,6 +2606,7 @@ client.on('messageCreate', async (message) => {
       cwd: state.cwd,
       channelState: state,
       discordChannel: message.channel,
+      discordUserId: message.author.id,
     };
     try {
       result = await runClaudeWithContinuation(messagePrompt, claudeOpts, message.channel);
