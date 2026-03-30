@@ -409,7 +409,7 @@ function askClaude(prompt, { sessionId = null, personalityFile = null, identity 
       '--model', 'sonnet',
       '--max-turns', String(maxTurns),
       '--dangerously-skip-permissions',
-      '--mcp-config', '/home/node/.claude/.mcp.json',
+      '--mcp-config', '/app/.mcp.json',
     ];
 
     if (sessionId) {

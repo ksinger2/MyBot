@@ -4,6 +4,7 @@
 - Bot is running via `docker compose up -d --build` from the MyBot directory
 - Docker Engine in WSL (v29.3.1), `restart: unless-stopped` for crash recovery
 - All features deployed and healthy
+- MCP config path fixed — Playwright browser tools now working inside container
 
 ## What's Working
 - Discord bot (**BiancaDaCow**) is live and responding
@@ -95,6 +96,9 @@ SPOTIFY_CLIENT_ID=            # for playlist generation (optional)
 SPOTIFY_CLIENT_SECRET=        # for playlist generation (optional)
 SPOTIFY_REDIRECT_URI=         # default: http://localhost:3400/auth/spotify/callback
 ```
+
+## Recently Fixed
+- **MCP config path mismatch** — `bot.js` referenced `/home/node/.claude/.mcp.json` but the Dockerfile never copied `.mcp.json` there. Fixed: Dockerfile now copies `.mcp.json` to `/app/`, bot.js points to `/app/.mcp.json`.
 
 ## Likely Next Steps
 1. **Set up Google OAuth** — create Google Cloud credentials, add to .env, test `!connect` and `!hangout`

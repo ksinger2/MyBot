@@ -46,7 +46,7 @@ WORKDIR /app
 COPY package.json ./
 RUN npm install
 
-COPY *.js ./
+COPY *.js .mcp.json ./
 COPY wizards/ ./wizards/
 COPY personalities/ ./personalities/
 COPY skills/ ./skills/
