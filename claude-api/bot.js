@@ -11,7 +11,7 @@ const { startAllSchedules, registerJob, cancelJob } = require('./scheduler');
 const { saveChannelState, loadAllChannelStates, flushPendingWrites } = require('./channel-persistence');
 const { appendEntry, getJournalContext } = require('./session-journal');
 const { getSkill, listSkills } = require('./skills/skill-loader');
-const { detectLinks, buildExtractionPrompt } = require('./link-extractor');
+const { detectLinks, buildExtractionPrompt, buildSmartPrompt, enrichLinks } = require('./link-extractor');
 const { startHangoutWizard, processHangoutStep } = require('./wizards/hangout');
 const { startTripPlannerWizard, runResearchPhase } = require('./wizards/trip-planner');
 const { handleComponentInteraction } = require('./discord-components');
@@ -561,9 +561,9 @@ SESSION HANDOFF: When you finish significant work (feature, fix, refactor), upda
           if (event.type === 'result') {
             resultText = event.result || '';
             resultSessionId = event.session_id || resultSessionId;
-            resultCost = event.total_cost_usd || resultCost;
-            resultNumTurns = event.num_turns || resultNumTurns;
-            console.log(`[result] turns=${resultNumTurns} cost=$${resultCost} text_len=${(resultText || '').length}`);
+            resultCost = event.total_cost_usd != null ? event.total_cost_usd : resultCost;
+            resultNumTurns = event.num_turns != null ? event.num_turns : resultNumTurns;
+            console.log(`[result] turns=${resultNumTurns} cost=$${resultCost} text_len=${(resultText || '').length} text=${JSON.stringify((resultText || '').substring(0, 300))}`);
             continue;
           }
 
@@ -845,6 +845,20 @@ SESSION HANDOFF: When you finish significant work (feature, fix, refactor), upda
 
       if (code !== 0) {
         console.error(`[exit-error] code=${code} stderr:`, stderr.substring(0, 1000));
+        // If the CLI exited non-zero but still produced a valid result, use it
+        // This handles cases where MCP cleanup or other post-response steps fail
+        const hasValidResult = resultText && resultText.length > 10;
+        if (hasValidResult) {
+          console.log(`[exit-recovery] CLI exited ${code} but has valid result (${resultText.length} chars, $${resultCost}) — using it`);
+          return resolve({
+            text: resultText,
+            sessionId: resultSessionId,
+            cost: resultCost,
+            numTurns: resultNumTurns,
+            hitTurnLimit: resultNumTurns >= maxTurns,
+            stopped: false,
+          });
+        }
         const exitErr = new Error(`Claude CLI exited with code ${code}\n${stderr.substring(0, 300)}`);
         sendErrorAlert(exitErr, { source: 'askClaude', detail: `Exit code ${code}` });
         return reject(exitErr);
@@ -1201,6 +1215,45 @@ async function handleCommand(message) {
       break;
     }
 
+    case '!refresh': {
+      // Nuclear reset: kill all processes, clear all state, clear CLI session cache, restart
+      const statusMsg = await message.reply('Refreshing... killing processes, clearing all state, and restarting.');
+      // Kill all active processes
+      for (const [, s] of channels) {
+        if (s.process) s.process.kill();
+      }
+      // Clear all channel state
+      for (const [chId, s] of channels) {
+        s.sessionId = null;
+        s.busy = false;
+        s.process = null;
+        s.queue = [];
+        s.activeTask = null;
+        s.progress = freshProgress();
+        saveChannelState(chId, s);
+      }
+      flushPendingWrites();
+      // Clear CLI session files to prevent stale session resume issues
+      try {
+        const sessionDirs = ['/home/node/.claude/projects'];
+        for (const dir of sessionDirs) {
+          if (fs.existsSync(dir)) {
+            const { execFileSync } = require('child_process');
+            // Remove .jsonl session files (not CLAUDE.md or other configs)
+            execFileSync('find', [dir, '-name', '*.jsonl', '-delete'], { timeout: 5000 });
+          }
+        }
+        console.log('[refresh] Cleared CLI session files');
+      } catch (err) {
+        console.error('[refresh] Failed to clear sessions:', err.message);
+      }
+      // Mark clean shutdown and restart
+      try { fs.writeFileSync(path.join('/home/node/.claude', '.clean-shutdown'), Date.now().toString()); } catch {}
+      try { fs.writeFileSync(path.join(__dirname, '.restart-channel'), message.channel.id); } catch {}
+      setTimeout(() => process.exit(0), 500);
+      break;
+    }
+
     case '!imagine': {
       if (!arg) {
         await message.reply('Usage: `!imagine <description>` — e.g. `!imagine a cow in a spacesuit on the moon`');
@@ -1236,6 +1289,7 @@ async function handleCommand(message) {
         `\`!kill\` — Hard kill + destroy session\n` +
         `\`!killall\` — Kill everything across all channels\n` +
         `\`!restart\` — Restart bot container\n` +
+        `\`!refresh\` — Nuclear reset: kill all, clear state, restart\n` +
         `\`!status\` — Show session info\n` +
         `\`!processes\` — Show active Claude processes\n` +
         `\`!btw\` — Peek at progress while working\n` +
@@ -2037,10 +2091,15 @@ async function handleCommand(message) {
         await message.reply('Already working. Use `!stop` first.');
         break;
       }
-      // Detect any links and build extraction prompt
+      // Detect any links, pre-fetch metadata, and build action prompt
       const links = detectLinks(arg);
-      const extractionPrefix = links.length > 0 ? buildExtractionPrompt(links) : '';
-      const planPrompt = extractionPrefix + (links.length > 0 ? arg : `[PLANNING MODE]\nThe user wants to plan around this:\n${arg}\n\nUse WebSearch to research this destination/event. Provide: what it is, address, pet-friendly status, things to do nearby, distance from Alameda CA (drive/fly), weather, budget estimate. Check the user's calendar for good times to visit. Keep output Discord-concise.`);
+      let planPrompt;
+      if (links.length > 0) {
+        const enriched = await enrichLinks(links);
+        planPrompt = buildSmartPrompt(enriched) + arg;
+      } else {
+        planPrompt = `[PLANNING MODE]\nThe user wants to plan around this:\n${arg}\n\nUse WebSearch to research this destination/event. Provide: what it is, address, pet-friendly status, things to do nearby, distance from Alameda CA (drive/fly), weather, budget estimate. Check the user's calendar for good times to visit. Keep output Discord-concise.`;
+      }
 
       state.busy = true;
       state.startedAt = Date.now();
@@ -2593,11 +2652,13 @@ client.on('messageCreate', async (message) => {
     flushPendingWrites();
 
     let result;
-    // Auto-detect social/location links — prepend extraction instructions for Claude
+    // Auto-detect social/location links — pre-fetch metadata and build action prompt
     const detectedLinks = detectLinks(message.content);
-    const messagePrompt = detectedLinks.length > 0
-      ? buildExtractionPrompt(detectedLinks) + message.content
-      : message.content;
+    let messagePrompt = message.content;
+    if (detectedLinks.length > 0) {
+      const enriched = await enrichLinks(detectedLinks);
+      messagePrompt = buildSmartPrompt(enriched) + message.content;
+    }
 
     const claudeOpts = {
       sessionId: state.sessionId,
@@ -2614,15 +2675,41 @@ client.on('messageCreate', async (message) => {
       if (state.sessionId) {
         console.log('Session resume failed, retrying fresh:', err.message);
         state.sessionId = null;
-        result = await askClaude(message.content, {
-          personalityFile,
-          identity: state.identity,
-          cwd: state.cwd,
-          channelState: state,
-          discordChannel: message.channel,
-        });
+        try {
+          result = await askClaude(message.content, {
+            personalityFile,
+            identity: state.identity,
+            cwd: state.cwd,
+            channelState: state,
+            discordChannel: message.channel,
+          });
+        } catch (freshErr) {
+          // Fresh call also failed — wait 3s and try once more
+          console.log('Fresh call also failed, retrying after delay:', freshErr.message);
+          await new Promise(r => setTimeout(r, 3000));
+          result = await askClaude(message.content, {
+            personalityFile,
+            identity: state.identity,
+            cwd: state.cwd,
+            channelState: state,
+            discordChannel: message.channel,
+          });
+        }
       } else {
-        throw err;
+        // No session — wait 3s and retry once
+        console.log('CLI failed, retrying after delay:', err.message);
+        await new Promise(r => setTimeout(r, 3000));
+        try {
+          result = await askClaude(message.content, {
+            personalityFile,
+            identity: state.identity,
+            cwd: state.cwd,
+            channelState: state,
+            discordChannel: message.channel,
+          });
+        } catch (retryErr) {
+          throw retryErr;
+        }
       }
     }
 
@@ -2713,7 +2800,8 @@ client.on('messageCreate', async (message) => {
     errorParts.push(errorMsg);
     const lastLogs = state.progress.rawLog.slice(-3).map(e => e.text).join('\n');
     if (lastLogs) errorParts.push(`\nLast activity:\n${lastLogs}`);
-    if (state.sessionId) errorParts.push('\n*Session preserved — send another message to retry.*');
+    if (state.sessionId) errorParts.push('\n*Session preserved — send another message to retry, or `!refresh` to reset everything.*');
+    else errorParts.push('\n*Try again, or `!refresh` to reset everything.*');
     await message.reply(errorParts.join(' · ')).catch(() => {});
     sendErrorAlert(err, { source: 'message handler', channel: message.channel.id, detail: message.content.substring(0, 100) });
   } finally {
