@@ -95,21 +95,15 @@ function buildExtractionPrompt(links) {
     .join('\n');
 
   return [
-    '[LINK EXTRACTION MODE]',
-    'The user\'s message contains the following links. For each link:',
+    '[LINK DETECTED]',
+    'The user shared these links:',
     '',
     linkList,
     '',
-    'Follow these steps:',
-    '1. Use WebFetch to load each URL. Extract the page title, og:title, og:description, any Schema.org JSON-LD, and address/location info from meta tags and page text.',
-    '2. Identify: location name, full address, event dates (if any), what the place/event is, price range or cost.',
-    '3. Search for travel info: distance and drive time from Alameda, CA. If over 200 miles, note flight options.',
-    '4. Search for pet-friendliness of the venue.',
-    '5. Find 3-5 things to do nearby.',
-    '6. Use gcal_find_my_free_time to check the user\'s calendar for the next 2-4 weeks, then suggest 2-3 good times to visit (accounting for travel time).',
-    '7. Present a brief Discord-formatted summary with all the above info.',
-    '',
-    'Keep output concise (Discord-friendly). Now handle the user\'s message below:',
+    'Use WebFetch to load each URL and extract what it is (place, event, video, etc.).',
+    'Then give a short, helpful summary — what it is, where it is (if a location), key details.',
+    'If it\'s a place or event, mention anything useful like hours, price, or what to expect.',
+    'Keep it casual and Discord-concise. Respond naturally to whatever the user said along with the link.',
     '',
   ].join('\n');
 }

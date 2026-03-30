@@ -2587,13 +2587,8 @@ client.on('messageCreate', async (message) => {
     flushPendingWrites();
 
     let result;
-    // Auto-detect social/location links — trigger social plan wizard if available
+    // Auto-detect social/location links — prepend extraction instructions for Claude
     const detectedLinks = detectLinks(message.content);
-    if (detectedLinks.length > 0 && startSocialPlanWizard && !state.wizard) {
-      const participants = await getChannelParticipants(message.channel);
-      startSocialPlanWizard(state, message, detectedLinks, participants);
-      return;
-    }
     const messagePrompt = detectedLinks.length > 0
       ? buildExtractionPrompt(detectedLinks) + message.content
       : message.content;
