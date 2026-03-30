@@ -1,0 +1,7 @@
+.env
+node_modules
+*.md
+.git
+.claude
+.DS_Store
+Thumbs.db

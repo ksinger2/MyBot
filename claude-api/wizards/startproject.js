@@ -1,6 +1,6 @@
 const fs = require('fs');
 const path = require('path');
-const { execSync } = require('child_process');
+const { execSync, execFileSync } = require('child_process');
 const { startWizard } = require('../wizard');
 
 const STANDALONE_TEMPLATE_DIR = '/workspace/ClaudeCodeTemplate';
@@ -25,6 +25,8 @@ function startProjectWizard(state, message) {
         prompt: 'Where should I create it? (full path, or press enter for `/workspace`)',
         default: '/workspace',
         validate: (input) => {
+          const resolved = path.resolve(input);
+          if (!resolved.startsWith('/workspace')) return 'Projects must be created under `/workspace/`.';
           if (!fs.existsSync(input)) return `Directory \`${input}\` doesn't exist. Enter a valid path.`;
           if (!fs.statSync(input).isDirectory()) return `\`${input}\` is not a directory.`;
           return true;
@@ -44,8 +46,8 @@ function startProjectWizard(state, message) {
         condition: (data) => data.gitSetup === '2',
         validate: (input) => {
           if (!input || input.length === 0) return 'Repo URL cannot be empty.';
-          if (!input.includes('github.com') && !input.includes('gitlab.com') && !input.includes('bitbucket.org') && !input.endsWith('.git')) {
-            return 'That doesn\'t look like a repo URL. Send a GitHub/GitLab/Bitbucket URL.';
+          if (!/^https?:\/\/[\w.-]+\/[\w.-]+\/[\w.-]+(\.git)?$/.test(input)) {
+            return 'Invalid repo URL format. Use a full HTTPS URL like `https://github.com/user/repo.git`.';
           }
           return true;
         },
@@ -93,13 +95,13 @@ async function executeProjectSetup(data, message, channelState) {
     if (data.gitSetup === '1') {
       // New private GitHub repo
       try {
-        execSync('git init', execOpts);
-        execSync('git add .', execOpts);
-        execSync(`git commit -m "Initial project setup with Claude Code template"`, execOpts);
-        const ghOutput = execSync(
-          `gh repo create ${data.name} --private --source=. --push 2>&1`,
+        execFileSync('git', ['init'], execOpts);
+        execFileSync('git', ['add', '.'], execOpts);
+        execFileSync('git', ['commit', '-m', 'Initial project setup with Claude Code template'], execOpts);
+        const ghOutput = execFileSync(
+          'gh', ['repo', 'create', data.name, '--private', '--source=.', '--push'],
           execOpts
-        ).trim();
+        ).toString().trim();
         gitStatus = `\nGitHub repo created (private): ${ghOutput}`;
       } catch (err) {
         gitStatus = `\n⚠️ Git init succeeded but GitHub repo creation failed: ${err.message.substring(0, 200)}`;
@@ -107,11 +109,11 @@ async function executeProjectSetup(data, message, channelState) {
     } else if (data.gitSetup === '2') {
       // Existing repo
       try {
-        execSync('git init', execOpts);
-        execSync(`git remote add origin ${data.repoUrl}`, execOpts);
-        execSync('git add .', execOpts);
-        execSync(`git commit -m "Initial project setup with Claude Code template"`, execOpts);
-        execSync('git push -u origin main 2>&1', execOpts);
+        execFileSync('git', ['init'], execOpts);
+        execFileSync('git', ['remote', 'add', 'origin', data.repoUrl], execOpts);
+        execFileSync('git', ['add', '.'], execOpts);
+        execFileSync('git', ['commit', '-m', 'Initial project setup with Claude Code template'], execOpts);
+        execFileSync('git', ['push', '-u', 'origin', 'main'], execOpts);
         gitStatus = `\nPushed to: ${data.repoUrl}`;
       } catch (err) {
         gitStatus = `\n⚠️ Git push failed: ${err.message.substring(0, 200)}\nYou may need to push manually.`;

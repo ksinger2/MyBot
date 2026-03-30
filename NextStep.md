@@ -1,81 +1,104 @@
-# MyBot — Session Handoff (2026-03-18)
+# MyBot — Session Handoff (2026-03-29)
+
+## Current Status
+- Bot is running via `docker compose up -d --build` from the MyBot directory
+- Docker Engine in WSL (v29.3.1), `restart: unless-stopped` for crash recovery
+- All features deployed and healthy
 
 ## What's Working
-- Discord bot (**MyBot**) is live and responding in Discord
-- Claude Code CLI integration working (subscription-based, not API)
+- Discord bot (**BiancaDaCow**) is live and responding
+- Claude Code CLI integration (subscription-based, stream-json)
 - Per-channel session persistence, identity/personality switching
-- Morning briefing system (scheduled 9am PT daily + `!briefing` on-demand)
-- Sunday weekly preview (`!weekly` on-demand, auto at noon Sundays)
-- Evening check-in at 10pm PT — bot asks for tomorrow's tasks via wizard
-- Briefing modules: stocks (with portfolio tracking), weather, news, jobs, tasks, mindfulness
-- Discord embed suppression via `MessageFlags.SuppressEmbeds` on briefing messages
-- Image attachment support — bot auto-attaches images referenced in Claude's responses
-- `!restart` command — bot restarts itself, notifies the channel when it's back up
-- `!email` command — drafts 3 professional email options in different tones
-- `!processes` command — shows active Claude processes and resource usage
-- `!btw` command — structured progress peek: current tool, file path, turn count, listening ports, other CLI sessions
-- `!startproject` wizard — creates new project with Claude Code template, agents, skills, commands, and optional git/GitHub setup
-- `!cancel` command — cancel an active wizard mid-flow
-- `!schedule` command — set up recurring DM reminders (daily, hourly, weekdays, specific days, or cron)
-- `!schedules` / `!unschedule` commands — view and remove scheduled messages
-- Generic wizard system for multi-step interactive commands
-- Docker control — Claude has full Docker access inside the container (socket mounted)
-- Error alerting — all errors posted to `#bot-errors` channel with dedup (5min per error type)
-- Robust error handling — Discord API errors, unhandled rejections, and uncaught exceptions all caught gracefully
+- Morning briefing (9am PT), weekly preview (Sunday noon), evening check-in (10pm PT)
+- Briefing modules: stocks, weather, news, jobs, tasks, mindfulness
+- Image generation, web browsing (Playwright), sub-agent tracking
+- `!restart`, `!email`, `!processes`, `!btw`, `!startproject` wizard, `!cancel`
+- `!schedule` / `!schedules` / `!unschedule` / `!autoschedule`
+- `!monitor ci` / `!monitor health` / `!monitors`
+- `!queue` / `!queued` / `!dequeue`
+- `!audit`, `!bugs`, `!preview`, `!skills`
+- Error alerting to `#bot-errors` with dedup
+- Auto-resume after crash, crash-loop recovery (3x in 2min → rollback)
+- Safe-rebuild with last-known-good snapshot
+
+### New: Security Hardening
+- **Access control** — `ALLOWED_USER_IDS` and `ADMIN_USER_IDS` env vars (empty = allow all for backward compat)
+- **Admin-only commands** — `!restart`, `!killall`, `!identity`, `!name`, `!personality`, `!autoschedule` gated
+- **Shell injection fixed** — `execSync` replaced with `execFileSync` + argument arrays in pollers.js and startproject.js
+- **Input validation** — repo names, branch names, URLs, identity text all validated
+- **Path restriction** — `!cd`, `!ls`, `!startproject` restricted to `/workspace/`
+- **System prompt hardening** — security rules block credential reading, env dumping, data exfiltration
+- **Environment sanitization** — Claude CLI subprocess only gets PATH, HOME, CI, CHROME_PATH (no API keys)
+- **Image path restriction** — attachments only from `/workspace` or `/tmp`
+- **SSRF mitigation** — monitor health URLs validated (http/https only)
+- **`.dockerignore` created** — excludes .env, .git, .claude, node_modules
+- **stderr no longer leaked** in `/ask` endpoint responses
+
+### New: Social Planning & Coordination
+- **`!plan <link or description>`** — paste a TikTok/Instagram/Maps/Yelp/Eventbrite link or describe a place; bot researches it (pet-friendly, distance, weather, budget, calendar)
+- **`!trip`** — full trip planning wizard: destination → research → companions → dates → itinerary → share/calendar
+- **`!hangout`** — group hangout wizard: what → who (@mentions) → check calendars → find overlapping free time → create events
+- **`!connect`** — DMs Google OAuth link for calendar access (multi-user)
+- **`!spotify`** — DMs Spotify OAuth link for playlist integration
+- **Auto link detection** — paste a social media link in any message, bot auto-triggers the social plan wizard
+- **Channel participant detection** — bot scans recent messages to identify who's active (GuildMembers intent)
+- **Discord interactive components** — buttons for quick actions (Add to Calendar, Share, Get Directions, More Info), voting, time slot selection
+- **Collaborative Spotify playlists** — analyzes both users' music tastes, creates road trip playlist with 40% shared / 30% each user mix, destination-themed tracks, "stay awake" high-energy mode
+- **Preference interview** — wizard asks: pet-friendly, budget/splurge, hotel, restaurants, playlist, calendars, driving/flying
+- **Multi-user Google Calendar** — OAuth per user, free/busy queries, overlapping time finder, group event creation
 
 ## Architecture
 ```
 Discord message → Discord.js bot (claude-api container) → Claude CLI (stream-json) → reply to Discord
 ```
 - `claude-api/` container: Express server (port 3400) + Discord.js bot
-- n8n removed (was unused — no Discord nodes in n8n 2.11.2)
 - Claude CLI authenticates via mounted credentials from host
-- Claude CLI uses `--output-format stream-json --verbose` for structured progress tracking
-- Docker socket mounted + `group_add: ["989"]` gives Claude container management access
-
-## What Was Done This Session
-
-### Bug Fixes
-- **Fixed bot crash on oversized messages** — Discord API `DiscordAPIError[50035]` (>2000 chars) was crashing the Node process. Repeated crashes broke the gateway connection, making the bot appear online but unresponsive.
-- **Added `client.on('error')` handler** — Discord client errors now logged instead of crashing.
-- **Added `process.on('unhandledRejection')` and `process.on('uncaughtException')` handlers** — prevents silent crashes from any unhandled errors.
-- **Wrapped `handleCommand()` in try/catch** — command failures now show a clear error message in Discord instead of silently dying.
-- **Fixed `!help` command** — message exceeded 2000 char limit. Condensed text and routed through `sendLongMessage` for auto-chunking.
-- **Fixed `!btw` command** — dynamic output (recent activity lines) could exceed 2000 chars. Now uses `sendLongMessage`.
-- **Raised chunk limit from 1900 to 1990** — maximizes message space while staying under Discord's 2000 char limit.
-- **Added `.catch()` to message sends in `sendLongMessage()`** — reply/chunk failures are logged instead of becoming unhandled rejections.
-
-### Previous Session Features (already committed)
-- `!schedule` / `!schedules` / `!unschedule` commands, schedule storage and runner
-- Error alerting, `!btw` rewrite, stream-json migration, n8n removal, brevity improvements
-- `!btw`, `!processes`, `!startproject` wizard, Sunday weekly preview, generic wizard system
-- Project template with 12 agents, 3 commands, verification skill
-- Embed suppression fix, evening check-in refactored to wizard system
-
-## Likely Next Steps
-
-### 1. More personalities
-- Add new personality files in `claude-api/personalities/`
-
-### 2. Additional monitoring
-- Track briefing success/failure rate over time
-- Add health check alerts if container goes unhealthy
+- Docker socket mounted for self-rebuild capability
+- OAuth callbacks: `/auth/google/callback`, `/auth/spotify/callback`
 
 ## Key Files
 | File | Purpose |
 |------|---------|
-| `claude-api/bot.js` | Discord bot — message handling, Claude CLI spawn (stream-json), commands, wizard integration |
-| `claude-api/error-alerting.js` | Error alerting — posts errors to #bot-errors with dedup |
+| `claude-api/bot.js` | Main bot — commands, Claude CLI wrapper, system prompt, progress tracking |
+| `claude-api/server.js` | Express server — `/ask`, `/imagine`, `/health`, OAuth callbacks |
+| `claude-api/link-extractor.js` | Detects TikTok/Instagram/Maps/Yelp/Eventbrite URLs |
+| `claude-api/discord-components.js` | Discord buttons, embeds, voting, interaction routing |
+| `claude-api/planning-context.js` | Aggregates venue info for trip planning |
+| `claude-api/google-auth.js` | Google OAuth flow for multi-user calendar |
+| `claude-api/calendar-coordinator.js` | Multi-user free/busy, overlapping time, group events |
+| `claude-api/user-tokens.js` | Google OAuth token storage |
+| `claude-api/spotify-auth.js` | Spotify OAuth flow + API client |
+| `claude-api/spotify-tokens.js` | Spotify OAuth token storage |
+| `claude-api/spotify-planner.js` | Collaborative playlist generation |
+| `claude-api/wizards/social-plan.js` | Social plan wizard (drop a link → full plan) |
+| `claude-api/wizards/hangout.js` | Group hangout wizard with calendar coordination |
+| `claude-api/wizards/trip-planner.js` | Full trip planning wizard |
+| `claude-api/pollers.js` | GitHub CI and URL health check pollers |
+| `claude-api/monitor-config.js` | Monitor config CRUD |
+| `claude-api/monitor-runner.js` | Timer-based polling loop |
+| `claude-api/briefings.js` | Briefing system — data fetchers, scheduler |
+| `claude-api/error-alerting.js` | Error alerting to #bot-errors |
 | `claude-api/wizard.js` | Generic multi-step wizard engine |
-| `claude-api/wizards/startproject.js` | `!startproject` wizard definition |
-| `claude-api/briefings.js` | Briefing system — data fetchers, prompt builder, scheduler, weekly preview |
-| `claude-api/briefing-config.js` | Briefing config — tickers, weather, news topics, job search, schedules, error channel |
-| `claude-api/tasks-storage.js` | Task persistence — save/load/clear tasks for briefing |
-| `claude-api/schedules-storage.js` | Schedule persistence — save/load/remove user-created schedules |
-| `claude-api/scheduler.js` | Schedule runner — registers node-schedule jobs, DM delivery |
-| `claude-api/project-template/` | Full Claude Code project template (CLAUDE.md, agents, commands, skills) |
-| `claude-api/personalities/tiffany_pollard.md` | Main personality file |
-| `claude-api/server.js` | Express server + bot startup |
-| `claude-api/Dockerfile` | Node 20, Claude CLI, Docker CLI, copies all .js + wizards + template |
-| `docker-compose.yml` | Single service (claude-api), healthcheck, Docker socket mount |
-| `.env` | Secrets (not committed) |
+| `claude-api/personalities/` | Personality files |
+| `docker-compose.yml` | Container config, env vars, volume mounts |
+
+## Environment Variables Needed
+```
+DISCORD_BOT_TOKEN=...
+OPENAI_API_KEY=...            # for image generation
+ALLOWED_USER_IDS=             # comma-separated Discord user IDs (empty = allow all)
+ADMIN_USER_IDS=               # comma-separated admin user IDs (empty = all are admin)
+GOOGLE_CLIENT_ID=             # for multi-user calendar (optional)
+GOOGLE_CLIENT_SECRET=         # for multi-user calendar (optional)
+GOOGLE_REDIRECT_URI=          # default: http://localhost:3400/auth/google/callback
+SPOTIFY_CLIENT_ID=            # for playlist generation (optional)
+SPOTIFY_CLIENT_SECRET=        # for playlist generation (optional)
+SPOTIFY_REDIRECT_URI=         # default: http://localhost:3400/auth/spotify/callback
+```
+
+## Likely Next Steps
+1. **Set up Google OAuth** — create Google Cloud credentials, add to .env, test `!connect` and `!hangout`
+2. **Set up Spotify OAuth** — create Spotify app credentials, add to .env, test `!spotify` and playlist generation
+3. **Set access control** — add your Discord user ID to `ALLOWED_USER_IDS` and `ADMIN_USER_IDS` in .env
+4. **More personalities** — add new personality files in `claude-api/personalities/`
+5. **Refine social plan wizard** — tune the preference interview, improve plan output formatting

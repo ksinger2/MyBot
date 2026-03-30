@@ -1,4 +1,4 @@
-const { execSync } = require('child_process');
+const { execFileSync } = require('child_process');
 
 /**
  * GitHub CI Poller — checks for new workflow failures via `gh` CLI
@@ -7,13 +7,25 @@ async function pollGitHubCI(monitor) {
   const repo = monitor.config.repo;
   if (!repo) return { changed: false };
 
-  const branchFlag = monitor.config.branch ? ` --branch ${monitor.config.branch}` : '';
+  // Validate repo format to prevent injection (owner/repo only)
+  if (!/^[a-zA-Z0-9._-]+\/[a-zA-Z0-9._-]+$/.test(repo)) {
+    console.error(`[poller] Invalid repo format: ${repo}`);
+    return { changed: false };
+  }
+
+  const args = ['run', 'list', '--repo', repo, '--limit', '5',
+    '--json', 'status,conclusion,name,headBranch,url,databaseId,updatedAt'];
+  if (monitor.config.branch) {
+    if (!/^[a-zA-Z0-9._\/-]+$/.test(monitor.config.branch)) {
+      console.error(`[poller] Invalid branch format: ${monitor.config.branch}`);
+      return { changed: false };
+    }
+    args.push('--branch', monitor.config.branch);
+  }
+
   let runs;
   try {
-    const output = execSync(
-      `gh run list --repo ${repo}${branchFlag} --limit 5 --json status,conclusion,name,headBranch,url,databaseId,updatedAt`,
-      { encoding: 'utf-8', timeout: 15000 }
-    );
+    const output = execFileSync('gh', args, { encoding: 'utf-8', timeout: 15000 });
     runs = JSON.parse(output);
   } catch (err) {
     console.error(`[poller] gh run list failed for ${repo}:`, err.message);

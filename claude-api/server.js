@@ -17,7 +17,11 @@ app.post('/ask', (req, res) => {
   ];
 
   const child = spawn('claude', args, {
-    env: { ...process.env, HOME: '/home/node', CI: 'true' },
+    env: {
+      HOME: '/home/node', CI: 'true',
+      PATH: process.env.PATH,
+      LANG: process.env.LANG || 'en_US.UTF-8',
+    },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
 
@@ -36,7 +40,7 @@ app.post('/ask', (req, res) => {
     if (code !== 0) {
       console.error('Claude CLI error, code:', code);
       if (stderr) console.error('stderr:', stderr);
-      return res.status(500).json({ error: `CLI exited with code ${code}`, stderr });
+      return res.status(500).json({ error: `CLI exited with code ${code}` });
     }
 
     try {
@@ -77,6 +81,34 @@ app.post('/imagine', async (req, res) => {
 });
 
 app.get('/health', (req, res) => res.json({ status: 'ok' }));
+
+// Spotify OAuth callback for playlist integration
+app.get('/auth/spotify/callback', async (req, res) => {
+  const { code, state } = req.query;
+  if (!code || !state) return res.status(400).send('Missing code or state parameter.');
+  try {
+    const spotifyAuth = require('./spotify-auth');
+    const { displayName, email } = await spotifyAuth.handleCallback(code, state);
+    res.send(`<h2>Spotify Connected!</h2><p>${displayName} (${email || 'no email'}) is now linked. You can close this tab.</p>`);
+  } catch (err) {
+    console.error('Spotify OAuth callback error:', err.message);
+    res.status(500).send(`<h2>Spotify authorization failed</h2><p>${err.message}</p>`);
+  }
+});
+
+// Google OAuth callback for multi-user calendar access
+app.get('/auth/google/callback', async (req, res) => {
+  const { code, state } = req.query;
+  if (!code || !state) return res.status(400).send('Missing code or state parameter.');
+  try {
+    const googleAuth = require('./google-auth');
+    const { email, displayName } = await googleAuth.handleCallback(code, state);
+    res.send(`<h2>Connected!</h2><p>${displayName} (${email}) is now linked to your Discord account. You can close this tab.</p>`);
+  } catch (err) {
+    console.error('OAuth callback error:', err.message);
+    res.status(500).send(`<h2>Authorization failed</h2><p>${err.message}</p>`);
+  }
+});
 
 // Reports channels with active Claude processes — used by Claude before self-rebuilding
 app.get('/active-sessions', (req, res) => {

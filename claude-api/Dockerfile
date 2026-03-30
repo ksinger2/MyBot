@@ -49,6 +49,7 @@ RUN npm install
 COPY *.js ./
 COPY wizards/ ./wizards/
 COPY personalities/ ./personalities/
+COPY skills/ ./skills/
 COPY project-template/ ./project-template/
 COPY entrypoint.sh /app/entrypoint.sh
 RUN chmod +x /app/entrypoint.sh
