@@ -24,20 +24,6 @@ RUN curl -fsSL https://github.com/cloudflare/cloudflared/releases/latest/downloa
     && dpkg -i /tmp/cloudflared.deb \
     && rm /tmp/cloudflared.deb
 
-# Install Chromium and dependencies for browser automation (Playwright MCP)
-RUN apt-get update && apt-get install -y \
-    chromium \
-    fonts-liberation \
-    libgbm1 \
-    libnss3 \
-    libatk-bridge2.0-0 \
-    libgtk-3-0 \
-    libasound2 \
-    && rm -rf /var/lib/apt/lists/*
-
-ENV CHROME_PATH=/usr/bin/chromium
-ENV PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH=/usr/bin/chromium
-
 # Install Claude Code CLI globally
 RUN npm install -g @anthropic-ai/claude-code
 
@@ -46,7 +32,7 @@ WORKDIR /app
 COPY package.json ./
 RUN npm install
 
-COPY *.js .mcp.json ./
+COPY *.js ./
 COPY wizards/ ./wizards/
 COPY personalities/ ./personalities/
 COPY skills/ ./skills/

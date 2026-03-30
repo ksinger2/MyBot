@@ -34,7 +34,6 @@ const MAX_AUTO_CONTINUES = 3;       // Auto-continue up to 3 times on turn limit
 const MAX_TIMEOUT = 90 * 60 * 1000; // 90 minutes hard cap
 const STALL_THRESHOLDS = {
   thinking: 5 * 60 * 1000,   // 5 min — no tool active, just "thinking"
-  browser:  15 * 60 * 1000,  // 15 min — MCP/Playwright tools
   bash:     10 * 60 * 1000,  // 10 min — shell commands
   default:  10 * 60 * 1000,  // 10 min — everything else
 };
@@ -50,11 +49,6 @@ const TOOL_LABELS = {
   Bash: 'Running command', Glob: 'Finding files', Grep: 'Searching code',
   WebSearch: 'Searching web', WebFetch: 'Fetching URL',
   Agent: 'Running sub-agent', Skill: 'Using skill',
-  mcp__playwright_browser_navigate: 'Browsing',
-  mcp__playwright_browser_screenshot: 'Taking screenshot',
-  mcp__playwright_browser_click: 'Clicking',
-  mcp__playwright_browser_type: 'Typing',
-  mcp__playwright_browser_search: 'Searching',
 };
 
 // Discover available agent types from global ~/.claude/agents/ directory
@@ -108,7 +102,6 @@ function freshProgress() {
 
 function getStallThreshold(currentTool) {
   if (!currentTool) return STALL_THRESHOLDS.thinking;
-  if (currentTool.startsWith('mcp__playwright')) return STALL_THRESHOLDS.browser;
   if (currentTool === 'Bash') return STALL_THRESHOLDS.bash;
   return STALL_THRESHOLDS.default;
 }
@@ -409,7 +402,6 @@ function askClaude(prompt, { sessionId = null, personalityFile = null, identity 
       '--model', 'sonnet',
       '--max-turns', String(maxTurns),
       '--dangerously-skip-permissions',
-      '--mcp-config', '/app/.mcp.json',
     ];
 
     if (sessionId) {
@@ -450,7 +442,7 @@ YOUR CAPABILITIES — You are a powerful AI assistant with the following tools. 
 
 1. **IMAGE GENERATION**: You CAN generate images! Run: curl -s -X POST http://localhost:3400/imagine -H "Content-Type: application/json" -d '{"prompt":"your detailed description here"}' — returns a file path. Include that path in your response so Discord attaches it. Use this when asked to draw, generate, create, or send any image/picture/photo/artwork.
 
-2. **WEB BROWSING / GOOGLE**: You have a headless Chromium browser via Playwright MCP tools. You can navigate to websites, take screenshots, click elements, fill forms, and extract content. When asked to look something up, google something, check a website, or find information online — USE THE BROWSER. You can also use WebSearch and WebFetch tools.
+2. **WEB BROWSING / GOOGLE**: You have WebSearch and WebFetch tools. Use WebSearch to google things and WebFetch to read web pages. When asked to look something up, google something, check a website, or find information online — USE THESE TOOLS. Do NOT try to use Playwright or any browser MCP tools — they are not available.
 
 3. **CODE & FILE OPERATIONS**: You can read, write, edit, and create any files. You can run any shell command. You can search codebases with Grep/Glob. You ARE a full software engineer — you build features, fix bugs, refactor code, write tests.
 
@@ -782,7 +774,6 @@ SESSION HANDOFF: When you finish significant work (feature, fix, refactor), upda
         // Send formatted stall diagnostic to Discord before rejecting
         if (discordChannel) {
           const thresholdLabel = !p.currentTool ? 'thinking'
-            : p.currentTool.startsWith('mcp__playwright') ? 'browser'
             : p.currentTool === 'Bash' ? 'bash' : 'default';
           const diagLines = [
             `🛑 **Stalled and killed** after ${Math.round(idle / 60000)}min of silence`,
