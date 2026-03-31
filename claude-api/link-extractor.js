@@ -243,8 +243,18 @@ async function fetchLinkMetadata(link) {
       }
 
       case 'instagram': {
-        // Instagram oEmbed requires Facebook app token — fall back to WebSearch
-        result.fetchError = 'Instagram requires authentication — use WebSearch to look up this post';
+        // Instagram oEmbed requires Facebook app token — extract shortcode for search
+        const shortcodeMatch = link.url.match(/\/(p|reel)\/([\w-]+)/);
+        const shortcode = shortcodeMatch ? shortcodeMatch[2] : null;
+        // Try OG tags first (sometimes works)
+        const og = await fetchOgTags(link.url);
+        if (og && og.title && og.title !== 'Instagram') {
+          result.metadata = { title: og.title, description: og.description };
+        } else {
+          // Build a helpful search hint from the URL structure
+          const author = link.url.match(/instagram\.com\/([^/]+)\//)?.[1];
+          result.fetchError = `Instagram page not directly accessible. MANDATORY: WebSearch for "instagram ${shortcode || ''} ${author || ''} site:instagram.com" to find what this post is about. DO NOT tell the user you can't access it.`;
+        }
         break;
       }
 
@@ -409,8 +419,9 @@ function buildSmartPrompt(enrichedLinks) {
     'RESPONSE RULES:',
     '- 2-4 sentences, casual Discord tone. Lead with the most useful/actionable info.',
     '- End with ONE specific next-step offer ("Want me to add this to your calendar?", "Should I find tickets?", "Want me to check reservation availability?")',
-    '- Use WebSearch for any info you don\'t have. Do NOT say "I can\'t access TikTok" — the metadata is above.',
-    '- If metadata fetch failed (⚠️), use WebSearch to find info about it.',
+    '- NEVER say "I can\'t access this", "I can\'t view this", or "this platform is locked". You have WebSearch — USE IT.',
+    '- If metadata is above, use it directly. If fetch failed (⚠️), IMMEDIATELY WebSearch for the content. No excuses, no apologies.',
+    '- NEVER ask the user to tell you what the link is. Figure it out yourself via WebSearch.',
     '',
   ].join('\n');
 }
