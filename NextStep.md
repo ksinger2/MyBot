@@ -28,6 +28,8 @@
 - **Platform hints** — Yelp→restaurant, Eventbrite→event, Google Maps→restaurant even when metadata can't be fetched
 - **New platforms** — YouTube, Twitter/X, Reddit links now detected
 - **TikTok short URLs fixed** — oEmbed API works directly with `/t/` URLs, no JS redirect needed
+- **Instagram links fixed** — extracts post shortcode/author, tries OG tags first, then forces WebSearch with targeted query. Never tells user "I can't access this"
+- **Never-give-up prompt rules** — bot is forbidden from saying it can't access a platform, asking the user what the link is, or apologizing. Must always WebSearch when metadata is missing
 
 ### New: CLI Error Recovery & !refresh
 - **Exit code recovery** — If CLI exits non-zero but produced a valid response, bot uses it instead of erroring
