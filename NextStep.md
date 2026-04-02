@@ -1,9 +1,10 @@
-# MyBot — Session Handoff (2026-03-30)
+# MyBot — Session Handoff (2026-04-02)
 
 ## Current Status
 - Bot is running via `docker compose up -d --build` from the MyBot directory
 - Docker Engine in WSL (v29.3.1), `restart: unless-stopped` for crash recovery
 - All features deployed and healthy
+- **Watchdog auto-recovery** in place — container self-heals on failure
 
 ## What's Working
 - Discord bot (**BiancaDaCow**) is live and responding
@@ -37,6 +38,12 @@
 - **Auto-retry with delay** — CLI failures get one retry after 3s before giving up
 - **`!refresh` command** — Nuclear reset from Discord: kills processes, clears all state, purges CLI session cache, restarts container
 - **Better error messages** — Error replies now suggest `!refresh` as a fix option
+
+### Watchdog & Auto-Recovery
+- **`watchdog.sh`** — checks container health every 5 min via cron; tries simple restart first, then full prune + rebuild if needed
+- **Boot sequence** — `wsl-autostart.bat` starts Docker, then runs watchdog to bring container up
+- **Cron job** — `*/5 * * * *` runs watchdog.sh, logs to `/tmp/mybot-watchdog.log` (auto-trimmed)
+- **Handles corrupted build cache** — the exact failure mode that took the bot down on 2026-04-02
 
 ### Security Hardening
 - **Access control** — `ALLOWED_USER_IDS` and `ADMIN_USER_IDS` env vars (empty = allow all for backward compat)
@@ -86,6 +93,7 @@ Discord message → Discord.js bot (claude-api container) → Claude CLI (stream
 | `claude-api/monitor-runner.js` | Timer-based polling loop |
 | `claude-api/briefings.js` | Briefing system — data fetchers, scheduler |
 | `claude-api/error-alerting.js` | Error alerting to #bot-errors |
+| `watchdog.sh` | Auto-recovery — checks container health, rebuilds if needed |
 | `docker-compose.yml` | Container config, env vars, volume mounts |
 
 ## Environment Variables Needed
