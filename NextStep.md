@@ -1,4 +1,4 @@
-# MyBot — Session Handoff (2026-04-02)
+# MyBot — Session Handoff (2026-04-05)
 
 ## Current Status
 - Bot is running via `docker compose up -d --build` from the MyBot directory
@@ -41,9 +41,20 @@
 
 ### Watchdog & Auto-Recovery
 - **`watchdog.sh`** — checks container health every 5 min via cron; tries simple restart first, then full prune + rebuild if needed
-- **Boot sequence** — `wsl-autostart.bat` starts Docker, then runs watchdog to bring container up
+- **Boot sequence** — `wsl-autostart.bat` starts Docker Desktop (if installed), waits 30s, then runs watchdog to bring container up
 - **Cron job** — `*/5 * * * *` runs watchdog.sh, logs to `/tmp/mybot-watchdog.log` (auto-trimmed)
 - **Handles corrupted build cache** — the exact failure mode that took the bot down on 2026-04-02
+- **Windows Task Scheduler** — `MyBot Autostart` task (ONLOGON) runs `wsl-autostart.bat` on every user logon, logs to `%USERPROFILE%\mybot-autostart.log`
+- **Optional `MyBot Autostart Boot`** — ONSTART+SYSTEM trigger for unattended reboots (requires admin cmd, not yet created; ONLOGON is sufficient for personal machines)
+
+### Full Recovery Matrix
+| Failure | Recovered by |
+|---|---|
+| Container crash | Docker `restart: unless-stopped` |
+| Container stuck/unhealthy | Cron watchdog (every 5 min) |
+| Docker daemon restart | Cron watchdog |
+| WSL restart | Cron watchdog (once WSL+cron are back) |
+| Windows reboot / user logon | Task Scheduler `MyBot Autostart` → `wsl-autostart.bat` → watchdog |
 
 ### Security Hardening
 - **Access control** — `ALLOWED_USER_IDS` and `ADMIN_USER_IDS` env vars (empty = allow all for backward compat)
