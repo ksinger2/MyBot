@@ -24,24 +24,28 @@ RUN curl -fsSL https://github.com/cloudflare/cloudflared/releases/latest/downloa
     && dpkg -i /tmp/cloudflared.deb \
     && rm /tmp/cloudflared.deb
 
-# Install Claude Code CLI globally
-RUN npm install -g @anthropic-ai/claude-code
+# Install Claude Code CLI, PM2, and Playwright MCP globally
+RUN npm install -g @anthropic-ai/claude-code pm2 @playwright/mcp
+
+# Install Playwright with Chromium for browser automation testing
+RUN npx playwright install --with-deps chromium
 
 WORKDIR /app
 
 COPY package.json ./
 RUN npm install
 
-COPY *.js ./
+COPY *.js .mcp.json ./
 COPY wizards/ ./wizards/
 COPY personalities/ ./personalities/
+COPY adapters/ ./adapters/
 COPY skills/ ./skills/
 COPY project-template/ ./project-template/
 COPY entrypoint.sh /app/entrypoint.sh
 RUN chmod +x /app/entrypoint.sh
 
-# Create .claude directory with correct ownership before switching user
-RUN mkdir -p /home/node/.claude && chown node:node /home/node/.claude
+# Create writable directories for runtime data (node user can't write to /app)
+RUN mkdir -p /home/node/.claude /app/data && chown -R node:node /home/node/.claude /app/data
 
 # Run as non-root user (required by Claude CLI)
 USER node

@@ -24,17 +24,23 @@ Identify and read the most critical source files for the project. Look at:
 Run these commands to understand current state:
 - `git log --oneline -10` to see recent commits
 - `git status` to see uncommitted changes
-- Check if services are running (docker, dev servers, etc.)
+- `PM2_HOME=/home/node/.claude/.pm2 pm2 list` to check running services
+- Check if dev server is running: `curl -sf http://localhost:3000/ > /dev/null && echo "Dev server running on 3000" || echo "No dev server on 3000"`
 
-## 5. Kick Off Domain Reviews
+## 5. Settings & Config
+- Read `.claude/settings.json` if it exists for project-specific config
+- Read `.claude/settings.local.json` if it exists
+
+## 6. Kick Off Domain Reviews
 Launch agents in parallel to review their domains:
 - **Engineering agents**: Read code files, check for technical debt, review architecture
 - **Design agents**: Read any design docs, check UI consistency
 - **Product agents**: Read any PRDs or specs, check feature completeness
 
-## 6. Summarize
+## 7. Summarize
 After reading everything, provide:
 1. A brief summary of the project state
 2. What's currently working vs broken
-3. The recommended next action to take
-4. Any blockers or questions to resolve first
+3. Running services (PM2 processes, dev servers)
+4. The recommended next action to take
+5. Any blockers or questions to resolve first

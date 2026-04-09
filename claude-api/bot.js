@@ -29,9 +29,9 @@ function isAdmin(userId) { return ADMIN_USER_IDS.size === 0 || ADMIN_USER_IDS.ha
 const PERSONALITIES_DIR = path.join(__dirname, 'personalities');
 const DEFAULT_PERSONALITY = 'tiffany_pollard';
 const DEFAULT_WORKSPACE = '/workspace';
-const DEFAULT_MAX_TURNS = 50;       // Let Claude work autonomously for many turns
-const MAX_AUTO_CONTINUES = 3;       // Auto-continue up to 3 times on turn limit
-const MAX_TIMEOUT = 90 * 60 * 1000; // 90 minutes hard cap
+const DEFAULT_MAX_TURNS = parseInt(process.env.DEFAULT_MAX_TURNS, 10) || 50;
+const MAX_AUTO_CONTINUES = parseInt(process.env.MAX_AUTO_CONTINUES, 10) || 3;
+const MAX_TIMEOUT = (parseInt(process.env.MAX_TIMEOUT_MINUTES, 10) || 90) * 60 * 1000;
 const STALL_THRESHOLDS = {
   thinking: 5 * 60 * 1000,   // 5 min — no tool active, just "thinking"
   bash:     10 * 60 * 1000,  // 10 min — shell commands
@@ -104,6 +104,24 @@ function getStallThreshold(currentTool) {
   if (!currentTool) return STALL_THRESHOLDS.thinking;
   if (currentTool === 'Bash') return STALL_THRESHOLDS.bash;
   return STALL_THRESHOLDS.default;
+}
+
+/**
+ * Gracefully kill a child process: SIGTERM first, then SIGKILL after timeout.
+ * Returns a Promise that resolves when the process is confirmed dead.
+ */
+function forceKillProcess(proc, timeoutMs = 3000) {
+  if (!proc || proc.exitCode !== null) return Promise.resolve();
+  return new Promise((resolve) => {
+    let resolved = false;
+    const done = () => { if (!resolved) { resolved = true; resolve(); } };
+    proc.once('exit', done);
+    proc.kill('SIGTERM');
+    setTimeout(() => {
+      try { process.kill(proc.pid, 0); proc.kill('SIGKILL'); } catch {}
+      setTimeout(done, 1000);
+    }, timeoutMs);
+  });
 }
 
 function pushRawLog(progress, entry) {
@@ -277,14 +295,21 @@ Begin Phase 1 now.`;
 // Per-channel state
 const channels = new Map();
 
-// Graceful shutdown — persist active task state so we can resume after restart
-function gracefulShutdown(signal) {
-  console.log(`[shutdown] Received ${signal}, persisting state...`);
+// Graceful shutdown — kill children, persist state, then exit
+async function gracefulShutdown(signal) {
+  console.log(`[shutdown] Received ${signal}, killing children and persisting state...`);
+  const killPromises = [];
   for (const [channelId, state] of channels) {
+    if (state.process) killPromises.push(forceKillProcess(state.process, 3000));
     if (state.busy && state.activeTask) {
       saveChannelState(channelId, state);
     }
   }
+  // Wait for all children to die (5s safety cap)
+  await Promise.race([
+    Promise.all(killPromises),
+    new Promise(resolve => setTimeout(resolve, 5000)),
+  ]);
   flushPendingWrites();
   process.exit(0);
 }
@@ -325,6 +350,7 @@ function getChannel(channelId) {
       personality: saved?.personality || DEFAULT_PERSONALITY,
       identity: saved?.identity ? { ...saved.identity } : { ...DEFAULT_IDENTITY },
       cwd: saved?.cwd || DEFAULT_WORKSPACE,
+      config: saved?.config || {},  // per-channel overrides (maxTurns, maxContinues, maxTimeout)
       process: null,  // active child process
       busy: false,    // is Claude currently working
       wizard: null,   // active wizard state (multi-step interactions)
@@ -354,7 +380,23 @@ function listPersonalities() {
     .map(f => f.replace('.md', ''));
 }
 
-function askClaude(prompt, { sessionId = null, personalityFile = null, identity = null, cwd = DEFAULT_WORKSPACE, maxTurns = DEFAULT_MAX_TURNS, channelState = null, discordChannel = null, discordUserId = null } = {}) {
+function askClaude(prompt, { sessionId = null, personalityFile = null, identity = null, cwd = DEFAULT_WORKSPACE, maxTurns = null, channelState = null, discordChannel = null, discordUserId = null } = {}) {
+  // Resolve maxTurns from per-channel config, then global default
+  if (!maxTurns) maxTurns = channelState?.config?.maxTurns || DEFAULT_MAX_TURNS;
+
+  // Auto-inject .claude/commands/ into project if missing (ensures /reinit, /bug-list available)
+  const templateCommandsDir = path.join(__dirname, 'project-template', '.claude', 'commands');
+  if (cwd !== DEFAULT_WORKSPACE && fs.existsSync(templateCommandsDir)) {
+    try {
+      const projectCommandsDir = path.join(cwd, '.claude', 'commands');
+      if (!fs.existsSync(projectCommandsDir)) fs.mkdirSync(projectCommandsDir, { recursive: true });
+      for (const f of fs.readdirSync(templateCommandsDir)) {
+        const dest = path.join(projectCommandsDir, f);
+        if (!fs.existsSync(dest)) fs.copyFileSync(path.join(templateCommandsDir, f), dest);
+      }
+    } catch {}
+  }
+
   return new Promise((resolve, reject) => {
     // Auto-load project context on new sessions (CLAUDE.md + NextSteps.md + session journal)
     if (!sessionId) {
@@ -402,6 +444,7 @@ function askClaude(prompt, { sessionId = null, personalityFile = null, identity 
       '--model', 'sonnet',
       '--max-turns', String(maxTurns),
       '--dangerously-skip-permissions',
+      '--mcp-config', '/app/.mcp.json',
     ];
 
     if (sessionId) {
@@ -442,7 +485,7 @@ YOUR CAPABILITIES — You are a powerful AI assistant with the following tools. 
 
 1. **IMAGE GENERATION**: You CAN generate images! Run: curl -s -X POST http://localhost:3400/imagine -H "Content-Type: application/json" -d '{"prompt":"your detailed description here"}' — returns a file path. Include that path in your response so Discord attaches it. Use this when asked to draw, generate, create, or send any image/picture/photo/artwork.
 
-2. **WEB BROWSING / GOOGLE**: You have WebSearch and WebFetch tools. Use WebSearch to google things and WebFetch to read web pages. When asked to look something up, google something, check a website, or find information online — USE THESE TOOLS. Do NOT try to use Playwright or any browser MCP tools — they are not available.
+2. **WEB BROWSING / GOOGLE**: You have WebSearch and WebFetch tools for quick lookups. Use WebSearch to google things and WebFetch to read web pages. For INTERACTIVE testing (clicking buttons, filling forms, taking screenshots, testing user flows), use the Playwright MCP tools — they ARE available and run headless Chromium. Playwright is your primary tool for QA, visual testing, and bug hunting.
 
 3. **CODE & FILE OPERATIONS**: You can read, write, edit, and create any files. You can run any shell command. You can search codebases with Grep/Glob. You ARE a full software engineer — you build features, fix bugs, refactor code, write tests.
 
@@ -482,11 +525,47 @@ Convert relative times ("tomorrow", "in 2 hours", "next Friday") to absolute ISO
 If the endpoint returns an error saying the user hasn't connected Google Calendar, tell them to run \`!connect\` first.
 After setting a reminder, confirm with the title and when it's set for. Keep it brief.
 
+10. **BACKGROUND SERVICES (PM2)**: When starting dev servers or long-running processes, ALWAYS use PM2:
+   - Start: \`PM2_HOME=/home/node/.claude/.pm2 pm2 start npm --name "project-dev" -- run dev\` or \`PM2_HOME=/home/node/.claude/.pm2 pm2 start server.js --name "my-api"\`
+   - List: \`PM2_HOME=/home/node/.claude/.pm2 pm2 list\`
+   - Logs: \`PM2_HOME=/home/node/.claude/.pm2 pm2 logs <name>\`
+   - Restart: \`PM2_HOME=/home/node/.claude/.pm2 pm2 restart <name>\`
+   - Stop: \`PM2_HOME=/home/node/.claude/.pm2 pm2 delete <name>\`
+   - Save state: \`PM2_HOME=/home/node/.claude/.pm2 pm2 dump\` (so services survive bot restarts)
+   ALWAYS set PM2_HOME=/home/node/.claude/.pm2 in every PM2 command. PM2 processes persist independently of your CLI session. NEVER use raw \`node server.js &\` or \`npm run dev &\` — always PM2. After starting/stopping, always \`pm2 dump\`.
+
+11. **BROWSER TESTING (Playwright)**: You have Playwright MCP tools for headless Chromium automation. Use them for:
+   - QA testing: navigate pages, click buttons, fill forms, check console errors
+   - Visual testing: take screenshots on every page
+   - Mobile testing: set viewport to emulate devices:
+     * iPhone 14: 390x844
+     * Pixel 7: 412x915
+     * iPad: 820x1180
+   Use Playwright after implementing features to verify they work visually.
+
+AVAILABLE PROJECT COMMANDS: When working on a project with .claude/commands/, use these:
+- \`/reinit\` — Re-initialize project context (read NextSteps.md, CLAUDE.md, check services, git status)
+- \`/bug-list\` — Crawl the app with Playwright, screenshot every page, find and list all bugs
+- \`/qa\` — Full QA pass
+- \`/fix\` — Team-based fix workflow
+- \`/audit\` — Comprehensive project audit
+Use /reinit at the start of work sessions. Use /bug-list after implementing features.
+
+TEST-FIX-RETEST LOOP: After implementing any feature or fix, follow this cycle:
+1. Start the dev server with PM2 (if not running)
+2. Test with Playwright — navigate pages, screenshot, check console errors
+3. Identify issues
+4. Fix the code
+5. Restart server: \`PM2_HOME=/home/node/.claude/.pm2 pm2 restart <name>\`
+6. Re-test with Playwright — screenshot the same pages
+7. Loop until clean
+Do NOT declare a feature complete without testing it visually.
+
 NEVER say you can't do something if one of these capabilities covers it. Try first, explain only if it actually fails.
 
 AUTONOMY: You are fully autonomous. Never stop to ask the user for confirmation unless it involves spending money, sending emails/messages, or destructive operations (deleting repos, dropping databases). If something fails, try a different approach. If stuck after 3 attempts, summarize what you tried, then move on. The user CANNOT respond while you're running — never wait for input. You have up to ${maxTurns} turns.
 
-SESSION HANDOFF: When you finish significant work (feature, fix, refactor), update NextSteps.md in the project root with what you did, what's working, what's broken, and specific next steps. Keep it concise — bullet points. This is how your future self picks up context.`);
+SESSION HANDOFF (MANDATORY): Before your LAST turn in any session, you MUST update NextSteps.md in the project root. Include: what you did (2-3 bullets), current state (working/broken), running services, and specific next steps. This is NON-OPTIONAL — future sessions depend on it.`);
     if (identity) {
       systemParts.push(`Your name is ${identity.name}. You are ${identity.description}.`);
     }
@@ -744,14 +823,17 @@ SESSION HANDOFF: When you finish significant work (feature, fix, refactor), upda
       }
     });
 
-    // Hard cap timeout — absolute maximum runtime
-    const hardTimeout = setTimeout(() => {
-      child.kill();
+    // Hard cap timeout — absolute maximum runtime (graceful kill)
+    const hardTimeout = setTimeout(async () => {
+      console.log(`[hard-timeout] Claude CLI hit hard timeout after ${MAX_TIMEOUT / 60000} minutes`);
+      await forceKillProcess(child, 5000);
       if (channelState) {
         channelState.process = null;
         channelState.busy = false;
         channelState.startedAt = null;
         channelState.progress = freshProgress();
+        saveChannelState(channelState._channelId, channelState);
+        flushPendingWrites();
       }
       const timeoutErr = new Error(`Claude CLI hit hard timeout after ${MAX_TIMEOUT / 60000} minutes`);
       sendErrorAlert(timeoutErr, { source: 'askClaude hard timeout' });
@@ -763,7 +845,11 @@ SESSION HANDOFF: When you finish significant work (feature, fix, refactor), upda
       if (!channelState) return;
       const p = channelState.progress;
       const idle = Date.now() - p.lastActivity;
-      const threshold = getStallThreshold(p.currentTool);
+      let threshold = getStallThreshold(p.currentTool);
+      // Sub-agents work without emitting output — use longer threshold
+      if (p.activeAgents.size > 0) {
+        threshold = Math.max(threshold, 30 * 60 * 1000); // 30 min minimum
+      }
 
       // At 80% of threshold: send warning (once per stall event)
       if (idle >= threshold * 0.8 && !p.stallWarned && discordChannel) {
@@ -774,7 +860,7 @@ SESSION HANDOFF: When you finish significant work (feature, fix, refactor), upda
 
       // At 100%: kill with formatted diagnostic
       if (idle >= threshold) {
-        child.kill();
+        forceKillProcess(child).catch(() => {});
         const lastEntries = p.rawLog.slice(-5).map(e => `[${e.ts}] ${e.text}`).join('\n');
 
         // Send formatted stall diagnostic to Discord before rejecting
@@ -881,11 +967,12 @@ async function runClaudeWithContinuation(prompt, opts, discordChannel) {
   let continueCount = 0;
   let totalCost = result.cost || 0;
   let totalTurns = result.numTurns || 0;
+  const maxContinues = opts.channelState?.config?.maxContinues || MAX_AUTO_CONTINUES;
 
-  while (result.hitTurnLimit && continueCount < MAX_AUTO_CONTINUES && !result.stopped) {
+  while (result.hitTurnLimit && continueCount < maxContinues && !result.stopped) {
     continueCount++;
     await discordChannel.send(
-      `*Turn limit reached (${continueCount}/${MAX_AUTO_CONTINUES}) — auto-continuing...*`
+      `*Turn limit reached (${continueCount}/${maxContinues}) — auto-continuing...*`
     ).catch(() => {});
     result = await askClaude(
       'You hit the turn limit. Continue where you left off. If the task is complete, just summarize what you did.',
@@ -895,9 +982,19 @@ async function runClaudeWithContinuation(prompt, opts, discordChannel) {
     totalTurns += result.numTurns || 0;
   }
 
-  if (result.hitTurnLimit && continueCount >= MAX_AUTO_CONTINUES) {
+  if (result.hitTurnLimit && continueCount >= maxContinues) {
+    // Final handoff turn — ensure NextSteps.md is updated
+    try {
+      const handoff = await askClaude(
+        'You have reached the turn limit. This is your LAST turn. Update NextSteps.md with: what you accomplished, what is working, what is broken, and specific next steps. Be concise — bullet points only.',
+        { ...opts, sessionId: result.sessionId, maxTurns: 1 }
+      );
+      totalCost += handoff.cost || 0;
+      totalTurns += handoff.numTurns || 0;
+      result = { ...handoff, cost: totalCost, numTurns: totalTurns };
+    } catch {}
     await discordChannel.send(
-      `*Reached max auto-continuations (${MAX_AUTO_CONTINUES}). Send another message to keep going.*`
+      `*Reached max auto-continuations (${maxContinues}). Session handed off via NextSteps.md. Send another message to keep going.*`
     ).catch(() => {});
   }
 
@@ -952,11 +1049,21 @@ async function sendLongMessage(message, text, cwd = DEFAULT_WORKSPACE) {
   // Send first chunk with any image attachments
   await message.reply({ content: chunks[0], files: files.length ? files : undefined }).catch(e => console.error('Reply failed:', e.message));
 
-  for (let i = 1; i < chunks.length && i < 8; i++) {
-    await message.channel.send(chunks[i]).catch(e => console.error('Chunk send failed:', e.message));
-  }
   if (chunks.length > 8) {
-    await message.channel.send(`*(${chunks.length - 8} more chunks truncated)*`);
+    // Too many chunks — send first 4 inline, then upload full text as attachment
+    for (let i = 1; i < Math.min(chunks.length, 4); i++) {
+      await message.channel.send(chunks[i]).catch(e => console.error('Chunk send failed:', e.message));
+    }
+    const fullTextBuffer = Buffer.from(text, 'utf-8');
+    const attachment = new AttachmentBuilder(fullTextBuffer, { name: 'full-response.txt' });
+    await message.channel.send({
+      content: `*Response was too long for Discord (${chunks.length} chunks). Full text attached:*`,
+      files: [attachment],
+    }).catch(e => console.error('Attachment send failed:', e.message));
+  } else {
+    for (let i = 1; i < chunks.length; i++) {
+      await message.channel.send(chunks[i]).catch(e => console.error('Chunk send failed:', e.message));
+    }
   }
 }
 
@@ -1037,7 +1144,7 @@ function parseFrequency(input) {
 }
 
 // Commands that require admin privileges
-const ADMIN_COMMANDS = new Set(['!restart', '!killall', '!identity', '!name', '!personality', '!autoschedule']);
+const ADMIN_COMMANDS = new Set(['!restart', '!killall', '!identity', '!name', '!personality', '!autoschedule', '!config']);
 
 async function handleCommand(message) {
   const parts = message.content.trim().split(/\s+/);
@@ -1054,10 +1161,12 @@ async function handleCommand(message) {
   switch (cmd) {
     case '!stop': {
       if (state.process) {
-        state._userStopped = true; // flag so silent-stop check knows user did this
-        state.process.kill();
+        state._userStopped = true;
+        await forceKillProcess(state.process);
         state.process = null;
         state.busy = false;
+        state.startedAt = null;
+        state.progress = freshProgress();
         const dropped = state.queue.length;
         state.queue = [];
         const extra = dropped ? ` (${dropped} queued message${dropped > 1 ? 's' : ''} cleared)` : '';
@@ -1069,12 +1178,17 @@ async function handleCommand(message) {
     }
 
     case '!clear': {
-      if (state.busy) {
-        await message.reply('Claude is currently working. Use `!stop` first, then `!clear`.');
-        break;
+      if (state.process) {
+        state._userStopped = true;
+        await forceKillProcess(state.process);
+        state.process = null;
+        state.busy = false;
+        state.startedAt = null;
+        state.progress = freshProgress();
       }
       state.sessionId = null;
       state.queue = [];
+      state.activeTask = null;
       saveChannelState(message.channel.id, state);
       await message.reply('Context cleared. Next message starts a fresh conversation (no memory of previous messages).');
       break;
@@ -1082,14 +1196,52 @@ async function handleCommand(message) {
 
     case '!kill': {
       if (state.process) {
-        state.process.kill();
+        await forceKillProcess(state.process);
         state.process = null;
         state.busy = false;
+        state.startedAt = null;
+        state.progress = freshProgress();
       }
       state.sessionId = null;
       state.queue = [];
+      state.activeTask = null;
       saveChannelState(message.channel.id, state);
       await message.reply('Process killed and session destroyed. Full reset — starting from scratch.');
+      break;
+    }
+
+    case '!config': {
+      const configParts = arg ? arg.trim().split(/\s+/) : [];
+      const configKey = configParts[0];
+      const configVal = configParts[1];
+
+      if (!configKey || configKey === 'show') {
+        const c = state.config || {};
+        const lines = [
+          `**Channel Config:**`,
+          `Max turns: ${c.maxTurns || DEFAULT_MAX_TURNS} ${c.maxTurns ? '(custom)' : '(default)'}`,
+          `Auto-continues: ${c.maxContinues || MAX_AUTO_CONTINUES} ${c.maxContinues ? '(custom)' : '(default)'}`,
+          `Timeout: ${c.maxTimeout ? c.maxTimeout / 60000 : MAX_TIMEOUT / 60000}min ${c.maxTimeout ? '(custom)' : '(default)'}`,
+        ];
+        await message.reply(lines.join('\n'));
+      } else if (configKey === 'turns' && configVal) {
+        state.config = state.config || {};
+        state.config.maxTurns = parseInt(configVal, 10);
+        saveChannelState(message.channel.id, state);
+        await message.reply(`Max turns set to **${state.config.maxTurns}** for this channel.`);
+      } else if (configKey === 'continues' && configVal) {
+        state.config = state.config || {};
+        state.config.maxContinues = parseInt(configVal, 10);
+        saveChannelState(message.channel.id, state);
+        await message.reply(`Auto-continues set to **${state.config.maxContinues}** for this channel.`);
+      } else if (configKey === 'timeout' && configVal) {
+        state.config = state.config || {};
+        state.config.maxTimeout = parseInt(configVal, 10) * 60 * 1000;
+        saveChannelState(message.channel.id, state);
+        await message.reply(`Timeout set to **${configVal} minutes** for this channel.`);
+      } else {
+        await message.reply('Usage: `!config show` | `!config turns <N>` | `!config continues <N>` | `!config timeout <minutes>`');
+      }
       break;
     }
 
@@ -1193,22 +1345,29 @@ async function handleCommand(message) {
       }
       // Flush persisted state before shutdown
       flushPendingWrites();
-      // Kill all active processes first
+      // Kill all active processes with escalation
+      const restartKills = [];
       for (const [, s] of channels) {
-        if (s.process) s.process.kill();
+        if (s.process) restartKills.push(forceKillProcess(s.process));
       }
+      await Promise.all(restartKills);
       // Exit cleanly — Docker restart policy will bring the container back up
       setTimeout(() => process.exit(0), 500);
       break;
     }
 
     case '!killall': {
+      const killAllPromises = [];
       for (const [chId, s] of channels) {
-        if (s.process) s.process.kill();
+        if (s.process) killAllPromises.push(forceKillProcess(s.process));
+        s.process = null;
+        s.busy = false;
         s.queue = [];
         s.sessionId = null;
+        s.activeTask = null;
         saveChannelState(chId, s);
       }
+      await Promise.all(killAllPromises);
       flushPendingWrites();
       channels.clear();
       await message.reply('All processes killed and all sessions destroyed across every channel.');
@@ -1218,10 +1377,12 @@ async function handleCommand(message) {
     case '!refresh': {
       // Nuclear reset: kill all processes, clear all state, clear CLI session cache, restart
       const statusMsg = await message.reply('Refreshing... killing processes, clearing all state, and restarting.');
-      // Kill all active processes
+      // Kill all active processes with escalation
+      const refreshKills = [];
       for (const [, s] of channels) {
-        if (s.process) s.process.kill();
+        if (s.process) refreshKills.push(forceKillProcess(s.process));
       }
+      await Promise.all(refreshKills);
       // Clear all channel state
       for (const [chId, s] of channels) {
         s.sessionId = null;
@@ -1310,7 +1471,9 @@ async function handleCommand(message) {
         `**Monitors:** \`!monitor ci <repo>\` · \`!monitor health <url>\` · \`!monitors\` · \`!monitor remove/pause/resume/check <#>\`\n` +
         `**Briefing:** \`!briefing\` · \`!weekly\`\n` +
         `**Preview:** \`!preview <port>\` — smart preview (asks device) · \`!preview <port> local\` — localhost link · \`!preview <port> phone\` — tunnel + magic link · \`!preview stop\`\n` +
-        `**Other:** \`!email <request>\` · \`!imagine <desc>\`\n\n` +
+        `**Services:** \`!services\` — list PM2 background services · \`!service stop|logs <name>\`\n` +
+        `**Config:** \`!config show\` · \`!config turns|continues|timeout <N>\` — per-channel limits\n` +
+        `**Other:** \`!email <request>\` · \`!imagine <desc>\` · \`!ainews\`\n\n` +
         `Just type what you want built. Claude runs autonomously — reads, writes, commits, pushes. Use \`!stop\` to interrupt, \`!clear\` to start over.\n\n` +
         `Current: **${state.identity.name}** | ${state.personality} | \`${state.cwd}\` | ${state.busy ? '🔄 WORKING' : (state.sessionId ? '💤 idle' : '⚫ no session')}`;
       await sendLongMessage(message, helpText, state.cwd);
@@ -1350,6 +1513,15 @@ async function handleCommand(message) {
         saveChannelState(message.channel.id, state);
         await message.reply(`Identity updated: **${state.identity.name}** — ${state.identity.description}\nSession cleared.`);
       }
+      break;
+    }
+
+    case '!ainews': {
+      const aiNews = require('./ai-news');
+      await message.reply('Scanning AI news now...');
+      aiNews.sendAINews(client).catch(err => {
+        message.reply(`AI news failed: ${err.message}`).catch(() => {});
+      });
       break;
     }
 
@@ -1510,6 +1682,56 @@ async function handleCommand(message) {
         await message.reply(`**System Processes:**\n\`\`\`\n${output}\n\`\`\`${channelInfo}`);
       } catch (err) {
         await message.reply(`Error checking processes: ${err.message}`);
+      }
+      break;
+    }
+
+    case '!services': {
+      try {
+        const pm2Env = { ...process.env, PM2_HOME: '/home/node/.claude/.pm2' };
+        const output = execSync('pm2 jlist', { encoding: 'utf-8', timeout: 5000, env: pm2Env });
+        const processes = JSON.parse(output);
+        if (processes.length === 0) {
+          await message.reply('No background services running. Claude can start dev servers with PM2.');
+          break;
+        }
+        const lines = processes.map(p => {
+          const status = p.pm2_env?.status || 'unknown';
+          const mem = p.monit ? Math.round(p.monit.memory / 1024 / 1024) : 0;
+          const uptime = p.pm2_env?.pm_uptime ? Math.round((Date.now() - p.pm2_env.pm_uptime) / 1000) : 0;
+          const uptimeStr = uptime > 3600 ? `${Math.round(uptime / 3600)}h` : uptime > 60 ? `${Math.round(uptime / 60)}m` : `${uptime}s`;
+          return `**${p.name}** — ${status} | PID ${p.pid} | ${mem}MB | up ${uptimeStr} | \`${p.pm2_env?.cwd || '?'}\``;
+        });
+        await message.reply(`**Background Services (PM2):**\n${lines.join('\n')}`);
+      } catch (err) {
+        await message.reply(`Error listing services: ${err.message.substring(0, 200)}`);
+      }
+      break;
+    }
+
+    case '!service': {
+      const svcParts = arg ? arg.trim().split(/\s+/) : [];
+      const svcAction = svcParts[0];
+      const svcName = svcParts.slice(1).join(' ');
+      const pm2Env = { ...process.env, PM2_HOME: '/home/node/.claude/.pm2' };
+
+      if (svcAction === 'stop' && svcName) {
+        try {
+          execSync(`pm2 delete ${JSON.stringify(svcName)}`, { encoding: 'utf-8', timeout: 5000, env: pm2Env });
+          execSync('pm2 dump', { timeout: 5000, env: pm2Env });
+          await message.reply(`Service **${svcName}** stopped and removed.`);
+        } catch (err) {
+          await message.reply(`Failed to stop service: ${err.message.substring(0, 200)}`);
+        }
+      } else if (svcAction === 'logs' && svcName) {
+        try {
+          const logs = execSync(`pm2 logs ${JSON.stringify(svcName)} --nostream --lines 20`, { encoding: 'utf-8', timeout: 5000, env: pm2Env });
+          await message.reply(`**Logs for ${svcName}:**\n\`\`\`\n${logs.substring(0, 1800)}\n\`\`\``);
+        } catch (err) {
+          await message.reply(`Failed to get logs: ${err.message.substring(0, 200)}`);
+        }
+      } else {
+        await message.reply('Usage: `!service stop <name>` or `!service logs <name>`');
       }
       break;
     }
@@ -2307,6 +2529,10 @@ client.on('clientReady', () => {
   const briefings = require('./briefings');
   briefings.startScheduler(client);
 
+  // Start AI news pulse (every 3 hours)
+  const aiNews = require('./ai-news');
+  aiNews.startAINewsScheduler(client);
+
   // Start user-created schedules
   startAllSchedules(client);
 
@@ -2349,6 +2575,9 @@ async function resumeChannel(channelId, savedState) {
     if (ch) ch.send('*I crashed while working and failed to resume after 2 attempts. Send your request again if needed.*').catch(() => {});
     return;
   }
+
+  // CRITICAL: Set busy immediately before any async work to prevent race
+  state.busy = true;
 
   // Increment attempt counter
   task.resumeAttempts = (task.resumeAttempts || 0) + 1;
@@ -2449,6 +2678,9 @@ async function resumeChannel(channelId, savedState) {
 async function processQueue(state) {
   if (!state.queue.length) return;
 
+  // CRITICAL: Set busy BEFORE splicing to prevent race with incoming messages
+  state.busy = true;
+
   // Combine all queued messages into one prompt
   const queued = state.queue.splice(0);
   const combined = queued.length === 1
@@ -2465,7 +2697,6 @@ async function processQueue(state) {
   }, 8000);
 
   try {
-    state.busy = true;
     state.startedAt = Date.now();
     state.progress = freshProgress();
 
@@ -2622,7 +2853,7 @@ client.on('messageCreate', async (message) => {
   // If Claude is already working, queue the message
   if (state.busy) {
     state.queue.push({ message, content: message.content });
-    saveChannelState(message.channel.id, state); // persist queue for crash recovery
+    saveChannelState(message.channel.id, state, { critical: true }); // persist queue immediately
     const pos = state.queue.length;
     if (pos >= 5) {
       await message.reply(`Queued (#${pos}) — queue is getting long. Use \`!stop\` to interrupt if needed.`);
@@ -2648,8 +2879,7 @@ client.on('messageCreate', async (message) => {
       startedAt: new Date().toISOString(),
       resumeAttempts: 0,
     };
-    saveChannelState(message.channel.id, state);
-    flushPendingWrites();
+    saveChannelState(message.channel.id, state, { critical: true });
 
     let result;
     // Auto-detect social/location links — pre-fetch metadata and build action prompt
@@ -2811,7 +3041,7 @@ client.on('messageCreate', async (message) => {
     state.progress = freshProgress();
     // Clear active task — work is done (or failed)
     state.activeTask = null;
-    saveChannelState(message.channel.id, state);
+    saveChannelState(message.channel.id, state, { critical: true });
     // Drain queued messages
     await processQueue(state);
   }
@@ -2826,13 +3056,149 @@ client.on('interactionCreate', async (interaction) => {
   }
 });
 
+// --- Signal adapter integration ---
+
+let signalAdapter = null;
+
+function startSignalAdapter() {
+  const phoneNumber = process.env.SIGNAL_PHONE_NUMBER;
+  if (!phoneNumber) return;
+
+  const { SignalAdapter } = require('./adapters/signal');
+  signalAdapter = new SignalAdapter({
+    apiUrl: process.env.SIGNAL_API_URL || 'http://signal-api:8080',
+    phoneNumber,
+    pollInterval: parseInt(process.env.SIGNAL_POLL_INTERVAL, 10) || 5000,
+  });
+
+  // Access control for Signal — comma-separated phone numbers
+  const allowedNumbers = new Set((process.env.SIGNAL_ALLOWED_NUMBERS || '').split(',').filter(Boolean));
+
+  signalAdapter.on('message', async (msg) => {
+    // Access control
+    if (allowedNumbers.size > 0 && !allowedNumbers.has(msg.senderId)) return;
+
+    const text = msg.text.trim();
+    if (!text) return;
+
+    // Use sender's phone number as chatId for per-conversation state
+    const chatId = `signal:${msg.chatId}`;
+    const state = getChannel(chatId);
+
+    // Handle commands (same !command syntax)
+    if (text.startsWith('!')) {
+      // Create a minimal message-like object for handleCommand
+      const fakeMessage = createSignalMessageProxy(msg, chatId, state);
+      const handled = await handleCommand(fakeMessage);
+      if (handled) return;
+    }
+
+    // If busy, queue the message
+    if (state.busy) {
+      const fakeMessage = createSignalMessageProxy(msg, chatId, state);
+      state.queue.push({ message: fakeMessage, content: text });
+      saveChannelState(chatId, state, { critical: true });
+      const pos = state.queue.length;
+      await signalAdapter.sendMessage(msg.chatId, `Queued (#${pos}) — I'll get to that next.`);
+      return;
+    }
+
+    // Normal message — run Claude
+    const personalityFile = getPersonalityFile(state.personality);
+    await signalAdapter.sendMessage(msg.chatId, '...');  // typing indicator equivalent
+
+    try {
+      state.activeTask = {
+        prompt: text.substring(0, 500),
+        channelId: chatId,
+        startedAt: new Date().toISOString(),
+        resumeAttempts: 0,
+      };
+      state.busy = true;
+      saveChannelState(chatId, state, { critical: true });
+
+      const claudeOpts = {
+        sessionId: state.sessionId,
+        personalityFile,
+        identity: state.identity,
+        cwd: state.cwd,
+        channelState: state,
+      };
+
+      const result = await runClaudeWithContinuation(text, claudeOpts, {
+        // Minimal discordChannel-like object for progress messages
+        send: (t) => signalAdapter.sendMessage(msg.chatId, typeof t === 'string' ? t : t.content || ''),
+        sendTyping: () => {},
+      });
+
+      if (result.sessionId) {
+        state.sessionId = result.sessionId;
+      }
+
+      if (!result.stopped) {
+        appendEntry(chatId, {
+          cwd: state.cwd,
+          promptSummary: text,
+          resultSummary: result.text,
+          turnCount: result.numTurns || 0,
+        });
+        await signalAdapter.sendLongMessage(msg.chatId, result.text || '*(No output)*');
+      }
+    } catch (err) {
+      console.error(`[signal] Error: ${err.message}`);
+      await signalAdapter.sendMessage(msg.chatId, `Error: ${err.message.substring(0, 500)}`);
+      sendErrorAlert(err, { source: 'signal handler', channel: chatId });
+    } finally {
+      state.busy = false;
+      state.startedAt = null;
+      state.progress = freshProgress();
+      state.activeTask = null;
+      saveChannelState(chatId, state, { critical: true });
+      // Drain queue
+      if (state.queue.length > 0) {
+        await processQueue(state);
+      }
+    }
+  });
+
+  signalAdapter.start().catch(err => {
+    console.error(`[signal] Failed to start: ${err.message}`);
+  });
+}
+
+/**
+ * Create a proxy object that looks enough like a Discord message for handleCommand().
+ * Maps reply/channel.send calls to Signal sends.
+ */
+function createSignalMessageProxy(msg, chatId, state) {
+  const reply = (content) => {
+    const text = typeof content === 'string' ? content : content.content || '';
+    return signalAdapter.sendMessage(msg.chatId, text);
+  };
+
+  return {
+    content: msg.text,
+    author: { id: msg.senderId, bot: false, username: msg.senderName },
+    channel: {
+      id: chatId,
+      send: reply,
+      sendTyping: () => Promise.resolve(),
+    },
+    reply,
+    client, // for commands that need client.channels
+  };
+}
+
 function start() {
   const token = process.env.DISCORD_BOT_TOKEN;
   if (!token) {
     console.warn('DISCORD_BOT_TOKEN not set — Discord bot disabled');
-    return;
+  } else {
+    client.login(token);
   }
-  client.login(token);
+
+  // Start Signal adapter if configured
+  startSignalAdapter();
 }
 
-module.exports = { start, askClaude, runClaudeWithContinuation, client, getChannelState, getPersonalityFile, sendLongMessage, freshProgress, channels };
+module.exports = { start, askClaude, runClaudeWithContinuation, client, getChannelState, getPersonalityFile, sendLongMessage, freshProgress, channels, signalAdapter };

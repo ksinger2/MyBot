@@ -2,7 +2,7 @@ const fs = require('fs');
 const path = require('path');
 
 const JOURNAL_FILE = path.join('/home/node/.claude', 'session-journal.json');
-const MAX_ENTRIES = 3;
+const MAX_ENTRIES = 5;
 
 function readJournal() {
   try {
@@ -12,10 +12,26 @@ function readJournal() {
 }
 
 function writeJournal(data) {
-  try {
-    fs.writeFileSync(JOURNAL_FILE, JSON.stringify(data, null, 2));
-  } catch (err) {
-    console.error('Failed to write session journal:', err.message);
+  const tmpFile = JOURNAL_FILE + '.tmp';
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      fs.writeFileSync(tmpFile, JSON.stringify(data, null, 2));
+      fs.renameSync(tmpFile, JOURNAL_FILE);
+      return;
+    } catch (err) {
+      console.error(`Session journal write attempt ${attempt + 1}/3 failed:`, err.message);
+      if (attempt < 2) {
+        // Brief synchronous delay before retry
+        const start = Date.now();
+        while (Date.now() - start < [100, 500][attempt]) {}
+      } else {
+        // Final failure — try to alert
+        try {
+          const { sendErrorAlert } = require('./error-alerting');
+          sendErrorAlert(err, { source: 'session-journal', detail: 'Journal write failed 3x' });
+        } catch {}
+      }
+    }
   }
 }
 

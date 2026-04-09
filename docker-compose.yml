@@ -25,6 +25,16 @@ services:
       - SPOTIFY_CLIENT_ID=${SPOTIFY_CLIENT_ID:-}
       - SPOTIFY_CLIENT_SECRET=${SPOTIFY_CLIENT_SECRET:-}
       - SPOTIFY_REDIRECT_URI=${SPOTIFY_REDIRECT_URI:-http://localhost:3400/auth/spotify/callback}
+      # Session limits (configurable)
+      - DEFAULT_MAX_TURNS=${DEFAULT_MAX_TURNS:-50}
+      - MAX_AUTO_CONTINUES=${MAX_AUTO_CONTINUES:-3}
+      - MAX_TIMEOUT_MINUTES=${MAX_TIMEOUT_MINUTES:-90}
+      # Signal adapter (optional — set SIGNAL_PHONE_NUMBER to enable)
+      - ENABLED_PLATFORMS=${ENABLED_PLATFORMS:-discord}
+      - SIGNAL_API_URL=${SIGNAL_API_URL:-http://signal-api:8080}
+      - SIGNAL_PHONE_NUMBER=${SIGNAL_PHONE_NUMBER:-}
+      - SIGNAL_POLL_INTERVAL=${SIGNAL_POLL_INTERVAL:-5000}
+      - SIGNAL_ALLOWED_NUMBERS=${SIGNAL_ALLOWED_NUMBERS:-}
     volumes:
       - ${HOME}/.claude:/home/node/.claude
       - ${HOME}/.claude.json:/home/node/.claude.json
@@ -39,6 +49,24 @@ services:
       timeout: 10s
       retries: 3
       start_period: 30s
+
+  # Signal messenger sidecar — REST API for signal-cli
+  # Enable by setting SIGNAL_PHONE_NUMBER in .env and running registration
+  # Registration: docker compose exec signal-api curl -X POST 'http://localhost:8080/v1/register/+1YOURNUMBER'
+  # Verify: docker compose exec signal-api curl -X POST 'http://localhost:8080/v1/register/+1YOURNUMBER/verify/CODE'
+  signal-api:
+    image: bbernhard/signal-cli-rest-api:latest
+    restart: unless-stopped
+    environment:
+      - MODE=json-rpc
+      - LOG_LEVEL=info
+    volumes:
+      - signal-data:/home/.local/share/signal-cli
+    profiles:
+      - signal  # Only starts when: docker compose --profile signal up -d
+
+volumes:
+  signal-data:
 
 networks:
   default:

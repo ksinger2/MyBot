@@ -1,11 +1,15 @@
 #!/bin/bash
-# Entrypoint wrapper — detects crash loops and restores last-known-good code
+# Entrypoint wrapper — PM2 lifecycle, crash loop detection, last-known-good restore
 
 CRASH_LOG="/home/node/.claude/.crash-timestamps"
 BACKUP_DIR="/home/node/.claude/.last-known-good-bot"
 MAX_CRASHES=3
 CRASH_WINDOW=120
 ROLLED_BACK_MARKER="/tmp/.rolled-back"
+
+# PM2 persistence — store PM2 state in mounted volume so it survives rebuilds
+export PM2_HOME="/home/node/.claude/.pm2"
+mkdir -p "$PM2_HOME"
 
 count_recent_crashes() {
   [ ! -f "$CRASH_LOG" ] && echo 0 && return
@@ -30,11 +34,25 @@ if [ "$RECENT" -ge "$MAX_CRASHES" ] && [ -d "$BACKUP_DIR" ]; then
   echo "[ENTRYPOINT] Restored. Starting with last-known-good code."
 fi
 
+# Start PM2 daemon and resurrect any saved processes from previous lifecycle
+pm2 resurrect 2>/dev/null || true
+pm2 ping >/dev/null 2>&1 || true
+
+# Trap signals to dump PM2 state before exit
+cleanup() {
+  echo "[ENTRYPOINT] Shutting down — dumping PM2 state..."
+  pm2 dump 2>/dev/null
+  pm2 kill 2>/dev/null
+  exit 0
+}
+trap cleanup SIGTERM SIGINT
+
 # Run the app
 node server.js
 EXIT_CODE=$?
 
-# On crash, record timestamp
+# On crash, record timestamp and dump PM2 state
+pm2 dump 2>/dev/null
 if [ $EXIT_CODE -ne 0 ]; then
   echo "[ENTRYPOINT] server.js exited with code $EXIT_CODE"
   date +%s >> "$CRASH_LOG"

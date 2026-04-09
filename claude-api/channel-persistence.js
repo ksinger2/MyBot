@@ -19,7 +19,7 @@ function writeStore(store) {
   fs.writeFileSync(STATE_FILE, JSON.stringify(store, null, 2));
 }
 
-function saveChannelState(channelId, state) {
+function saveChannelState(channelId, state, { critical = false } = {}) {
   // Only persist durable fields — skip transient runtime state
   const persistent = {
     sessionId: state.sessionId || null,
@@ -27,8 +27,25 @@ function saveChannelState(channelId, state) {
     identity: state.identity,
     cwd: state.cwd,
     activeTask: state.activeTask || null,
+    config: state.config || null,
     pendingQueue: (state.queue || []).map(q => typeof q === 'string' ? q : q.content).filter(Boolean),
   };
+
+  if (critical) {
+    // Flush immediately for critical state changes (activeTask, queue, completion)
+    if (pendingWrites.has(channelId)) {
+      clearTimeout(pendingWrites.get(channelId).timer);
+      pendingWrites.delete(channelId);
+    }
+    try {
+      const store = readStore();
+      store[channelId] = persistent;
+      writeStore(store);
+    } catch (err) {
+      console.error('Failed to persist critical channel state:', err.message);
+    }
+    return;
+  }
 
   // Debounce: schedule write, cancel previous pending write for this channel
   if (pendingWrites.has(channelId)) {
