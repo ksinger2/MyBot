@@ -58,7 +58,7 @@ services:
     image: bbernhard/signal-cli-rest-api:latest
     restart: unless-stopped
     environment:
-      - MODE=json-rpc
+      - MODE=normal
       - LOG_LEVEL=info
     volumes:
       - signal-data:/home/.local/share/signal-cli

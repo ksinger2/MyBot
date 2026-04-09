@@ -83,6 +83,9 @@ class SignalAdapter extends MessagePlatform {
    * @param {string[]} [opts.attachmentNames] - Filenames
    */
   async sendMessage(chatId, text, opts = {}) {
+    // Strip any prefix (e.g. "signal:") from chatId
+    const recipient = chatId.replace(/^signal:/, '');
+
     const payload = {
       message: text,
       number: this.phoneNumber,
@@ -90,11 +93,14 @@ class SignalAdapter extends MessagePlatform {
     };
 
     // Determine if chatId is a group or individual
-    if (this._isGroupId(chatId)) {
-      payload.recipients = []; // groups use group_id, not recipients
+    if (this._isGroupId(recipient)) {
+      payload.group_id = recipient;
+      // Do NOT set recipients for group sends — signal-cli-rest-api rejects empty arrays
     } else {
-      payload.recipients = [chatId];
+      payload.recipients = [recipient];
     }
+
+    console.log(`[signal] Sending to ${recipient}: ${text.substring(0, 50)}...`);
 
     // Handle attachments
     if (opts.attachments && opts.attachments.length > 0) {
@@ -207,10 +213,33 @@ class SignalAdapter extends MessagePlatform {
     this._pollTimer = setTimeout(() => this._poll(), this.pollInterval);
   }
 
+  async _acceptMessageRequest(uuid) {
+    if (!uuid || this._acceptedContacts?.has(uuid)) return;
+    if (!this._acceptedContacts) this._acceptedContacts = new Set();
+    try {
+      await this._fetch(`/v1/contacts/${encodeURIComponent(this.phoneNumber)}/accept-message-request`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ recipient: uuid }),
+      });
+      this._acceptedContacts.add(uuid);
+      console.log(`[signal] Accepted message request from ${uuid}`);
+    } catch (err) {
+      // Non-fatal — log and continue
+      console.warn(`[signal] Could not accept message request from ${uuid}: ${err.message}`);
+    }
+  }
+
   _handleIncoming(raw) {
     // signal-cli-rest-api returns envelope objects
     const envelope = raw.envelope || raw;
     if (!envelope) return;
+
+    // Auto-accept message requests so contacts can add bot to groups
+    const senderUuid = envelope.sourceUuid || envelope.source;
+    if (senderUuid && !senderUuid.startsWith('+')) {
+      this._acceptMessageRequest(senderUuid);
+    }
 
     const dataMessage = envelope.dataMessage;
     if (!dataMessage) return; // Skip receipts, typing indicators, etc.
@@ -221,6 +250,7 @@ class SignalAdapter extends MessagePlatform {
     const senderId = envelope.source || envelope.sourceNumber;
     const senderName = envelope.sourceName || senderId;
     const chatId = dataMessage.groupInfo?.groupId || senderId;
+    console.log(`[signal] Incoming from ${senderId} (chat: ${chatId}): ${(dataMessage.message || '').substring(0, 50)}`);
     const timestamp = dataMessage.timestamp || envelope.timestamp || Date.now();
 
     // Process attachments
@@ -250,8 +280,12 @@ class SignalAdapter extends MessagePlatform {
   }
 
   _isGroupId(chatId) {
-    // Signal group IDs are base64-encoded and longer than phone numbers
-    return chatId && !chatId.startsWith('+') && chatId.length > 20;
+    // Signal group IDs are base64-encoded, UUIDs are individual users
+    // UUID format: 8-4-4-4-12 hex chars with dashes
+    if (!chatId) return false;
+    if (chatId.startsWith('+')) return false; // phone number
+    if (/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(chatId)) return false; // UUID = individual
+    return chatId.length > 20; // everything else long = group
   }
 
   async _fetch(path, opts = {}) {
