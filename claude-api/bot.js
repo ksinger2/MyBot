@@ -10,6 +10,8 @@ const OpenAI = require('openai');
 const { startAllSchedules, registerJob, cancelJob } = require('./scheduler');
 const { saveChannelState, loadAllChannelStates, flushPendingWrites } = require('./channel-persistence');
 const { appendEntry, getJournalContext } = require('./session-journal');
+const { loadMemory } = require('./memory');
+const { startHeartbeat, stopHeartbeat, getHeartbeatStatus, listHeartbeats, loadStandingOrders } = require('./heartbeat');
 const { getSkill, listSkills } = require('./skills/skill-loader');
 const { detectLinks, buildExtractionPrompt, buildSmartPrompt, enrichLinks } = require('./link-extractor');
 const { startHangoutWizard, processHangoutStep } = require('./wizards/hangout');
@@ -30,7 +32,7 @@ const PERSONALITIES_DIR = path.join(__dirname, 'personalities');
 const DEFAULT_PERSONALITY = 'tiffany_pollard';
 const DEFAULT_WORKSPACE = '/workspace';
 const DEFAULT_MAX_TURNS = parseInt(process.env.DEFAULT_MAX_TURNS, 10) || 50;
-const MAX_AUTO_CONTINUES = parseInt(process.env.MAX_AUTO_CONTINUES, 10) || 3;
+const MAX_AUTO_CONTINUES = parseInt(process.env.MAX_AUTO_CONTINUES, 10) || 5;
 const MAX_TIMEOUT = (parseInt(process.env.MAX_TIMEOUT_MINUTES, 10) || 90) * 60 * 1000;
 const STALL_THRESHOLDS = {
   thinking: 5 * 60 * 1000,   // 5 min — no tool active, just "thinking"
@@ -122,6 +124,54 @@ function forceKillProcess(proc, timeoutMs = 3000) {
       setTimeout(done, 1000);
     }, timeoutMs);
   });
+}
+
+/**
+ * ChannelProxy — platform-agnostic wrapper for sending messages back to the user.
+ * Used by askClaude, runClaudeWithContinuation, stall detector, etc.
+ * Works identically for Discord channels and Signal conversations.
+ */
+class ChannelProxy {
+  constructor({ sendFn, typingFn, platform = 'discord', chatId = null }) {
+    this._sendFn = sendFn;
+    this._typingFn = typingFn || (() => Promise.resolve());
+    this.platform = platform;
+    this.chatId = chatId;
+  }
+
+  async send(content) {
+    try {
+      const text = typeof content === 'string' ? content : (content?.content || content?.toString() || '');
+      if (!text) return;
+      return await this._sendFn(text);
+    } catch (err) {
+      console.error(`[${this.platform}] ChannelProxy send error:`, err.message);
+    }
+  }
+
+  async sendTyping() {
+    try { await this._typingFn(); } catch {}
+  }
+
+  /** Create a ChannelProxy from a Discord message.channel object */
+  static fromDiscord(channel) {
+    return new ChannelProxy({
+      sendFn: (text) => channel.send(text),
+      typingFn: () => channel.sendTyping(),
+      platform: 'discord',
+      chatId: channel.id,
+    });
+  }
+
+  /** Create a ChannelProxy for a Signal conversation */
+  static fromSignal(adapter, recipientChatId) {
+    return new ChannelProxy({
+      sendFn: (text) => adapter.sendMessage(recipientChatId, text),
+      typingFn: () => Promise.resolve(), // Signal doesn't have typing indicators for bots
+      platform: 'signal',
+      chatId: recipientChatId,
+    });
+  }
 }
 
 function pushRawLog(progress, entry) {
@@ -380,7 +430,11 @@ function listPersonalities() {
     .map(f => f.replace('.md', ''));
 }
 
-function askClaude(prompt, { sessionId = null, personalityFile = null, identity = null, cwd = DEFAULT_WORKSPACE, maxTurns = null, channelState = null, discordChannel = null, discordUserId = null } = {}) {
+function askClaude(prompt, { sessionId = null, personalityFile = null, identity = null, cwd = DEFAULT_WORKSPACE, maxTurns = null, channelState = null, discordChannel = null, channelProxy = null, discordUserId = null } = {}) {
+  // Wrap raw Discord channel in ChannelProxy if needed
+  if (!channelProxy && discordChannel) {
+    channelProxy = ChannelProxy.fromDiscord(discordChannel);
+  }
   // Resolve maxTurns from per-channel config, then global default
   if (!maxTurns) maxTurns = channelState?.config?.maxTurns || DEFAULT_MAX_TURNS;
 
@@ -426,11 +480,15 @@ function askClaude(prompt, { sessionId = null, personalityFile = null, identity 
         } catch {}
       }
 
-      // Load rolling session journal (last 3 sessions across restarts)
+      // Load rolling session journal (last 5 sessions across restarts)
       if (channelState?._channelId) {
         const journalContext = getJournalContext(channelState._channelId);
         if (journalContext) contextParts.push(journalContext);
       }
+
+      // Load persistent memory (MEMORY.md + daily notes)
+      const memoryContext = loadMemory(cwd);
+      if (memoryContext) contextParts.push(memoryContext);
 
       if (contextParts.length > 0) {
         prompt = contextParts.join('\n\n') + `\n\n[Current request]:\n${prompt}`;
@@ -491,11 +549,15 @@ YOUR CAPABILITIES — You are a powerful AI assistant with the following tools. 
 
 4. **DOCKER ACCESS**: You can run \`docker ps\`, \`docker restart\`, \`docker compose up -d --build\`, etc. When you make code changes that need a rebuild, just do it yourself — don't tell the user to do it. The project docker-compose.yml is at /workspace/MyBot/docker-compose.yml.
 
-**SELF-REBUILD SAFETY** (MUST follow when rebuilding THIS bot's container):
-1. Syntax-check FIRST: \`for f in /workspace/MyBot/claude-api/*.js; do node -c "$f"; done\`
-2. Fix ANY syntax errors before proceeding
-3. Then rebuild: \`docker compose -f /workspace/MyBot/docker-compose.yml up -d --build\`
+**SELF-REBUILD SAFETY** (MUST follow when editing THIS bot's code in /workspace/MyBot/):
+1. NEVER edit bot.js, server.js, or core files while running from Signal. Only self-edit from Discord or when explicitly told to by the user.
+2. Before ANY rebuild, syntax-check ALL files: \`for f in /workspace/MyBot/claude-api/*.js; do node -c "$f" || { echo "SYNTAX ERROR in $f — FIX BEFORE REBUILD"; exit 1; }; done\`
+3. If syntax check fails, FIX the error before rebuilding. NEVER rebuild with broken syntax.
+4. Then rebuild: \`docker compose -f /workspace/MyBot/docker-compose.yml --profile signal up -d --build\`
+5. After rebuild, wait 15s then verify: \`docker ps | grep mybot\` — must show "healthy"
+6. If the container is crash-looping, check logs and fix immediately.
 The bot has automatic crash-loop recovery — if new code crashes 3x in 2 min, it auto-rollbacks to the last working version and notifies the error channel.
+CRITICAL: When editing your own code, make ONE change at a time, test it, then move to the next. Do NOT batch multiple risky changes into one rebuild.
 
 DEPLOYMENT VERIFICATION: After ANY \`docker compose up -d --build\` or \`docker restart\`:
 1. Wait 10s, then \`docker ps\` — verify status shows "Up", not "Restarting" or "Exit"
@@ -565,7 +627,17 @@ NEVER say you can't do something if one of these capabilities covers it. Try fir
 
 AUTONOMY: You are fully autonomous. Never stop to ask the user for confirmation unless it involves spending money, sending emails/messages, or destructive operations (deleting repos, dropping databases). If something fails, try a different approach. If stuck after 3 attempts, summarize what you tried, then move on. The user CANNOT respond while you're running — never wait for input. You have up to ${maxTurns} turns.
 
-SESSION HANDOFF (MANDATORY): Before your LAST turn in any session, you MUST update NextSteps.md in the project root. Include: what you did (2-3 bullets), current state (working/broken), running services, and specific next steps. This is NON-OPTIONAL — future sessions depend on it.`);
+PERSISTENT MEMORY: You have a persistent memory system at .claude/memory/ in the project root. Use it to remember important context across sessions:
+- Write to \`.claude/memory/MEMORY.md\` for long-term facts (user preferences, architecture decisions, key learnings)
+- Write to \`.claude/memory/YYYY-MM-DD.md\` (today's date) for daily progress notes
+- Memory files are automatically loaded into your context at session start
+- Save anything you'd want to know in a future session: what you learned, what worked, what didn't, user preferences
+- Keep entries concise — bullet points. Don't duplicate what's in NextSteps.md
+
+SESSION HANDOFF (MANDATORY): Before your LAST turn in any session, you MUST:
+1. Update NextSteps.md with: what you did, what's working/broken, specific next steps
+2. Save any important learnings to .claude/memory/MEMORY.md
+This is NON-OPTIONAL — future sessions depend on it.`);
     if (identity) {
       systemParts.push(`Your name is ${identity.name}. You are ${identity.description}.`);
     }
@@ -760,15 +832,15 @@ SESSION HANDOFF (MANDATORY): Before your LAST turn in any session, you MUST upda
             if (channelState.progress.toolSignatures.length > 15) {
               channelState.progress.toolSignatures.shift();
             }
-            if (detectLoop(channelState.progress) && discordChannel) {
+            if (detectLoop(channelState.progress) && channelProxy) {
               const now = Date.now();
               if (!channelState.progress.lastLoopWarning || now - channelState.progress.lastLoopWarning > 120000) {
                 channelState.progress.lastLoopWarning = now;
-                discordChannel.send('⚠️ **Loop detected** — Claude appears to be repeating the same actions. Auto-killing in 60s if it continues.').catch(() => {});
+                channelProxy.send('⚠️ **Loop detected** — Claude appears to be repeating the same actions. Auto-killing in 60s if it continues.').catch(() => {});
                 setTimeout(() => {
                   if (channelState.process && detectLoop(channelState.progress)) {
                     child.kill();
-                    discordChannel.send('🛑 Killed due to detected loop.').catch(() => {});
+                    channelProxy.send('🛑 Killed due to detected loop.').catch(() => {});
                   }
                 }, 60000);
               }
@@ -852,10 +924,10 @@ SESSION HANDOFF (MANDATORY): Before your LAST turn in any session, you MUST upda
       }
 
       // At 80% of threshold: send warning (once per stall event)
-      if (idle >= threshold * 0.8 && !p.stallWarned && discordChannel) {
+      if (idle >= threshold * 0.8 && !p.stallWarned && channelProxy) {
         p.stallWarned = true;
         const toolInfo = p.currentTool ? `Tool: ${p.currentTool}` : 'Thinking (no tool active)';
-        discordChannel.send(`⚠️ **Stall warning** — no output for ${Math.round(idle / 60000)}min. ${toolInfo}. Will kill in ${Math.round((threshold - idle) / 60000)}min if no activity.`).catch(() => {});
+        channelProxy.send(`⚠️ **Stall warning** — no output for ${Math.round(idle / 60000)}min. ${toolInfo}. Will kill in ${Math.round((threshold - idle) / 60000)}min if no activity.`).catch(() => {});
       }
 
       // At 100%: kill with formatted diagnostic
@@ -864,7 +936,7 @@ SESSION HANDOFF (MANDATORY): Before your LAST turn in any session, you MUST upda
         const lastEntries = p.rawLog.slice(-5).map(e => `[${e.ts}] ${e.text}`).join('\n');
 
         // Send formatted stall diagnostic to Discord before rejecting
-        if (discordChannel) {
+        if (channelProxy) {
           const thresholdLabel = !p.currentTool ? 'thinking'
             : p.currentTool === 'Bash' ? 'bash' : 'default';
           const diagLines = [
@@ -876,7 +948,7 @@ SESSION HANDOFF (MANDATORY): Before your LAST turn in any session, you MUST upda
           if (p.rawLog.length > 0) {
             diagLines.push('', '**Last activity before stall:**', '```', lastEntries, '```');
           }
-          discordChannel.send(diagLines.join('\n')).catch(() => {});
+          channelProxy.send(diagLines.join('\n')).catch(() => {});
         }
 
         channelState.process = null;
@@ -892,7 +964,7 @@ SESSION HANDOFF (MANDATORY): Before your LAST turn in any session, you MUST upda
     // Periodic check-in — send progress to Discord every CHECKIN_INTERVAL
     let lastCheckin = Date.now();
     const checkinTimer = setInterval(() => {
-      if (!discordChannel || !channelState || !channelState.startedAt) return;
+      if (!channelProxy || !channelState || !channelState.startedAt) return;
       const now = Date.now();
       if (now - lastCheckin < CHECKIN_INTERVAL) return;
       lastCheckin = now;
@@ -907,7 +979,7 @@ SESSION HANDOFF (MANDATORY): Before your LAST turn in any session, you MUST upda
         const label = TOOL_LABELS[p.currentTool] || p.currentTool;
         parts.push(`Currently: ${label}${p.toolDetail ? ` (${p.toolDetail})` : ''}`);
       }
-      discordChannel.send(`*Still working — ${parts.join(' · ')}*`).catch(() => {});
+      channelProxy.send(`*Still working — ${parts.join(' · ')}*`).catch(() => {});
     }, 30000); // evaluate every 30s, only send at CHECKIN_INTERVAL
 
     child.on('close', (code) => {
@@ -962,7 +1034,7 @@ SESSION HANDOFF (MANDATORY): Before your LAST turn in any session, you MUST upda
   });
 }
 
-async function runClaudeWithContinuation(prompt, opts, discordChannel) {
+async function runClaudeWithContinuation(prompt, opts, channelProxy) {
   let result = await askClaude(prompt, opts);
   let continueCount = 0;
   let totalCost = result.cost || 0;
@@ -971,7 +1043,7 @@ async function runClaudeWithContinuation(prompt, opts, discordChannel) {
 
   while (result.hitTurnLimit && continueCount < maxContinues && !result.stopped) {
     continueCount++;
-    await discordChannel.send(
+    await channelProxy.send(
       `*Turn limit reached (${continueCount}/${maxContinues}) — auto-continuing...*`
     ).catch(() => {});
     result = await askClaude(
@@ -993,7 +1065,7 @@ async function runClaudeWithContinuation(prompt, opts, discordChannel) {
       totalTurns += handoff.numTurns || 0;
       result = { ...handoff, cost: totalCost, numTurns: totalTurns };
     } catch {}
-    await discordChannel.send(
+    await channelProxy.send(
       `*Reached max auto-continuations (${maxContinues}). Session handed off via NextSteps.md. Send another message to keep going.*`
     ).catch(() => {});
   }
@@ -2056,6 +2128,130 @@ async function handleCommand(message) {
       break;
     }
 
+    case '!loop': {
+      if (!arg) {
+        await message.reply('Usage: `!loop <task description>` — runs Claude in a loop until the task is done (max 10 iterations).');
+        break;
+      }
+      if (state.busy) {
+        await message.reply('Already working. Use `!stop` first.');
+        break;
+      }
+
+      const maxIterations = 10;
+      const personalityFile = getPersonalityFile(state.personality);
+      const proxy = message.channel.send ? ChannelProxy.fromDiscord(message.channel) : null;
+
+      await message.reply(`Starting autonomous loop: "${arg.substring(0, 100)}"\nMax ${maxIterations} iterations. Use \`!stop\` to interrupt.`);
+
+      (async () => {
+        for (let i = 1; i <= maxIterations; i++) {
+          if (!state.process && i > 1) {
+            // Check if task is done by reading NextSteps.md
+            const nsPath = path.join(state.cwd, 'NextSteps.md');
+            if (fs.existsSync(nsPath)) {
+              const ns = fs.readFileSync(nsPath, 'utf-8');
+              if (ns.toLowerCase().includes('task complete') || ns.toLowerCase().includes('all done')) {
+                await message.channel.send(`*Loop completed after ${i - 1} iterations — task marked done in NextSteps.md.*`);
+                break;
+              }
+            }
+          }
+
+          const iterPrompt = i === 1
+            ? arg
+            : `Continue working on this task: "${arg}"\n\nThis is iteration ${i}/${maxIterations} of an autonomous loop. Read NextSteps.md for context from your previous iteration. When the task is FULLY DONE, write "TASK COMPLETE" in NextSteps.md. If not done, update NextSteps.md with progress and what's left.`;
+
+          try {
+            state.activeTask = { prompt: iterPrompt.substring(0, 500), channelId: message.channel.id, startedAt: new Date().toISOString(), resumeAttempts: 0 };
+            saveChannelState(message.channel.id, state, { critical: true });
+
+            const result = await runClaudeWithContinuation(iterPrompt, {
+              sessionId: state.sessionId,
+              personalityFile,
+              identity: state.identity,
+              cwd: state.cwd,
+              channelState: state,
+              discordChannel: message.channel,
+            }, proxy);
+
+            if (result.sessionId) state.sessionId = result.sessionId;
+            if (result.stopped) {
+              await message.channel.send('*Loop stopped by user.*');
+              break;
+            }
+
+            await sendLongMessage(message, result.text, state.cwd);
+            await message.channel.send(`*— Loop iteration ${i}/${maxIterations} complete —*`);
+
+            // Brief pause between iterations
+            await new Promise(r => setTimeout(r, 3000));
+          } catch (err) {
+            await message.channel.send(`*Loop iteration ${i} failed: ${err.message.substring(0, 200)}*`);
+            break;
+          } finally {
+            state.busy = false;
+            state.startedAt = null;
+            state.progress = freshProgress();
+            state.activeTask = null;
+            saveChannelState(message.channel.id, state, { critical: true });
+          }
+        }
+      })();
+      break;
+    }
+
+    case '!heartbeat': {
+      if (!arg || arg === 'status') {
+        const hb = getHeartbeatStatus(message.channel.id);
+        if (hb) {
+          await message.reply(`Heartbeat **active** — every ${hb.intervalMinutes}min in \`${hb.cwd}\``);
+        } else {
+          await message.reply('No heartbeat active. Use `!heartbeat <minutes>` to start (e.g. `!heartbeat 30`).');
+        }
+        break;
+      }
+      if (arg === 'off' || arg === 'stop') {
+        stopHeartbeat(message.channel.id);
+        await message.reply('Heartbeat stopped.');
+        break;
+      }
+      const interval = parseInt(arg, 10);
+      if (isNaN(interval) || interval < 5) {
+        await message.reply('Usage: `!heartbeat <minutes>` (min 5) | `!heartbeat off` | `!heartbeat status`');
+        break;
+      }
+      const personalityFile = getPersonalityFile(state.personality);
+      startHeartbeat(message.channel.id, {
+        cwd: state.cwd,
+        intervalMinutes: interval,
+        onWake: (prompt) => askClaude(prompt, {
+          sessionId: state.sessionId,
+          personalityFile,
+          identity: state.identity,
+          cwd: state.cwd,
+          channelState: state,
+          discordChannel: message.channel,
+        }),
+        onResult: async (result) => {
+          if (result.sessionId) { state.sessionId = result.sessionId; saveChannelState(message.channel.id, state); }
+          await sendLongMessage(message, result.text, state.cwd);
+        },
+      });
+      await message.reply(`Heartbeat started — checking every **${interval} minutes**. Reads AGENTS.md for standing orders. Use \`!heartbeat off\` to stop.`);
+      break;
+    }
+
+    case '!orders': {
+      const orders = loadStandingOrders(state.cwd);
+      if (!orders) {
+        await message.reply(`No standing orders found. Create \`AGENTS.md\` in \`${state.cwd}\` with instructions for autonomous work.`);
+      } else {
+        await sendLongMessage(message, `**Standing Orders (AGENTS.md):**\n${orders}`, state.cwd);
+      }
+      break;
+    }
+
     case '!monitor': {
       const monArgs = parts.slice(1);
       const subCmd = (monArgs[0] || '').toLowerCase();
@@ -2223,7 +2419,7 @@ async function handleCommand(message) {
           cwd: state.cwd,
           channelState: state,
           discordChannel: message.channel,
-        }, message.channel);
+        }, ChannelProxy.fromDiscord(message.channel));
         if (auditResult.sessionId) {
           state.sessionId = auditResult.sessionId;
           saveChannelState(message.channel.id, state);
@@ -2618,7 +2814,7 @@ async function resumeChannel(channelId, savedState) {
         cwd: state.cwd,
         channelState: state,
         discordChannel: ch,
-      }, ch);
+      }, ChannelProxy.fromDiscord(ch));
     } catch (err) {
       // If session resume fails, try fresh with the original prompt
       if (state.sessionId) {
@@ -2710,7 +2906,7 @@ async function processQueue(state) {
       discordChannel: replyTarget.channel,
     };
     try {
-      result = await runClaudeWithContinuation(combined, queueOpts, replyTarget.channel);
+      result = await runClaudeWithContinuation(combined, queueOpts, ChannelProxy.fromDiscord(replyTarget.channel));
     } catch (err) {
       if (state.sessionId) {
         console.log('Session resume failed in queue, retrying fresh:', err.message);
@@ -2900,7 +3096,7 @@ client.on('messageCreate', async (message) => {
       discordUserId: message.author.id,
     };
     try {
-      result = await runClaudeWithContinuation(messagePrompt, claudeOpts, message.channel);
+      result = await runClaudeWithContinuation(messagePrompt, claudeOpts, ChannelProxy.fromDiscord(message.channel));
     } catch (err) {
       if (state.sessionId) {
         console.log('Session resume failed, retrying fresh:', err.message);
@@ -3117,19 +3313,18 @@ function startSignalAdapter() {
       state.busy = true;
       saveChannelState(chatId, state, { critical: true });
 
+      const signalProxy = ChannelProxy.fromSignal(signalAdapter, msg.chatId);
       const claudeOpts = {
         sessionId: state.sessionId,
         personalityFile,
         identity: state.identity,
         cwd: state.cwd,
         channelState: state,
+        channelProxy: signalProxy,
+        discordUserId: msg.senderId,
       };
 
-      const result = await runClaudeWithContinuation(text, claudeOpts, {
-        // Minimal discordChannel-like object for progress messages
-        send: (t) => signalAdapter.sendMessage(msg.chatId, typeof t === 'string' ? t : t.content || ''),
-        sendTyping: () => {},
-      });
+      const result = await runClaudeWithContinuation(text, claudeOpts, signalProxy);
 
       if (result.sessionId) {
         state.sessionId = result.sessionId;

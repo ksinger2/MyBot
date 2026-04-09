@@ -214,15 +214,16 @@ class SignalAdapter extends MessagePlatform {
   }
 
   async _acceptMessageRequest(uuid) {
-    if (!uuid || this._acceptedContacts?.has(uuid)) return;
+    if (!uuid) return;
     if (!this._acceptedContacts) this._acceptedContacts = new Set();
+    if (this._acceptedContacts.has(uuid)) return;
+    this._acceptedContacts.add(uuid); // add before async call to prevent races
     try {
       await this._fetch(`/v1/contacts/${encodeURIComponent(this.phoneNumber)}/accept-message-request`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ recipient: uuid }),
       });
-      this._acceptedContacts.add(uuid);
       console.log(`[signal] Accepted message request from ${uuid}`);
     } catch (err) {
       // Non-fatal — log and continue
