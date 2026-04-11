@@ -1,9 +1,82 @@
 const express = require('express');
 const { spawn } = require('child_process');
 const crypto = require('crypto');
+const fs = require('fs');
+const path = require('path');
 
 const app = express();
-app.use(express.json());
+// L5: cap default JSON body size at 1mb. The per-route /signal/webhook override
+// (5mb) still applies because it's mounted locally on that route.
+app.use(express.json({ limit: '1mb' }));
+
+// ── HTML escape helper (used for CSRF token injection in /setup) ─────────────
+function escapeHtml(str) {
+  return String(str == null ? '' : str)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+// ── L7: CSRF tokens for /setup/:userId form ──────────────────────────────────
+// Map<userId, { token, expiresAt }> — GET issues, POST verifies and deletes.
+const _setupCsrfTokens = new Map();
+const SETUP_CSRF_TTL_MS = 30 * 60 * 1000; // 30 minutes
+
+// ── M2 + L7: periodic cleanup intervals ──────────────────────────────────────
+// Module-level guard so `require.cache` re-entry (hot reload, test harness)
+// doesn't register duplicate intervals.
+if (!global.__mybotServerIntervals) {
+  global.__mybotServerIntervals = true;
+
+  // M2: sweep stale /tmp/imagine_* files every hour. Anything older than 2h
+  // gets removed. Never crash the process if this fails.
+  setInterval(() => {
+    try {
+      const now = Date.now();
+      const maxAgeMs = 2 * 60 * 60 * 1000; // 2 hours
+      const dir = '/tmp';
+      let removed = 0;
+      const entries = fs.readdirSync(dir);
+      for (const name of entries) {
+        if (!name.startsWith('imagine_')) continue;
+        const full = path.join(dir, name);
+        try {
+          const st = fs.statSync(full);
+          if (now - st.mtimeMs > maxAgeMs) {
+            fs.unlinkSync(full);
+            removed++;
+          }
+        } catch { /* ignore per-file errors */ }
+      }
+      if (removed > 0) {
+        console.log(`[imagine-cleanup] removed ${removed} stale file(s)`);
+      }
+    } catch (err) {
+      console.error('[imagine-cleanup] sweep failed:', err.message);
+    }
+  }, 60 * 60 * 1000).unref();
+
+  // L7: sweep expired CSRF tokens every hour.
+  setInterval(() => {
+    try {
+      const now = Date.now();
+      let expired = 0;
+      for (const [uid, entry] of _setupCsrfTokens.entries()) {
+        if (!entry || entry.expiresAt <= now) {
+          _setupCsrfTokens.delete(uid);
+          expired++;
+        }
+      }
+      if (expired > 0) {
+        console.log(`[setup-csrf] expired ${expired} stale token(s)`);
+      }
+    } catch (err) {
+      console.error('[setup-csrf] sweep failed:', err.message);
+    }
+  }, 60 * 60 * 1000).unref();
+}
 
 // ── Security: shared-secret auth for internal routes ────────────────────────
 // Every mutating/sensitive endpoint (/ask, /imagine, /remind, /rebuild, …) is
@@ -46,12 +119,8 @@ function requireInternalToken(req, res, next) {
   next();
 }
 
-// HTML escape for user-controlled interpolations in the /setup pages. Defends
-// against reflected XSS, which in a same-origin context would bypass auth on
-// every other endpoint.
-const escapeHtml = (s) => String(s ?? '').replace(/[&<>"']/g, c => ({
-  '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'
-}[c]));
+// (escapeHtml is defined above near the CSRF helpers — used by /setup XSS escapes
+// and by the CSRF token injection.)
 
 app.post('/ask', requireInternalToken, (req, res) => {
   const { prompt } = req.body;
@@ -119,7 +188,6 @@ app.post('/imagine', requireInternalToken, async (req, res) => {
     });
     const base64 = response.data[0].b64_json;
     const buffer = Buffer.from(base64, 'base64');
-    const fs = require('fs');
     const imgPath = `/tmp/imagine_${Date.now()}.png`;
     fs.writeFileSync(imgPath, buffer);
     res.json({ path: imgPath, prompt });
@@ -198,9 +266,7 @@ app.get('/health', (req, res) => res.json({ status: 'ok' }));
 // We respond to the HTTP request BEFORE the rebuild starts so Claude gets a
 // confirmation it can announce to the user before the container disappears.
 app.post('/rebuild', requireInternalToken, async (req, res) => {
-  const fs = require('fs');
-  const path = require('path');
-  const { spawn, execSync } = require('child_process');
+  const { execSync } = require('child_process');
 
   const APP_DIR = '/workspace/MyBot/claude-api';
   const COMPOSE_FILE = '/workspace/MyBot/docker-compose.yml';
@@ -259,6 +325,25 @@ app.post('/rebuild', requireInternalToken, async (req, res) => {
     console.error('[rebuild] could not mark channels:', err.message);
   }
 
+  // L4: validate HOST_PROJECT_PATH before we commit to spawning anything.
+  // Even though flipping this env var requires container access, validating
+  // here is cheap defense-in-depth — it blocks accidental misconfiguration
+  // and any future path where an attacker can influence env.
+  const HOST_PROJECT_PATH = process.env.HOST_PROJECT_PATH
+    || '/mnt/c/Users/karen/Desktop/Github Projects/MyBot';
+  const _pathInvalid =
+    typeof HOST_PROJECT_PATH !== 'string' ||
+    !HOST_PROJECT_PATH.startsWith('/') ||
+    HOST_PROJECT_PATH.split('/').includes('..') ||
+    /[;|&$`<>\n\r]/.test(HOST_PROJECT_PATH);
+  if (_pathInvalid) {
+    console.error('[rebuild] HOST_PROJECT_PATH failed validation:', HOST_PROJECT_PATH);
+    return res.status(500).json({
+      ok: false,
+      error: 'HOST_PROJECT_PATH is invalid or contains unsafe characters',
+    });
+  }
+
   // 4. Respond before the rebuild starts so Claude can announce success
   res.json({
     ok: true,
@@ -290,8 +375,6 @@ app.post('/rebuild', requireInternalToken, async (req, res) => {
   //    In dev that's the WSL Windows path; in CI/cloud it'd be different.
   setTimeout(() => {
     try {
-      const HOST_PROJECT_PATH = process.env.HOST_PROJECT_PATH
-        || '/mnt/c/Users/karen/Desktop/Github Projects/MyBot';
       console.log(`[rebuild] Spawning host-side rebuild container (HOST_PROJECT_PATH=${HOST_PROJECT_PATH})`);
       const dockerArgs = [
         'run', '-d', '--rm',
@@ -299,7 +382,10 @@ app.post('/rebuild', requireInternalToken, async (req, res) => {
         '-v', '/var/run/docker.sock:/var/run/docker.sock',
         '-v', `${HOST_PROJECT_PATH}:/work`,
         '-w', '/work',
-        'docker:cli',
+        // L1: pin docker:cli to a specific minor version so supply-chain
+        // surprises (a poisoned `latest` tag) can't compromise the rebuild.
+        // Update this tag intentionally when upgrading the Docker CLI.
+        'docker:27-cli',
         'sh', '-c',
         // Sleep so the HTTP response and any tool_use logs can flush before
         // we start tearing down the original container. The compose up
@@ -428,6 +514,14 @@ app.get('/setup/:userId', (req, res) => {
   let profile = {};
   try { profile = require('./user-profiles').getProfile(userId) || {}; } catch {}
 
+  // L7: issue a fresh CSRF token tied to this userId. Stored server-side
+  // with a 30min TTL; POST will verify and delete it (single-use).
+  const csrfToken = crypto.randomBytes(16).toString('hex');
+  _setupCsrfTokens.set(userId, {
+    token: csrfToken,
+    expiresAt: Date.now() + SETUP_CSRF_TTL_MS,
+  });
+
   const calConnected = profile.gcal_connected
     ? `<p style="color:#4caf50;font-weight:bold;">✓ Google Calendar connected (${escapeHtml(profile.gcal_email)})</p>`
     : '';
@@ -459,6 +553,7 @@ app.get('/setup/:userId', (req, res) => {
 
   <div class="section">
     <form method="POST" action="/setup/${encodeURIComponent(userId)}">
+      <input type="hidden" name="_csrf" value="${escapeHtml(csrfToken)}">
       <label for="name">Your Name</label>
       <input type="text" id="name" name="name" value="${escapeHtml(profile.name || '')}" placeholder="e.g. Mike" required>
 
@@ -491,6 +586,24 @@ app.get('/setup/:userId', (req, res) => {
 app.post('/setup/:userId', express.urlencoded({ extended: false }), (req, res) => {
   const userId = decodeURIComponent(req.params.userId);
   const { name, location, timezone } = req.body;
+
+  // L7: verify same-origin CSRF token. Each GET issues a fresh token scoped
+  // to the userId with a 30min TTL; POST must present the matching token and
+  // we delete it on success (single-use) so a replay can't resubmit.
+  const submitted = req.body && req.body._csrf;
+  const entry = _setupCsrfTokens.get(userId);
+  const csrfOk =
+    entry &&
+    typeof submitted === 'string' &&
+    submitted.length > 0 &&
+    entry.token === submitted &&
+    entry.expiresAt > Date.now();
+  if (!csrfOk) {
+    if (entry) _setupCsrfTokens.delete(userId); // scrub stale/expired entries
+    return res.status(403).send('Invalid or expired form token — refresh the page and try again.');
+  }
+  _setupCsrfTokens.delete(userId);
+
   try {
     require('./user-profiles').setProfile(userId, {
       name: (name || '').trim(),
