@@ -1,4 +1,100 @@
-# MyBot — Session Handoff (2026-04-11)
+# MyBot — Session Handoff (2026-04-11, evening)
+
+## What changed this session (the headline)
+
+The bot was crashing every time it tried to fix or add a feature. Root cause:
+the Dockerfile installed `docker.io` which on Debian 12 does **not** include the
+`docker compose` v2 plugin. So when Claude tried `docker compose up -d --build`
+per the system prompt, the command failed, and Claude improvised with
+`docker stop mybot-claude-api-1 && docker run -d --name mybot-claude-api-1-new`
+— which killed the container without rebuilding the image, dropped every
+in-flight conversation, and brought back stale code under the wrong name.
+
+Fixed end-to-end. The bot can now safely rebuild itself in a loop without
+losing conversations or breaking, plus it has OpenClaw-grade loop detection
+to catch runaway tool calls before they melt the session.
+
+### Self-rebuild that survives the rebuild
+- **Dockerfile** — installs the standalone `docker compose` v2 binary into
+  `/usr/local/lib/docker/cli-plugins/`. Verified inside the container:
+  `Docker Compose version v5.1.2`.
+- **`POST /rebuild` endpoint** in `claude-api/server.js` — the **only**
+  sanctioned rebuild path. It:
+  1. Syntax-checks every `.js` file in `claude-api/` and refuses on failure
+  2. Flushes pending channel-state writes
+  3. Marks every busy channel for "I just rebuilt" notification (persisted
+     via `wantsRestartNotification` flag in channel-state.json)
+  4. Spawns a **host-side** `docker:cli` container that bind-mounts the
+     docker socket and runs `docker compose up -d --build` from outside the
+     dying container. This was the critical lesson: a `spawn(..., { detached: true })`
+     from inside Docker gets SIGKILLed when the container dies regardless of
+     `unref()`. The host-side rebuilder survives because it runs in its own
+     PID namespace on the host.
+  5. Returns JSON before being replaced
+- **System prompt** in `bot.js` — strong, explicit prohibition on
+  `docker stop|kill|rm|restart|run` against `mybot-*` containers. Single
+  canonical instruction: `curl -X POST http://localhost:3400/rebuild`.
+- **`HOST_PROJECT_PATH` env var** in docker-compose.yml — required because
+  the docker daemon resolves bind-mounts on the host filesystem, not inside
+  the calling container. Defaults to the WSL Windows path; override per env.
+- **End-to-end tested**: hit `/rebuild`, got `{"ok":true,"syntaxChecked":33}`,
+  watched `mybot-rebuilder-*` container start, replace claude-api, and the
+  new container come back healthy in ~50s with all 9 channel states restored.
+
+### Restart notification reaches every affected channel
+- Auto-resume scan in `bot.js` now notifies any channel with **either** an
+  `activeTask`, a non-empty `pendingQueue`, **or** a `wantsRestartNotification`
+  flag. Previously only `activeTask` channels got notified — channels
+  mid-conversation but pre-task were silent.
+- New `buildRestartMessage()` helper produces context-aware text:
+  "Back online — I just rebuilt myself, was working on X, resend if you
+  didn't get an answer." vs "I'm back from an unexpected restart…"
+- Signal and Discord both go through the same builder.
+
+### Signal image attachments now reach Claude
+- `adapters/signal.js` — `_handleIncoming` is now async, downloads each
+  attachment via `GET /v1/attachments/{id}`, saves to
+  `/tmp/signal-attachments/{ts}_{filename}` with proper extensions inferred
+  from `contentType`, and passes `localPath` through `NormalizedMessage.attachments`.
+- `bot.js` Signal handler — synthesizes a prompt block telling Claude
+  "User attached N file(s)" with the local paths so Claude can `Read` them.
+- `server.js` webhook — wraps the now-async `_handleIncoming` in
+  `Promise.resolve(...).catch(...)` so a single bad envelope can't cause
+  an unhandled rejection.
+
+### Group mention enforcement
+- Discord guild channels were already gated; confirmed working.
+- Signal group mention check now matches by **both phone number and UUID**
+  (signal-cli mention objects vary). Logs the rejection so you can see
+  when it fires.
+- `NormalizedMessage` now carries a `mentions` array.
+- Note: bot's own UUID lookup isn't wired yet — phone-number match handles
+  the common case. If you see a "bot not mentioned" log when you DID
+  mention it, that's the gap to fix next.
+
+### Tool-call loop detection (OpenClaw port)
+- New `claude-api/loop-detection.js` (~330 LOC), JS port of OpenClaw's
+  `tool-loop-detection.ts`. Three orthogonal detectors:
+
+  | Detector | Threshold | Action |
+  |---|---|---|
+  | `generic_repeat` | 10 identical calls | warn |
+  | `known_poll_no_progress` (e.g. `BashOutput`) | 10 / 20 | warn / **kill** |
+  | `ping_pong` (A→B→A→B with stable outcomes) | 10 / 20 | warn / **kill** |
+  | `global_circuit_breaker` | 30 identical no-progress | **kill** |
+
+- Wired into `bot.js` at three places:
+  - `freshProgress()` initializes `loopState` per Claude run
+  - `tool_use` handler calls `recordToolCall` + `detectToolCallLoop`.
+    Critical → kills child + sends `🛑 Loop blocked` to channel. Warning →
+    sends `⚠️ ...` once per pattern (deduped via `lastLoopWarningKey`).
+  - `tool_result` handler calls `recordOutcomeById` to stamp the result hash
+    so the no-progress detectors can tell "same result" from "different result".
+- Removed the old 16-line `detectLoop()` helper and `toolSignatures` field —
+  strictly inferior.
+- All four detectors smoke-tested before wiring (`generic_repeat`,
+  `known_poll_no_progress`, `ping_pong`, healthy-mixed → no false positive).
+- Module loads successfully inside the running container.
 
 ## Current status
 - **Discord** (`BiancaDaCow#3914`) — live, healthy
@@ -6,6 +102,7 @@
 - Both run from a single `mybot-claude-api` container; signal-cli runs in the `mybot-signal-api` sidecar
 - Bring up: `docker compose --profile signal up -d --build`
 - Tear down: `docker compose --profile signal down`
+- **Self-rebuild from Claude:** `curl -X POST http://localhost:3400/rebuild` (the ONLY sanctioned path; never use `docker stop|kill|rm|restart|run` against `mybot-*`)
 
 ## Architecture (current)
 ```
@@ -118,6 +215,12 @@ SPOTIFY_CLIENT_SECRET=
 
 # Used by /setup links and !setup command for absolute URL generation
 PUBLIC_URL=http://localhost:3400
+
+# Self-rebuild — absolute host path to the project root. The /rebuild
+# endpoint spawns a host-side `mybot-rebuilder-*` container that bind-mounts
+# this path so it can run `docker compose up -d --build` from outside the
+# dying claude-api container.
+HOST_PROJECT_PATH=/mnt/c/Users/karen/Desktop/Github Projects/MyBot
 ```
 
 ## Known issues
@@ -134,39 +237,140 @@ Three groups (`Beep`, `boop`, `Bianca & Booboo`) show the bot in `pending_invite
 
 ## Testing checklist for next session
 
-### Live verification
-- [ ] **TikTok transcript pipeline** — send a TikTok URL with "tldr" via Signal, confirm Bianca summarizes the actual spoken content (not just title/author). First call ~15-30s due to download + Whisper; cached afterward.
-- [ ] **Conversational onboarding** — message Bianca from a phone number that's NOT in `user-profiles.json` and NOT the owner. Confirm the 3-step wizard runs (name → location → calendar y/n) and the OAuth link only appears on yes.
-- [ ] **Group member context / "plan for us"** — get a small group of onboarded users with connected calendars, ask "when can we 3 grab dinner this week", confirm Bianca cross-references calendars.
-- [ ] **Read-only enforcement** — from a non-owner Signal account, ask Bianca to edit a file in `/workspace/`. Confirm the Edit tool is unavailable (not just refused via prompt rule).
-- [ ] **`!joingroup`** — get a real Signal group invite link, send it to Bianca via `!joingroup <link>`, confirm she joins as a real member (verify with `signal-cli listGroups -d` showing `Active: true`).
-- [ ] **Pre-rebuild warning** — ask Bianca (from Discord) to make a small code edit and rebuild. Confirm she sends the "rebuilding myself, brb 30s" warning before running `docker compose up -d --build`.
-- [ ] **Signal auto-resume** — start a long task on Signal, `docker compose restart claude-api` mid-task, wait for restart. Confirm Bianca sends "I'm back from a restart, I was working on X — resend if you still need it."
+### High-priority live verification (this session's work)
+- [ ] **`/rebuild` from Claude end-to-end** — ask Bianca from Discord to make
+      any small code edit and rebuild. She should: (1) edit, (2) tell you
+      she's rebuilding, (3) call POST /rebuild, (4) NOT run `docker stop`
+      or `docker run`. Container should come back healthy in ~50s and the
+      conversation should keep going.
+- [ ] **Restart-notification covers all channels** — start a conversation
+      in Channel A, then trigger a rebuild while a conversation is also
+      active in Channel B (no `activeTask` yet, just a fresh message).
+      Both should receive a "Back online — I just rebuilt myself…" notice.
+- [ ] **Signal image pipeline** — send a JPG/PNG to Bianca on Signal and
+      ask "what's in this image". She should `Read` the file from
+      `/tmp/signal-attachments/` and describe it. (Previously she replied
+      "Image didn't come through — just a placeholder character.")
+- [ ] **Loop detection — known poll** — get Bianca into a stuck poll loop
+      (e.g. start a long-running bash via `Bash` then have her hammer
+      `BashOutput`). After ~10 identical no-progress polls she should warn,
+      after ~20 she should self-kill with a `🛑 Loop blocked` message.
+- [ ] **Loop detection — ping-pong** — give her a task that makes her
+      alternate between two tools forever (e.g. "keep checking X then
+      editing Y until Z"). Same warn/critical thresholds.
+- [ ] **Loop detection — no false positives** — make her do a normal
+      multi-step build (read 5 files, edit 3, run tests). She should get
+      to a clean finish with no `⚠️` or `🛑` messages.
+- [ ] **Signal mention in group** — `@Bianca what's up` in a Signal group
+      she's a member of, confirm she replies. Send a non-mention message
+      in the same group, confirm she stays silent (logs should show
+      "Group message — bot not mentioned").
+
+### Older verification still pending
+- [ ] **TikTok transcript pipeline** — send a TikTok URL with "tldr" via
+      Signal, confirm Bianca summarizes the actual spoken content.
+- [ ] **Conversational onboarding** — message Bianca from a phone number
+      that's NOT in `user-profiles.json` and NOT the owner. Confirm the
+      3-step wizard runs.
+- [ ] **Group member context / "plan for us"** — small group of onboarded
+      users with connected calendars, ask "when can we 3 grab dinner".
+- [ ] **Read-only enforcement** — non-owner Signal account asks for an
+      edit; confirm Edit tool is unavailable.
+- [ ] **`!joingroup`** — get a real Signal invite link, paste it,
+      confirm `signal-cli listGroups -d` shows `Active: true`.
+- [ ] **Signal auto-resume** — start long task on Signal, `docker compose
+      restart claude-api`, confirm "I'm back" message arrives.
 
 ### Edge cases worth probing
-- [ ] What happens if a user starts the onboarding wizard, then sends `!status`? (`!cancel` is wired, but does a normal `!command` mid-wizard escape cleanly?)
-- [ ] What happens if a non-owner user invokes `!loop` from Signal? Should be allowed (not a write operation per se), but `!loop "edit X"` might fail because `--disallowedTools` blocks Edit. Verify the loop bails gracefully.
-- [ ] Long Whisper transcripts (>3500 chars) — prompt injection truncates to 3500. Confirm tldr quality on a long video.
+- [ ] Onboarding wizard + `!status` mid-flow — does a normal `!command`
+      mid-wizard escape cleanly?
+- [ ] Non-owner `!loop "edit X"` from Signal — should bail gracefully
+      because `--disallowedTools` blocks Edit.
+- [ ] Long Whisper transcripts (>3500 chars) truncation quality.
+- [ ] **Loop detection w/ sub-agents** — spawn 3+ sub-agents that each
+      hit the loop threshold; the parent's loopState is shared, so the
+      first sub-agent to trip should kill the whole session. Verify
+      this is the desired behaviour or whether sub-agents need their
+      own loopState.
+- [ ] **`/rebuild` with broken syntax** — intentionally edit a file to
+      have a syntax error, hit /rebuild. Should return
+      `{ok:false, error:"Syntax errors found", details:[...]}` and NOT
+      kill the running container.
+
+## Known issues
+
+### Pending-invite Signal groups can't be auto-joined
+Three groups (`Beep`, `boop`, `Bianca & Booboo`) show the bot in
+`pending_invites`. signal-cli's `updateGroup -g` (the v2 invite-accept
+path) throws `"Cannot find service ID for self to accept invite"` on
+standalone-registered accounts. **Workaround:** `!joingroup
+<invite-link>` command. **Real fix (deferred):** linked-device onboarding.
+
+### bbernhard silently swallows JSON-RPC errors
+`POST /v1/groups/.../join` returns `204 No Content` even when the
+underlying call fails. Adapter now verifies actual membership after
+the call.
+
+### Signal mention by UUID is best-effort only
+The Signal mention detector matches against the bot's phone number
+AND `signalAdapter._selfUuid`, but `_selfUuid` is never populated
+(no signal-cli endpoint wired to fetch it). Phone-number match
+covers the common case. If you ever see "bot not mentioned" when you
+clearly @-mentioned her, this is the gap.
+
+### Loop detection state is per-session, not per-sub-agent
+`channelState.progress.loopState` is shared across the parent and any
+sub-agents Claude spawns. Three sub-agents each hitting their own
+local loop will increment the same shared counter. May or may not be
+desirable — see edge-case test above.
 
 ## Future work (deferred)
 
 ### OpenClaw architectural recommendations
-A deep research agent read OpenClaw's source end-to-end during the prior session. The full report is at `/home/karen/.claude/plans/logical-noodling-sun-agent-aaa46579895eda2ac.md`. Top 5 ports the user should consider:
+Deep-research report at `/home/karen/.claude/plans/logical-noodling-sun-agent-aaa46579895eda2ac.md`.
+Status of the top 5 ports:
 
-1. **Port `tool-loop-detection.ts`** — three orthogonal loop detectors (generic_repeat, known_poll_no_progress, ping_pong) + a global circuit breaker. Wired as a `before_tool_call` hook that *blocks* a tool call by returning `{blocked: true}`. ~700 LOC. Source: `/tmp/openclaw/src/agents/tool-loop-detection.ts`. Target: new `claude-api/loop-detection.js` + tool-use handler in `bot.js:~780`.
-2. **Heartbeat-wake coalesce/priority scheduler** with `requests-in-flight` skip — heartbeats never interrupt active conversations. Source: `/tmp/openclaw/src/infra/heartbeat-wake.ts`. Target: `claude-api/heartbeat.js`.
-3. **Replace `!loop` done-detection with a wrapper-tolerant `LOOP_COMPLETE` token strip** — copies the `HEARTBEAT_OK` pattern from `auto-reply/heartbeat.ts:124-185`. The current `<<TASK_COMPLETE>>` sentinel is a simpler version of this.
-4. **Supervisor module with `scopeKey` + `replaceExistingScope` + dual timers** — extract from `bot.js:askClaude()` into `claude-api/supervisor.js`. Eliminates the `state.process` / `_userStopped` / `busy` dance and makes `!stop` a one-liner. Source: `/tmp/openclaw/src/process/supervisor/supervisor.ts`.
-5. **Channel adapter contract tests** — one suite, run against both Discord and Signal adapters, prevents drift. Source pattern: `/tmp/openclaw/src/channels/plugins/contracts/inbound.{discord,signal}.contract.test.ts`. Target: new `tests/adapters/contract.test.js`.
+1. ~~**Port `tool-loop-detection.ts`**~~ — **DONE this session.** See
+   `claude-api/loop-detection.js` + wiring at `bot.js:freshProgress()`,
+   `tool_use` handler, and `tool_result` handler.
+2. **Heartbeat-wake coalesce/priority scheduler** with `requests-in-flight`
+   skip. Source: `/tmp/openclaw/src/infra/heartbeat-wake.ts`. Target:
+   `claude-api/heartbeat.js`.
+3. **Replace `!loop` done-detection with a wrapper-tolerant `LOOP_COMPLETE`
+   token strip** — copies the `HEARTBEAT_OK` pattern from
+   `auto-reply/heartbeat.ts:124-185`.
+4. **Supervisor module with `scopeKey` + `replaceExistingScope` + dual
+   timers** — extract from `bot.js:askClaude()` into
+   `claude-api/supervisor.js`. Eliminates the `state.process` /
+   `_userStopped` / `busy` dance and makes `!stop` a one-liner.
+5. **Channel adapter contract tests** — one suite run against both Discord
+   and Signal adapters.
+
+### SQLite migration of `tasks-storage.js`
+Originally listed as `task-ledger.js`, but `task-ledger.js` turned out
+to be dead code (nothing requires it). The actively-used file with the
+same crash-mid-write risk is `tasks-storage.js` (`briefing-tasks.json`).
+Move it to `better-sqlite3` (Node 20 doesn't have built-in `node:sqlite`)
+with per-task upserts. Low effort, eliminates corruption-on-crash. May
+also delete `task-ledger.js` outright since it's never imported.
+
+### Self-UUID lookup for Signal mention detection
+Add `_loadSelfInfo()` to `SignalAdapter.start()` — query
+`/v1/identities/{number}` (or whichever bbernhard endpoint exposes the
+account ACI/PNI), cache as `this._selfUuid`. Then group mention
+detection works for clients that mention by UUID rather than phone.
 
 ### iMessage adapter
-BlueBubbles on Mac. Same `MessagePlatform` base class pattern as `adapters/signal.js` and `adapters/discord.js`.
+BlueBubbles on Mac. Same `MessagePlatform` base class pattern as
+`adapters/signal.js`.
 
 ### "Tap to onboard" hint in groups
-Currently the conversational onboarding wizard only runs in 1:1 DMs (multi-step in a group is confusing). When an unknown user posts in a group, the bot should send them a hint to DM directly for setup.
-
-### SQLite task ledger
-`task-ledger.js` does `fs.writeFileSync` of the whole JSON on every mutation — a crash mid-write nukes the file. Move to `node:sqlite` (built-in on Node 22+) with per-task upsert. Cited in OpenClaw research as a high-value, low-effort improvement.
+The conversational onboarding wizard only runs in 1:1 DMs. When an
+unknown user posts in a group, the bot should send them a hint to DM
+directly for setup.
 
 ### Linked-device Signal onboarding
-The proper fix for pending-invite groups. Requires a phone or Android emulator with Signal installed using `+15106412088`. Once linked, all the `acceptInvite` paths will work because the local account store will have the self ACI/PNI populated via sync messages from the primary.
+Proper fix for pending-invite groups. Requires a phone or Android
+emulator with Signal installed using `+15106412088`. Once linked, all
+the `acceptInvite` paths will work because the local account store
+will have the self ACI/PNI populated via sync messages from the primary.

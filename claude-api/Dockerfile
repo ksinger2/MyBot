@@ -23,7 +23,15 @@ RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg -o 
     && apt-get update && apt-get install -y gh && rm -rf /var/lib/apt/lists/*
 
 # Install Docker CLI (for container management from inside the container)
-RUN apt-get update && apt-get install -y docker.io && rm -rf /var/lib/apt/lists/*
+# docker.io provides the engine + CLI, but on Debian 12 it does NOT include the
+# `docker compose` v2 plugin. Without compose, the self-rebuild path falls back
+# to `docker run` which kills this container without rebuilding it. We install
+# the standalone v2 binary explicitly so `docker compose ...` works inside.
+RUN apt-get update && apt-get install -y docker.io && rm -rf /var/lib/apt/lists/* \
+    && mkdir -p /usr/local/lib/docker/cli-plugins \
+    && curl -fsSL "https://github.com/docker/compose/releases/latest/download/docker-compose-linux-$(uname -m)" \
+       -o /usr/local/lib/docker/cli-plugins/docker-compose \
+    && chmod +x /usr/local/lib/docker/cli-plugins/docker-compose
 
 # Install cloudflared for exposing local dev servers via tunnel
 RUN curl -fsSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb -o /tmp/cloudflared.deb \

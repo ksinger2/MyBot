@@ -39,6 +39,11 @@ services:
       # Inbound messages arrive at /signal/webhook in this container. Set to "true"
       # to disable the polling loop in the signal adapter.
       - SIGNAL_USE_WEBHOOK=${SIGNAL_USE_WEBHOOK:-true}
+      # Absolute host path to the MyBot project root. Used by /rebuild when
+      # spawning the host-side `mybot-rebuilder-*` container so that bind
+      # mounts resolve correctly on the host filesystem (not the calling
+      # container's). Override per environment.
+      - HOST_PROJECT_PATH=${HOST_PROJECT_PATH:-/mnt/c/Users/karen/Desktop/Github Projects/MyBot}
     volumes:
       - ${HOME}/.claude:/home/node/.claude
       - ${HOME}/.claude.json:/home/node/.claude.json

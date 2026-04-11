@@ -111,6 +111,7 @@ class NormalizedMessage {
     senderName = null,
     text = '',
     attachments = [],
+    mentions = [],
     timestamp = Date.now(),
     raw = null,        // original platform-specific message object
   }) {
@@ -120,7 +121,8 @@ class NormalizedMessage {
     this.senderId = senderId;
     this.senderName = senderName;
     this.text = text;
-    this.attachments = attachments; // [{ name, type, data: Buffer }]
+    this.attachments = attachments; // [{ name, type, id, size, localPath }]
+    this.mentions = mentions;       // [{ number, uuid, name, start, length }]
     this.timestamp = timestamp;
     this.raw = raw;
   }

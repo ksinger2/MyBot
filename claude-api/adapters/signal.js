@@ -485,7 +485,7 @@ class SignalAdapter extends MessagePlatform {
     }
   }
 
-  _handleIncoming(raw) {
+  async _handleIncoming(raw) {
     // signal-cli-rest-api returns envelope objects
     const envelope = raw.envelope || raw;
     if (!envelope) return;
@@ -523,19 +523,49 @@ class SignalAdapter extends MessagePlatform {
       this._uuidToPhone.set(senderUuid, envelope.sourceNumber);
       console.log(`[signal] Learned UUID→phone: ${senderUuid} → ${envelope.sourceNumber}`);
     }
-    console.log(`[signal] Incoming from ${senderId} (phone: ${senderPhone}, uuid: ${senderUuid}, chat: ${chatId}): ${(dataMessage.message || '').substring(0, 50)}`);
+    console.log(`[signal] Incoming from ${senderId} (phone: ${senderPhone}, uuid: ${senderUuid}, chat: ${chatId}): ${(dataMessage.message || '').substring(0, 50)}${dataMessage.attachments?.length ? ` [${dataMessage.attachments.length} attachment(s)]` : ''}`);
     const timestamp = dataMessage.timestamp || envelope.timestamp || Date.now();
 
-    // Process attachments
-    const attachments = (dataMessage.attachments || []).map(att => ({
-      name: att.filename || `attachment_${att.id}`,
-      type: att.contentType || 'application/octet-stream',
-      id: att.id,
-      size: att.size,
-    }));
+    // Download attachments to a local temp dir so Claude can Read them. The
+    // signal-api exposes raw bytes at GET /v1/attachments/{id}; we save under
+    // /tmp/signal-attachments/{ts}-{filename} and pass the local path through.
+    // Without this, Claude only sees an attachment id and cannot inspect the
+    // file — which is the bug the user reported ("sent an image, bot couldn't
+    // receive it").
+    const attachments = [];
+    for (const att of (dataMessage.attachments || [])) {
+      const attMeta = {
+        name: att.filename || `attachment_${att.id}`,
+        type: att.contentType || 'application/octet-stream',
+        id: att.id,
+        size: att.size,
+        localPath: null,
+      };
+      try {
+        const localPath = await this._downloadAttachment(att.id, attMeta.name, attMeta.type);
+        if (localPath) {
+          attMeta.localPath = localPath;
+        }
+      } catch (err) {
+        console.warn(`[signal] Failed to download attachment ${att.id}: ${err.message}`);
+      }
+      attachments.push(attMeta);
+    }
 
     // Cache chat info
     this._chats.set(chatId, { id: chatId, name: senderName, lastSeen: Date.now() });
+
+    // Extract mentions in a normalized form so the consumer can check whether
+    // the bot was @mentioned in a group. signal-cli mention objects vary in
+    // shape — sometimes only `uuid` is set, sometimes only `number`, sometimes
+    // both. We pass through whatever the envelope had.
+    const mentions = (dataMessage.mentions || []).map(m => ({
+      number: m.number || null,
+      uuid: m.uuid || null,
+      name: m.name || null,
+      start: m.start,
+      length: m.length,
+    }));
 
     const normalized = new NormalizedMessage({
       id: String(timestamp),
@@ -545,11 +575,49 @@ class SignalAdapter extends MessagePlatform {
       senderName,
       text: text || '',
       attachments,
+      mentions,
       timestamp,
       raw,
     });
 
     this.emit('message', normalized);
+  }
+
+  /**
+   * Download an attachment from signal-api and save it to /tmp.
+   * Returns the local file path, or null on failure.
+   */
+  async _downloadAttachment(attachmentId, filename, contentType) {
+    if (!attachmentId) return null;
+    const fs = require('fs');
+    const path = require('path');
+
+    const dir = '/tmp/signal-attachments';
+    fs.mkdirSync(dir, { recursive: true });
+
+    // Pick an extension if filename has none — helps Claude figure out file type
+    let safeName = (filename || `att_${attachmentId}`).replace(/[^\w.\-]/g, '_');
+    if (!path.extname(safeName) && contentType) {
+      const extMap = {
+        'image/jpeg': '.jpg', 'image/png': '.png', 'image/gif': '.gif',
+        'image/webp': '.webp', 'image/heic': '.heic', 'image/heif': '.heif',
+        'video/mp4': '.mp4', 'video/quicktime': '.mov',
+        'audio/aac': '.aac', 'audio/mpeg': '.mp3', 'audio/ogg': '.ogg',
+        'application/pdf': '.pdf',
+      };
+      const ext = extMap[contentType];
+      if (ext) safeName += ext;
+    }
+    const localPath = path.join(dir, `${Date.now()}_${safeName}`);
+
+    const resp = await this._fetch(`/v1/attachments/${encodeURIComponent(attachmentId)}`);
+    if (!resp.ok) {
+      throw new Error(`signal-api returned ${resp.status} for attachment ${attachmentId}`);
+    }
+    const buf = Buffer.from(await resp.arrayBuffer());
+    fs.writeFileSync(localPath, buf);
+    console.log(`[signal] Downloaded attachment ${attachmentId} → ${localPath} (${buf.length} bytes)`);
+    return localPath;
   }
 
   _isGroupId(chatId) {

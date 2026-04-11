@@ -132,6 +132,143 @@ app.post('/remind', async (req, res) => {
 
 app.get('/health', (req, res) => res.json({ status: 'ok' }));
 
+// ── Self-rebuild endpoint ────────────────────────────────────────────────────
+// Single sanctioned path for the bot to rebuild itself. Claude is told via the
+// system prompt to call this instead of running docker commands directly.
+//
+// Safety steps:
+//   1. Syntax-check every .js file in /workspace/MyBot/claude-api before doing
+//      anything destructive. Reject the rebuild if anything fails to parse.
+//   2. Flush all pending channel-state writes so we don't lose anything.
+//   3. Mark every busy channel with a "wantsRestartNotification" flag so the
+//      next process can let users know "I went down — resend if you still need it".
+//   4. Spawn the rebuild as a fully-detached background process via nohup so
+//      that when docker compose stops THIS container, the spawn keeps going on
+//      the host's docker socket and replaces us with the new image.
+//
+// We respond to the HTTP request BEFORE the rebuild starts so Claude gets a
+// confirmation it can announce to the user before the container disappears.
+app.post('/rebuild', async (req, res) => {
+  const fs = require('fs');
+  const path = require('path');
+  const { spawn, execSync } = require('child_process');
+
+  const APP_DIR = '/workspace/MyBot/claude-api';
+  const COMPOSE_FILE = '/workspace/MyBot/docker-compose.yml';
+
+  // 1. Syntax check every .js file
+  let jsFiles = [];
+  try {
+    jsFiles = fs.readdirSync(APP_DIR).filter(f => f.endsWith('.js'));
+  } catch (err) {
+    return res.status(500).json({ ok: false, error: `Cannot read ${APP_DIR}: ${err.message}` });
+  }
+  const syntaxErrors = [];
+  for (const f of jsFiles) {
+    try {
+      execSync(`node -c "${path.join(APP_DIR, f)}"`, { stdio: 'pipe' });
+    } catch (err) {
+      const stderr = (err.stderr || '').toString().split('\n').slice(0, 3).join(' ');
+      syntaxErrors.push(`${f}: ${stderr}`);
+    }
+  }
+  if (syntaxErrors.length > 0) {
+    return res.status(400).json({
+      ok: false,
+      error: 'Syntax errors found — refusing to rebuild',
+      details: syntaxErrors,
+    });
+  }
+
+  // 2. Flush all pending channel state writes
+  try {
+    const { flushPendingWrites } = require('./channel-persistence');
+    flushPendingWrites();
+  } catch (err) {
+    console.error('[rebuild] flushPendingWrites failed:', err.message);
+  }
+
+  // 3. Mark every busy channel as needing a restart notification
+  try {
+    const bot = require('./bot');
+    const channels = bot.channels || new Map();
+    const { saveChannelState } = require('./channel-persistence');
+    let marked = 0;
+    for (const [chanId, state] of channels.entries()) {
+      if (state && (state.busy || (state.queue && state.queue.length > 0))) {
+        state.wantsRestartNotification = {
+          reason: 'rebuild',
+          at: new Date().toISOString(),
+          summary: state.activeTask?.prompt?.substring(0, 100) || null,
+        };
+        saveChannelState(chanId, state, { critical: true });
+        marked++;
+      }
+    }
+    console.log(`[rebuild] Marked ${marked} channel(s) for restart notification`);
+  } catch (err) {
+    console.error('[rebuild] could not mark channels:', err.message);
+  }
+
+  // 4. Respond before the rebuild starts so Claude can announce success
+  res.json({
+    ok: true,
+    message: 'Rebuild started — container will be replaced in ~30s',
+    syntaxChecked: jsFiles.length,
+  });
+
+  // 5. Spawn the rebuild via a SEPARATE host-side container so it survives
+  //    THIS container being stopped.
+  //
+  //    Critical lesson learned the hard way: a process spawned with
+  //    `detached: true` from inside a Docker container gets SIGKILLed when
+  //    the container is stopped, regardless of unref(). The whole PID
+  //    namespace dies. So you MUST hand the rebuild off to something running
+  //    on the host.
+  //
+  //    Approach: ask the host docker daemon to start a new short-lived
+  //    `docker:cli` container that:
+  //      - mounts the docker socket so it can drive `docker compose`
+  //      - mounts the project source from the host at /work
+  //      - sleeps a couple seconds to let our HTTP response flush
+  //      - runs `docker compose up -d --build` (which stops/replaces THIS
+  //        container as part of its normal flow)
+  //      - exits and is auto-removed
+  //
+  //    HOST_PROJECT_PATH is the absolute path on the host to the MyBot
+  //    project — required because the docker daemon resolves bind-mount
+  //    paths relative to the HOST filesystem, not the calling container.
+  //    In dev that's the WSL Windows path; in CI/cloud it'd be different.
+  setTimeout(() => {
+    try {
+      const HOST_PROJECT_PATH = process.env.HOST_PROJECT_PATH
+        || '/mnt/c/Users/karen/Desktop/Github Projects/MyBot';
+      console.log(`[rebuild] Spawning host-side rebuild container (HOST_PROJECT_PATH=${HOST_PROJECT_PATH})`);
+      const dockerArgs = [
+        'run', '-d', '--rm',
+        '--name', `mybot-rebuilder-${Date.now()}`,
+        '-v', '/var/run/docker.sock:/var/run/docker.sock',
+        '-v', `${HOST_PROJECT_PATH}:/work`,
+        '-w', '/work',
+        'docker:cli',
+        'sh', '-c',
+        // Sleep so the HTTP response and any tool_use logs can flush before
+        // we start tearing down the original container. The compose up
+        // command itself replaces the container; without --build it'd reuse
+        // the cached image (we want a fresh build).
+        'sleep 3 && docker compose -f docker-compose.yml --profile signal up -d --build',
+      ];
+      const child = spawn('docker', dockerArgs, {
+        detached: true,
+        stdio: 'ignore',
+      });
+      child.unref();
+    } catch (err) {
+      console.error('[rebuild] spawn failed:', err.message);
+    }
+  }, 500);
+});
+
 // Signal webhook receiver — used when signal-api runs in MODE=json-rpc.
 // bbernhard's signal-cli-rest-api forwards every JSON-RPC frame from signal-cli
 // to this endpoint. The frames come in three shapes:
@@ -172,7 +309,12 @@ app.post('/signal/webhook', express.json({ limit: '5mb' }), (req, res) => {
     for (const item of items) {
       const envelope = _extractSignalEnvelope(item);
       if (envelope) {
-        adapter._handleIncoming(envelope);
+        // _handleIncoming is async (it downloads attachments) — wrap with
+        // .catch so a single bad envelope can't crash the process via an
+        // unhandled rejection.
+        Promise.resolve(adapter._handleIncoming(envelope)).catch(err => {
+          console.error('[signal-webhook] handler error:', err.message, err.stack);
+        });
         processed++;
       } else {
         ignored++;
