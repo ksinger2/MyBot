@@ -17,6 +17,10 @@ services:
       - ELEVENLABS_API_KEY=${ELEVENLABS_API_KEY:-}
       - REPLICATE_API_TOKEN=${REPLICATE_API_TOKEN:-}
       - STRIPE_SECRET_KEY=${STRIPE_SECRET_KEY:-}
+      # AES-256-GCM key (HKDF-derived) for encrypting OAuth tokens at rest in
+      # /app/data/user-tokens.json and /app/data/spotify-tokens.json. If unset,
+      # tokens are stored in plaintext (dev fallback) and the modules warn.
+      - TOKEN_ENCRYPTION_KEY=${TOKEN_ENCRYPTION_KEY:-}
       # Google OAuth for multi-user calendar coordination
       - GOOGLE_CLIENT_ID=${GOOGLE_CLIENT_ID:-}
       - GOOGLE_CLIENT_SECRET=${GOOGLE_CLIENT_SECRET:-}
