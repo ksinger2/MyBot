@@ -533,3 +533,32 @@ Proper fix for pending-invite groups. Requires a phone or Android
 emulator with Signal installed using `+15106412088`. Once linked, all
 the `acceptInvite` paths will work because the local account store
 will have the self ACI/PNI populated via sync messages from the primary.
+
+### Shopping / product recommendations (deferred — user will start conversational)
+User wants to ask Bianca for product recommendations and best-price links
+on retailers like Amazon. Today's tools cover this conversationally:
+- **WebSearch** + **WebFetch** + **Playwright MCP** are all live and
+  available to owner sessions. Read-only Signal users get WebSearch + WebFetch
+  but not Playwright (per the C4 allowlist).
+- **Caveat:** Amazon actively blocks scrapers; WebFetch hits a captcha
+  ~30-50% of the time on product URLs and Playwright detection isn't
+  much better. Workable today by routing through Google Shopping
+  (`<product> price comparison` style queries) which aggregates Amazon,
+  Walmart, Target, Best Buy etc.
+- User decided 2026-04-11 to **start by just asking Bianca conversationally**
+  and see how she does before adding any structured tooling.
+
+If/when we want to harden this, options ranked by effort:
+1. **`!shop <product>` command** — wraps a Google Shopping search +
+   2-3 retailer site queries in parallel, returns a ranked best-price list.
+   Pure code change, no API keys.
+2. **Affiliate link rewriting** — append `?tag=<associate-id>-20` to every
+   Amazon URL Bianca returns so the user earns on clicks. Needs an
+   Amazon Associates signup (~5 min).
+3. **Amazon Product Advertising API (PA-API)** — official, free with an
+   Associates account, returns clean JSON with current price + affiliate
+   link. Most reliable Amazon-specific path.
+4. **Keepa** or **Rainforest API** — paid, accurate Amazon price history
+   + cross-retailer.
+5. **SerpAPI Google Shopping** — paid, scrapes Google Shopping cleanly
+   without the brittleness of WebFetch.
