@@ -64,7 +64,10 @@ services:
   # Registration: docker compose exec signal-api curl -X POST 'http://localhost:8080/v1/register/+1YOURNUMBER'
   # Verify: docker compose exec signal-api curl -X POST 'http://localhost:8080/v1/register/+1YOURNUMBER/verify/CODE'
   signal-api:
-    image: bbernhard/signal-cli-rest-api:latest
+    # Pinned 2026-04-11 to 0.98 to avoid silent supply-chain drift on rebuild.
+    # To bump: check https://hub.docker.com/r/bbernhard/signal-cli-rest-api/tags
+    # for the latest stable, update the tag, and `docker compose up -d --build signal-api`.
+    image: bbernhard/signal-cli-rest-api:0.98
     restart: unless-stopped
     environment:
       # MODE=json-rpc runs signal-cli as a persistent daemon (one JVM, started once).

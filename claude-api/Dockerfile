@@ -17,7 +17,10 @@ RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/*
 # yt-dlp from pip — much fresher than apt's package; --break-system-packages
 # is needed because Debian 12 ships PEP 668-protected python.
-RUN pip3 install --break-system-packages --no-cache-dir yt-dlp
+# Pinned 2026-04-11 to avoid silent supply-chain drift. yt-dlp uses calendar
+# versioning. To bump, check https://pypi.org/project/yt-dlp/ for the latest
+# stable, update the version below, and rebuild.
+RUN pip3 install --break-system-packages --no-cache-dir yt-dlp==2026.3.17
 RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg -o /usr/share/keyrings/githubcli-archive-keyring.gpg \
     && echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" > /etc/apt/sources.list.d/github-cli.list \
     && apt-get update && apt-get install -y gh && rm -rf /var/lib/apt/lists/*
