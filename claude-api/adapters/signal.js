@@ -37,6 +37,9 @@ class SignalAdapter extends MessagePlatform {
     this._uuidToPhone = new Map(); // UUID → phone number cache
     this._groups = new Map(); // internal_id → { publicId, name, isMember }
     this._joinedGroups = new Set(); // internal_ids we've already attempted to join
+    this._selfUuid = null; // bot's own ACI/PNI — populated by _loadSelfInfo() so
+                           // group mention detection can match @-mentions that
+                           // identify the bot by UUID rather than phone number
 
     // When SIGNAL_USE_WEBHOOK=true, signal-api runs in MODE=json-rpc and pushes
     // incoming messages to /signal/webhook in claude-api. Polling /v1/receive/
@@ -83,6 +86,11 @@ class SignalAdapter extends MessagePlatform {
 
     // Load contacts to build UUID→phone mapping
     await this._loadContacts();
+
+    // Resolve the bot's own UUID so group @-mention matching works for clients
+    // that reference the bot by ACI rather than phone number. Best-effort —
+    // falls back to phone-only matching if the lookup fails.
+    await this._loadSelfInfo();
 
     // Load groups so we know how to address them and which need joining.
     await this._loadGroups();
@@ -439,6 +447,42 @@ class SignalAdapter extends MessagePlatform {
     if (cached?.publicId) return cached.publicId;
     // Fresh wrap — works even before _loadGroups has populated the cache.
     return 'group.' + Buffer.from(internalId, 'utf-8').toString('base64');
+  }
+
+  /**
+   * Resolve this.phoneNumber → this._selfUuid via /v1/identities/{number}.
+   *
+   * bbernhard's /v1/identities endpoint returns every identity signal-cli has
+   * seen for the account — including the account's OWN entry, which carries
+   * its ACI in the `uuid` field. We find the row where `number === phoneNumber`
+   * and cache its UUID so the Signal mention detector in bot.js can match
+   * @-mentions that identify the bot by UUID instead of phone number.
+   *
+   * Best-effort — any failure just leaves _selfUuid null and mention detection
+   * falls back to phone-number match.
+   */
+  async _loadSelfInfo() {
+    try {
+      const resp = await this._fetch(`/v1/identities/${encodeURIComponent(this.phoneNumber)}`);
+      if (!resp.ok) {
+        console.warn(`[signal] Could not load self identity: HTTP ${resp.status}`);
+        return;
+      }
+      const identities = await resp.json();
+      if (!Array.isArray(identities)) return;
+      const selfRow = identities.find(i => i && i.number === this.phoneNumber && i.uuid);
+      if (selfRow) {
+        this._selfUuid = selfRow.uuid;
+        // Also seed the UUID→phone cache with the self mapping so replies
+        // that come back addressed by UUID resolve correctly.
+        this._uuidToPhone.set(selfRow.uuid, this.phoneNumber);
+        console.log(`[signal] Self UUID resolved: ${this._selfUuid}`);
+      } else {
+        console.warn(`[signal] No identity row found for self (${this.phoneNumber}) — UUID mention detection disabled`);
+      }
+    } catch (err) {
+      console.warn(`[signal] Could not load self info: ${err.message}`);
+    }
   }
 
   async _loadContacts() {

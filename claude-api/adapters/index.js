@@ -2,7 +2,7 @@
  * Messaging Adapters — platform-agnostic messaging layer.
  *
  * Reusable across projects. Drop the adapters/ folder into any Node.js project
- * and use the same interface for Discord, Signal, iMessage, etc.
+ * and use the same interface for Discord, Signal, etc.
  *
  * Usage:
  *   const { DiscordAdapter, SignalAdapter, createAdapter } = require('./adapters');

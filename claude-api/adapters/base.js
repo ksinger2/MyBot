@@ -1,7 +1,7 @@
 /**
  * MessagePlatform — base adapter interface for messaging platforms.
  *
- * Reusable across projects. Subclass this for Discord, Signal, iMessage, etc.
+ * Reusable across projects. Subclass this for Discord, Signal, etc.
  * All bot logic talks to this interface, never to platform-specific APIs directly.
  *
  * Usage:
@@ -15,7 +15,7 @@ const EventEmitter = require('events');
 class MessagePlatform extends EventEmitter {
   constructor(opts = {}) {
     super();
-    this.platform = 'base';       // override in subclass: 'discord', 'signal', 'imessage'
+    this.platform = 'base';       // override in subclass: 'discord', 'signal'
     this.ready = false;
     this.opts = opts;
   }

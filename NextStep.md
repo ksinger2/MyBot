@@ -1,3 +1,22 @@
+# MyBot — Session Handoff (2026-04-11, late evening)
+
+## This session's fixes (after the resilience overhaul)
+- **Signal self-UUID resolved** — `SignalAdapter._loadSelfInfo()` queries
+  `/v1/identities/{phoneNumber}` and caches `this._selfUuid`. Group
+  @-mention matching now works for clients that reference the bot by UUID.
+- **Per-sub-agent loop detection** — each `activeAgents` entry gets its
+  own `loopState`. Tool-use and tool-result handlers route via
+  `parent_tool_use_id` → `agentObj.loopState`. Sub-agents no longer
+  pollute each other's sliding windows.
+- **`/rebuild` project-name bug** — the host-side rebuilder ran
+  `docker compose up` inside `/work`, so compose derived project name
+  `work` and created duplicate `work-claude-api-1` / `work-signal-api-1`
+  containers next to the real `mybot-*` ones. Added `-p mybot` to the
+  compose command in `server.js:259` so the project name is deterministic
+  regardless of working directory.
+
+---
+
 # MyBot — Session Handoff (2026-04-11, evening)
 
 ## What changed this session (the headline)
@@ -311,18 +330,20 @@ standalone-registered accounts. **Workaround:** `!joingroup
 underlying call fails. Adapter now verifies actual membership after
 the call.
 
-### Signal mention by UUID is best-effort only
-The Signal mention detector matches against the bot's phone number
-AND `signalAdapter._selfUuid`, but `_selfUuid` is never populated
-(no signal-cli endpoint wired to fetch it). Phone-number match
-covers the common case. If you ever see "bot not mentioned" when you
-clearly @-mentioned her, this is the gap.
+### ~~Signal mention by UUID is best-effort only~~ — FIXED
+`SignalAdapter._loadSelfInfo()` now queries `/v1/identities/{phoneNumber}`
+at startup, finds the row where `number === phoneNumber`, and caches the
+`uuid` as `this._selfUuid`. Verified live: startup logs now print
+`[signal] Self UUID resolved: e69a86a8-c394-4852-92f4-d4ba6b06fb72`.
+Group @-mentions that reference the bot by UUID now match.
 
-### Loop detection state is per-session, not per-sub-agent
-`channelState.progress.loopState` is shared across the parent and any
-sub-agents Claude spawns. Three sub-agents each hitting their own
-local loop will increment the same shared counter. May or may not be
-desirable — see edge-case test above.
+### ~~Loop detection state is per-session, not per-sub-agent~~ — FIXED
+Each sub-agent spawned via the `Agent` tool now gets its own
+`loopState` stored on its `activeAgents` entry. The `tool_use` and
+`tool_result` handlers in `bot.js` route loop-detection calls via
+`agentObj ? agentObj.loopState : channelState.progress.loopState`,
+where `agentObj` is looked up from `parent_tool_use_id`. Sub-agents
+can no longer pollute each other's sliding windows.
 
 ## Future work (deferred)
 
@@ -353,16 +374,6 @@ same crash-mid-write risk is `tasks-storage.js` (`briefing-tasks.json`).
 Move it to `better-sqlite3` (Node 20 doesn't have built-in `node:sqlite`)
 with per-task upserts. Low effort, eliminates corruption-on-crash. May
 also delete `task-ledger.js` outright since it's never imported.
-
-### Self-UUID lookup for Signal mention detection
-Add `_loadSelfInfo()` to `SignalAdapter.start()` — query
-`/v1/identities/{number}` (or whichever bbernhard endpoint exposes the
-account ACI/PNI), cache as `this._selfUuid`. Then group mention
-detection works for clients that mention by UUID rather than phone.
-
-### iMessage adapter
-BlueBubbles on Mac. Same `MessagePlatform` base class pattern as
-`adapters/signal.js`.
 
 ### "Tap to onboard" hint in groups
 The conversational onboarding wizard only runs in 1:1 DMs. When an

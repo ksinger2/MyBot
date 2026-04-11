@@ -6,7 +6,16 @@ services:
       - "989"
     environment:
       - DISCORD_BOT_TOKEN=${DISCORD_BOT_TOKEN}
-      # Access control — comma-separated Discord user IDs (empty = allow all)
+      # Shared secret for internal API auth. Required for /ask, /imagine,
+      # /remind, /rebuild, /active-sessions, and (via ?token= query) the
+      # /signal/webhook receiver. Consumed by bot.js internal callers, the
+      # signal-api sidecar webhook forwarder, and any future internal services.
+      # MUST be set to a long random value in .env — if unset, all authenticated
+      # routes fail with HTTP 503 (we refuse to fail open).
+      - INTERNAL_API_TOKEN=${INTERNAL_API_TOKEN:-}
+      # Access control — comma-separated IDs/numbers (empty = DENY ALL after the
+      # 2026-04-11 fail-closed flip). SIGNAL_OWNER_NUMBER always bypasses the
+      # Signal allowlist so the owner can never lock themselves out.
       - ALLOWED_USER_IDS=${ALLOWED_USER_IDS:-}
       - ADMIN_USER_IDS=${ADMIN_USER_IDS:-}
       # API keys available to Claude Code when building projects
@@ -44,12 +53,19 @@ services:
       # mounts resolve correctly on the host filesystem (not the calling
       # container's). Override per environment.
       - HOST_PROJECT_PATH=${HOST_PROJECT_PATH:-/mnt/c/Users/karen/Desktop/Github Projects/MyBot}
+      # GitHub auth for `gh` CLI. Replaces the old ${HOME}/.config/gh bind mount
+      # (removed 2026-04-11 for security). The `gh` CLI natively picks up
+      # GH_TOKEN from the environment. Set this in .env to a personal access
+      # token with minimum scopes the bot needs (repo, workflow — NOT admin).
+      - GH_TOKEN=${GH_TOKEN:-}
+    # SSH key and gh config mounts were removed 2026-04-11 after a security
+    # review found prompt-injection could exfiltrate them via Claude's Read
+    # tool + --dangerously-skip-permissions. `gh` CLI now authenticates via
+    # GH_TOKEN (set in .env). See NextStep.md finding H3.
     volumes:
       - ${HOME}/.claude:/home/node/.claude
       - ${HOME}/.claude.json:/home/node/.claude.json
       - ${HOME}/.gitconfig:/home/node/.gitconfig:ro
-      - ${HOME}/.ssh:/home/node/.ssh:ro
-      - ${HOME}/.config/gh:/home/node/.config/gh:ro
       - /mnt/c/Users/karen/Desktop/Github Projects:/workspace
       - /var/run/docker.sock:/var/run/docker.sock
     healthcheck:
@@ -73,7 +89,11 @@ services:
       - MODE=json-rpc
       # Push every incoming envelope to the bot's webhook receiver. Only honored
       # when MODE=json-rpc (verified in bbernhard src/main.go:159-161).
-      - RECEIVE_WEBHOOK_URL=http://claude-api:3400/signal/webhook
+      # The ?token= query param is the shared secret gate — the claude-api
+      # server rejects any webhook delivery whose token does not match
+      # INTERNAL_API_TOKEN. Without this gate, envelope.sourceNumber is
+      # trivially forgeable by any sibling on the docker bridge.
+      - RECEIVE_WEBHOOK_URL=http://claude-api:3400/signal/webhook?token=${INTERNAL_API_TOKEN:-}
       - LOG_LEVEL=info
     volumes:
       - signal-data:/home/.local/share/signal-cli

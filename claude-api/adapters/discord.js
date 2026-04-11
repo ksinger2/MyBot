@@ -1,8 +1,8 @@
 /**
  * DiscordAdapter — Wraps discord.js Client as a MessagePlatform adapter.
  *
- * This adapter normalizes Discord events into the same interface as SignalAdapter,
- * iMessageAdapter, etc. so bot logic can be platform-agnostic.
+ * This adapter normalizes Discord events into the same interface as SignalAdapter
+ * so bot logic can be platform-agnostic.
  *
  * Usage:
  *   const adapter = new DiscordAdapter({ token: process.env.DISCORD_BOT_TOKEN });

@@ -1,10 +1,59 @@
 const express = require('express');
 const { spawn } = require('child_process');
+const crypto = require('crypto');
 
 const app = express();
 app.use(express.json());
 
-app.post('/ask', (req, res) => {
+// ── Security: shared-secret auth for internal routes ────────────────────────
+// Every mutating/sensitive endpoint (/ask, /imagine, /remind, /rebuild, …) is
+// gated by a shared secret supplied in the X-Internal-Token header (or the
+// ?token= query string for /signal/webhook, where bbernhard's JSON-RPC
+// forwarder cannot inject custom headers).
+//
+// The secret comes from INTERNAL_API_TOKEN in the environment. If it is unset
+// we REFUSE every authenticated request with 503 — we never fail open.
+const INTERNAL_API_TOKEN = process.env.INTERNAL_API_TOKEN || '';
+if (!INTERNAL_API_TOKEN) {
+  console.error('[security] WARNING: INTERNAL_API_TOKEN not set — all authenticated routes will be unreachable');
+}
+
+// Constant-time string compare. Pads to equal length before calling
+// timingSafeEqual so a length mismatch doesn't leak via an early throw.
+function safeTokenEqual(a, b) {
+  if (typeof a !== 'string' || typeof b !== 'string') return false;
+  if (a.length === 0 || b.length === 0) return false;
+  const len = Math.max(a.length, b.length);
+  const ab = Buffer.alloc(len, 0);
+  const bb = Buffer.alloc(len, 0);
+  ab.write(a);
+  bb.write(b);
+  // Final length check guards against the pathological case where both
+  // strings differ only in trailing NULs after padding.
+  const sameLen = a.length === b.length;
+  const eq = crypto.timingSafeEqual(ab, bb);
+  return sameLen && eq;
+}
+
+function requireInternalToken(req, res, next) {
+  if (!INTERNAL_API_TOKEN) {
+    return res.status(503).json({ error: 'server misconfigured: INTERNAL_API_TOKEN not set' });
+  }
+  const supplied = req.get('X-Internal-Token') || '';
+  if (!safeTokenEqual(supplied, INTERNAL_API_TOKEN)) {
+    return res.status(401).json({ error: 'unauthorized' });
+  }
+  next();
+}
+
+// HTML escape for user-controlled interpolations in the /setup pages. Defends
+// against reflected XSS, which in a same-origin context would bypass auth on
+// every other endpoint.
+const escapeHtml = (s) => String(s ?? '').replace(/[&<>"']/g, c => ({
+  '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'
+}[c]));
+
+app.post('/ask', requireInternalToken, (req, res) => {
   const { prompt } = req.body;
   if (!prompt) return res.status(400).json({ error: 'prompt required' });
 
@@ -53,7 +102,7 @@ app.post('/ask', (req, res) => {
 });
 
 // Internal image generation endpoint — called by Claude CLI via curl
-app.post('/imagine', async (req, res) => {
+app.post('/imagine', requireInternalToken, async (req, res) => {
   const { prompt } = req.body;
   if (!prompt) return res.status(400).json({ error: 'prompt required' });
   if (!process.env.OPENAI_API_KEY) return res.status(500).json({ error: 'No OPENAI_API_KEY configured' });
@@ -82,7 +131,7 @@ app.post('/imagine', async (req, res) => {
 
 // Internal reminder endpoint — creates a Google Calendar event as a reminder
 // Called by Claude CLI via curl when user asks "remind me..."
-app.post('/remind', async (req, res) => {
+app.post('/remind', requireInternalToken, async (req, res) => {
   const { title, datetime, duration_minutes, discord_user_id, description } = req.body;
   if (!title || !datetime || !discord_user_id) {
     return res.status(400).json({ error: 'title, datetime (ISO 8601), and discord_user_id are required' });
@@ -148,7 +197,7 @@ app.get('/health', (req, res) => res.json({ status: 'ok' }));
 //
 // We respond to the HTTP request BEFORE the rebuild starts so Claude gets a
 // confirmation it can announce to the user before the container disappears.
-app.post('/rebuild', async (req, res) => {
+app.post('/rebuild', requireInternalToken, async (req, res) => {
   const fs = require('fs');
   const path = require('path');
   const { spawn, execSync } = require('child_process');
@@ -256,7 +305,12 @@ app.post('/rebuild', async (req, res) => {
         // we start tearing down the original container. The compose up
         // command itself replaces the container; without --build it'd reuse
         // the cached image (we want a fresh build).
-        'sleep 3 && docker compose -f docker-compose.yml --profile signal up -d --build',
+        //
+        // `-p mybot` is CRITICAL: without it, docker-compose derives the
+        // project name from the working directory (`/work` → `work`), which
+        // would create a second set of `work-claude-api-1` / `work-signal-api-1`
+        // containers instead of replacing the existing `mybot-*` ones.
+        'sleep 3 && docker compose -p mybot -f docker-compose.yml --profile signal up -d --build',
       ];
       const child = spawn('docker', dockerArgs, {
         detached: true,
@@ -293,7 +347,26 @@ function _extractSignalEnvelope(body) {
   return body;
 }
 
+// Signal webhook auth: bbernhard's JSON-RPC forwarder cannot inject custom
+// HTTP headers, so we accept the shared secret as a ?token= query string.
+// Operators MUST configure signal-api with:
+//   RECEIVE_WEBHOOK_URL=http://claude-api:3400/signal/webhook?token=${INTERNAL_API_TOKEN}
+// Without the token gate, envelope.sourceNumber is trivially forgeable and an
+// attacker could impersonate the owner.
+let _signalAuthLastWarnAt = 0;
 app.post('/signal/webhook', express.json({ limit: '5mb' }), (req, res) => {
+  if (!INTERNAL_API_TOKEN) {
+    return res.status(503).end();
+  }
+  const supplied = typeof req.query.token === 'string' ? req.query.token : '';
+  if (!safeTokenEqual(supplied, INTERNAL_API_TOKEN)) {
+    const now = Date.now();
+    if (now - _signalAuthLastWarnAt > 60000) {
+      _signalAuthLastWarnAt = now;
+      console.warn('[signal-webhook] rejected request with missing/invalid ?token= (logged at most once/min)');
+    }
+    return res.status(401).json({ error: 'unauthorized' });
+  }
   try {
     const bot = require('./bot'); // late require to avoid cycle
     const adapter = bot.signalAdapter; // read live property; mutated post-init
@@ -337,10 +410,10 @@ app.get('/auth/spotify/callback', async (req, res) => {
   try {
     const spotifyAuth = require('./spotify-auth');
     const { displayName, email } = await spotifyAuth.handleCallback(code, state);
-    res.send(`<h2>Spotify Connected!</h2><p>${displayName} (${email || 'no email'}) is now linked. You can close this tab.</p>`);
+    res.send(`<h2>Spotify Connected!</h2><p>${escapeHtml(displayName)} (${escapeHtml(email || 'no email')}) is now linked. You can close this tab.</p>`);
   } catch (err) {
     console.error('Spotify OAuth callback error:', err.message);
-    res.status(500).send(`<h2>Spotify authorization failed</h2><p>${err.message}</p>`);
+    res.status(500).send(`<h2>Spotify authorization failed</h2><p>${escapeHtml(err.message)}</p>`);
   }
 });
 
@@ -356,7 +429,7 @@ app.get('/setup/:userId', (req, res) => {
   try { profile = require('./user-profiles').getProfile(userId) || {}; } catch {}
 
   const calConnected = profile.gcal_connected
-    ? `<p style="color:#4caf50;font-weight:bold;">✓ Google Calendar connected (${profile.gcal_email})</p>`
+    ? `<p style="color:#4caf50;font-weight:bold;">✓ Google Calendar connected (${escapeHtml(profile.gcal_email)})</p>`
     : '';
 
   const googleBtn = googleConfigured
@@ -382,15 +455,15 @@ app.get('/setup/:userId', (req, res) => {
 </head>
 <body>
   <h1>Set Up Your Profile</h1>
-  <p class="sub">Phone: ${userId}</p>
+  <p class="sub">Phone: ${escapeHtml(userId)}</p>
 
   <div class="section">
     <form method="POST" action="/setup/${encodeURIComponent(userId)}">
       <label for="name">Your Name</label>
-      <input type="text" id="name" name="name" value="${profile.name || ''}" placeholder="e.g. Mike" required>
+      <input type="text" id="name" name="name" value="${escapeHtml(profile.name || '')}" placeholder="e.g. Mike" required>
 
       <label for="location">Your City / Location</label>
-      <input type="text" id="location" name="location" value="${profile.location || ''}" placeholder="e.g. Austin, TX" required>
+      <input type="text" id="location" name="location" value="${escapeHtml(profile.location || '')}" placeholder="e.g. Austin, TX" required>
 
       <label for="timezone">Timezone</label>
       <select id="timezone" name="timezone">
@@ -398,7 +471,7 @@ app.get('/setup/:userId', (req, res) => {
           'America/New_York','America/Chicago','America/Denver','America/Los_Angeles',
           'America/Phoenix','America/Anchorage','Pacific/Honolulu',
           'Europe/London','Europe/Paris','Europe/Berlin','Asia/Tokyo','Asia/Seoul','Australia/Sydney'
-        ].map(tz => `<option value="${tz}"${profile.timezone === tz ? ' selected' : ''}>${tz.replace('_',' ')}</option>`).join('')}
+        ].map(tz => `<option value="${escapeHtml(tz)}"${profile.timezone === tz ? ' selected' : ''}>${escapeHtml(tz.replace('_',' '))}</option>`).join('')}
       </select>
 
       <button type="submit">Save Profile</button>
@@ -435,7 +508,7 @@ app.post('/setup/:userId', express.urlencoded({ extended: false }), (req, res) =
 <style>body{font-family:-apple-system,sans-serif;max-width:480px;margin:60px auto;padding:0 20px;text-align:center;}</style></head>
 <body>
   <h1>✓ Profile Saved!</h1>
-  <p>Name: <strong>${(name||'').trim()}</strong><br>Location: <strong>${(location||'').trim()}</strong><br>Timezone: <strong>${timezone||''}</strong></p>
+  <p>Name: <strong>${escapeHtml((name||'').trim())}</strong><br>Location: <strong>${escapeHtml((location||'').trim())}</strong><br>Timezone: <strong>${escapeHtml(timezone||'')}</strong></p>
   <p style="margin-top:32px;color:#666;">You can close this tab. Come back to connect Google Calendar if you haven't already.</p>
   <a href="/setup/${encodeURIComponent(userId)}" style="display:inline-block;margin-top:16px;color:#4285f4;">Back to setup</a>
 </body></html>`);
@@ -452,7 +525,7 @@ app.get('/auth/google/calendar/:userId', async (req, res) => {
     const authUrl = googleAuth.getAuthUrl(userId);
     res.redirect(authUrl);
   } catch (err) {
-    res.status(500).send(`OAuth error: ${err.message}`);
+    res.status(500).send(`OAuth error: ${escapeHtml(err.message)}`);
   }
 });
 
@@ -463,15 +536,15 @@ app.get('/auth/google/callback', async (req, res) => {
   try {
     const googleAuth = require('./google-auth');
     const { email, displayName } = await googleAuth.handleCallback(code, state);
-    res.send(`<h2>Connected!</h2><p>${displayName} (${email}) is now linked to your Discord account. You can close this tab.</p>`);
+    res.send(`<h2>Connected!</h2><p>${escapeHtml(displayName)} (${escapeHtml(email)}) is now linked to your Discord account. You can close this tab.</p>`);
   } catch (err) {
     console.error('OAuth callback error:', err.message);
-    res.status(500).send(`<h2>Authorization failed</h2><p>${err.message}</p>`);
+    res.status(500).send(`<h2>Authorization failed</h2><p>${escapeHtml(err.message)}</p>`);
   }
 });
 
 // Reports channels with active Claude processes — used by Claude before self-rebuilding
-app.get('/active-sessions', (req, res) => {
+app.get('/active-sessions', requireInternalToken, (req, res) => {
   try {
     const { channels, client } = require('./bot');
     const active = [];

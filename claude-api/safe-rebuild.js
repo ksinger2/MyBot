@@ -1,6 +1,5 @@
 const fs = require('fs');
 const path = require('path');
-const { execSync } = require('child_process');
 
 const BACKUP_DIR = '/home/node/.claude/.last-known-good-bot';
 const APP_DIR = '/app';
@@ -17,11 +16,16 @@ function snapshotGoodState() {
     }
 
     // Copy subdirectories
+    // Use fs.rmSync + fs.cpSync instead of execSync('rm -rf ... && cp -r ...')
+    // to avoid shell command interpolation (security fix H6, 2026-04-11).
+    // Inputs are hardcoded today, but template-literal interpolation into a
+    // shell string is a trap waiting for the first config-driven change.
     for (const dir of ['wizards', 'personalities', 'project-template']) {
       const src = path.join(APP_DIR, dir);
       const dest = path.join(BACKUP_DIR, dir);
       if (fs.existsSync(src)) {
-        execSync(`rm -rf "${dest}" && cp -r "${src}" "${dest}"`);
+        fs.rmSync(dest, { recursive: true, force: true });
+        fs.cpSync(src, dest, { recursive: true });
       }
     }
 
