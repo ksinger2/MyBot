@@ -34,6 +34,14 @@ class SignalAdapter extends MessagePlatform {
 
     // Track known conversations for chat metadata
     this._chats = new Map(); // chatId → { name, lastSeen }
+    this._uuidToPhone = new Map(); // UUID → phone number cache
+    this._groups = new Map(); // internal_id → { publicId, name, isMember }
+    this._joinedGroups = new Set(); // internal_ids we've already attempted to join
+
+    // When SIGNAL_USE_WEBHOOK=true, signal-api runs in MODE=json-rpc and pushes
+    // incoming messages to /signal/webhook in claude-api. Polling /v1/receive/
+    // is then disabled (it returns "Not implemented" in json-rpc mode anyway).
+    this.useWebhook = (opts.useWebhook ?? (process.env.SIGNAL_USE_WEBHOOK || '').toLowerCase() === 'true');
   }
 
   async start() {
@@ -41,26 +49,56 @@ class SignalAdapter extends MessagePlatform {
       throw new Error('SignalAdapter: phoneNumber is required (set SIGNAL_PHONE_NUMBER env var or pass in opts)');
     }
 
-    // Verify connectivity to signal-cli-rest-api
-    try {
-      const resp = await this._fetch('/v1/about');
-      if (resp.ok) {
-        const info = await resp.json();
-        console.log(`[signal] Connected to signal-cli-rest-api v${info.versions?.['signal-cli'] || 'unknown'}`);
-      } else {
-        console.warn(`[signal] API responded with ${resp.status} — may need registration`);
+    // Verify connectivity to signal-cli-rest-api with retry-with-backoff —
+    // signal-api may take 30-60s to come up (especially in json-rpc mode where
+    // signal-cli has to spawn the daemon). Retry for up to ~2 minutes before
+    // giving up. We do NOT bail on persistent failure: if it eventually comes
+    // up, we want the adapter to be functional, so we continue past this check
+    // and rely on per-call error handling for any remaining issues.
+    let connected = false;
+    const maxAttempts = 12;
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      try {
+        const resp = await this._fetch('/v1/about');
+        if (resp.ok) {
+          const info = await resp.json();
+          console.log(`[signal] Connected to signal-cli-rest-api v${info.versions?.['signal-cli'] || 'unknown'} (attempt ${attempt})`);
+          connected = true;
+          break;
+        } else {
+          console.warn(`[signal] API responded with ${resp.status} on attempt ${attempt} — retrying`);
+        }
+      } catch (err) {
+        if (attempt === 1 || attempt === maxAttempts) {
+          console.warn(`[signal] Cannot reach ${this.apiUrl} (attempt ${attempt}/${maxAttempts}): ${err.message}`);
+        }
       }
-    } catch (err) {
-      console.error(`[signal] Cannot reach ${this.apiUrl}: ${err.message}`);
-      console.error('[signal] Make sure signal-api container is running');
-      return;
+      if (attempt < maxAttempts) {
+        await new Promise(r => setTimeout(r, Math.min(10000, 1000 * attempt))); // 1s..10s backoff
+      }
+    }
+    if (!connected) {
+      console.error('[signal] Could not reach signal-api after retries — adapter will start anyway and rely on per-call error handling');
     }
 
-    // Start polling for incoming messages
+    // Load contacts to build UUID→phone mapping
+    await this._loadContacts();
+
+    // Load groups so we know how to address them and which need joining.
+    await this._loadGroups();
+
+    // Start inbound message ingestion. In webhook mode the signal-api container
+    // POSTs every incoming envelope to /signal/webhook in claude-api, so polling
+    // is unnecessary (and would fail anyway — /v1/receive returns "Not implemented"
+    // in MODE=json-rpc).
     this._stopping = false;
-    this._poll();
+    if (this.useWebhook) {
+      console.log(`[signal] Webhook mode — not polling. Inbound arrives at /signal/webhook for ${this.phoneNumber} (${this._uuidToPhone.size} contacts mapped)`);
+    } else {
+      this._poll();
+      console.log(`[signal] Adapter started — polling every ${this.pollInterval}ms for ${this.phoneNumber} (${this._uuidToPhone.size} contacts mapped)`);
+    }
     this.ready = true;
-    console.log(`[signal] Adapter started — polling every ${this.pollInterval}ms for ${this.phoneNumber}`);
     this.emit('ready');
   }
 
@@ -83,8 +121,9 @@ class SignalAdapter extends MessagePlatform {
    * @param {string[]} [opts.attachmentNames] - Filenames
    */
   async sendMessage(chatId, text, opts = {}) {
-    // Strip any prefix (e.g. "signal:") from chatId
-    const recipient = chatId.replace(/^signal:/, '');
+    // Strip any prefix (e.g. "signal:") and resolve UUID→phone
+    const raw = chatId.replace(/^signal:/, '');
+    const recipient = this._resolveRecipient(raw);
 
     const payload = {
       message: text,
@@ -92,13 +131,15 @@ class SignalAdapter extends MessagePlatform {
       text_mode: 'normal',
     };
 
-    // Determine if chatId is a group or individual
+    // bbernhard/signal-cli-rest-api /v2/send takes EVERYTHING via `recipients`.
+    // Phone numbers / UUIDs go in raw; group IDs must be wrapped as
+    // `group.{base64(internal_id)}` (the API's "public" group form).
+    // Inbound messages give us the internal_id; convert it on the way out.
+    let sendRecipient = recipient;
     if (this._isGroupId(recipient)) {
-      payload.group_id = recipient;
-      // Do NOT set recipients for group sends — signal-cli-rest-api rejects empty arrays
-    } else {
-      payload.recipients = [recipient];
+      sendRecipient = this._toPublicGroupId(recipient);
     }
+    payload.recipients = [sendRecipient];
 
     console.log(`[signal] Sending to ${recipient}: ${text.substring(0, 50)}...`);
 
@@ -130,6 +171,32 @@ class SignalAdapter extends MessagePlatform {
     } catch (err) {
       console.error(`[signal] Send error: ${err.message}`);
       return { id: null, error: err.message };
+    }
+  }
+
+  /**
+   * Show the real Signal typing indicator (not a fake "..." message).
+   * Calls bbernhard's PUT /v1/typing-indicator/{number} which dispatches a
+   * proper SignalServiceTypingMessage. Idempotent and best-effort: errors
+   * are swallowed because typing indicators are not critical.
+   *
+   * Signal typing indicators auto-expire after a few seconds, so callers
+   * should re-call this on an interval (e.g. every 8s) while busy.
+   */
+  async sendTyping(chatId) {
+    if (!chatId || !this.ready) return;
+    const raw = chatId.replace(/^signal:/, '');
+    const recipient = this._resolveRecipient(raw);
+    // Same recipient format as /v2/send: groups must be wrapped as `group.{base64(internal)}`.
+    const sendRecipient = this._isGroupId(recipient) ? this._toPublicGroupId(recipient) : recipient;
+    try {
+      await this._fetch(`/v1/typing-indicator/${encodeURIComponent(this.phoneNumber)}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ recipient: sendRecipient }),
+      });
+    } catch {
+      // Best-effort — typing indicators are not critical
     }
   }
 
@@ -213,6 +280,193 @@ class SignalAdapter extends MessagePlatform {
     this._pollTimer = setTimeout(() => this._poll(), this.pollInterval);
   }
 
+  /**
+   * Load all groups for this account, building the internal_id → public_id map
+   * and auto-joining any groups where we're listed as a pending invite.
+   */
+  async _loadGroups() {
+    try {
+      const resp = await this._fetch(`/v1/groups/${encodeURIComponent(this.phoneNumber)}`);
+      if (!resp.ok) {
+        console.warn(`[signal] Could not list groups: HTTP ${resp.status}`);
+        return;
+      }
+      const groups = await resp.json();
+      if (!Array.isArray(groups)) return;
+
+      let pending = 0;
+      for (const g of groups) {
+        if (!g.internal_id) continue;
+        const isMember = Array.isArray(g.members) && g.members.some(m => m === this.phoneNumber);
+        const isPending = Array.isArray(g.pending_invites) && g.pending_invites.some(p => p === this.phoneNumber);
+        this._groups.set(g.internal_id, {
+          publicId: g.id,           // already in `group.{base64}` form
+          name: g.name || g.internal_id,
+          isMember,
+        });
+        if (!isMember && isPending && !this._joinedGroups.has(g.internal_id)) {
+          pending++;
+          this._joinedGroups.add(g.internal_id);
+          this._joinGroup(g.id, g.name || g.internal_id, g.internal_id).catch(() => {});
+        }
+      }
+      console.log(`[signal] Loaded ${this._groups.size} group(s); attempting to join ${pending} pending invite(s)`);
+    } catch (err) {
+      console.warn(`[signal] Could not load groups: ${err.message}`);
+    }
+  }
+
+  /**
+   * Attempt to join a group we've been invited to. Idempotent.
+   *
+   * NOTE: bbernhard's /v1/groups/.../join endpoint returns 204 (success) even
+   * when the underlying signal-cli `updateGroup -g` call fails with "Cannot
+   * find service ID for self to accept invite" — the json-rpc error is
+   * silently swallowed by the REST wrapper. So we cannot trust the HTTP
+   * response. We re-fetch the group list afterward to verify actual membership
+   * and only log success if the bot is actually a member now.
+   *
+   * The "Cannot find service ID for self" error is a known limitation of
+   * standalone-registered signal-cli accounts. The only real fix is to
+   * onboard the bot as a linked device of a primary phone Signal install.
+   */
+  async _joinGroup(publicId, name, internalId) {
+    try {
+      const resp = await this._fetch(`/v1/groups/${encodeURIComponent(this.phoneNumber)}/${encodeURIComponent(publicId)}/join`, {
+        method: 'POST',
+      });
+      if (!resp.ok) {
+        const errText = await resp.text().catch(() => '');
+        console.warn(`[signal] Failed to join group "${name}" (${publicId}): HTTP ${resp.status} ${errText.substring(0, 200)}`);
+        return;
+      }
+      // Verify actual membership (bbernhard returns 204 even on silent errors)
+      const verifyResp = await this._fetch(`/v1/groups/${encodeURIComponent(this.phoneNumber)}/${encodeURIComponent(publicId)}`);
+      if (verifyResp.ok) {
+        const grp = await verifyResp.json();
+        const actuallyMember = (grp.members || []).includes(this.phoneNumber);
+        if (actuallyMember) {
+          console.log(`[signal] Joined group "${name}" — confirmed member`);
+          if (internalId && this._groups.has(internalId)) {
+            this._groups.get(internalId).isMember = true;
+          }
+        } else {
+          console.warn(`[signal] Join call returned 204 for "${name}" but bot is still pending invite — likely the "Cannot find service ID for self" signal-cli limitation. Group will be unreachable until the account is re-linked as a linked device.`);
+        }
+      }
+    } catch (err) {
+      console.warn(`[signal] Error joining group "${name}": ${err.message}`);
+    }
+  }
+
+  /**
+   * Join a Signal v2 group via an invite LINK (https://signal.group/#...).
+   *
+   * This is a fundamentally different code path from "accepting a pending
+   * invite" — signal-cli's `joinGroup` method uses the invite key embedded
+   * in the URI to add the bot directly as a member, bypassing the
+   * `GroupV2Helper.acceptInvite()` call that fails with "Cannot find service
+   * ID for self" on standalone-registered accounts.
+   *
+   * Implementation: bbernhard's REST wrapper does NOT expose this endpoint
+   * (only `/join` which calls `updateGroup -g` — the broken path). So we
+   * shell out via `docker exec` into the signal-api container and connect
+   * directly to signal-cli's JSON-RPC daemon on localhost:6001 via Python.
+   * The docker socket is already mounted in claude-api for this exact kind
+   * of cross-container ops.
+   */
+  async joinGroupByLink(uri) {
+    if (!uri || typeof uri !== 'string') throw new Error('joinGroupByLink: uri required');
+    if (!/^https?:\/\/signal\.group\/#/.test(uri)) {
+      throw new Error('Not a Signal group invite link (should start with https://signal.group/#)');
+    }
+    const containerName = process.env.SIGNAL_API_CONTAINER || 'mybot-signal-api-1';
+    const account = this.phoneNumber;
+    // Inline Python that connects to the local signal-cli JSON-RPC daemon.
+    // We pass account + uri via env vars to avoid quoting issues.
+    const pyScript = [
+      'import socket, json, os, sys',
+      's = socket.create_connection(("127.0.0.1", 6001), timeout=30)',
+      'req = json.dumps({"jsonrpc":"2.0","id":"jgl","method":"joinGroup","params":{"account":os.environ["ACCOUNT"],"uri":os.environ["URI"]}}) + "\\n"',
+      's.sendall(req.encode())',
+      'buf = b""',
+      'while b"\\n" not in buf:',
+      '    chunk = s.recv(4096)',
+      '    if not chunk: break',
+      '    buf += chunk',
+      'sys.stdout.write(buf.decode().strip())',
+    ].join('\n');
+
+    const { spawn } = require('child_process');
+    return new Promise((resolve, reject) => {
+      const proc = spawn('docker', [
+        'exec',
+        '-i',
+        '-e', `ACCOUNT=${account}`,
+        '-e', `URI=${uri}`,
+        containerName,
+        'python3', '-c', pyScript,
+      ]);
+      let stdout = '';
+      let stderr = '';
+      proc.stdout.on('data', d => { stdout += d.toString(); });
+      proc.stderr.on('data', d => { stderr += d.toString(); });
+      proc.on('error', err => reject(err));
+      proc.on('close', code => {
+        if (code !== 0) {
+          return reject(new Error(`docker exec failed (code ${code}): ${stderr || stdout}`));
+        }
+        try {
+          const resp = JSON.parse(stdout);
+          if (resp.error) {
+            return reject(new Error(resp.error.message || 'JSON-RPC error'));
+          }
+          resolve(resp.result || {});
+        } catch (e) {
+          reject(new Error(`Failed to parse JSON-RPC response: ${stdout.substring(0, 300)}`));
+        }
+      });
+    });
+  }
+
+  /**
+   * Convert an internal group ID (base64, no prefix) into the public form
+   * `group.{base64(internal_id)}` that /v2/send expects in `recipients`.
+   * Falls back to a fresh base64-wrap if the group isn't in the cache.
+   */
+  _toPublicGroupId(internalId) {
+    const cached = this._groups.get(internalId);
+    if (cached?.publicId) return cached.publicId;
+    // Fresh wrap — works even before _loadGroups has populated the cache.
+    return 'group.' + Buffer.from(internalId, 'utf-8').toString('base64');
+  }
+
+  async _loadContacts() {
+    try {
+      const resp = await this._fetch(`/v1/contacts/${encodeURIComponent(this.phoneNumber)}`);
+      if (resp.ok) {
+        const contacts = await resp.json();
+        for (const c of contacts) {
+          if (c.uuid && c.number) {
+            this._uuidToPhone.set(c.uuid, c.number);
+          }
+        }
+        console.log(`[signal] Loaded ${this._uuidToPhone.size} UUID→phone mappings`);
+      }
+    } catch (err) {
+      console.warn(`[signal] Could not load contacts: ${err.message}`);
+    }
+  }
+
+  /**
+   * Resolve a UUID to a phone number. Falls back to UUID if no mapping.
+   */
+  _resolveRecipient(uuidOrPhone) {
+    if (!uuidOrPhone) return uuidOrPhone;
+    if (uuidOrPhone.startsWith('+')) return uuidOrPhone; // already a phone number
+    return this._uuidToPhone.get(uuidOrPhone) || uuidOrPhone;
+  }
+
   async _acceptMessageRequest(uuid) {
     if (!uuid) return;
     if (!this._acceptedContacts) this._acceptedContacts = new Set();
@@ -248,10 +502,28 @@ class SignalAdapter extends MessagePlatform {
     const text = dataMessage.message;
     if (!text && !dataMessage.attachments?.length) return; // Skip empty messages
 
-    const senderId = envelope.source || envelope.sourceNumber;
+    // Resolve UUID→phone so replies go to the same chat thread
+    const senderPhone = envelope.sourceNumber || this._resolveRecipient(senderUuid);
+    const senderId = senderPhone || senderUuid;
     const senderName = envelope.sourceName || senderId;
-    const chatId = dataMessage.groupInfo?.groupId || senderId;
-    console.log(`[signal] Incoming from ${senderId} (chat: ${chatId}): ${(dataMessage.message || '').substring(0, 50)}`);
+    const groupInternalId = dataMessage.groupInfo?.groupId;
+    const chatId = groupInternalId || senderPhone || senderUuid;
+
+    // If this is a group we don't know about (or aren't a member of), refresh
+    // the group list — it's likely a fresh invite. _loadGroups will auto-join
+    // any pending invites it finds.
+    if (groupInternalId) {
+      const cached = this._groups.get(groupInternalId);
+      if (!cached || !cached.isMember) {
+        this._loadGroups().catch(() => {});
+      }
+    }
+    // Cache any new UUID→phone mapping we discover
+    if (senderUuid && envelope.sourceNumber && !this._uuidToPhone.has(senderUuid)) {
+      this._uuidToPhone.set(senderUuid, envelope.sourceNumber);
+      console.log(`[signal] Learned UUID→phone: ${senderUuid} → ${envelope.sourceNumber}`);
+    }
+    console.log(`[signal] Incoming from ${senderId} (phone: ${senderPhone}, uuid: ${senderUuid}, chat: ${chatId}): ${(dataMessage.message || '').substring(0, 50)}`);
     const timestamp = dataMessage.timestamp || envelope.timestamp || Date.now();
 
     // Process attachments

@@ -35,6 +35,10 @@ services:
       - SIGNAL_PHONE_NUMBER=${SIGNAL_PHONE_NUMBER:-}
       - SIGNAL_POLL_INTERVAL=${SIGNAL_POLL_INTERVAL:-5000}
       - SIGNAL_ALLOWED_NUMBERS=${SIGNAL_ALLOWED_NUMBERS:-}
+      # When signal-api runs in MODE=json-rpc, it cannot serve /v1/receive/.
+      # Inbound messages arrive at /signal/webhook in this container. Set to "true"
+      # to disable the polling loop in the signal adapter.
+      - SIGNAL_USE_WEBHOOK=${SIGNAL_USE_WEBHOOK:-true}
     volumes:
       - ${HOME}/.claude:/home/node/.claude
       - ${HOME}/.claude.json:/home/node/.claude.json
@@ -58,10 +62,20 @@ services:
     image: bbernhard/signal-cli-rest-api:latest
     restart: unless-stopped
     environment:
-      - MODE=normal
+      # MODE=json-rpc runs signal-cli as a persistent daemon (one JVM, started once).
+      # Per-call latency drops from seconds to milliseconds vs MODE=normal.
+      # /v1/receive/ is NOT supported in this mode — inbound MUST arrive via webhook.
+      - MODE=json-rpc
+      # Push every incoming envelope to the bot's webhook receiver. Only honored
+      # when MODE=json-rpc (verified in bbernhard src/main.go:159-161).
+      - RECEIVE_WEBHOOK_URL=http://claude-api:3400/signal/webhook
       - LOG_LEVEL=info
     volumes:
       - signal-data:/home/.local/share/signal-cli
+    # No depends_on — both containers come up independently and the signal
+    # adapter retries with backoff if signal-api isn't ready yet. Webhook
+    # deliveries from signal-api that happen during the brief window before
+    # claude-api is up may be lost; signal-api typically retries on failure.
     profiles:
       - signal  # Only starts when: docker compose --profile signal up -d
 

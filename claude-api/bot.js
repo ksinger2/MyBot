@@ -34,6 +34,10 @@ const DEFAULT_WORKSPACE = '/workspace';
 const DEFAULT_MAX_TURNS = parseInt(process.env.DEFAULT_MAX_TURNS, 10) || 50;
 const MAX_AUTO_CONTINUES = parseInt(process.env.MAX_AUTO_CONTINUES, 10) || 5;
 const MAX_TIMEOUT = (parseInt(process.env.MAX_TIMEOUT_MINUTES, 10) || 90) * 60 * 1000;
+// Cumulative spend cap per !loop run. Loop bails gracefully when exceeded.
+const MAX_LOOP_COST_USD = parseFloat(process.env.MAX_LOOP_COST_USD) || 5;
+// Pause between loop iterations (let Discord catch up, give system time to flush).
+const LOOP_ITERATION_COOLDOWN_MS = parseInt(process.env.LOOP_ITERATION_COOLDOWN_MS, 10) || 5000;
 const STALL_THRESHOLDS = {
   thinking: 5 * 60 * 1000,   // 5 min — no tool active, just "thinking"
   bash:     10 * 60 * 1000,  // 10 min — shell commands
@@ -430,7 +434,7 @@ function listPersonalities() {
     .map(f => f.replace('.md', ''));
 }
 
-function askClaude(prompt, { sessionId = null, personalityFile = null, identity = null, cwd = DEFAULT_WORKSPACE, maxTurns = null, channelState = null, discordChannel = null, channelProxy = null, discordUserId = null } = {}) {
+function askClaude(prompt, { sessionId = null, personalityFile = null, identity = null, cwd = DEFAULT_WORKSPACE, maxTurns = null, channelState = null, discordChannel = null, channelProxy = null, discordUserId = null, readOnly = false, profileContext = null } = {}) {
   // Wrap raw Discord channel in ChannelProxy if needed
   if (!channelProxy && discordChannel) {
     channelProxy = ChannelProxy.fromDiscord(discordChannel);
@@ -505,6 +509,17 @@ function askClaude(prompt, { sessionId = null, personalityFile = null, identity 
       '--mcp-config', '/app/.mcp.json',
     ];
 
+    // Hard-enforce read-only mode for non-owner Signal users at the CLI tool
+    // level. The system-prompt rule alone is not enough — Claude can be
+    // social-engineered into ignoring it. Disabling the actual write tools
+    // makes it physically impossible to mutate anything in /workspace/.
+    if (readOnly) {
+      args.push(
+        '--disallowedTools',
+        'Edit,Write,NotebookEdit,Bash,SlashCommand,KillShell,BashOutput,mcp__playwright__browser_file_upload,mcp__playwright__browser_evaluate'
+      );
+    }
+
     if (sessionId) {
       args.push('--resume', sessionId);
     }
@@ -551,11 +566,12 @@ YOUR CAPABILITIES — You are a powerful AI assistant with the following tools. 
 
 **SELF-REBUILD SAFETY** (MUST follow when editing THIS bot's code in /workspace/MyBot/):
 1. NEVER edit bot.js, server.js, or core files while running from Signal. Only self-edit from Discord or when explicitly told to by the user.
-2. Before ANY rebuild, syntax-check ALL files: \`for f in /workspace/MyBot/claude-api/*.js; do node -c "$f" || { echo "SYNTAX ERROR in $f — FIX BEFORE REBUILD"; exit 1; }; done\`
-3. If syntax check fails, FIX the error before rebuilding. NEVER rebuild with broken syntax.
-4. Then rebuild: \`docker compose -f /workspace/MyBot/docker-compose.yml --profile signal up -d --build\`
-5. After rebuild, wait 15s then verify: \`docker ps | grep mybot\` — must show "healthy"
-6. If the container is crash-looping, check logs and fix immediately.
+2. **WARN THE USER BEFORE REBUILDING.** Any \`docker compose up -d --build\`, \`docker restart\`, or \`docker compose restart\` will kill THIS process and drop the current conversation. BEFORE running such a command, send the user a message: "Rebuilding myself now — I'll be back in ~30 seconds. If I don't reply right after, message me and I'll resume." Wait for that message to send, then run the rebuild. Without this warning the user thinks you crashed.
+3. Before ANY rebuild, syntax-check ALL files: \`for f in /workspace/MyBot/claude-api/*.js; do node -c "$f" || { echo "SYNTAX ERROR in $f — FIX BEFORE REBUILD"; exit 1; }; done\`
+4. If syntax check fails, FIX the error before rebuilding. NEVER rebuild with broken syntax.
+5. Then rebuild: \`docker compose -f /workspace/MyBot/docker-compose.yml --profile signal up -d --build\`
+6. After rebuild, wait 15s then verify: \`docker ps | grep mybot\` — must show "healthy"
+7. If the container is crash-looping, check logs and fix immediately.
 The bot has automatic crash-loop recovery — if new code crashes 3x in 2 min, it auto-rollbacks to the last working version and notifies the error channel.
 CRITICAL: When editing your own code, make ONE change at a time, test it, then move to the next. Do NOT batch multiple risky changes into one rebuild.
 
@@ -644,6 +660,27 @@ This is NON-OPTIONAL — future sessions depend on it.`);
     if (personalityFile) {
       try { systemParts.push(fs.readFileSync(personalityFile, 'utf-8')); } catch {}
     }
+    // Inject per-user profile context (location, calendar) for Signal users
+    if (profileContext) {
+      systemParts.push(profileContext);
+    }
+    // Strict read-only mode for non-owner Signal users
+    if (readOnly) {
+      systemParts.push(`STRICT READ-ONLY MODE — ENFORCED:
+This user does NOT have write permissions. You may ONLY:
+- Answer questions and have conversations
+- Read files when explicitly asked (no sensitive files)
+- Look up weather using their profile location
+- Read their Google Calendar (read-only)
+You may NOT under any circumstances:
+- Edit, create, or delete any files
+- Run shell commands or Bash
+- Make git commits or push code
+- Rebuild Docker or restart services
+- Change bot permissions or configuration
+- Execute any action that modifies the system
+If asked to do any of the above, politely decline and explain they need owner approval.`);
+    }
     if (systemParts.length > 0) {
       args.push('--append-system-prompt', systemParts.join('\n\n'));
     }
@@ -666,9 +703,13 @@ This is NON-OPTIONAL — future sessions depend on it.`);
     if (channelState) {
       channelState.process = child;
       channelState.busy = true;
-      channelState.startedAt = Date.now();
-      channelState.progress = freshProgress();
-      channelState.progress._startTime = Date.now();
+      // Preserve startedAt across retries so elapsed time is cumulative, not reset per-retry
+      if (!channelState.startedAt) channelState.startedAt = Date.now();
+      // Only reset progress if this is a fresh call (no prior turns)
+      if (!channelState.progress || !channelState.progress._startTime) {
+        channelState.progress = freshProgress();
+      }
+      channelState.progress._startTime = channelState.startedAt;
     }
 
     // Stream-json result accumulators
@@ -1232,17 +1273,30 @@ async function handleCommand(message) {
 
   switch (cmd) {
     case '!stop': {
+      const wasLooping = state.loopActive;
       if (state.process) {
         state._userStopped = true;
         await forceKillProcess(state.process);
         state.process = null;
         state.busy = false;
+        state.loopActive = false;
         state.startedAt = null;
         state.progress = freshProgress();
         const dropped = state.queue.length;
         state.queue = [];
         const extra = dropped ? ` (${dropped} queued message${dropped > 1 ? 's' : ''} cleared)` : '';
-        await message.reply(`Stopped. Session preserved — send another message to continue where it left off.${extra}`);
+        await message.reply(`Stopped${wasLooping ? ' loop' : ''}. Session preserved — send another message to continue.${extra}`);
+      } else if (state.busy || state.loopActive) {
+        // Process died silently but busy/loop flag is stuck — force clear it
+        state.busy = false;
+        state.loopActive = false;
+        state.startedAt = null;
+        state.progress = freshProgress();
+        const dropped = state.queue.length;
+        state.queue = [];
+        saveChannelState(message.channel.id, state, { critical: true });
+        const extra = dropped ? ` (${dropped} queued message${dropped > 1 ? 's' : ''} cleared)` : '';
+        await message.reply(`Cleared stuck state${wasLooping ? ' (loop ended)' : ''}.${extra} You're good to go.`);
       } else {
         await message.reply('Nothing is running in this channel.');
       }
@@ -1258,10 +1312,11 @@ async function handleCommand(message) {
         state.startedAt = null;
         state.progress = freshProgress();
       }
+      state.loopActive = false;
       state.sessionId = null;
       state.queue = [];
       state.activeTask = null;
-      saveChannelState(message.channel.id, state);
+      saveChannelState(message.channel.id, state, { critical: true });
       await message.reply('Context cleared. Next message starts a fresh conversation (no memory of previous messages).');
       break;
     }
@@ -1274,10 +1329,11 @@ async function handleCommand(message) {
         state.startedAt = null;
         state.progress = freshProgress();
       }
+      state.loopActive = false;
       state.sessionId = null;
       state.queue = [];
       state.activeTask = null;
-      saveChannelState(message.channel.id, state);
+      saveChannelState(message.channel.id, state, { critical: true });
       await message.reply('Process killed and session destroyed. Full reset — starting from scratch.');
       break;
     }
@@ -2133,7 +2189,7 @@ async function handleCommand(message) {
         await message.reply('Usage: `!loop <task description>` — runs Claude in a loop until the task is done (max 10 iterations).');
         break;
       }
-      if (state.busy) {
+      if (state.busy || state.loopActive) {
         await message.reply('Already working. Use `!stop` first.');
         break;
       }
@@ -2141,32 +2197,73 @@ async function handleCommand(message) {
       const maxIterations = 10;
       const personalityFile = getPersonalityFile(state.personality);
       const proxy = message.channel.send ? ChannelProxy.fromDiscord(message.channel) : null;
+      const channelId = message.channel.id;
+      const nsPath = path.join(state.cwd, 'NextSteps.md');
 
-      await message.reply(`Starting autonomous loop: "${arg.substring(0, 100)}"\nMax ${maxIterations} iterations. Use \`!stop\` to interrupt.`);
+      // L-Fix-2: hold loopActive + busy for the ENTIRE loop. Per-iteration
+      // finally must NOT clear these — only the outer finally below does.
+      state.loopActive = true;
+      state.busy = true;
+      saveChannelState(channelId, state, { critical: true });
 
+      await message.reply(`Starting autonomous loop: "${arg.substring(0, 100)}"\nMax ${maxIterations} iterations · cost cap $${MAX_LOOP_COST_USD}. Use \`!stop\` to interrupt.\nWrite \`<<TASK_COMPLETE>>\` in NextSteps.md to signal done.`);
+
+      // L-Fix-1: top-level try/catch — no more silent error swallowing.
       (async () => {
-        for (let i = 1; i <= maxIterations; i++) {
-          if (!state.process && i > 1) {
-            // Check if task is done by reading NextSteps.md
-            const nsPath = path.join(state.cwd, 'NextSteps.md');
-            if (fs.existsSync(nsPath)) {
+        let totalCost = 0;
+        let lastNsHash = null;
+        let unchangedIterations = 0;
+        let exitReason = 'max-iterations';
+
+        try {
+          for (let i = 1; i <= maxIterations; i++) {
+            // L-Fix-2: !stop sets loopActive=false; honor it between iterations.
+            if (!state.loopActive) {
+              exitReason = 'user-stopped';
+              break;
+            }
+
+            // L-Fix-3 + L-Fix-4: done detection at start of every iteration after the first.
+            // Two signals: (a) sentinel <<TASK_COMPLETE>> in NextSteps.md, (b) NextSteps.md
+            // hash unchanged for 2 consecutive iterations → assume stuck.
+            if (i > 1 && fs.existsSync(nsPath)) {
               const ns = fs.readFileSync(nsPath, 'utf-8');
-              if (ns.toLowerCase().includes('task complete') || ns.toLowerCase().includes('all done')) {
-                await message.channel.send(`*Loop completed after ${i - 1} iterations — task marked done in NextSteps.md.*`);
+              if (ns.includes('<<TASK_COMPLETE>>')) {
+                await message.channel.send(`*Loop completed after ${i - 1} iteration${i === 2 ? '' : 's'} — \`<<TASK_COMPLETE>>\` sentinel found in NextSteps.md. Total cost: $${totalCost.toFixed(4)}.*`);
+                exitReason = 'sentinel';
                 break;
               }
+              const crypto = require('crypto');
+              const nsHash = crypto.createHash('sha256').update(ns).digest('hex');
+              if (lastNsHash && nsHash === lastNsHash) {
+                unchangedIterations++;
+                if (unchangedIterations >= 2) {
+                  await message.channel.send(`*Loop appears stalled — NextSteps.md unchanged for 2 iterations. Stopping after ${i - 1} iterations. Total cost: $${totalCost.toFixed(4)}.*`);
+                  exitReason = 'idle';
+                  break;
+                }
+              } else {
+                unchangedIterations = 0;
+              }
+              lastNsHash = nsHash;
+            } else if (i === 1 && fs.existsSync(nsPath)) {
+              const crypto = require('crypto');
+              lastNsHash = crypto.createHash('sha256').update(fs.readFileSync(nsPath, 'utf-8')).digest('hex');
             }
-          }
 
-          const iterPrompt = i === 1
-            ? arg
-            : `Continue working on this task: "${arg}"\n\nThis is iteration ${i}/${maxIterations} of an autonomous loop. Read NextSteps.md for context from your previous iteration. When the task is FULLY DONE, write "TASK COMPLETE" in NextSteps.md. If not done, update NextSteps.md with progress and what's left.`;
+            // L-Fix-5: cumulative cost cap.
+            if (totalCost > MAX_LOOP_COST_USD) {
+              await message.channel.send(`*Loop bailed: cumulative cost $${totalCost.toFixed(4)} exceeds cap of $${MAX_LOOP_COST_USD}. Update NextSteps.md is up to Claude. Resume manually if needed.*`);
+              exitReason = 'cost-cap';
+              break;
+            }
 
-          try {
-            state.activeTask = { prompt: iterPrompt.substring(0, 500), channelId: message.channel.id, startedAt: new Date().toISOString(), resumeAttempts: 0 };
-            saveChannelState(message.channel.id, state, { critical: true });
+            const iterPrompt = i === 1
+              ? `${arg}\n\nThis is iteration 1 of an autonomous loop (max ${maxIterations}). When the task is FULLY DONE, write the literal token "<<TASK_COMPLETE>>" on its own line in NextSteps.md. Otherwise, update NextSteps.md with progress and what's left.`
+              : `Continue working on this task: "${arg}"\n\nThis is iteration ${i}/${maxIterations}. Read NextSteps.md for context from previous iterations. When the task is FULLY DONE, write the literal token "<<TASK_COMPLETE>>" on its own line in NextSteps.md. Otherwise, update NextSteps.md with progress and what's left.`;
 
-            const result = await runClaudeWithContinuation(iterPrompt, {
+            // L-Fix-6: per-iteration retry on transient error.
+            const runIteration = async () => runClaudeWithContinuation(iterPrompt, {
               sessionId: state.sessionId,
               personalityFile,
               identity: state.identity,
@@ -2175,29 +2272,112 @@ async function handleCommand(message) {
               discordChannel: message.channel,
             }, proxy);
 
+            let result;
+            state.activeTask = { prompt: iterPrompt.substring(0, 500), channelId, startedAt: new Date().toISOString(), resumeAttempts: 0 };
+            saveChannelState(channelId, state, { critical: true });
+
+            try {
+              result = await runIteration();
+            } catch (err) {
+              await message.channel.send(`*Loop iteration ${i} hit an error (${err.message.substring(0, 150)}). Retrying once after 30s...*`);
+              await new Promise(r => setTimeout(r, 30000));
+              if (!state.loopActive) {
+                exitReason = 'user-stopped';
+                break;
+              }
+              try {
+                result = await runIteration();
+              } catch (retryErr) {
+                await message.channel.send(`*Loop iteration ${i} failed twice: ${retryErr.message.substring(0, 200)}. Stopping.*`);
+                sendErrorAlert(retryErr, { source: '!loop iteration retry', channel: channelId });
+                exitReason = 'iteration-error';
+                break;
+              }
+            }
+
             if (result.sessionId) state.sessionId = result.sessionId;
+            if (result.cost) totalCost += result.cost;
+
             if (result.stopped) {
               await message.channel.send('*Loop stopped by user.*');
+              exitReason = 'user-stopped';
               break;
             }
 
             await sendLongMessage(message, result.text, state.cwd);
-            await message.channel.send(`*— Loop iteration ${i}/${maxIterations} complete —*`);
+            await message.channel.send(`*— Loop iteration ${i}/${maxIterations} complete · cumulative $${totalCost.toFixed(4)} —*`);
 
-            // Brief pause between iterations
-            await new Promise(r => setTimeout(r, 3000));
-          } catch (err) {
-            await message.channel.send(`*Loop iteration ${i} failed: ${err.message.substring(0, 200)}*`);
-            break;
-          } finally {
-            state.busy = false;
-            state.startedAt = null;
-            state.progress = freshProgress();
-            state.activeTask = null;
-            saveChannelState(message.channel.id, state, { critical: true });
+            // L-Fix-7: configurable cooldown.
+            await new Promise(r => setTimeout(r, LOOP_ITERATION_COOLDOWN_MS));
+          }
+
+          if (exitReason === 'max-iterations') {
+            await message.channel.send(`*Loop hit ${maxIterations} iteration limit without seeing <<TASK_COMPLETE>>. Total cost: $${totalCost.toFixed(4)}. Send another message to continue.*`);
+          }
+        } catch (err) {
+          // L-Fix-1: top-level safety net — any unhandled error goes here.
+          console.error('[!loop] Unhandled error:', err);
+          sendErrorAlert(err, { source: '!loop top-level', channel: channelId });
+          try {
+            await message.channel.send(`*Loop crashed: ${err.message.substring(0, 300)}*`).catch(() => {});
+          } catch {}
+        } finally {
+          // ONLY place that clears loopActive — restores normal channel state.
+          state.loopActive = false;
+          state.busy = false;
+          state.startedAt = null;
+          state.progress = freshProgress();
+          state.activeTask = null;
+          saveChannelState(channelId, state, { critical: true });
+          // Drain any messages queued during the loop so they don't sit forever.
+          if (state.queue.length > 0) {
+            try { await processQueue(state); } catch (e) { console.error('[!loop] post-loop drain error:', e.message); }
           }
         }
-      })();
+      })().catch(err => {
+        // Belt-and-suspenders: if even the IIFE wrapper throws, log it.
+        console.error('[!loop] IIFE rejection:', err);
+        state.loopActive = false;
+        state.busy = false;
+        saveChannelState(channelId, state, { critical: true });
+      });
+      break;
+    }
+
+    case '!joingroup': {
+      // Bypass for the broken "Cannot find service ID for self to accept invite"
+      // signal-cli bug. Instead of accepting a pending invite (the broken path),
+      // the user gets a Signal group invite LINK and pastes it here. signal-cli's
+      // joinGroup-via-uri uses a totally different code path that DOES work on
+      // standalone-registered accounts.
+      //
+      // To get the link in Signal: open the group → tap the group name → Group
+      // Link → "Share group via link" toggle on → copy. Then send to Bianca:
+      // !joingroup https://signal.group/#CjQK...
+      if (!signalAdapter) {
+        await message.reply('Signal adapter not running.');
+        break;
+      }
+      if (!arg) {
+        await message.reply('Usage: `!joingroup <signal-group-invite-link>`\nGet the link from Signal: open the group → tap the name → Group Link → enable + copy.\nExample: `!joingroup https://signal.group/#CjQK...`');
+        break;
+      }
+      const uri = arg.trim();
+      if (!/^https?:\/\/signal\.group\/#/.test(uri)) {
+        await message.reply('That doesn\'t look like a Signal group link. It should start with `https://signal.group/#`');
+        break;
+      }
+      await message.reply('Trying to join the group via invite link...');
+      try {
+        const result = await signalAdapter.joinGroupByLink(uri);
+        // Refresh group cache so future sends know about it
+        await signalAdapter._loadGroups().catch(() => {});
+        const groupId = result?.groupId || result?.group_id || '(unknown)';
+        await message.reply(`✅ Joined! Internal group ID: \`${groupId}\`. You can now message me in that group.`);
+      } catch (err) {
+        await message.reply(`❌ Couldn't join: ${err.message.substring(0, 400)}`);
+        sendErrorAlert(err, { source: '!joingroup', channel: message.channel.id, detail: uri.substring(0, 100) });
+      }
       break;
     }
 
@@ -2581,6 +2761,116 @@ async function handleCommand(message) {
       break;
     }
 
+    // ── Signal permission & profile commands ──────────────────────────────────
+
+    case '!permit': {
+      // Only the Signal owner can grant permissions
+      const { isSignalOwner: _iso, grantPermission } = require('./project-permissions');
+      const senderId = message.author?.id || message._signalSenderId;
+      if (!_iso(senderId)) {
+        await message.reply('Only the owner can grant permissions.');
+        break;
+      }
+      const target = arg.trim();
+      if (!target) { await message.reply('Usage: `!permit +1234567890`'); break; }
+      grantPermission(target, state.cwd);
+      await message.reply(`Granted ${target} access to ${path.basename(state.cwd) || state.cwd}.`);
+      break;
+    }
+
+    case '!revoke': {
+      const { isSignalOwner: _iso2, revokePermission } = require('./project-permissions');
+      const senderId = message.author?.id || message._signalSenderId;
+      if (!_iso2(senderId)) {
+        await message.reply('Only the owner can revoke permissions.');
+        break;
+      }
+      const target = arg.trim();
+      if (!target) { await message.reply('Usage: `!revoke +1234567890`'); break; }
+      revokePermission(target, state.cwd);
+      await message.reply(`Revoked ${target}'s access to ${path.basename(state.cwd) || state.cwd}.`);
+      break;
+    }
+
+    case '!perms': {
+      const { listPermissions: _lp } = require('./project-permissions');
+      const { allowed, owner } = _lp(state.cwd);
+      const projectName = path.basename(state.cwd) || state.cwd;
+      const lines = [`**Permissions for ${projectName}:**`, `Owner (full access): ${owner}`];
+      if (allowed.length > 0) lines.push(`Also allowed: ${allowed.join(', ')}`);
+      else lines.push('No additional users granted access.');
+      await message.reply(lines.join('\n'));
+      break;
+    }
+
+    case '!profile': {
+      const { getProfile: _gp, setProfile: _sp, getAllProfiles: _gap } = require('./user-profiles');
+      const senderId = message.author?.id || message._signalSenderId;
+      const { isSignalOwner: _iso3 } = require('./project-permissions');
+      const parts = arg.trim().split(/\s+/);
+
+      // !profile @+1234567890 set field value  (owner only, for others)
+      // !profile set field value               (set own field)
+      // !profile                               (view own profile)
+      // !profile all                           (owner only, view all)
+
+      if (parts[0] === 'all' && _iso3(senderId)) {
+        const all = _gap();
+        const keys = Object.keys(all);
+        if (keys.length === 0) { await message.reply('No profiles saved yet.'); break; }
+        const summary = keys.map(k => {
+          const p = all[k];
+          return `${k}: ${p.name || '(unnamed)'}, ${p.location || 'no location'}${p.gcal_connected ? ', cal ✓' : ''}`;
+        }).join('\n');
+        await message.reply(`**All profiles:**\n${summary}`);
+        break;
+      }
+
+      // Determine target: could be "set field value" (own) or "+phone set field value" (owner for others)
+      let targetPhone = senderId;
+      let rest = parts;
+      if (_iso3(senderId) && parts[0] && parts[0].startsWith('+') && parts[1] === 'set') {
+        targetPhone = parts[0];
+        rest = parts.slice(1);
+      }
+
+      if (rest[0] === 'set') {
+        const field = rest[1];
+        const value = rest.slice(2).join(' ');
+        const allowed = ['name', 'location', 'timezone'];
+        if (!allowed.includes(field)) {
+          await message.reply(`Can set: ${allowed.join(', ')}`);
+          break;
+        }
+        if (!value) { await message.reply(`Usage: !profile set ${field} <value>`); break; }
+        _sp(targetPhone, { [field]: value });
+        await message.reply(`Profile updated: ${field} = ${value}`);
+      } else {
+        const p = _gp(targetPhone);
+        if (!p) { await message.reply('No profile yet. Use `!setup` to create one.'); break; }
+        const lines = [`**Profile for ${targetPhone}:**`];
+        if (p.name)     lines.push(`Name: ${p.name}`);
+        if (p.location) lines.push(`Location: ${p.location}`);
+        if (p.timezone) lines.push(`Timezone: ${p.timezone}`);
+        lines.push(`Google Calendar: ${p.gcal_connected ? `${p.gcal_email} ✓` : 'not connected'}`);
+        await message.reply(lines.join('\n'));
+      }
+      break;
+    }
+
+    case '!setup': {
+      // Generate a setup link for the sender (or a target number if owner specifies one)
+      const senderId = message.author?.id || message._signalSenderId;
+      const { isSignalOwner: _iso4 } = require('./project-permissions');
+      const targetPhone = (arg.trim() && _iso4(senderId)) ? arg.trim() : senderId;
+      const baseUrl = process.env.PUBLIC_URL || `http://localhost:3400`;
+      const setupUrl = `${baseUrl}/setup/${encodeURIComponent(targetPhone)}`;
+      await message.reply(`Setup link for ${targetPhone}:\n${setupUrl}\n\nTap it on your phone to set your name, location, and connect Google Calendar.`);
+      break;
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+
     case '!spotify': {
       try {
         if (!spotifyAuth) {
@@ -2762,13 +3052,50 @@ async function resumeChannel(channelId, savedState) {
   const task = savedState.activeTask;
   const state = getChannel(channelId);
 
+  // Signal-aware auto-resume: instead of trying to resume via Discord client
+  // cache (which doesn't have Signal channels), send a "I'm back" notification
+  // to the Signal user via the adapter. We don't try to re-run the previous
+  // task — that's risky if it was the cause of a crash. Just acknowledge that
+  // the bot is back and the user should resend if needed.
+  if (channelId.startsWith('signal:')) {
+    const signalChatId = channelId.replace(/^signal:/, '');
+    state.activeTask = null;
+    state.busy = false;
+    saveChannelState(channelId, state, { critical: true });
+    if (signalAdapter && signalAdapter.ready) {
+      const taskSummary = (task.prompt || '').substring(0, 80);
+      const msg = taskSummary
+        ? `*I'm back from a restart. I was working on: "${taskSummary}${task.prompt && task.prompt.length > 80 ? '...' : ''}" — that got interrupted. Resend if you still want me to do it.*`
+        : `*I'm back from a restart. Whatever I was working on got interrupted — resend if you still need it.*`;
+      signalAdapter.sendMessage(signalChatId, msg).catch(err => {
+        console.warn(`[auto-resume] Could not notify Signal channel ${channelId}: ${err.message}`);
+      });
+      console.log(`[auto-resume] Notified Signal channel ${channelId} of restart`);
+    } else {
+      console.log(`[auto-resume] Signal adapter not ready, skipping notification for ${channelId}`);
+    }
+    return;
+  }
+
   // Safety: don't retry more than 2 times
   if ((task.resumeAttempts || 0) >= 2) {
     console.log(`[auto-resume] Giving up on channel ${channelId} after ${task.resumeAttempts} attempts`);
     state.activeTask = null;
-    saveChannelState(channelId, state);
+    state.busy = false;
+    saveChannelState(channelId, state, { critical: true });
     const ch = client.channels.cache.get(channelId);
     if (ch) ch.send('*I crashed while working and failed to resume after 2 attempts. Send your request again if needed.*').catch(() => {});
+    return;
+  }
+
+  // Look up the channel BEFORE marking busy. If we can't find it we must NOT
+  // strand state.busy = true, or every subsequent message will be queued forever.
+  const ch = client.channels.cache.get(channelId);
+  if (!ch) {
+    console.log(`[auto-resume] Channel ${channelId} not in cache, clearing stale activeTask`);
+    state.activeTask = null;
+    state.busy = false;
+    saveChannelState(channelId, state, { critical: true });
     return;
   }
 
@@ -2780,12 +3107,6 @@ async function resumeChannel(channelId, savedState) {
   state.activeTask = task;
   saveChannelState(channelId, state);
   flushPendingWrites();
-
-  const ch = client.channels.cache.get(channelId);
-  if (!ch) {
-    console.log(`[auto-resume] Channel ${channelId} not in cache, skipping`);
-    return;
-  }
 
   console.log(`[auto-resume] Resuming work in channel ${channelId} (attempt ${task.resumeAttempts}/2)`);
   await ch.send(`*I crashed while working on your request. Resuming now... (attempt ${task.resumeAttempts}/2)*`).catch(() => {});
@@ -2979,6 +3300,13 @@ async function processQueue(state) {
     state.busy = false;
     state.startedAt = null;
     state.progress = freshProgress();
+    state.activeTask = null;
+    // Persist cleared state — otherwise disk still shows pendingQueue/activeTask
+    // and the next restart will trigger spurious auto-resume.
+    const persistChannelId = state._channelId || replyTarget?.channel?.id;
+    if (persistChannelId) {
+      saveChannelState(persistChannelId, state, { critical: true });
+    }
     // Recursively drain if more messages came in during processing
     await processQueue(state);
   }
@@ -2989,6 +3317,36 @@ client.on('messageCreate', async (message) => {
 
   // Access control — reject unauthorized users
   if (!isAllowed(message.author.id)) return;
+
+  // In guild channels, only respond when @mentioned (or a ! command)
+  const isGuild = !!message.guild;
+  const isMentioned = message.mentions.has(client.user);
+
+  // F1: diagnostic logging — every guild message reaches the handler.
+  // Without this we cannot tell if mentions are detected, content is empty, etc.
+  if (isGuild) {
+    console.log(`[discord-msg] guild=${message.guild.id} ch=${message.channel.id} user=${message.author.tag} mentions=${message.mentions.size} contentLen=${message.content.length} isMentioned=${isMentioned}`);
+  }
+
+  // F3: detect MESSAGE_CONTENT privileged-intent failure. If a guild message
+  // arrives with empty content + no attachments + no embeds + no mentions, the
+  // dev portal MESSAGE_CONTENT toggle is almost certainly off. Log loudly, once.
+  if (isGuild && !message.content && message.attachments.size === 0 && (!message.embeds || message.embeds.length === 0) && message.mentions.size === 0) {
+    if (!global.__messageContentIntentWarned) {
+      global.__messageContentIntentWarned = true;
+      console.error('[CRITICAL] Guild message has empty content and no other payload — the MESSAGE_CONTENT privileged intent is almost certainly disabled in the Discord developer portal. Fix: https://discord.com/developers/applications → your bot → Bot → Privileged Gateway Intents → enable MESSAGE CONTENT INTENT.');
+    }
+  }
+
+  if (isGuild && !isMentioned && !message.content.startsWith('!')) return;
+
+  // Strip the @mention prefix from message content so Claude doesn't see it
+  if (isGuild && isMentioned) {
+    message.content = message.content.replace(/<@!?\d+>/g, '').trim();
+    // F2: mention-only messages would otherwise be silently dropped by the
+    // empty-content check below. Use a friendly default so the bot still replies.
+    if (!message.content) message.content = 'hi';
+  }
 
   const state = getChannel(message.channel.id);
 
@@ -3046,15 +3404,19 @@ client.on('messageCreate', async (message) => {
   // Ignore empty messages (e.g. stickers, attachments with no text)
   if (!message.content.trim()) return;
 
-  // If Claude is already working, queue the message
+  // If Claude is already working, queue the message.
+  // L-Fix-2: a !loop holds state.busy=true for its whole duration, so messages
+  // sent during a loop fall into this path and get queued. processQueue won't
+  // run them until the loop's outer finally clears state.busy.
   if (state.busy) {
     state.queue.push({ message, content: message.content });
     saveChannelState(message.channel.id, state, { critical: true }); // persist queue immediately
     const pos = state.queue.length;
+    const ctx = state.loopActive ? ' (loop in progress — use `!stop` to interrupt)' : '';
     if (pos >= 5) {
-      await message.reply(`Queued (#${pos}) — queue is getting long. Use \`!stop\` to interrupt if needed.`);
+      await message.reply(`Queued (#${pos}) — queue is getting long. Use \`!stop\` to interrupt if needed.${ctx}`);
     } else {
-      await message.reply(`Queued (#${pos}) — I'll get to that next.`);
+      await message.reply(`Queued (#${pos}) — I'll get to that next.${ctx}`);
     }
     return;
   }
@@ -3101,6 +3463,7 @@ client.on('messageCreate', async (message) => {
       if (state.sessionId) {
         console.log('Session resume failed, retrying fresh:', err.message);
         state.sessionId = null;
+        await message.channel.send('*Session error — retrying fresh (1/2)...*').catch(() => {});
         try {
           result = await askClaude(message.content, {
             personalityFile,
@@ -3112,6 +3475,7 @@ client.on('messageCreate', async (message) => {
         } catch (freshErr) {
           // Fresh call also failed — wait 3s and try once more
           console.log('Fresh call also failed, retrying after delay:', freshErr.message);
+          await message.channel.send('*Still failing — retrying one more time (2/2)...*').catch(() => {});
           await new Promise(r => setTimeout(r, 3000));
           result = await askClaude(message.content, {
             personalityFile,
@@ -3124,6 +3488,7 @@ client.on('messageCreate', async (message) => {
       } else {
         // No session — wait 3s and retry once
         console.log('CLI failed, retrying after delay:', err.message);
+        await message.channel.send('*Hit an error — retrying in 3s...*').catch(() => {});
         await new Promise(r => setTimeout(r, 3000));
         try {
           result = await askClaude(message.content, {
@@ -3266,9 +3631,17 @@ function startSignalAdapter() {
     phoneNumber,
     pollInterval: parseInt(process.env.SIGNAL_POLL_INTERVAL, 10) || 5000,
   });
+  // Mutate module.exports so late `require('./bot').signalAdapter` (used by
+  // the /signal/webhook receiver in server.js) sees the actual instance.
+  // The destructured `signalAdapter` in `module.exports = {..., signalAdapter}`
+  // below captures `null` at module load time.
+  module.exports.signalAdapter = signalAdapter;
 
   // Access control for Signal — comma-separated phone numbers
   const allowedNumbers = new Set((process.env.SIGNAL_ALLOWED_NUMBERS || '').split(',').filter(Boolean));
+
+  const { isSignalOwner, hasProjectPermission } = require('./project-permissions');
+  const { buildProfileContext, getProfile } = require('./user-profiles');
 
   signalAdapter.on('message', async (msg) => {
     // Access control
@@ -3277,9 +3650,69 @@ function startSignalAdapter() {
     const text = msg.text.trim();
     if (!text) return;
 
-    // Use sender's phone number as chatId for per-conversation state
+    // Owner flag — only +16315214787 can edit code or change permissions
+    const senderIsOwner = isSignalOwner(msg.senderId);
+
+    // Use sender's phone number as chatId for per-conversation state.
+    // For 1:1 DMs the chatId IS the sender's phone. For groups the chatId is
+    // the group's base64 internal ID. We use a per-sender state key for
+    // wizards (so onboarding tracks per-person, not per-group).
     const chatId = `signal:${msg.chatId}`;
     const state = getChannel(chatId);
+
+    // Auto-onboard new Signal users: if we don't have a profile for this phone
+    // number AND they're messaging in a 1:1 (not a group), kick off the
+    // conversational onboarding wizard. We avoid running it in groups because
+    // multi-step wizards over a group chat are confusing for everyone else.
+    // Owner is skipped (already known). Group members get profile-less
+    // responses until they DM the bot directly to onboard.
+    const isGroupMessage = msg.chatId !== msg.senderId;
+
+    // In Signal group chats, only respond when the bot is @mentioned or it's a !command.
+    // Mirrors the Discord guild behaviour (line ~3341). !commands bypass this so group
+    // admin tasks still work without an @mention.
+    if (isGroupMessage && !text.startsWith('!')) {
+      const mentions = msg.raw?.envelope?.dataMessage?.mentions || [];
+      const botMentioned = mentions.some(m => m.number === signalAdapter.phoneNumber);
+      if (!botMentioned) return;
+    }
+
+    if (!senderIsOwner && !isGroupMessage && msg.senderId && msg.senderId.startsWith('+')) {
+      const existing = getProfile(msg.senderId);
+      const alreadyOnboarded = existing?.setup_complete;
+      // Only kick off the wizard once per session, and only if they don't have
+      // a complete profile AND there's no wizard already running for them.
+      if (!alreadyOnboarded && !state.wizard && !text.startsWith('!')) {
+        const { buildOnboardingWizard } = require('./wizards/onboarding');
+        const fakeMessage = createSignalMessageProxy(msg, chatId, state);
+        try {
+          await startWizard(state, fakeMessage, buildOnboardingWizard());
+        } catch (err) {
+          console.warn(`[signal] onboarding wizard kickoff failed: ${err.message}`);
+        }
+        return; // The wizard's first prompt has been sent — wait for the user's reply
+      }
+    }
+
+    // If a wizard is active for this chat, let it consume the message.
+    // The wizard handles its own step progression and onComplete callback.
+    if (state.wizard) {
+      const fakeMessage = createSignalMessageProxy(msg, chatId, state);
+      // Allow !cancel to escape the wizard
+      if (text.toLowerCase() === '!cancel') {
+        await cancelWizard(state, fakeMessage);
+        return;
+      }
+      try {
+        const handled = await handleWizardMessage(state, fakeMessage);
+        if (handled) return;
+      } catch (err) {
+        console.error(`[signal] wizard error: ${err.message}`);
+        state.wizard = null;
+        await signalAdapter.sendMessage(msg.chatId, `Wizard error: ${err.message.substring(0, 200)}. Cancelled.`);
+        return;
+      }
+    }
 
     // Handle commands (same !command syntax)
     if (text.startsWith('!')) {
@@ -3301,7 +3734,13 @@ function startSignalAdapter() {
 
     // Normal message — run Claude
     const personalityFile = getPersonalityFile(state.personality);
-    await signalAdapter.sendMessage(msg.chatId, '...');  // typing indicator equivalent
+    // Real Signal typing indicator (replaces the old "..." literal-message hack).
+    // Signal typing dots auto-expire after a few seconds, so refresh on an interval
+    // for the duration of Claude's run.
+    await signalAdapter.sendTyping(msg.chatId).catch(() => {});
+    const signalTypingInterval = setInterval(() => {
+      signalAdapter.sendTyping(msg.chatId).catch(() => {});
+    }, 8000);
 
     try {
       state.activeTask = {
@@ -3314,6 +3753,38 @@ function startSignalAdapter() {
       saveChannelState(chatId, state, { critical: true });
 
       const signalProxy = ChannelProxy.fromSignal(signalAdapter, msg.chatId);
+
+      // Build profile context. For 1:1 messages, just the sender. For group
+      // messages, also list all OTHER known members of the group so the bot
+      // can answer things like "plan for us" using everyone's calendars.
+      let combinedProfileContext = buildProfileContext(msg.senderId);
+      const isGroupMessage = msg.chatId !== msg.senderId; // group ID differs from sender
+      if (isGroupMessage) {
+        try {
+          const groupInfo = await signalAdapter._fetch(`/v1/groups/${encodeURIComponent(signalAdapter.phoneNumber)}/${encodeURIComponent(signalAdapter._toPublicGroupId(msg.chatId))}`);
+          if (groupInfo.ok) {
+            const grp = await groupInfo.json();
+            const memberIds = (grp.members || []).filter(m => m.startsWith('+') && m !== msg.senderId && m !== signalAdapter.phoneNumber);
+            const memberContexts = [];
+            for (const mid of memberIds) {
+              const ctx = buildProfileContext(mid);
+              if (ctx) memberContexts.push(ctx.replace('USER PROFILE (this message is from', 'OTHER GROUP MEMBER ('));
+            }
+            if (memberContexts.length > 0) {
+              const groupHeader = `GROUP CONTEXT — This message is from a Signal group "${grp.name || msg.chatId}" with ${grp.members?.length || '?'} members. Sender is ${msg.senderId}. Other known members:`;
+              combinedProfileContext = [
+                combinedProfileContext || '',
+                groupHeader,
+                ...memberContexts,
+                'When the user says "us" or "we", coordinate across all known members. Use their Google Calendars (where connected) to find times that work for everyone.',
+              ].filter(Boolean).join('\n\n');
+            }
+          }
+        } catch (err) {
+          console.warn(`[signal] group member lookup failed: ${err.message}`);
+        }
+      }
+
       const claudeOpts = {
         sessionId: state.sessionId,
         personalityFile,
@@ -3322,9 +3793,21 @@ function startSignalAdapter() {
         channelState: state,
         channelProxy: signalProxy,
         discordUserId: msg.senderId,
+        readOnly: !senderIsOwner,
+        profileContext: combinedProfileContext,
       };
 
-      const result = await runClaudeWithContinuation(text, claudeOpts, signalProxy);
+      // Auto-detect social/location links — pre-fetch metadata and build action prompt.
+      // Mirrors the Discord handler at bot.js:~3250 — without this, TikTok/Instagram/etc.
+      // links go straight to Claude which gets blocked by their bot walls.
+      let signalPrompt = text;
+      const detectedLinks = detectLinks(text);
+      if (detectedLinks.length > 0) {
+        const enriched = await enrichLinks(detectedLinks);
+        signalPrompt = buildSmartPrompt(enriched) + text;
+      }
+
+      const result = await runClaudeWithContinuation(signalPrompt, claudeOpts, signalProxy);
 
       if (result.sessionId) {
         state.sessionId = result.sessionId;
@@ -3344,6 +3827,7 @@ function startSignalAdapter() {
       await signalAdapter.sendMessage(msg.chatId, `Error: ${err.message.substring(0, 500)}`);
       sendErrorAlert(err, { source: 'signal handler', channel: chatId });
     } finally {
+      clearInterval(signalTypingInterval);
       state.busy = false;
       state.startedAt = null;
       state.progress = freshProgress();
@@ -3352,6 +3836,8 @@ function startSignalAdapter() {
       // Drain queue
       if (state.queue.length > 0) {
         await processQueue(state);
+        // processQueue clears in-memory state; re-persist so disk matches.
+        saveChannelState(chatId, state, { critical: true });
       }
     }
   });
@@ -3381,6 +3867,8 @@ function createSignalMessageProxy(msg, chatId, state) {
     },
     reply,
     client, // for commands that need client.channels
+    _signalSenderId: msg.senderId, // used by wizards/onComplete to key profile saves
+    _signalChatId: msg.chatId,
   };
 }
 

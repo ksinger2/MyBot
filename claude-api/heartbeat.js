@@ -52,6 +52,28 @@ function buildHeartbeatPrompt(cwd) {
 }
 
 /**
+ * H3: detect a "no action needed" response. Tolerates the model wrapping the
+ * sentinel in light markdown (`**NO_ACTION_NEEDED**`, `*NO_ACTION_NEEDED*`),
+ * and only treats it as silent if the stripped result is short enough to
+ * plausibly be only the sentinel — otherwise the model is reporting actual
+ * work and we should forward it to the channel.
+ */
+function isNoActionResponse(text) {
+  if (!text) return false;
+  // Strip common markdown wrappers and trim whitespace
+  const stripped = text.trim().replace(/^[*_`>\s]+|[*_`>\s]+$/g, '').trim();
+  if (stripped === 'NO_ACTION_NEEDED') return true;
+  // Allow a leading/trailing line of whitespace + the sentinel on its own line,
+  // but bail if there's substantive other content (>120 chars after strip).
+  if (stripped.length <= 120 && /\bNO_ACTION_NEEDED\b/.test(stripped)) {
+    // Make sure removing the sentinel leaves nothing meaningful
+    const remainder = stripped.replace(/\bNO_ACTION_NEEDED\b/, '').replace(/[*_`>\s.!?]+/g, '');
+    return remainder.length === 0;
+  }
+  return false;
+}
+
+/**
  * Start a heartbeat for a channel.
  * @param {string} channelId
  * @param {object} opts
@@ -63,22 +85,57 @@ function buildHeartbeatPrompt(cwd) {
 function startHeartbeat(channelId, { cwd, intervalMinutes = 30, onWake, onResult }) {
   stopHeartbeat(channelId);
 
+  // H1 + H2: per-heartbeat state for in-flight guard and error backoff.
+  const hbState = {
+    inFlight: false,
+    consecutiveErrors: 0,
+    skippedDueToInFlight: 0,
+  };
+
+  const baseIntervalMs = intervalMinutes * 60 * 1000;
+
   const cronRule = `*/${intervalMinutes} * * * *`;
   const job = schedule.scheduleJob(cronRule, async () => {
+    // H1: skip if a previous tick is still running. Prevents overlap when a
+    // single wake takes longer than the interval.
+    if (hbState.inFlight) {
+      hbState.skippedDueToInFlight++;
+      console.log(`[heartbeat] ${channelId}: skipped (previous tick still running, skipped=${hbState.skippedDueToInFlight})`);
+      return;
+    }
+
+    // H2: error backoff. After 3 consecutive failures, only run every Nth
+    // tick (where N doubles up to 8x) until a success resets the counter.
+    if (hbState.consecutiveErrors >= 3) {
+      const skipFactor = Math.min(8, 2 ** (hbState.consecutiveErrors - 2));
+      const ageMs = Date.now() - (hbState.lastAttemptMs || 0);
+      if (ageMs < baseIntervalMs * skipFactor) {
+        console.log(`[heartbeat] ${channelId}: backing off after ${hbState.consecutiveErrors} errors (skip factor ${skipFactor}x)`);
+        return;
+      }
+    }
+
+    hbState.inFlight = true;
+    hbState.lastAttemptMs = Date.now();
     const prompt = buildHeartbeatPrompt(cwd);
     try {
       const result = await onWake(prompt);
-      if (result && result.text && !result.text.includes('NO_ACTION_NEEDED')) {
+      hbState.consecutiveErrors = 0;
+      // H3: smarter sentinel detection — wrapper-tolerant exact match.
+      if (result && result.text && !isNoActionResponse(result.text)) {
         await onResult(result);
       } else {
         console.log(`[heartbeat] ${channelId}: no action needed`);
       }
     } catch (err) {
-      console.error(`[heartbeat] ${channelId} error:`, err.message);
+      hbState.consecutiveErrors++;
+      console.error(`[heartbeat] ${channelId} error (${hbState.consecutiveErrors} consecutive):`, err.message);
+    } finally {
+      hbState.inFlight = false;
     }
   });
 
-  heartbeats.set(channelId, { job, intervalMinutes, enabled: true, cwd });
+  heartbeats.set(channelId, { job, intervalMinutes, enabled: true, cwd, state: hbState });
   console.log(`[heartbeat] Started for ${channelId}: every ${intervalMinutes}min`);
 }
 

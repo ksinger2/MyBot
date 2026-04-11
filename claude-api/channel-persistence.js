@@ -73,8 +73,31 @@ function flushPendingWrites() {
   }
 }
 
+// activeTask older than this is treated as orphaned (e.g. crashed and never
+// cleaned up) and cleared on load so it doesn't poison auto-resume forever.
+const STALE_TASK_TTL_MS = 60 * 60 * 1000; // 1 hour
+
 function loadAllChannelStates() {
-  return readStore();
+  const store = readStore();
+  let cleared = 0;
+  for (const [id, s] of Object.entries(store)) {
+    if (s && s.activeTask && s.activeTask.startedAt) {
+      const age = Date.now() - new Date(s.activeTask.startedAt).getTime();
+      if (!Number.isFinite(age) || age > STALE_TASK_TTL_MS) {
+        s.activeTask = null;
+        cleared++;
+      }
+    } else if (s && s.activeTask && !s.activeTask.startedAt) {
+      // No timestamp at all — treat as stale
+      s.activeTask = null;
+      cleared++;
+    }
+  }
+  if (cleared > 0) {
+    try { writeStore(store); } catch {}
+    console.log(`[channel-persistence] Cleared ${cleared} stale activeTask(s) on load`);
+  }
+  return store;
 }
 
 function clearChannelState(channelId) {

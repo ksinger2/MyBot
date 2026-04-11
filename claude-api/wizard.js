@@ -10,9 +10,10 @@ async function startWizard(state, message, def) {
   state.wizard = {
     type: def.type,
     step: 0,
-    data: {},
+    data: { ...(def.initialData || {}) },
     steps: def.steps,
     onComplete: def.onComplete,
+    silent: !!def.silent,
   };
 
   // Find and send the first applicable step
@@ -89,7 +90,15 @@ async function cancelWizard(state, message) {
 }
 
 /**
- * Send the prompt for the current wizard step
+ * Send the prompt for the current wizard step.
+ *
+ * Step config:
+ *   - prompt:  string OR function(data) => string  — what to ask the user
+ *   - silent:  bool — if true, omit the "**Step X/Y:**" prefix (for casual flows)
+ *   - condition, validate, default — see handleWizardMessage
+ *
+ * Wizard config:
+ *   - silent:  bool — global silent flag, applies to all steps
  */
 async function sendCurrentStep(state, message) {
   const wiz = state.wizard;
@@ -109,10 +118,17 @@ async function sendCurrentStep(state, message) {
 
   const step = wiz.steps[wiz.step];
   if (step.prompt) {
-    const stepNum = getVisibleStepNumber(wiz);
-    const totalVisible = getVisibleStepCount(wiz);
-    const prefix = `**Step ${stepNum}/${totalVisible}:**`;
-    await message.reply(`${prefix} ${step.prompt}`);
+    // Support functional prompts that reference prior answers
+    const promptText = typeof step.prompt === 'function' ? step.prompt(wiz.data) : step.prompt;
+    const silent = wiz.silent || step.silent;
+    if (silent) {
+      await message.reply(promptText);
+    } else {
+      const stepNum = getVisibleStepNumber(wiz);
+      const totalVisible = getVisibleStepCount(wiz);
+      const prefix = `**Step ${stepNum}/${totalVisible}:**`;
+      await message.reply(`${prefix} ${promptText}`);
+    }
   }
 }
 

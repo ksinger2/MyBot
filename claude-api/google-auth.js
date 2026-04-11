@@ -73,6 +73,12 @@ async function handleCallback(code, state) {
     displayName,
   });
 
+  // If this is a Signal user (phone number), update their profile too
+  try {
+    const userProfiles = require('./user-profiles');
+    userProfiles.markCalendarConnected(discordUserId, email);
+  } catch {}
+
   return { email, displayName };
 }
 

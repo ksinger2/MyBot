@@ -323,17 +323,127 @@ function classifyContentType(metadata, platform) {
   return PLATFORM_TYPE_HINTS[platform] || 'general';
 }
 
+// --- Video transcript extraction ---
+//
+// For social video links (TikTok, Instagram Reels, YouTube), oEmbed only gives
+// us title/author/thumbnail — not the actual content. To answer "tldr this video"
+// or "plan for us based on what's in this video" we need the spoken content.
+//
+// Pipeline: yt-dlp → mp3 audio file → OpenAI Whisper API → text transcript
+// Requires: yt-dlp, ffmpeg, OPENAI_API_KEY (all set up in Dockerfile + env)
+
+const VIDEO_TRANSCRIBABLE_PLATFORMS = new Set(['tiktok', 'instagram', 'youtube']);
+const TRANSCRIPT_TIMEOUT_MS = 60000; // 60s — Whisper for short clips is fast
+const MAX_AUDIO_BYTES = 24 * 1024 * 1024; // 24MB — Whisper API limit is 25MB
+const _transcriptCache = new Map(); // url → transcript (in-memory, lifetime of process)
+const TRANSCRIPT_CACHE_MAX = 200;
+
+/**
+ * Download a social video as audio and transcribe via OpenAI Whisper.
+ * Returns the transcript text, or null on failure.
+ */
+async function fetchVideoTranscript(url) {
+  if (!url) return null;
+  if (_transcriptCache.has(url)) return _transcriptCache.get(url);
+  if (!process.env.OPENAI_API_KEY) {
+    console.warn('[transcript] OPENAI_API_KEY not set — cannot transcribe');
+    return null;
+  }
+
+  const fs = require('fs');
+  const path = require('path');
+  const os = require('os');
+  const { spawn } = require('child_process');
+
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ytdlp-'));
+  const outputTemplate = path.join(tmpDir, 'audio.%(ext)s');
+
+  try {
+    // Step 1: yt-dlp → audio. Use mp3 encoding for Whisper compatibility.
+    // -x extracts audio, --audio-format mp3 converts via ffmpeg, --quiet keeps logs clean.
+    // --max-filesize protects against giant videos.
+    await new Promise((resolve, reject) => {
+      const proc = spawn('yt-dlp', [
+        '-x',
+        '--audio-format', 'mp3',
+        '--audio-quality', '5', // VBR ~130kbps — good enough for speech
+        '--max-filesize', '50m',
+        '--no-playlist',
+        '--no-warnings',
+        '--quiet',
+        '-o', outputTemplate,
+        url,
+      ], { stdio: ['ignore', 'pipe', 'pipe'] });
+
+      let stderr = '';
+      proc.stderr.on('data', d => { stderr += d.toString(); });
+      const t = setTimeout(() => {
+        proc.kill('SIGKILL');
+        reject(new Error(`yt-dlp timeout after ${TRANSCRIPT_TIMEOUT_MS}ms`));
+      }, TRANSCRIPT_TIMEOUT_MS);
+      proc.on('close', code => {
+        clearTimeout(t);
+        if (code === 0) resolve();
+        else reject(new Error(`yt-dlp exit ${code}: ${stderr.substring(0, 200)}`));
+      });
+      proc.on('error', err => {
+        clearTimeout(t);
+        reject(err);
+      });
+    });
+
+    // Find the produced mp3 (yt-dlp picks the actual extension at runtime)
+    const files = fs.readdirSync(tmpDir).filter(f => /\.(mp3|m4a|opus|ogg|wav)$/i.test(f));
+    if (files.length === 0) {
+      throw new Error('yt-dlp produced no audio file');
+    }
+    const audioPath = path.join(tmpDir, files[0]);
+    const stat = fs.statSync(audioPath);
+    if (stat.size > MAX_AUDIO_BYTES) {
+      throw new Error(`audio file too large (${stat.size} > ${MAX_AUDIO_BYTES})`);
+    }
+
+    // Step 2: send to OpenAI Whisper. Use the SDK for proper multipart encoding.
+    const OpenAI = require('openai');
+    const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+    const transcription = await openai.audio.transcriptions.create({
+      file: fs.createReadStream(audioPath),
+      model: 'whisper-1',
+      response_format: 'text',
+    });
+    const text = (typeof transcription === 'string' ? transcription : transcription.text || '').trim();
+
+    // Cache (with size cap)
+    if (_transcriptCache.size >= TRANSCRIPT_CACHE_MAX) {
+      const firstKey = _transcriptCache.keys().next().value;
+      _transcriptCache.delete(firstKey);
+    }
+    _transcriptCache.set(url, text);
+    return text;
+  } catch (err) {
+    console.warn(`[transcript] Failed for ${url}: ${err.message}`);
+    return null;
+  } finally {
+    // Cleanup temp dir
+    try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch {}
+  }
+}
+
 // --- Public API ---
 
 /**
  * Enrich detected links with pre-fetched metadata and content classification.
- * Runs all fetches in parallel with a 3-second overall timeout.
+ * Runs metadata fetches in parallel with a 3-second timeout. For transcribable
+ * social videos (TikTok, Instagram, YouTube), ALSO kicks off a Whisper transcript
+ * extraction in parallel with a longer timeout — this is what enables "tldr the
+ * video" to actually summarize the video's content.
  */
 async function enrichLinks(links) {
   if (!links || links.length === 0) return [];
 
   const startTime = Date.now();
 
+  // Phase 1: metadata (oEmbed/OG tags) — fast, short timeout
   const enriched = await Promise.race([
     Promise.allSettled(links.map(fetchLinkMetadata)),
     new Promise(resolve => setTimeout(() => resolve(links.map(l => ({
@@ -350,7 +460,19 @@ async function enrichLinks(links) {
     return link;
   });
 
-  console.log(`[enrichLinks] ${results.length} link(s) enriched in ${Date.now() - startTime}ms`);
+  // Phase 2: video transcripts for TikTok/Instagram/YouTube — slower, longer timeout
+  // Run in parallel for all transcribable links
+  const transcribableLinks = results.filter(r => VIDEO_TRANSCRIBABLE_PLATFORMS.has(r.platform));
+  if (transcribableLinks.length > 0) {
+    await Promise.allSettled(transcribableLinks.map(async (link) => {
+      const transcript = await fetchVideoTranscript(link.resolvedUrl || link.url);
+      if (transcript) {
+        link.transcript = transcript;
+      }
+    }));
+  }
+
+  console.log(`[enrichLinks] ${results.length} link(s) enriched in ${Date.now() - startTime}ms (${transcribableLinks.filter(l => l.transcript).length} transcribed)`);
   return results;
 }
 
@@ -368,7 +490,17 @@ function buildSmartPrompt(enrichedLinks) {
       if (link.metadata.description) lines.push(`  Description: ${link.metadata.description.substring(0, 200)}`);
     }
     lines.push(`  Content type (hint): ${link.contentType}`);
-    if (link.fetchError) lines.push(`  ⚠️ ${link.fetchError}`);
+    // Whisper-extracted spoken content from the video itself. This is the
+    // ACTUAL content of the video, not just metadata. Treat it as authoritative
+    // for "what is this video about" / "tldr" / "what event is in this video".
+    if (link.transcript) {
+      const t = link.transcript.length > 3500 ? link.transcript.substring(0, 3500) + '...(truncated)' : link.transcript;
+      lines.push(`  📝 VIDEO TRANSCRIPT (extracted via Whisper — this is what the video actually says):`);
+      lines.push(`  """`);
+      lines.push(t.split('\n').map(l => '  ' + l).join('\n'));
+      lines.push(`  """`);
+    }
+    if (link.fetchError && !link.transcript) lines.push(`  ⚠️ ${link.fetchError}`);
     return lines.join('\n');
   }).join('\n\n');
 
@@ -417,11 +549,12 @@ function buildSmartPrompt(enrichedLinks) {
     '  - If purely entertainment, give a brief natural reaction',
     '',
     'RESPONSE RULES:',
-    '- 2-4 sentences, casual Discord tone. Lead with the most useful/actionable info.',
+    '- 2-4 sentences, casual tone. Lead with the most useful/actionable info.',
+    '- IF a VIDEO TRANSCRIPT is provided above, USE IT as the primary source of truth for what the video is about. The transcript is what the video literally says. For "tldr" / "summarize" requests, summarize the transcript directly. For "plan for us" requests, extract dates/locations/events from the transcript.',
     '- End with ONE specific next-step offer ("Want me to add this to your calendar?", "Should I find tickets?", "Want me to check reservation availability?")',
-    '- NEVER say "I can\'t access this", "I can\'t view this", or "this platform is locked". You have WebSearch — USE IT.',
-    '- If metadata is above, use it directly. If fetch failed (⚠️), IMMEDIATELY WebSearch for the content. No excuses, no apologies.',
-    '- NEVER ask the user to tell you what the link is. Figure it out yourself via WebSearch.',
+    '- NEVER say "I can\'t access this", "I can\'t view this", or "this platform is locked". You have WebSearch AND a video transcript — USE THEM.',
+    '- If metadata is above, use it directly. If fetch failed (⚠️) AND there is no transcript, IMMEDIATELY WebSearch for the content. No excuses, no apologies.',
+    '- NEVER ask the user to tell you what the link is. Figure it out yourself via the transcript or WebSearch.',
     '',
   ].join('\n');
 }
