@@ -1,5 +1,6 @@
 const fs = require('fs');
 const path = require('path');
+const { atomicWriteJsonSync } = require('./atomic-write');
 
 // Store in mounted .claude dir so tasks persist across container rebuilds
 const TASKS_FILE = path.join('/home/node/.claude', 'briefing-tasks.json');
@@ -25,7 +26,7 @@ function readStore() {
 }
 
 function writeStore(store) {
-  fs.writeFileSync(TASKS_FILE, JSON.stringify(store, null, 2));
+  atomicWriteJsonSync(TASKS_FILE, store);
 }
 
 function loadActiveTasks() {

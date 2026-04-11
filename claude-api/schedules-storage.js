@@ -1,5 +1,6 @@
 const fs = require('fs');
 const path = require('path');
+const { atomicWriteJsonSync } = require('./atomic-write');
 
 // Store in mounted .claude dir so schedules persist across container rebuilds
 const SCHEDULES_FILE = path.join('/home/node/.claude', 'schedules.json');
@@ -13,7 +14,7 @@ function readStore() {
 }
 
 function writeStore(store) {
-  fs.writeFileSync(SCHEDULES_FILE, JSON.stringify(store, null, 2));
+  atomicWriteJsonSync(SCHEDULES_FILE, store);
 }
 
 function loadSchedules() {
