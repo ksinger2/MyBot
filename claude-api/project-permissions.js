@@ -10,6 +10,7 @@
 
 const fs   = require('fs');
 const path = require('path');
+const { atomicWriteJsonSync } = require('./atomic-write');
 
 // The one and only person who can edit code or change permissions from Signal
 const SIGNAL_OWNER = process.env.SIGNAL_OWNER_NUMBER || '+16315214787';
@@ -28,8 +29,7 @@ function _read(projectPath) {
 
 function _write(projectPath, data) {
   const f = _permFile(projectPath);
-  fs.mkdirSync(path.dirname(f), { recursive: true });
-  fs.writeFileSync(f, JSON.stringify(data, null, 2));
+  atomicWriteJsonSync(f, data);
 }
 
 /** Is this phone number the Signal owner? */

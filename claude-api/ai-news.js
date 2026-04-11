@@ -8,6 +8,7 @@ const schedule = require('node-schedule');
 const fs = require('fs');
 const path = require('path');
 const { MessageFlags } = require('discord.js');
+const { atomicWriteJsonSync } = require('./atomic-write');
 
 // Persist seen headlines so we don't repeat across 3-hour cycles
 const SEEN_FILE = path.join(__dirname, 'data', 'ai-news-seen.json');
@@ -26,7 +27,7 @@ function saveSeen(seen) {
   try {
     // Keep only the last MAX_SEEN entries
     const arr = [...seen].slice(-MAX_SEEN);
-    fs.writeFileSync(SEEN_FILE, JSON.stringify(arr));
+    atomicWriteJsonSync(SEEN_FILE, arr, { spaces: 0 });
   } catch (err) {
     console.warn('[ai-news] Could not save seen file:', err.message);
   }

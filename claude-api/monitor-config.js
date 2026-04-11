@@ -1,5 +1,6 @@
 const fs = require('fs');
 const path = require('path');
+const { atomicWriteJsonSync } = require('./atomic-write');
 
 const MONITOR_FILE = path.join('/home/node/.claude', 'monitor-config.json');
 
@@ -12,7 +13,7 @@ function readStore() {
 }
 
 function writeStore(store) {
-  fs.writeFileSync(MONITOR_FILE, JSON.stringify(store, null, 2));
+  atomicWriteJsonSync(MONITOR_FILE, store);
 }
 
 function addMonitor({ type, channelId, action, config, pollInterval, cwd }) {

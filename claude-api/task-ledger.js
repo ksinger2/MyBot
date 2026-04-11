@@ -7,6 +7,7 @@
 
 const fs = require('fs');
 const path = require('path');
+const { atomicWriteJsonSync } = require('./atomic-write');
 
 const LEDGER_FILE = path.join('/home/node/.claude', 'task-ledger.json');
 const MAX_COMPLETED = 50; // Keep last 50 completed tasks
@@ -20,7 +21,7 @@ function readLedger() {
 
 function writeLedger(ledger) {
   try {
-    fs.writeFileSync(LEDGER_FILE, JSON.stringify(ledger, null, 2));
+    atomicWriteJsonSync(LEDGER_FILE, ledger);
   } catch (err) {
     console.error('[task-ledger] Write error:', err.message);
   }

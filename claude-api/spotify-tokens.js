@@ -1,5 +1,6 @@
 const fs = require('fs');
 const path = require('path');
+const { atomicWriteJsonSync } = require('./atomic-write');
 
 // NOTE: In production, tokens should be encrypted at rest (e.g. via AES-256-GCM
 // with a key from a secrets manager). This module stores them as plaintext JSON
@@ -15,9 +16,7 @@ function readStore() {
 }
 
 function writeStore(store) {
-  const dir = path.dirname(TOKENS_FILE);
-  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-  fs.writeFileSync(TOKENS_FILE, JSON.stringify(store, null, 2));
+  atomicWriteJsonSync(TOKENS_FILE, store);
 }
 
 /**

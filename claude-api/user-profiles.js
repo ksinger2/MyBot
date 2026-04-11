@@ -20,6 +20,7 @@
 
 const fs = require('fs');
 const path = require('path');
+const { atomicWriteJsonSync } = require('./atomic-write');
 
 const PROFILES_FILE = '/app/data/user-profiles.json';
 
@@ -31,8 +32,7 @@ function _read() {
 }
 
 function _write(store) {
-  fs.mkdirSync(path.dirname(PROFILES_FILE), { recursive: true });
-  fs.writeFileSync(PROFILES_FILE, JSON.stringify(store, null, 2));
+  atomicWriteJsonSync(PROFILES_FILE, store);
 }
 
 /** Get a user's profile by phone number. Returns null if not found. */

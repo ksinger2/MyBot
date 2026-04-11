@@ -1,5 +1,6 @@
 const fs = require('fs');
 const path = require('path');
+const { atomicWriteJsonSync } = require('./atomic-write');
 
 // Store in mounted .claude dir so state persists across container rebuilds
 const STATE_FILE = path.join('/home/node/.claude', 'channel-state.json');
@@ -16,7 +17,7 @@ function readStore() {
 }
 
 function writeStore(store) {
-  fs.writeFileSync(STATE_FILE, JSON.stringify(store, null, 2));
+  atomicWriteJsonSync(STATE_FILE, store);
 }
 
 function saveChannelState(channelId, state, { critical = false } = {}) {

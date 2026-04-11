@@ -1,5 +1,6 @@
 const fs = require('fs');
 const path = require('path');
+const { atomicWriteJsonSync } = require('./atomic-write');
 
 // Store in mounted .claude dir so queue persists across container rebuilds
 const QUEUE_FILE = path.join('/home/node/.claude', 'work-queue.json');
@@ -47,7 +48,7 @@ function readStore() {
 }
 
 function writeStore(store) {
-  fs.writeFileSync(QUEUE_FILE, JSON.stringify(store, null, 2));
+  atomicWriteJsonSync(QUEUE_FILE, store);
 }
 
 function addItem({ prompt, channelId, userId, cwd, personality, identity }) {
