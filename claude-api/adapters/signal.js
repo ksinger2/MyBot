@@ -21,6 +21,67 @@
  */
 
 const { MessagePlatform, NormalizedMessage } = require('./base');
+const fs = require('fs');
+const path = require('path');
+
+/**
+ * Redact a phone number for log output. Shows first 2 chars (usually "+1")
+ * and last 2 digits, masking the middle: "+1****72". Preserves non-strings
+ * and non-E.164 values unchanged so we never mangle a UUID or an object.
+ * Only used in log output — data flow continues to carry real numbers.
+ */
+function _redactPhone(p) {
+  if (typeof p !== 'string' || !p.startsWith('+')) return p;
+  if (p.length <= 4) return p;
+  return p.slice(0, 2) + '****' + p.slice(-2);
+}
+
+/**
+ * Redact a UUID for log output. Shows first 4 and last 4 characters:
+ * "abcd...1234". UUIDs are PII in the same sense phone numbers are.
+ * Skips phone numbers (handled by _redactPhone) and short non-PII strings.
+ */
+function _redactUuid(u) {
+  if (typeof u !== 'string' || u.length < 12) return u;
+  if (u.startsWith('+')) return u; // phone number — caller should use _redactPhone
+  return u.slice(0, 4) + '...' + u.slice(-4);
+}
+
+/**
+ * Redact either a phone number or UUID — whichever the input looks like.
+ * Useful for fields like `senderId`/`recipient` that can be either shape.
+ */
+function _redactId(id) {
+  if (typeof id !== 'string') return id;
+  if (id.startsWith('+')) return _redactPhone(id);
+  return _redactUuid(id);
+}
+
+/**
+ * Age-out sweep for /tmp/signal-attachments/. Deletes any file whose mtime
+ * is older than 24h. Silent on individual file errors (best-effort GC).
+ */
+function _cleanupOldAttachments() {
+  const dir = '/tmp/signal-attachments';
+  try {
+    if (!fs.existsSync(dir)) return;
+    const cutoff = Date.now() - 24 * 60 * 60 * 1000;
+    let removed = 0;
+    for (const name of fs.readdirSync(dir)) {
+      try {
+        const full = path.join(dir, name);
+        const stat = fs.statSync(full);
+        if (stat.mtimeMs < cutoff) {
+          fs.unlinkSync(full);
+          removed++;
+        }
+      } catch { /* skip individual file errors */ }
+    }
+    if (removed > 0) console.log(`[signal] cleaned up ${removed} stale attachment(s) older than 24h`);
+  } catch (err) {
+    console.warn(`[signal] attachment cleanup failed: ${err.message}`);
+  }
+}
 
 class SignalAdapter extends MessagePlatform {
   constructor(opts = {}) {
@@ -30,6 +91,7 @@ class SignalAdapter extends MessagePlatform {
     this.phoneNumber = opts.phoneNumber || process.env.SIGNAL_PHONE_NUMBER;
     this.pollInterval = opts.pollInterval || parseInt(process.env.SIGNAL_POLL_INTERVAL, 10) || 5000;
     this._pollTimer = null;
+    this._cleanupTimer = null;
     this._stopping = false;
 
     // Track known conversations for chat metadata
@@ -95,6 +157,17 @@ class SignalAdapter extends MessagePlatform {
     // Load groups so we know how to address them and which need joining.
     await this._loadGroups();
 
+    // Age-out sweep for downloaded attachments in /tmp. Run immediately so
+    // cruft from a previous boot (including whatever was there when this
+    // container started) gets cleaned right away, then once per hour while
+    // the adapter is alive. Guard against double-register in case start()
+    // is called twice.
+    _cleanupOldAttachments();
+    if (!this._cleanupTimer) {
+      this._cleanupTimer = setInterval(_cleanupOldAttachments, 60 * 60 * 1000);
+      if (typeof this._cleanupTimer.unref === 'function') this._cleanupTimer.unref();
+    }
+
     // Start inbound message ingestion. In webhook mode the signal-api container
     // POSTs every incoming envelope to /signal/webhook in claude-api, so polling
     // is unnecessary (and would fail anyway — /v1/receive returns "Not implemented"
@@ -115,6 +188,10 @@ class SignalAdapter extends MessagePlatform {
     if (this._pollTimer) {
       clearTimeout(this._pollTimer);
       this._pollTimer = null;
+    }
+    if (this._cleanupTimer) {
+      clearInterval(this._cleanupTimer);
+      this._cleanupTimer = null;
     }
     this.ready = false;
     console.log('[signal] Adapter stopped');
@@ -149,7 +226,7 @@ class SignalAdapter extends MessagePlatform {
     }
     payload.recipients = [sendRecipient];
 
-    console.log(`[signal] Sending to ${recipient}: ${text.substring(0, 50)}...`);
+    console.log(`[signal] Sending to ${_redactId(recipient)}: ${text.substring(0, 50)}...`);
 
     // Handle attachments
     if (opts.attachments && opts.attachments.length > 0) {
@@ -522,10 +599,10 @@ class SignalAdapter extends MessagePlatform {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ recipient: uuid }),
       });
-      console.log(`[signal] Accepted message request from ${uuid}`);
+      console.log(`[signal] Accepted message request from ${_redactUuid(uuid)}`);
     } catch (err) {
       // Non-fatal — log and continue
-      console.warn(`[signal] Could not accept message request from ${uuid}: ${err.message}`);
+      console.warn(`[signal] Could not accept message request from ${_redactUuid(uuid)}: ${err.message}`);
     }
   }
 
@@ -565,9 +642,9 @@ class SignalAdapter extends MessagePlatform {
     // Cache any new UUID→phone mapping we discover
     if (senderUuid && envelope.sourceNumber && !this._uuidToPhone.has(senderUuid)) {
       this._uuidToPhone.set(senderUuid, envelope.sourceNumber);
-      console.log(`[signal] Learned UUID→phone: ${senderUuid} → ${envelope.sourceNumber}`);
+      console.log(`[signal] Learned UUID→phone: ${_redactUuid(senderUuid)} → ${_redactPhone(envelope.sourceNumber)}`);
     }
-    console.log(`[signal] Incoming from ${senderId} (phone: ${senderPhone}, uuid: ${senderUuid}, chat: ${chatId}): ${(dataMessage.message || '').substring(0, 50)}${dataMessage.attachments?.length ? ` [${dataMessage.attachments.length} attachment(s)]` : ''}`);
+    console.log(`[signal] Incoming from ${_redactId(senderId)} (phone: ${_redactPhone(senderPhone)}, uuid: ${_redactUuid(senderUuid)}, chat: ${_redactId(chatId)}): ${(dataMessage.message || '').substring(0, 50)}${dataMessage.attachments?.length ? ` [${dataMessage.attachments.length} attachment(s)]` : ''}`);
     const timestamp = dataMessage.timestamp || envelope.timestamp || Date.now();
 
     // Download attachments to a local temp dir so Claude can Read them. The
@@ -633,8 +710,6 @@ class SignalAdapter extends MessagePlatform {
    */
   async _downloadAttachment(attachmentId, filename, contentType) {
     if (!attachmentId) return null;
-    const fs = require('fs');
-    const path = require('path');
 
     const dir = '/tmp/signal-attachments';
     fs.mkdirSync(dir, { recursive: true });
