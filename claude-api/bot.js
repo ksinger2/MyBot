@@ -38,6 +38,29 @@ const MAX_TIMEOUT = (parseInt(process.env.MAX_TIMEOUT_MINUTES, 10) || 90) * 60 *
 const MAX_LOOP_COST_USD = parseFloat(process.env.MAX_LOOP_COST_USD) || 5;
 // Pause between loop iterations (let Discord catch up, give system time to flush).
 const LOOP_ITERATION_COOLDOWN_MS = parseInt(process.env.LOOP_ITERATION_COOLDOWN_MS, 10) || 5000;
+// M3: hard wallclock ceiling on a single !loop run (defense-in-depth on top of
+// per-iteration timeout + cost cap). Prevents a recovering loop from churning
+// forever across iterations.
+const MAX_LOOP_WALLCLOCK_MS = parseInt(process.env.MAX_LOOP_WALLCLOCK_MS, 10) || (2 * 60 * 60 * 1000); // 2h default
+// M3: per-channel daily iteration cap — a runaway loop that keeps recovering
+// from errors can't burn through more than this many iterations in a UTC day.
+const MAX_LOOP_ITERATIONS_PER_DAY = parseInt(process.env.MAX_LOOP_ITERATIONS_PER_DAY, 10) || 200;
+// M3: in-memory per-channel iteration counter, keyed by UTC date. Resets on
+// day rollover. Map<channelId, { date: 'YYYY-MM-DD', count: number }>.
+const _loopIterationsToday = new Map();
+function _todayUTC() {
+  return new Date().toISOString().slice(0, 10);
+}
+function _bumpLoopIterationCount(channelId) {
+  const today = _todayUTC();
+  const entry = _loopIterationsToday.get(channelId);
+  if (!entry || entry.date !== today) {
+    _loopIterationsToday.set(channelId, { date: today, count: 1 });
+    return 1;
+  }
+  entry.count += 1;
+  return entry.count;
+}
 const STALL_THRESHOLDS = {
   thinking: 5 * 60 * 1000,   // 5 min — no tool active, just "thinking"
   bash:     10 * 60 * 1000,  // 10 min — shell commands
@@ -2239,7 +2262,11 @@ async function handleCommand(message) {
       state.busy = true;
       saveChannelState(channelId, state, { critical: true });
 
-      await message.reply(`Starting autonomous loop: "${arg.substring(0, 100)}"\nMax ${maxIterations} iterations · cost cap $${MAX_LOOP_COST_USD}. Use \`!stop\` to interrupt.\nWrite \`<<TASK_COMPLETE>>\` in NextSteps.md to signal done.`);
+      await message.reply(`Starting autonomous loop: "${arg.substring(0, 100)}"\nMax ${maxIterations} iterations · cost cap $${MAX_LOOP_COST_USD} · wallclock cap ${Math.round(MAX_LOOP_WALLCLOCK_MS / 60000)}m · daily cap ${MAX_LOOP_ITERATIONS_PER_DAY}. Use \`!stop\` to interrupt.\nWrite \`<<TASK_COMPLETE>>\` in NextSteps.md to signal done.`);
+
+      // M3: record wall-start so we can bail even if individual iterations
+      // keep returning successfully within their own 90m hard cap.
+      const loopStartedAt = Date.now();
 
       // L-Fix-1: top-level try/catch — no more silent error swallowing.
       (async () => {
@@ -2253,6 +2280,22 @@ async function handleCommand(message) {
             // L-Fix-2: !stop sets loopActive=false; honor it between iterations.
             if (!state.loopActive) {
               exitReason = 'user-stopped';
+              break;
+            }
+
+            // M3: hard wallclock ceiling across the whole !loop run.
+            if (Date.now() - loopStartedAt > MAX_LOOP_WALLCLOCK_MS) {
+              await message.channel.send(`🛑 !loop wallclock cap reached (${Math.round(MAX_LOOP_WALLCLOCK_MS / 60000)}m) — stopping. Total cost: $${totalCost.toFixed(4)}.`);
+              exitReason = 'wallclock-cap';
+              break;
+            }
+
+            // M3: per-channel daily iteration counter. Bumps BEFORE the iteration
+            // runs so a runaway that keeps restarting still burns its daily budget.
+            const iterationsToday = _bumpLoopIterationCount(channelId);
+            if (iterationsToday > MAX_LOOP_ITERATIONS_PER_DAY) {
+              await message.channel.send(`🛑 !loop daily iteration cap reached (${MAX_LOOP_ITERATIONS_PER_DAY}) — try again tomorrow. Total cost this run: $${totalCost.toFixed(4)}.`);
+              exitReason = 'daily-iter-cap';
               break;
             }
 

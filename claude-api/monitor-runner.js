@@ -4,6 +4,33 @@ const { pollGitHubCI, pollURLHealth } = require('./pollers');
 const timers = new Map();     // monitorId -> intervalId
 const fixCounts = new Map();  // monitorId -> [{ timestamp }] for rate limiting
 
+// L8: cumulative auto-fix Claude cost per UTC day, across ALL monitors.
+// A misconfigured monitor that keeps triggering auto-fixes can otherwise drain
+// the Anthropic budget overnight even though MAX_FIXES_PER_HOUR limits frequency.
+// Map<'YYYY-MM-DD', number>. We keep only today's entry — old entries get GC'd
+// naturally on rollover since we only read/write the current UTC date string.
+const _dailyAutoFixCost = new Map();
+const MAX_AUTO_FIX_COST_PER_DAY_USD = parseFloat(process.env.MAX_AUTO_FIX_COST_PER_DAY_USD) || 5.00;
+
+function _todayUTC() {
+  return new Date().toISOString().slice(0, 10);
+}
+
+function _getDailyAutoFixCost() {
+  const today = _todayUTC();
+  // Drop stale entries so the map never grows unbounded.
+  for (const key of _dailyAutoFixCost.keys()) {
+    if (key !== today) _dailyAutoFixCost.delete(key);
+  }
+  return _dailyAutoFixCost.get(today) || 0;
+}
+
+function _addDailyAutoFixCost(usd) {
+  if (!usd || !Number.isFinite(usd) || usd <= 0) return;
+  const today = _todayUTC();
+  _dailyAutoFixCost.set(today, (_dailyAutoFixCost.get(today) || 0) + usd);
+}
+
 const POLLERS = {
   'github-ci': pollGitHubCI,
   'url-health': pollURLHealth,
@@ -95,6 +122,15 @@ async function runPoll(monitorId, client) {
       return;
     }
 
+    // L8: daily spend cap across all monitors. If we're already at/over the
+    // cap, skip dispatching another auto-fix until UTC midnight.
+    const spentToday = _getDailyAutoFixCost();
+    if (spentToday >= MAX_AUTO_FIX_COST_PER_DAY_USD) {
+      console.log(`[monitor] daily auto-fix cost cap reached ($${spentToday.toFixed(4)}) — skipping fix dispatch until tomorrow`);
+      await channel.send(`**Monitor #${monitor.id}** (daily cost cap $${MAX_AUTO_FIX_COST_PER_DAY_USD.toFixed(2)} reached — notify only):\n${result.summary}`).catch(() => {});
+      return;
+    }
+
     recordFixAction(monitorId);
     await channel.send(`**Monitor #${monitor.id} — auto-fixing:**\n${result.summary}`).catch(() => {});
 
@@ -118,6 +154,15 @@ async function runPoll(monitorId, client) {
       if (fixResult.sessionId) {
         state.sessionId = fixResult.sessionId;
         saveChannelState(monitor.channelId, state);
+      }
+      // L8: record Claude spend against the UTC-day bucket. runClaudeWithContinuation
+      // returns { cost } in USD (see bot.js — used by !loop and inline replies).
+      if (fixResult && fixResult.cost) {
+        _addDailyAutoFixCost(fixResult.cost);
+        const spent = _getDailyAutoFixCost();
+        if (spent >= MAX_AUTO_FIX_COST_PER_DAY_USD) {
+          console.log(`[monitor] daily auto-fix cost cap just crossed: $${spent.toFixed(4)} / $${MAX_AUTO_FIX_COST_PER_DAY_USD.toFixed(2)}`);
+        }
       }
       if (fixResult.text && !fixResult.stopped) {
         const fakeMsg = { reply: (opts) => channel.send(opts), channel };
