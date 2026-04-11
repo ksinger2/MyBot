@@ -1,6 +1,129 @@
 # MyBot — Session Handoff (2026-04-11, late evening)
 
-## Headline this session: full security pass
+## CRITICAL incident: bind-mount break in /rebuild flow (2026-04-11, fixed)
+
+**Symptom:** User messaged Bianca on Signal post-streaming-fix and got
+`*(No output)*` as the reply. Logs showed `[close] code=0 turns=0 elapsed=0s`
+— Claude CLI started and immediately exited cleanly with no output. Many
+parallel `EACCES: permission denied` errors writing to `/home/node/.claude/`
+in the logs (atomic-write tmp files, session-journal, channel-state).
+
+**Root cause:** The `/rebuild` flow spawns a host-side `docker:27-cli`
+container as the rebuilder. That container runs as root with `HOME=/root`.
+When it executes `docker compose up -d --build`, compose substitutes
+`${HOME}` in `docker-compose.yml` volume mounts → `/root/.claude:/home/node/.claude`.
+`/root/.claude` doesn't exist on the host, so Docker silently CREATES it
+as an empty root-owned directory and bind-mounts THAT. Inside the new
+container, `/home/node/.claude/` is an empty root-owned dir, `.claude.json`
+and `.gitconfig` are also empty root dirs (Docker created mount points
+because the source files don't exist at `/root/.claude.json`). Claude
+CLI can't read its credentials, exits at 0 turns. Bot looks alive but
+silent. The atomic-write helper from M1 was the canary because it tries
+to MKDIR the parent and create a .tmp sibling — both require write
+permission on a directory the node user doesn't own.
+
+**Fix:**
+1. `docker-compose.yml` — replaced `${HOME}/.claude*` with
+   `${HOST_HOME:-/home/karen}/.claude*`. The default kicks in when
+   HOST_HOME is unset, so even a clean rebuild without env propagation
+   resolves to the right path. Added a long incident comment above the
+   volumes block so future me doesn't reintroduce this.
+2. `docker-compose.yml` — added `HOST_HOME=${HOST_HOME:-/home/karen}` to
+   the claude-api environment block so the bot.js process inside the
+   container can read it and pass it through to the rebuilder.
+3. `claude-api/server.js` — `/rebuild` handler now adds
+   `-e HOST_HOME=${process.env.HOST_HOME || '/home/karen'}` to the
+   `docker run` args of the rebuilder. The rebuilder's compose-up call
+   then substitutes the right value into the volume mounts.
+
+**Verified live:**
+- `docker exec mybot-claude-api-1 ls -lan /home/node/` now shows
+  `.claude` as a real 16-entry directory, `.claude.json` as a real 41KB
+  file, `.gitconfig` as a real 297-byte file (all owned by uid 1000, not
+  root). Previously they were empty root-owned directories.
+- No more `EACCES` errors in the boot logs.
+- Bot is healthy on the new image; Claude CLI can read credentials.
+
+**For other operators:** if your home is not `/home/karen`, set
+`HOST_HOME=/home/youruser` in `.env` before `docker compose up -d --build`.
+
+---
+
+## Signal latency fix (after the security pass)
+
+User reported "Response time on Signal is incredibly slow", then "It is
+endlessly loading a response to my message seems like broken". Diagnosed
+from the live container: a casual `hey girl` triggered a 9-tool-call /
+136-second investigation run where Bianca read `bot.js`, grepped mention
+logic, ran `docker logs` — **and never produced a single text reply** the
+entire time. Two compounding causes:
+
+1. **Bianca's default mode is "engineer", not "chat bot."** The system
+   prompt's CAPABILITIES section is so heavy with engineering instructions
+   that any ambiguous message gets interpreted as a debugging task. The
+   BREVITY rule existed but had nothing to say about *when* tools should
+   or shouldn't be used.
+2. **No streaming.** Even when a Claude run takes 60+ seconds, the user
+   sees ZERO output until the run completes. There's no "thinking…",
+   no first-line preview, no progress indication on Signal.
+
+### What got fixed
+
+#### CRITICAL RULE #0 — Conversational default (`bot.js:580` area)
+New top-priority system-prompt rule that overrides everything else. Tells
+Bianca she is "FIRST a chat bot, SECOND an engineer." Lists what counts
+as conversational (greetings, small talk, simple questions, acknowledgments,
+short messages under ~10 words) and instructs her to reply in 1-3 sentences
+with **ZERO tool calls** for those. Tool calls are ONLY for explicit
+code/research/file/system tasks. If she's not 100% sure whether the user
+wants an action, she's instructed to ASK in 1 sentence rather than
+starting tool calls. Rationale spelled out: "Tool calls cost real money
+and time — don't run them on a hunch."
+
+#### Streaming partial replies (`bot.js:askClaude`)
+- New `streamReplies` option on `askClaude(prompt, opts)`. When set AND
+  a `channelProxy` is provided, each `text` block in the stream-json
+  output is sent live via `channelProxy.send()` as it arrives, instead
+  of buffering the entire run.
+- Sub-agent text blocks are NOT streamed (the user only sees the parent
+  agent's words — sub-agent output is internal investigation).
+- Full text is still accumulated for `result.text` so callers that need
+  it (image extraction, conversation log via `appendEntry`) get the
+  complete version.
+- New `result.streamed: bool` field. `runClaudeWithContinuation` ORs it
+  across continuations so a multi-iteration run that streamed any text
+  marks the whole result as streamed.
+- Signal handler (`bot.js:~4078`) now passes `streamReplies: true` and
+  skips the final `signalAdapter.sendLongMessage` when `result.streamed`
+  is true (avoids duplicating the reply the user already saw).
+- **Discord caller path is intentionally unchanged** — Discord works
+  fine today and the user complaint was Signal-specific. Discord still
+  buffers and sends the full reply at the end. Easy to enable later by
+  passing `streamReplies: true` in the Discord opts block.
+
+### How to verify
+- Send Bianca a casual message on Signal: `hey girl`. Expected: she
+  replies in ~5-10s in a single short message, no tool calls in logs.
+- Send Bianca a real task on Signal: `find me good wireless earbuds
+  under $100`. Expected: first sentence of her reply arrives within
+  ~5-10s as a Signal message, then her remaining text streams in as
+  she works through tools.
+- Check `docker compose logs claude-api` for `[event] type=assistant`
+  events with no associated `[tool]` events for casual messages.
+
+### Followup that's still worth doing
+- Enable streaming for the Discord caller path too. Just add
+  `streamReplies: true` in the `claudeOpts` block at `bot.js:~3645` and
+  apply the same `if (!result.streamed) sendLongMessage(...)` skip on
+  the Discord post-result branch. ~5 min change.
+- Surface a typing indicator OR a "Bianca is thinking…" first message
+  on the Signal path when no text has streamed within ~3s of webhook
+  receipt. Currently the typing indicator only fires if `signalTypingInterval`
+  is wired up; verify this still works post-streaming.
+
+---
+
+## Headline previous: full security pass
 
 A two-phase security review (engineering + threat-model agents working in
 parallel) identified 21 findings — 5 critical, 8 high, 7 medium, 9 low.

@@ -57,6 +57,13 @@ services:
       # mounts resolve correctly on the host filesystem (not the calling
       # container's). Override per environment.
       - HOST_PROJECT_PATH=${HOST_PROJECT_PATH:-/mnt/c/Users/karen/Desktop/Github Projects/MyBot}
+      # Absolute host path to the operator's HOME. Used by /rebuild to pass
+      # through to the host-side rebuilder so that `${HOST_HOME}/.claude*`
+      # bind mounts resolve correctly. Without this, the rebuilder runs as
+      # root with HOME=/root, and ${HOME} substitution would silently break
+      # the .claude / .claude.json / .gitconfig mounts. See the volumes
+      # block below for the full incident note.
+      - HOST_HOME=${HOST_HOME:-/home/karen}
       # GitHub auth for `gh` CLI. Replaces the old ${HOME}/.config/gh bind mount
       # (removed 2026-04-11 for security). The `gh` CLI natively picks up
       # GH_TOKEN from the environment. Set this in .env to a personal access
@@ -66,10 +73,18 @@ services:
     # review found prompt-injection could exfiltrate them via Claude's Read
     # tool + --dangerously-skip-permissions. `gh` CLI now authenticates via
     # GH_TOKEN (set in .env). See NextStep.md finding H3.
+    #
+    # CRITICAL: these MUST use HOST_HOME (an absolute host path), NOT ${HOME}.
+    # The /rebuild flow spawns a host-side `docker:27-cli` container where
+    # HOME=/root, so any ${HOME} interpolation at compose-up time would
+    # resolve to /root and Docker would silently CREATE EMPTY MOUNT POINTS at
+    # /root/.claude/ etc. That broke the bot end-to-end on 2026-04-11 —
+    # Claude CLI couldn't read its credentials and exited at 0 turns.
+    # Override HOST_HOME in your env if your home directory is different.
     volumes:
-      - ${HOME}/.claude:/home/node/.claude
-      - ${HOME}/.claude.json:/home/node/.claude.json
-      - ${HOME}/.gitconfig:/home/node/.gitconfig:ro
+      - ${HOST_HOME:-/home/karen}/.claude:/home/node/.claude
+      - ${HOST_HOME:-/home/karen}/.claude.json:/home/node/.claude.json
+      - ${HOST_HOME:-/home/karen}/.gitconfig:/home/node/.gitconfig:ro
       - /mnt/c/Users/karen/Desktop/Github Projects:/workspace
       - /var/run/docker.sock:/var/run/docker.sock
     healthcheck:

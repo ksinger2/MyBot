@@ -375,13 +375,27 @@ app.post('/rebuild', requireInternalToken, async (req, res) => {
   //    In dev that's the WSL Windows path; in CI/cloud it'd be different.
   setTimeout(() => {
     try {
-      console.log(`[rebuild] Spawning host-side rebuild container (HOST_PROJECT_PATH=${HOST_PROJECT_PATH})`);
+      // HOST_HOME passthrough — CRITICAL. The docker:27-cli rebuilder runs
+      // as root with HOME=/root by default, and docker-compose substitutes
+      // ${HOME} at compose-up time. Without forwarding our HOST_HOME env
+      // var, the .claude / .claude.json / .gitconfig bind mounts would
+      // resolve to /root/.claude* (which doesn't exist on the host) and
+      // Docker would silently create empty mount points there. Result:
+      // Claude CLI inside the bot container can't read its credentials and
+      // exits at 0 turns. This bit us once on 2026-04-11 — see commit
+      // history. The default below mirrors docker-compose.yml.
+      const HOST_HOME = process.env.HOST_HOME || '/home/karen';
+      console.log(`[rebuild] Spawning host-side rebuild container (HOST_PROJECT_PATH=${HOST_PROJECT_PATH}, HOST_HOME=${HOST_HOME})`);
       const dockerArgs = [
         'run', '-d', '--rm',
         '--name', `mybot-rebuilder-${Date.now()}`,
         '-v', '/var/run/docker.sock:/var/run/docker.sock',
         '-v', `${HOST_PROJECT_PATH}:/work`,
         '-w', '/work',
+        // Forward HOST_HOME so the inner `docker compose up` substitutes
+        // ${HOST_HOME} in volume mounts to the operator's actual home,
+        // not the rebuilder's /root.
+        '-e', `HOST_HOME=${HOST_HOME}`,
         // L1: pin docker:cli to a specific minor version so supply-chain
         // surprises (a poisoned `latest` tag) can't compromise the rebuild.
         // Update this tag intentionally when upgrading the Docker CLI.
