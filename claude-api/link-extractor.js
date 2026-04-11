@@ -6,6 +6,67 @@
  * prompts for Claude CLI.
  */
 
+/**
+ * SSRF gate for yt-dlp invocations. yt-dlp will happily fetch file:// URIs,
+ * internal HTTP endpoints, and cloud metadata services (169.254.169.254) if
+ * given the chance. We lock it down to HTTPS + a hostname allowlist of known
+ * social/video sources, and we reject IP literals outright. Adding a new
+ * platform is a one-line regex addition.
+ */
+function _isUrlSafeForYtdlp(url) {
+  let parsed;
+  try { parsed = new URL(url); } catch { return false; }
+  // Scheme: HTTPS only. No file://, no http:// (cleartext), no data:, no ftp:.
+  if (parsed.protocol !== 'https:') return false;
+  // Hostname allowlist: only known social/video sources.
+  const allowedHosts = [
+    /(^|\.)tiktok\.com$/i,
+    /(^|\.)instagram\.com$/i,
+    /(^|\.)youtube\.com$/i,
+    /(^|\.)youtu\.be$/i,
+    /(^|\.)twitter\.com$/i,
+    /(^|\.)x\.com$/i,
+    /(^|\.)facebook\.com$/i,
+    /(^|\.)vimeo\.com$/i,
+    /(^|\.)reddit\.com$/i,
+  ];
+  const hostname = parsed.hostname.toLowerCase();
+  if (!allowedHosts.some(re => re.test(hostname))) return false;
+  // Block IP literals (defeats DNS rebinding to private space).
+  if (/^(\d+\.){3}\d+$/.test(hostname)) return false;
+  if (hostname.includes(':')) return false; // IPv6 literal
+  return true;
+}
+
+/**
+ * Minimal SSRF gate for fetch()-based metadata lookups (oEmbed / OG tags).
+ * Less restrictive than the yt-dlp gate — oEmbed legitimately hits many
+ * hosts — but still blocks private/loopback/link-local IP literals and
+ * non-HTTP(S) schemes. Returns false on anything suspicious.
+ */
+function _isUrlSafeForFetch(url) {
+  let parsed;
+  try { parsed = new URL(url); } catch { return false; }
+  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return false;
+  const hostname = parsed.hostname.toLowerCase();
+  // Block IPv4 literals in private/loopback/link-local ranges
+  const ipv4 = hostname.match(/^(\d+)\.(\d+)\.(\d+)\.(\d+)$/);
+  if (ipv4) {
+    const [, a, b] = ipv4.map(Number);
+    if (a === 10) return false;                              // 10.0.0.0/8
+    if (a === 127) return false;                             // loopback
+    if (a === 169 && b === 254) return false;                // link-local + cloud metadata
+    if (a === 172 && b >= 16 && b <= 31) return false;       // 172.16.0.0/12
+    if (a === 192 && b === 168) return false;                // 192.168.0.0/16
+    if (a === 0) return false;                               // 0.0.0.0/8
+  }
+  // Block obvious IPv6 literals (anything with colons in hostname)
+  if (hostname.includes(':')) return false;
+  // Block "localhost" and common internal names
+  if (hostname === 'localhost' || hostname.endsWith('.local') || hostname.endsWith('.internal')) return false;
+  return true;
+}
+
 const PLATFORM_PATTERNS = [
   {
     platform: 'tiktok',
@@ -106,6 +167,7 @@ function detectLinks(messageContent) {
  * Follow HTTP redirects for short URLs. Returns canonical URL or original on failure.
  */
 async function resolveShortUrl(url) {
+  if (!_isUrlSafeForFetch(url)) return url;
   try {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 2000);
@@ -131,6 +193,7 @@ async function resolveShortUrl(url) {
  * Fetch oEmbed data from a provider.
  */
 async function fetchOEmbed(oembedUrl) {
+  if (!_isUrlSafeForFetch(oembedUrl)) return null;
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 2500);
   try {
@@ -151,6 +214,7 @@ async function fetchOEmbed(oembedUrl) {
  * Extract OG/meta tags from HTML (first 8KB only).
  */
 async function fetchOgTags(url) {
+  if (!_isUrlSafeForFetch(url)) return null;
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 2500);
   try {
@@ -344,6 +408,13 @@ const TRANSCRIPT_CACHE_MAX = 200;
  */
 async function fetchVideoTranscript(url) {
   if (!url) return null;
+  // SSRF gate: yt-dlp runs as a subprocess and will fetch file://,
+  // http://169.254.169.254 (cloud metadata), etc. without asking. Only
+  // allow HTTPS URLs on a narrow allowlist of known video sources.
+  if (!_isUrlSafeForYtdlp(url)) {
+    console.warn(`[link-extractor] rejected unsafe URL for yt-dlp: ${String(url).substring(0, 80)}`);
+    return null;
+  }
   if (_transcriptCache.has(url)) return _transcriptCache.get(url);
   if (!process.env.OPENAI_API_KEY) {
     console.warn('[transcript] OPENAI_API_KEY not set — cannot transcribe');
