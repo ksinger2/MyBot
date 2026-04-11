@@ -1,7 +1,46 @@
+const crypto = require('crypto');
 const spotifyTokens = require('./spotify-tokens');
 
 // Requires env vars: SPOTIFY_CLIENT_ID, SPOTIFY_CLIENT_SECRET
 // Optional: SPOTIFY_REDIRECT_URI (defaults to http://localhost:3400/auth/spotify/callback)
+
+// ---------------------------------------------------------------------------
+// OAuth state map (M6 hardening) — random server-side tokens mapped to userId.
+// The state param sent to Spotify is no longer the userId; it's an unguessable
+// 48-hex-char token that we look up on callback. This prevents a CSRF-style
+// link hijack from matching a callback to the wrong user.
+// ---------------------------------------------------------------------------
+const STATE_TTL_MS = 15 * 60 * 1000; // 15 minutes
+const _stateMap = new Map();
+
+function _putState(userId) {
+  const stateToken = crypto.randomBytes(24).toString('hex');
+  _stateMap.set(stateToken, {
+    userId,
+    provider: 'spotify',
+    expiresAt: Date.now() + STATE_TTL_MS,
+  });
+  return stateToken;
+}
+
+function _takeState(stateToken) {
+  const entry = _stateMap.get(stateToken);
+  if (!entry) return null;
+  _stateMap.delete(stateToken); // one-time use
+  if (entry.expiresAt < Date.now()) return null;
+  return entry;
+}
+
+// Guard against double-register if the module is imported more than once.
+if (!global.__mybot_spotify_state_sweeper) {
+  global.__mybot_spotify_state_sweeper = true;
+  setInterval(() => {
+    const now = Date.now();
+    for (const [token, entry] of _stateMap.entries()) {
+      if (entry.expiresAt < now) _stateMap.delete(token);
+    }
+  }, 5 * 60 * 1000).unref?.();
+}
 
 const SCOPES = [
   'playlist-modify-public',
@@ -23,12 +62,13 @@ const REDIRECT_URI = process.env.SPOTIFY_REDIRECT_URI || 'http://localhost:3400/
  * @returns {string} authorization URL
  */
 function getAuthUrl(discordUserId) {
+  const stateToken = _putState(discordUserId);
   const params = new URLSearchParams({
     response_type: 'code',
     client_id: process.env.SPOTIFY_CLIENT_ID,
     scope: SCOPES.join(' '),
     redirect_uri: REDIRECT_URI,
-    state: discordUserId,
+    state: stateToken,
   });
   return `https://accounts.spotify.com/authorize?${params.toString()}`;
 }
@@ -40,7 +80,11 @@ function getAuthUrl(discordUserId) {
  * @returns {Promise<{ displayName: string, email: string, spotifyUserId: string, isPremium: boolean }>}
  */
 async function handleCallback(code, state) {
-  const discordUserId = state;
+  const entry = _takeState(state);
+  if (!entry) {
+    throw new Error('OAuth state not found or expired — please restart the connect flow');
+  }
+  const discordUserId = entry.userId;
 
   // Exchange code for tokens
   const tokenRes = await fetch('https://accounts.spotify.com/api/token', {

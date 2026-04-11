@@ -1,3 +1,4 @@
+const crypto = require('crypto');
 const { google } = require('googleapis');
 const userTokens = require('./user-tokens');
 
@@ -6,6 +7,44 @@ const userTokens = require('./user-tokens');
 // For the bot's internal Express server, this would be something like:
 //   http://localhost:3400/auth/google/callback  (dev)
 //   https://yourdomain.com/auth/google/callback (prod)
+
+// ---------------------------------------------------------------------------
+// OAuth state map (M6 hardening) — random server-side tokens mapped to userId.
+// The state param sent to Google is no longer the userId; it's an unguessable
+// 48-hex-char token that we look up on callback. This prevents a CSRF-style
+// link hijack from matching a callback to the wrong user.
+// ---------------------------------------------------------------------------
+const STATE_TTL_MS = 15 * 60 * 1000; // 15 minutes
+const _stateMap = new Map();
+
+function _putState(userId) {
+  const stateToken = crypto.randomBytes(24).toString('hex');
+  _stateMap.set(stateToken, {
+    userId,
+    provider: 'google',
+    expiresAt: Date.now() + STATE_TTL_MS,
+  });
+  return stateToken;
+}
+
+function _takeState(stateToken) {
+  const entry = _stateMap.get(stateToken);
+  if (!entry) return null;
+  _stateMap.delete(stateToken); // one-time use
+  if (entry.expiresAt < Date.now()) return null;
+  return entry;
+}
+
+// Guard against double-register if the module is imported more than once.
+if (!global.__mybot_google_state_sweeper) {
+  global.__mybot_google_state_sweeper = true;
+  setInterval(() => {
+    const now = Date.now();
+    for (const [token, entry] of _stateMap.entries()) {
+      if (entry.expiresAt < now) _stateMap.delete(token);
+    }
+  }, 5 * 60 * 1000).unref?.();
+}
 
 const SCOPES = [
   'https://www.googleapis.com/auth/calendar.readonly',
@@ -34,11 +73,12 @@ function getOAuth2Client() {
  */
 function getAuthUrl(discordUserId) {
   const client = getOAuth2Client();
+  const stateToken = _putState(discordUserId);
   return client.generateAuthUrl({
     access_type: 'offline',
     prompt: 'consent',
     scope: SCOPES,
-    state: discordUserId,
+    state: stateToken,
   });
 }
 
@@ -49,7 +89,11 @@ function getAuthUrl(discordUserId) {
  * @returns {Promise<{ email: string, displayName: string }>}
  */
 async function handleCallback(code, state) {
-  const discordUserId = state;
+  const entry = _takeState(state);
+  if (!entry) {
+    throw new Error('OAuth state not found or expired — please restart the connect flow');
+  }
+  const discordUserId = entry.userId;
   const client = getOAuth2Client();
 
   const { tokens } = await client.getToken(code);
