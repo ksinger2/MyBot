@@ -181,7 +181,14 @@ async function resolveShortUrl(url) {
     const location = res.headers.get('location');
     if (location && location !== url) {
       // Follow one more hop if needed
-      if (/^https?:\/\//.test(location)) return location;
+      if (/^https?:\/\//.test(location)) {
+        // Re-gate: the redirect target could point to cloud metadata, private IPs, etc.
+        if (!_isUrlSafeForFetch(location)) {
+          console.log(`[link-extractor] rejected unsafe redirect: ${location.substring(0, 80)}`);
+          return url;
+        }
+        return location;
+      }
     }
     return url;
   } catch {
@@ -252,11 +259,16 @@ async function fetchOgTags(url) {
       if (!tags[key]) tags[key] = m[1];
     }
 
+    // Re-gate og:image — it's an attacker-controlled URL from the page's HTML
+    // that surfaces in Claude's prompt and could point to cloud metadata / private IPs.
+    const rawImage = tags['og:image'] || null;
+    const safeImage = rawImage && _isUrlSafeForFetch(rawImage) ? rawImage : null;
+
     return {
       title: tags['og:title'] || tags.title || null,
       description: tags['og:description'] || tags.description || null,
       type: tags['og:type'] || null,
-      image: tags['og:image'] || null,
+      image: safeImage,
     };
   } catch {
     clearTimeout(timeout);
@@ -279,11 +291,14 @@ async function fetchLinkMetadata(link) {
           // Also resolve for canonical URL
           const resolved = await resolveShortUrl(link.url);
           result.resolvedUrl = resolved;
+          // Re-gate URLs from oEmbed response — attacker-controlled content
+          const authorUrl = oembed.author_url && _isUrlSafeForFetch(oembed.author_url) ? oembed.author_url : null;
+          const thumbnail = oembed.thumbnail_url && _isUrlSafeForFetch(oembed.thumbnail_url) ? oembed.thumbnail_url : null;
           result.metadata = {
             title: oembed.title || null,
             author: oembed.author_name || null,
-            authorUrl: oembed.author_url || null,
-            thumbnail: oembed.thumbnail_url || null,
+            authorUrl,
+            thumbnail,
           };
         } else {
           result.fetchError = 'oEmbed failed — use WebSearch to look up this TikTok';
@@ -294,11 +309,14 @@ async function fetchLinkMetadata(link) {
       case 'youtube': {
         const oembed = await fetchOEmbed(`https://www.youtube.com/oembed?url=${encodeURIComponent(link.url)}&format=json`);
         if (oembed) {
+          // Re-gate URLs from oEmbed response — attacker-controlled content
+          const authorUrl = oembed.author_url && _isUrlSafeForFetch(oembed.author_url) ? oembed.author_url : null;
+          const thumbnail = oembed.thumbnail_url && _isUrlSafeForFetch(oembed.thumbnail_url) ? oembed.thumbnail_url : null;
           result.metadata = {
             title: oembed.title || null,
             author: oembed.author_name || null,
-            authorUrl: oembed.author_url || null,
-            thumbnail: oembed.thumbnail_url || null,
+            authorUrl,
+            thumbnail,
           };
         } else {
           result.fetchError = 'oEmbed failed — use WebSearch to look up this YouTube video';
