@@ -128,4 +128,28 @@ class NormalizedMessage {
   }
 }
 
-module.exports = { MessagePlatform, NormalizedMessage };
+/**
+ * Extract image file paths from text. Looks for absolute paths ending in common
+ * image extensions, validates they exist on disk and live under safe directories
+ * (/workspace or /tmp). Returns an array of resolved absolute paths (max 10).
+ *
+ * Shared by Discord and Signal send paths so both surfaces can attach images
+ * that Claude generates or downloads during a run.
+ */
+function extractImageAttachments(text) {
+  const fs = require('fs');
+  const path = require('path');
+  const imageRegex = /(?:^|\s|["'`(])((\/[^\s"'`()]+|[^\s"'`()]+)\.(?:png|jpg|jpeg|gif|webp))/gim;
+  const found = new Set();
+  let match;
+  while ((match = imageRegex.exec(text)) !== null) {
+    const p = match[1].trim();
+    const resolved = path.resolve(p);
+    if ((resolved.startsWith('/workspace') || resolved.startsWith('/tmp')) && fs.existsSync(resolved)) {
+      found.add(resolved);
+    }
+  }
+  return [...found].slice(0, 10);
+}
+
+module.exports = { MessagePlatform, NormalizedMessage, extractImageAttachments };

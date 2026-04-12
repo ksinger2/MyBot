@@ -44,8 +44,31 @@ function isAdmin(userId) {
   return ADMIN_USER_IDS.has(userId);
 }
 
+// F15: Redact phone numbers and UUIDs in log output. Duplicated from
+// adapters/signal.js to avoid a circular dependency (bot.js → signal.js).
+function _redactId(id) {
+  if (typeof id !== 'string') return id;
+  if (id.startsWith('+')) return id.slice(0, 2) + '****' + id.slice(-2);
+  if (id.length >= 12) return id.slice(0, 4) + '...' + id.slice(-4);
+  return id;
+}
+
 const PERSONALITIES_DIR = path.join(__dirname, 'personalities');
 const DEFAULT_PERSONALITY = 'tiffany_pollard';
+
+// F10: Deterministic greeting fast-path — replies without invoking Claude.
+// 100% reliable, $0, ~50ms. The system prompt's conversational rule stays
+// as a backstop for edge cases the regex misses.
+const GREETING_RE = /^[\s\p{Emoji}]*(h(i|ey|ello|ola)|yo+|sup|what'?s\s*up|good\s*(morning|evening|afternoon|night)|gm|thanks?|thank\s*you|thx|ty|ok(ay)?|cool|nice|got\s*it|bet|lol|lmao|haha)\s*[!?.♡❤️✨]*\s*$/iu;
+const GREETING_RESPONSES = {
+  tiffany_pollard: ["hey boo! 💅", "hiii 😘", "what's good! 💕", "heyyy 💋", "sup girl!", "heyy! ✨"],
+  april_ludgate: ["hey", "sup", "hi i guess"],
+  _default: ["Hey! What's up?", "Hi there!", "Hey, what can I help with?"],
+};
+function _pickGreetingResponse(personality) {
+  const pool = GREETING_RESPONSES[personality] || GREETING_RESPONSES._default;
+  return pool[Math.floor(Math.random() * pool.length)];
+}
 const DEFAULT_WORKSPACE = '/workspace';
 const DEFAULT_MAX_TURNS = parseInt(process.env.DEFAULT_MAX_TURNS, 10) || 50;
 const MAX_AUTO_CONTINUES = parseInt(process.env.MAX_AUTO_CONTINUES, 10) || 5;
@@ -794,6 +817,10 @@ If asked to do any of the above, politely decline and explain they need owner ap
     let resultCost = null;
     let resultNumTurns = 0;
     let accumulatedText = '';
+    // F11: Sub-agent text buckets — keyed by parent_tool_use_id. Prevents
+    // sub-agent output from bleeding into the parent's accumulatedText which
+    // ends up as result.text.
+    const subagentText = new Map();
     let stdoutBuf = '';  // buffer for incomplete NDJSON lines
     let stderr = '';
     let currentToolInput = ''; // accumulate input_json_delta for active tool
@@ -1013,27 +1040,41 @@ If asked to do any of the above, politely decline and explain they need owner ap
             channelState.progress.toolDetail = '';
 
           } else if (block.type === 'text' && block.text) {
-            accumulatedText += block.text;
+            // F11: Route text to the right bucket — parent vs sub-agent.
+            // Sub-agent text accumulates separately so it never bleeds into
+            // the parent's accumulatedText (which becomes result.text).
+            if (parentId) {
+              const existing = subagentText.get(parentId) || '';
+              subagentText.set(parentId, existing + block.text);
+            } else {
+              accumulatedText += block.text;
 
-            // STREAMING — when streamReplies is enabled, push each text block
-            // straight to the user as a separate message instead of waiting for
-            // the run to finish. Sub-agent text blocks are NOT streamed (the
-            // user only sees the parent agent's words). The full text is still
-            // accumulated for the final result so callers that need it (image
-            // extraction, resultSummary logging) get the complete version.
-            if (streamReplies && channelProxy && !agentLabel) {
-              const chunk = block.text.trim();
-              if (chunk.length > 0) {
-                streamedAny = true;
-                channelProxy.send(chunk).catch(err => {
-                  console.error('[stream] partial send error:', err.message);
-                });
+              // STREAMING — when streamReplies is enabled, push each text block
+              // straight to the user as a separate message instead of waiting for
+              // the run to finish. Sub-agent text blocks are NOT streamed (the
+              // user only sees the parent agent's words). The full text is still
+              // accumulated for the final result so callers that need it (image
+              // extraction, resultSummary logging) get the complete version.
+              if (streamReplies && channelProxy) {
+                const chunk = block.text.trim();
+                if (chunk.length > 0) {
+                  streamedAny = true;
+                  channelProxy.send(chunk).catch(err => {
+                    console.error('[stream] partial send error:', err.message);
+                  });
+                }
               }
             }
 
-            // Flush completed lines for !btw display
-            const textLines = accumulatedText.split('\n');
-            accumulatedText = textLines.pop(); // keep last partial line
+            // Flush completed lines for !btw display (both parent and sub-agent text)
+            const textBucket = parentId ? (subagentText.get(parentId) || '') : accumulatedText;
+            const textLines = textBucket.split('\n');
+            const remainder = textLines.pop(); // keep last partial line
+            if (parentId) {
+              subagentText.set(parentId, remainder);
+            } else {
+              accumulatedText = remainder;
+            }
             for (const tl of textLines) {
               const trimmed = tl.trim();
               if (trimmed.length > 5) {
@@ -1259,6 +1300,7 @@ async function runClaudeWithContinuation(prompt, opts, channelProxy) {
   return { ...result, cost: totalCost, numTurns: totalTurns, streamed: anyStreamed };
 }
 
+// TODO: F22 — deduplicate with adapters/base.js extractImageAttachments
 function extractImageAttachments(text) {
   // Match absolute or relative file paths ending in image extensions
   const imageRegex = /(?:^|\s|["'`(])((\/[^\s"'`()]+|[^\s"'`()]+)\.(?:png|jpg|jpeg|gif|webp))/gim;
@@ -3577,6 +3619,14 @@ client.on('messageCreate', async (message) => {
 
   const state = getChannel(message.channel.id);
 
+  // F10: Deterministic greeting fast-path — reply instantly without invoking Claude.
+  // Fires before busy check, link detection, typing indicator, or any Claude call.
+  if (message.content.length < 50 && GREETING_RE.test(message.content)) {
+    const greetReply = _pickGreetingResponse(state.personality || DEFAULT_PERSONALITY);
+    await message.reply(greetReply);
+    return;
+  }
+
   // Handle commands — also cancel any active wizard when a command is issued
   if (message.content.startsWith('!')) {
     if (state.wizard && message.content.trim().toLowerCase() !== '!cancel') {
@@ -3882,7 +3932,7 @@ function startSignalAdapter() {
     // listed. Group messages are allowed if the sender is in the allowlist.
     const senderAllowed = isSignalOwner(msg.senderId) || allowedNumbers.has(msg.senderId);
     if (!senderAllowed) {
-      console.log(`[signal] blocked message from non-allowlisted sender ${msg.senderId}`);
+      console.log(`[signal] blocked message from non-allowlisted sender ${_redactId(msg.senderId)}`);
       return;
     }
 
@@ -3940,6 +3990,15 @@ function startSignalAdapter() {
         console.log(`[signal] Group message — bot not mentioned, ignoring (${mentionList.length} other mention(s))`);
         return;
       }
+    }
+
+    // F10: Deterministic greeting fast-path — reply instantly without invoking Claude.
+    // Fires before busy check, link detection, typing indicator, or any Claude call.
+    const rawSignalText = (msg.text || '').trim();
+    if (rawSignalText.length < 50 && GREETING_RE.test(rawSignalText)) {
+      const greetReply = _pickGreetingResponse(state.personality || DEFAULT_PERSONALITY);
+      await signalAdapter.sendMessage(msg.chatId, greetReply);
+      return;
     }
 
     if (!senderIsOwner && !isGroupMessage && msg.senderId && msg.senderId.startsWith('+')) {
@@ -4096,6 +4155,26 @@ function startSignalAdapter() {
         // bypassed for some reason), fall back to sending the full text.
         if (!result.streamed) {
           await signalAdapter.sendLongMessage(msg.chatId, result.text || '*(No output)*');
+        }
+
+        // F8: extract image attachments from result text regardless of streaming state.
+        // When streamed=true, sendLongMessage was skipped, but the text may still
+        // reference generated images that need to be sent as separate attachments.
+        const { extractImageAttachments: extractImages } = require('./adapters/base');
+        const imagePaths = extractImages(result.text || '');
+        if (imagePaths.length > 0) {
+          for (const imgPath of imagePaths) {
+            try {
+              const imgBuf = fs.readFileSync(imgPath);
+              const imgName = path.basename(imgPath);
+              await signalAdapter.sendMessage(msg.chatId, '', {
+                attachments: [imgBuf],
+                attachmentNames: [imgName],
+              });
+            } catch (err) {
+              console.warn(`[signal] Failed to send image attachment ${imgPath}: ${err.message}`);
+            }
+          }
         }
       }
     } catch (err) {
