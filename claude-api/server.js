@@ -269,6 +269,160 @@ app.post('/remind', requireInternalToken, async (req, res) => {
   }
 });
 
+// ── Group event creation endpoint ────────────────────────────────────────────
+// Creates a calendar event on one or more users' calendars. Used by Claude in
+// group chats to coordinate events (concerts, dinners, hangouts). When an event
+// is created in a group context, it's also stored as a "pending event" so that
+// subsequent "I'm in" messages can reference it without session continuity.
+//
+// Pending events expire after 24 hours and are stored in-memory (lost on restart,
+// which is fine — they're short-lived coordination state, not durable data).
+const _pendingGroupEvents = new Map(); // chatId → { title, datetime, end_datetime, location, description, createdAt, createdBy, attendees }
+const PENDING_EVENT_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
+
+// Sweep expired pending events every hour
+if (!global.__mybotPendingEventSweeper) {
+  global.__mybotPendingEventSweeper = true;
+  setInterval(() => {
+    const now = Date.now();
+    for (const [chatId, ev] of _pendingGroupEvents.entries()) {
+      if (now - ev.createdAt > PENDING_EVENT_TTL_MS) _pendingGroupEvents.delete(chatId);
+    }
+  }, 60 * 60 * 1000).unref();
+}
+
+app.post('/event', requireInternalToken, async (req, res) => {
+  const { title, datetime, end_datetime, duration_minutes, location, description, user_ids, chat_id } = req.body;
+  if (!title || !datetime || !user_ids || !Array.isArray(user_ids) || user_ids.length === 0) {
+    return res.status(400).json({ error: 'title, datetime (ISO 8601), and user_ids (array of phone numbers or Discord IDs) are required' });
+  }
+
+  const googleAuth = require('./google-auth');
+  const userTokens = require('./user-tokens');
+
+  const startTime = new Date(datetime);
+  const endDt = end_datetime ? new Date(end_datetime) : null;
+  const durationMs = (duration_minutes || 120) * 60 * 1000;
+  const endTime = endDt || new Date(startTime.getTime() + durationMs);
+
+  // Gather emails of all connected users for the attendees list
+  const attendeeEmails = [];
+  for (const uid of user_ids) {
+    const tok = userTokens.getToken(uid);
+    if (tok?.email) attendeeEmails.push(tok.email);
+  }
+
+  const created = [];
+  const failed = [];
+
+  for (const userId of user_ids) {
+    const calendar = await googleAuth.getCalendarClient(userId);
+    if (!calendar) {
+      failed.push({ userId, error: 'not_connected — tell them to run !connect or !setup to link Google Calendar' });
+      continue;
+    }
+    try {
+      const event = await calendar.events.insert({
+        calendarId: 'primary',
+        requestBody: {
+          summary: title,
+          description: description || '',
+          location: location || undefined,
+          start: { dateTime: startTime.toISOString() },
+          end: { dateTime: endTime.toISOString() },
+          attendees: attendeeEmails.map(email => ({ email })),
+        },
+      });
+      const tok = userTokens.getToken(userId);
+      created.push({ userId, email: tok?.email || 'unknown', eventId: event.data.id });
+    } catch (err) {
+      console.error(`[event] create error for ${userId}:`, err.message);
+      failed.push({ userId, error: err.message });
+    }
+  }
+
+  // Store as pending event for the group so "I'm in" works later
+  if (chat_id) {
+    _pendingGroupEvents.set(chat_id, {
+      title,
+      datetime: startTime.toISOString(),
+      end_datetime: endTime.toISOString(),
+      location: location || null,
+      description: description || null,
+      createdAt: Date.now(),
+      createdBy: user_ids[0],
+      attendees: created.map(c => c.userId),
+    });
+  }
+
+  res.json({ created, failed, pending_stored: !!chat_id });
+});
+
+// Expose pending events for bot.js to inject into group context.
+// Set on both app.locals (for internal routes) and global (for bot.js,
+// which can't require server.js without a circular dependency).
+app.locals.getPendingEvent = (chatId) => _pendingGroupEvents.get(chatId) || null;
+global.__mybotGetPendingEvent = app.locals.getPendingEvent;
+
+// Let the bot add a user to a pending event without re-specifying all details
+app.post('/event/join', requireInternalToken, async (req, res) => {
+  const { chat_id, user_id } = req.body;
+  if (!chat_id || !user_id) {
+    return res.status(400).json({ error: 'chat_id and user_id required' });
+  }
+
+  const pending = _pendingGroupEvents.get(chat_id);
+  if (!pending) {
+    return res.status(404).json({ error: 'No pending event for this chat. Create one with /event first.' });
+  }
+
+  const googleAuth = require('./google-auth');
+  const userTokens = require('./user-tokens');
+
+  const calendar = await googleAuth.getCalendarClient(user_id);
+  if (!calendar) {
+    return res.status(400).json({ error: 'User has not connected Google Calendar. Tell them to run !connect or !setup first.' });
+  }
+
+  // Gather all existing + new attendee emails
+  const allAttendees = [...new Set([...pending.attendees, user_id])];
+  const attendeeEmails = [];
+  for (const uid of allAttendees) {
+    const tok = userTokens.getToken(uid);
+    if (tok?.email) attendeeEmails.push(tok.email);
+  }
+
+  try {
+    const event = await calendar.events.insert({
+      calendarId: 'primary',
+      requestBody: {
+        summary: pending.title,
+        description: pending.description || '',
+        location: pending.location || undefined,
+        start: { dateTime: pending.datetime },
+        end: { dateTime: pending.end_datetime },
+        attendees: attendeeEmails.map(email => ({ email })),
+      },
+    });
+
+    // Update pending event attendees list
+    if (!pending.attendees.includes(user_id)) pending.attendees.push(user_id);
+    const tok = userTokens.getToken(user_id);
+
+    res.json({
+      success: true,
+      userId: user_id,
+      email: tok?.email || 'unknown',
+      eventId: event.data.id,
+      event_title: pending.title,
+      event_datetime: pending.datetime,
+    });
+  } catch (err) {
+    console.error(`[event/join] error for ${user_id}:`, err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 app.get('/health', (req, res) => res.json({ status: 'ok' }));
 
 // ── Self-rebuild endpoint ────────────────────────────────────────────────────

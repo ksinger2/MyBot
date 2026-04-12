@@ -71,7 +71,35 @@ function buildOnboardingWizard() {
       const wantsCal = /^(yes|y|sure|ok|okay|yep|yeah|please|do it)$/i.test(data.wantsCalendar.trim());
       if (wantsCal) {
         const baseUrl = process.env.PUBLIC_URL || 'http://localhost:3400';
-        const oauthUrl = `${baseUrl}/auth/google/calendar/${encodeURIComponent(phone)}`;
+        // Get an ephemeral token so the OAuth link actually works
+        let oauthUrl = `${baseUrl}/auth/google/calendar/${encodeURIComponent(phone)}`;
+        try {
+          const http = require('http');
+          const tokenRes = await new Promise((resolve, reject) => {
+            const body = JSON.stringify({ userId: phone });
+            const req = http.request({
+              hostname: 'localhost', port: 3400, path: '/internal/setup-token',
+              method: 'POST',
+              headers: {
+                'Content-Type': 'application/json',
+                'X-Internal-Token': process.env.INTERNAL_API_TOKEN || '',
+                'Content-Length': Buffer.byteLength(body),
+              },
+            }, res => {
+              let data = '';
+              res.on('data', c => data += c);
+              res.on('end', () => {
+                try { resolve(JSON.parse(data)); } catch { reject(new Error('bad response')); }
+              });
+            });
+            req.on('error', reject);
+            req.write(body);
+            req.end();
+          });
+          if (tokenRes.token) oauthUrl += `?t=${tokenRes.token}`;
+        } catch (err) {
+          console.warn(`[onboarding] failed to get calendar token: ${err.message}`);
+        }
         await message.reply(`Perfect, all set ${data.name.trim()}. Tap this once to connect your calendar (just a quick Google sign-in):\n${oauthUrl}\n\nAfter that, just message me normally for anything you need.`);
       } else {
         await message.reply(`Cool, you're all set ${data.name.trim()}. Just message me anytime for anything. If you change your mind about the calendar later, run \`!setup\`.`);

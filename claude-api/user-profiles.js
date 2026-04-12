@@ -149,10 +149,16 @@ function deleteProfile(phoneNumber) {
 
 // ── Preferences helpers ──
 
-/** Append a learned preference. Caps at 50 per user. */
+/** Append a learned preference. Caps at 50 per user.
+ *  Auto-creates a minimal profile if one doesn't exist yet (e.g. first
+ *  interaction in a group chat before the onboarding wizard runs). */
 function addPreference(phone, fact, source = 'conversation') {
-  const profile = getProfile(phone);
-  if (!profile) return false;
+  let profile = getProfile(phone);
+  if (!profile) {
+    // Bootstrap a stub profile so preferences have somewhere to live.
+    setProfile(phone, {});
+    profile = getProfile(phone) || {};
+  }
   if (!profile.preferences) profile.preferences = [];
   // Cap at 50 preferences per user
   if (profile.preferences.length >= 50) profile.preferences.shift();

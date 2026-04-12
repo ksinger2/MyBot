@@ -1,6 +1,57 @@
-# MyBot — Session Handoff (2026-04-12, early morning)
+# MyBot — Session Handoff (2026-04-12)
 
-## Signal group chat: social assistant mode + access control fix
+## Onboarding fixes + group event calendar coordination
+
+### Four onboarding bugs fixed
+1. **`addPreference()` silently failed for new users** — `getProfile()`
+   returned `null` for users without a profile, so `[LEARNED:]` tags in
+   group chats were silently dropped. Now auto-creates a stub profile.
+2. **Group onboard hint looped forever** — Claude asked "What's your name?"
+   on every single group message because `setup_complete` was never set.
+   Now marks `setup_complete: true` after the first onboard-hint response.
+3. **`!setup` generated broken URLs** — missing ephemeral `?t=` token from
+   `/internal/setup-token`. Server returned 403 on click. Fixed: command
+   now requests a token before building the URL.
+4. **Onboarding wizard calendar OAuth URL broken** — same missing token
+   issue in `wizards/onboarding.js`. Fixed with the same pattern.
+
+### Group event calendar coordination (new feature)
+When someone shares an event link in a Signal group and friends accept,
+the event now gets added to everyone's Google Calendars.
+
+**New endpoints:**
+- `POST /event` — creates a calendar event on multiple users' calendars
+  at once. Accepts `user_ids[]`, `chat_id`, `title`, `datetime`,
+  `duration_minutes`, `location`, `description`. Stores a "pending event"
+  per group (24h TTL in-memory) so late-joiners can use `/event/join`.
+- `POST /event/join` — adds a user to the pending group event without
+  re-specifying details. For "I'm in" / "count me in" messages.
+
+**How it works:**
+1. User A shares a concert link in group → Claude offers to add to calendar
+2. User A says "yes" → Claude calls `/event` with User A's phone → event
+   created on A's calendar. Pending event stored for the group.
+3. User B says "I'm in" → Claude sees the pending event in its context
+   (injected via `pendingEventContext`) → calls `/event/join` → event
+   added to B's calendar with all attendees listed.
+
+**System prompt** updated with capability #12 (GROUP EVENTS) explaining
+`/event` and `/event/join` curl patterns, when to use them, and to
+always include both the link sharer and accepter.
+
+**Group context** now includes `CHAT_ID` and `SENDER_ID` so Claude can
+pass the right values to the endpoints, plus any pending event details.
+
+### Remaining improvements (not blockers)
+- Command files still use raw `message.reply()` — need adapter routing
+- Discord streaming not enabled yet
+- WhatsApp adapter not started
+- Pending events are in-memory only (lost on restart) — fine for 24h TTL
+  coordination but could use persistence if needed
+
+---
+
+## Previous: Signal group chat — social assistant mode + access control fix
 
 ### Group chats are now a social assistant, not an engineer
 Groups use a custom tool allowlist: `Read, WebSearch, WebFetch, Bash,

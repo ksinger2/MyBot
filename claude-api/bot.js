@@ -1927,6 +1927,19 @@ function startSignalAdapter() {
         }
       }
 
+      // Inject pending event context for group chats so Claude can handle
+      // "I'm in" / "add me" without session continuity.
+      let pendingEventContext = '';
+      if (isGroupChat) {
+        try {
+          const getPendingEvent = global.__mybotGetPendingEvent;
+          const pending = getPendingEvent ? getPendingEvent(msg.chatId) : null;
+          if (pending && (Date.now() - pending.createdAt < 24 * 60 * 60 * 1000)) {
+            pendingEventContext = `\n\n[PENDING EVENT in this group — someone recently created this event. If the current user says "I'm in", "add me", "count me in", or similar, use POST /event/join with chat_id="${msg.chatId}" and user_id="${msg.senderId}" to add them.]\nEvent: "${pending.title}" on ${pending.datetime}${pending.location ? ` at ${pending.location}` : ''} — ${pending.attendees.length} attendee(s) so far.`;
+          }
+        } catch {}
+      }
+
       const claudeOpts = {
         sessionId: isGroupChat ? null : state.sessionId,
         personalityFile,
@@ -1941,7 +1954,7 @@ function startSignalAdapter() {
         // Instead we pass a custom groupAllowedTools list.
         readOnly: isGroupChat ? false : (!senderIsOwner || !_isChannelElevated(chatId)),
         groupAllowedTools: isGroupChat ? 'Read,WebSearch,WebFetch,Bash,Task,TodoWrite' : undefined,
-        profileContext: (combinedProfileContext || '') + groupOnboardHint,
+        profileContext: (combinedProfileContext || '') + groupOnboardHint + pendingEventContext + (isGroupChat ? `\n\nCHAT_ID: ${msg.chatId}\nSENDER_ID: ${msg.senderId}` : ''),
         streamReplies: true,
         maxTurns: isGroupChat ? 5 : undefined,
       };
@@ -1978,6 +1991,22 @@ function startSignalAdapter() {
           await signalAdapter.sendMessage(msg.chatId, `\u{1F4DD} I noted: ${fact}. Say \`!forget ${fact}\` to remove.`);
         } catch (e) {
           console.warn(`[auto-learn] failed to store preference: ${e.message}`);
+        }
+      }
+
+      // If the group onboard hint was injected this turn, mark the sender
+      // as onboarded so the hint doesn't fire again on every message.
+      // The user either shared their info (stored via [LEARNED:] above)
+      // or chose not to — either way, don't keep pestering them.
+      if (groupOnboardHint && msg.senderId && msg.senderId.startsWith('+')) {
+        try {
+          const { setProfile: _sp } = require('./user-profiles');
+          const existing = getProfile(msg.senderId);
+          if (!existing || !existing.setup_complete) {
+            _sp(msg.senderId, { setup_complete: true, greeted: true });
+          }
+        } catch (e) {
+          console.warn(`[group-onboard] failed to mark setup_complete: ${e.message}`);
         }
       }
 
