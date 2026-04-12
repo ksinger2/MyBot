@@ -518,6 +518,7 @@ function getChannel(channelId) {
       identity: saved?.identity ? { ...saved.identity } : { ...DEFAULT_IDENTITY },
       cwd: saved?.cwd || DEFAULT_WORKSPACE,
       config: saved?.config || {},  // per-channel overrides (maxTurns, maxContinues, maxTimeout)
+      listenToAll: saved?.listenToAll || false, // when true, respond to all group messages (not just mentions)
       process: null,  // active child process
       busy: false,    // is Claude currently working
       wizard: null,   // active wizard state (multi-step interactions)
@@ -1375,7 +1376,10 @@ client.on('messageCreate', async (message) => {
     }
   }
 
-  if (isGuild && !isMentioned && !message.content.startsWith('!')) return;
+  if (isGuild && !isMentioned && !message.content.startsWith('!')) {
+    const guildState = getChannel(message.channel.id);
+    if (!guildState.listenToAll) return;
+  }
 
   // Strip the @mention prefix from message content so Claude doesn't see it
   if (isGuild && isMentioned) {
@@ -1773,18 +1777,22 @@ function startSignalAdapter() {
     // phone number OR UUID — sometimes both, sometimes only one. We match
     // against both forms (the adapter's own number, and its UUID if known).
     if (isGroupMessage && !text.startsWith('!')) {
-      const mentionList = (msg.mentions && msg.mentions.length > 0)
-        ? msg.mentions
-        : (msg.raw?.envelope?.dataMessage?.mentions || []);
-      const botPhone = signalAdapter.phoneNumber;
-      const botUuid = signalAdapter._selfUuid || null;
-      const botMentioned = mentionList.some(m =>
-        (m.number && m.number === botPhone) ||
-        (m.uuid && botUuid && m.uuid === botUuid)
-      );
-      if (!botMentioned) {
-        console.log(`[signal] Group message — bot not mentioned, ignoring (${mentionList.length} other mention(s))`);
-        return;
+      // Check per-chat listenToAll toggle — if on, skip the mention check
+      const chatState = getChannel(msg.chatId);
+      if (!chatState.listenToAll) {
+        const mentionList = (msg.mentions && msg.mentions.length > 0)
+          ? msg.mentions
+          : (msg.raw?.envelope?.dataMessage?.mentions || []);
+        const botPhone = signalAdapter.phoneNumber;
+        const botUuid = signalAdapter._selfUuid || null;
+        const botMentioned = mentionList.some(m =>
+          (m.number && m.number === botPhone) ||
+          (m.uuid && botUuid && m.uuid === botUuid)
+        );
+        if (!botMentioned) {
+          console.log(`[signal] Group message — bot not mentioned, ignoring (${mentionList.length} other mention(s))`);
+          return;
+        }
       }
     }
 

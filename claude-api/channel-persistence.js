@@ -29,6 +29,7 @@ function saveChannelState(channelId, state, { critical = false } = {}) {
     cwd: state.cwd,
     activeTask: state.activeTask || null,
     config: state.config || null,
+    listenToAll: state.listenToAll || false,
     pendingQueue: (state.queue || []).map(q => typeof q === 'string' ? q : q.content).filter(Boolean),
     // Set by /rebuild before the container is replaced. The next process
     // reads this on startup to send a "I just rebuilt — resend if needed"

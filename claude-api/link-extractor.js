@@ -286,22 +286,25 @@ async function fetchLinkMetadata(link) {
     switch (link.platform) {
       case 'tiktok': {
         // oEmbed works directly with short URLs — no need to resolve first
+        const resolved = await resolveShortUrl(link.url);
+        result.resolvedUrl = resolved;
         const oembed = await fetchOEmbed(`https://www.tiktok.com/oembed?url=${encodeURIComponent(link.url)}`);
-        if (oembed) {
-          // Also resolve for canonical URL
-          const resolved = await resolveShortUrl(link.url);
-          result.resolvedUrl = resolved;
+        // Also fetch OG tags for the video description/caption (oEmbed only
+        // gives title+author, OG tags often include the full caption text)
+        const og = await fetchOgTags(resolved);
+        if (oembed || (og && og.title)) {
           // Re-gate URLs from oEmbed response — attacker-controlled content
-          const authorUrl = oembed.author_url && _isUrlSafeForFetch(oembed.author_url) ? oembed.author_url : null;
-          const thumbnail = oembed.thumbnail_url && _isUrlSafeForFetch(oembed.thumbnail_url) ? oembed.thumbnail_url : null;
+          const authorUrl = oembed?.author_url && _isUrlSafeForFetch(oembed.author_url) ? oembed.author_url : null;
+          const thumbnail = oembed?.thumbnail_url && _isUrlSafeForFetch(oembed.thumbnail_url) ? oembed.thumbnail_url : (og?.image || null);
           result.metadata = {
-            title: oembed.title || null,
-            author: oembed.author_name || null,
+            title: oembed?.title || og?.title || null,
+            author: oembed?.author_name || null,
             authorUrl,
             thumbnail,
+            description: og?.description || null,
           };
         } else {
-          result.fetchError = 'oEmbed failed — use WebSearch to look up this TikTok';
+          result.fetchError = 'oEmbed + OG tags both failed — use WebSearch to look up this TikTok';
         }
         break;
       }
@@ -598,7 +601,10 @@ function buildSmartPrompt(enrichedLinks) {
       lines.push(t.split('\n').map(l => '  ' + l).join('\n'));
       lines.push(`  """`);
     }
-    if (link.fetchError && !link.transcript) lines.push(`  ⚠️ ${link.fetchError}`);
+    if (link.fetchError && !link.transcript) {
+      lines.push(`  ⚠️ ${link.fetchError}`);
+      lines.push(`  🔄 FALLBACK: Use browser_navigate to open the URL, then browser_screenshot to see the page. Describe what the video/post is about from the visual content. If the page doesn't load, WebSearch for "${link.platform} ${link.metadata?.author || ''} ${link.metadata?.title || ''}" to find details.`);
+    }
     return lines.join('\n');
   }).join('\n\n');
 
@@ -650,9 +656,9 @@ function buildSmartPrompt(enrichedLinks) {
     '- 2-4 sentences, casual tone. Lead with the most useful/actionable info.',
     '- IF a VIDEO TRANSCRIPT is provided above, USE IT as the primary source of truth for what the video is about. The transcript is what the video literally says. For "tldr" / "summarize" requests, summarize the transcript directly. For "plan for us" requests, extract dates/locations/events from the transcript.',
     '- End with ONE specific next-step offer ("Want me to add this to your calendar?", "Should I find tickets?", "Want me to check reservation availability?")',
-    '- NEVER say "I can\'t access this", "I can\'t view this", or "this platform is locked". You have WebSearch AND a video transcript — USE THEM.',
-    '- If metadata is above, use it directly. If fetch failed (⚠️) AND there is no transcript, IMMEDIATELY WebSearch for the content. No excuses, no apologies.',
-    '- NEVER ask the user to tell you what the link is. Figure it out yourself via the transcript or WebSearch.',
+    '- NEVER say "I can\'t access this", "I can\'t view this", or "this platform is locked". You have WebSearch, browser tools, AND possibly a video transcript — USE THEM.',
+    '- If metadata is above, use it directly. If fetch failed (⚠️) AND there is no transcript, IMMEDIATELY try browser_navigate + browser_screenshot to view the page. If that also fails, WebSearch for the content. No excuses, no apologies.',
+    '- NEVER ask the user to tell you what the link is. Figure it out yourself via the transcript, browser screenshot, or WebSearch. You MUST identify the specific content (exact recipe, exact video topic, etc.) — vague guesses like "likely a recipe based on their content style" are NOT acceptable.',
     '',
   ].join('\n');
 }

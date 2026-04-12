@@ -1,6 +1,56 @@
 # MyBot — Session Handoff (2026-04-12)
 
-## Onboarding fixes + group event calendar coordination
+## `!listen` toggle + better video link fallback
+
+### `!listen` command (new)
+Per-channel toggle that controls whether the bot responds to every message
+in a group chat or only to @mentions and !commands.
+
+- `!listen` — flip-flop toggle
+- `!listen on` — respond to all group messages
+- `!listen off` — mentions-only (default)
+- Aliases: `!listenall`, `!listening`
+- Works on both Signal and Discord
+- Persisted across restarts via `channel-persistence.js`
+
+**Files changed:**
+- `claude-api/commands/listen.js` (new) — command handler
+- `claude-api/bot.js` — `getChannel()` now initializes `listenToAll` from
+  saved state; Signal group filter (line ~1775) and Discord guild filter
+  (line ~1378) both check `state.listenToAll` before ignoring un-mentioned
+  messages
+- `claude-api/channel-persistence.js` — `listenToAll` added to persistent
+  fields
+
+### Better video link fallback (TikTok/Instagram/YouTube)
+When yt-dlp fails (IP-blocked, geo-restricted, etc.), the bot now has a
+multi-tier fallback instead of just saying "couldn't pull the video":
+
+1. **OG tags** — TikTok links now fetch both oEmbed AND OG meta tags in
+   parallel. OG tags often contain the full video caption/description that
+   oEmbed omits.
+2. **Browser screenshot** — prompt now instructs Claude to use Playwright
+   `browser_navigate` + `browser_screenshot` to view the actual page and
+   describe the visual content.
+3. **WebSearch** — last resort, with stronger instructions to identify the
+   specific content (exact recipe, exact topic) rather than vague guesses.
+4. **Anti-vagueness rule** — "vague guesses like 'likely a recipe based on
+   their content style' are NOT acceptable" added to response rules.
+
+**Files changed:**
+- `claude-api/link-extractor.js` — TikTok `fetchLinkMetadata` now fetches
+  OG tags alongside oEmbed; `buildSmartPrompt` adds browser fallback
+  instructions per failed link; response rules strengthened
+
+### Remaining improvements (not blockers)
+- Command files still use raw `message.reply()` — need adapter routing
+- Discord streaming not enabled yet
+- WhatsApp adapter not started
+- Pending events are in-memory only (lost on restart)
+
+---
+
+## Previous: Onboarding fixes + group event calendar coordination
 
 ### Four onboarding bugs fixed
 1. **`addPreference()` silently failed for new users** — `getProfile()`
