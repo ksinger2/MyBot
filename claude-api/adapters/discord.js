@@ -14,28 +14,48 @@ const { Client, GatewayIntentBits, Partials, AttachmentBuilder } = require('disc
 const { MessagePlatform, NormalizedMessage } = require('./base');
 
 class DiscordAdapter extends MessagePlatform {
+  /**
+   * @param {object} [opts]
+   * @param {string} [opts.token] - Discord bot token (defaults to DISCORD_BOT_TOKEN env var)
+   * @param {Client} [opts.client] - Existing discord.js Client to reuse (F23: avoids creating a
+   *   second Client when bot.js already has one). When provided, the adapter skips Client creation
+   *   and event wiring — the caller owns the Client lifecycle.
+   */
   constructor(opts = {}) {
     super(opts);
     this.platform = 'discord';
     this.token = opts.token || process.env.DISCORD_BOT_TOKEN;
 
-    this.client = new Client({
-      intents: [
-        GatewayIntentBits.Guilds,
-        GatewayIntentBits.GuildMessages,
-        GatewayIntentBits.GuildMembers,
-        GatewayIntentBits.MessageContent,
-        GatewayIntentBits.DirectMessages,
-      ],
-      partials: [Partials.Channel],
-    });
+    if (opts.client) {
+      // F23: Reuse an existing discord.js Client (bot.js already has one).
+      // The caller is responsible for login/ready/event wiring.
+      this.client = opts.client;
+      this.ready = this.client.isReady?.() || false;
+    } else {
+      this.client = new Client({
+        intents: [
+          GatewayIntentBits.Guilds,
+          GatewayIntentBits.GuildMessages,
+          GatewayIntentBits.GuildMembers,
+          GatewayIntentBits.MessageContent,
+          GatewayIntentBits.DirectMessages,
+        ],
+        partials: [Partials.Channel],
+      });
 
-    // Wire up Discord events → normalized events
-    this.client.on('messageCreate', (msg) => this._handleMessage(msg));
-    this.client.on('interactionCreate', (interaction) => this.emit('interaction', interaction));
+      // Wire up Discord events → normalized events
+      this.client.on('messageCreate', (msg) => this._handleMessage(msg));
+      this.client.on('interactionCreate', (interaction) => this.emit('interaction', interaction));
+    }
   }
 
   async start() {
+    // F23: If constructed with an existing client that's already ready, skip login
+    if (this.client.isReady?.()) {
+      this.ready = true;
+      return;
+    }
+
     if (!this.token) {
       throw new Error('DiscordAdapter: token is required (set DISCORD_BOT_TOKEN env var)');
     }

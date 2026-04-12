@@ -53,6 +53,7 @@ COPY package.json ./
 RUN npm install
 
 COPY *.js .mcp.json ./
+COPY commands/ ./commands/
 COPY wizards/ ./wizards/
 COPY personalities/ ./personalities/
 COPY adapters/ ./adapters/

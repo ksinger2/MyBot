@@ -24,6 +24,29 @@ try { spotifyAuth = require('./spotify-auth'); } catch {}
 const { Runner } = require('./runner');
 const { sweepOrphanTmpFiles } = require('./atomic-write');
 const { extractImageAttachments } = require('./adapters/base');
+const { DiscordAdapter } = require('./adapters/discord');
+const { loadCommands } = require('./commands');
+
+// F23: Module-level DiscordAdapter instance — all Discord sends route through this
+let discordAdapter = null;
+
+// F23: Convenience helpers — route through adapter when available, fall back to raw Discord.js
+function _isSignalProxy(message) { return !!message._signalSenderId; }
+async function _dsend(channel, text) {
+  if (discordAdapter && typeof channel.id === 'string' && !channel.id.startsWith('signal:'))
+    return discordAdapter.sendMessage(channel.id, text);
+  return channel.send(text);
+}
+async function _dreply(message, text) {
+  if (discordAdapter && !_isSignalProxy(message))
+    return discordAdapter.sendMessage(message.channel.id, text, { rawMessage: message });
+  return message.reply(text);
+}
+async function _dtyping(channel) {
+  if (discordAdapter && typeof channel.id === 'string' && !channel.id.startsWith('signal:'))
+    return discordAdapter.sendTyping(channel.id);
+  return channel.sendTyping();
+}
 
 // F10: Deterministic greeting fast-path — replies without invoking Claude.
 // 100% reliable, $0, ~50ms. The system prompt rule stays as a backstop.
@@ -224,6 +247,15 @@ class ChannelProxy {
 
   /** Create a ChannelProxy from a Discord message.channel object */
   static fromDiscord(channel) {
+    // F23: Route through DiscordAdapter when available for symmetry with Signal path
+    if (discordAdapter) {
+      return new ChannelProxy({
+        sendFn: (text) => discordAdapter.sendMessage(channel.id, text).then(r => r),
+        typingFn: () => discordAdapter.sendTyping(channel.id),
+        platform: 'discord',
+        chatId: channel.id,
+      });
+    }
     return new ChannelProxy({
       sendFn: (text) => channel.send(text),
       typingFn: () => channel.sendTyping(),
@@ -547,7 +579,7 @@ async function runClaudeWithContinuation(prompt, opts, channelProxy) {
 
 async function sendLongMessage(message, text, cwd = DEFAULT_WORKSPACE) {
   if (!text || text.length === 0) {
-    await message.reply('*(No output)*');
+    await _dreply(message, '*(No output)*');
     return;
   }
 
@@ -558,6 +590,63 @@ async function sendLongMessage(message, text, cwd = DEFAULT_WORKSPACE) {
   });
 
   const imagePaths = extractImageAttachments(resolvedText);
+
+  // F23: Route all sends through the DiscordAdapter when available.
+  // Skip for Signal proxy messages — those already go through signalAdapter.
+  // The adapter's sendMessage handles AttachmentBuilder creation internally via Buffer,
+  // so we read image files into buffers. For non-image file attachments (like full-response.txt),
+  // we also pass buffers.
+  if (discordAdapter && !_isSignalProxy(message)) {
+    const imageBuffers = [];
+    const imageNames = [];
+    for (const imgPath of imagePaths) {
+      try {
+        imageBuffers.push(fs.readFileSync(imgPath));
+        imageNames.push(path.basename(imgPath));
+      } catch (e) { console.error(`[sendLongMessage] Could not read image ${imgPath}: ${e.message}`); }
+    }
+
+    const chunks = [];
+    if (text.length <= 1900) {
+      chunks.push(text);
+    } else {
+      let r = text;
+      while (r.length > 0) {
+        if (r.length <= 1990) { chunks.push(r); break; }
+        let splitAt = r.lastIndexOf('\n', 1990);
+        if (splitAt < 500) splitAt = 1990;
+        chunks.push(r.substring(0, splitAt));
+        r = r.substring(splitAt);
+      }
+    }
+
+    // First chunk: reply to original message, include image attachments
+    const firstOpts = { rawMessage: message };
+    if (imageBuffers.length) {
+      firstOpts.attachments = imageBuffers;
+      firstOpts.attachmentNames = imageNames;
+    }
+    await discordAdapter.sendMessage(message.channel.id, chunks[0], firstOpts).catch(e => console.error('Reply failed:', e.message));
+
+    if (chunks.length > 8) {
+      for (let i = 1; i < Math.min(chunks.length, 4); i++) {
+        await discordAdapter.sendMessage(message.channel.id, chunks[i]).catch(e => console.error('Chunk send failed:', e.message));
+      }
+      const fullTextBuffer = Buffer.from(text, 'utf-8');
+      await discordAdapter.sendMessage(
+        message.channel.id,
+        `*Response was too long for Discord (${chunks.length} chunks). Full text attached:*`,
+        { attachments: [fullTextBuffer], attachmentNames: ['full-response.txt'] }
+      ).catch(e => console.error('Attachment send failed:', e.message));
+    } else {
+      for (let i = 1; i < chunks.length; i++) {
+        await discordAdapter.sendMessage(message.channel.id, chunks[i]).catch(e => console.error('Chunk send failed:', e.message));
+      }
+    }
+    return;
+  }
+
+  // Legacy path: direct Discord.js calls (fallback when adapter not initialized)
   const files = imagePaths.map(p => new AttachmentBuilder(p));
 
   const chunks = [];
@@ -577,7 +666,7 @@ async function sendLongMessage(message, text, cwd = DEFAULT_WORKSPACE) {
   else chunks.push(...remaining);
 
   // Send first chunk with any image attachments
-  await message.reply({ content: chunks[0], files: files.length ? files : undefined }).catch(e => console.error('Reply failed:', e.message));
+  await _dreply(message,{ content: chunks[0], files: files.length ? files : undefined }).catch(e => console.error('Reply failed:', e.message));
 
   if (chunks.length > 8) {
     // Too many chunks — send first 4 inline, then upload full text as attachment
@@ -673,21 +762,82 @@ function parseFrequency(input) {
   return null;
 }
 
-// Commands that require admin privileges
-// SECURITY: !joingroup (Signal group-invite injection vector — C5) and !service
-// (PM2 shell — defense-in-depth alongside C3's execFileSync fix) are admin-only.
-const ADMIN_COMMANDS = new Set(['!restart', '!killall', '!identity', '!name', '!personality', '!autoschedule', '!config', '!joingroup', '!service']);
+// ── Command dispatch ──────────────────────────────────────────────────────────
+// Commands are loaded from claude-api/commands/*.js. Each exports
+// { name, aliases?, adminOnly?, description, run(message, arg, state, ctx) }.
+// The ctx object passes bot.js internals to command handlers.
+
+const commands = loadCommands();
+
+function buildCommandCtx() {
+  return {
+    // Discord client & channel state
+    client, channels, getChannel, saveChannelState, flushPendingWrites,
+    // Messaging helpers
+    sendLongMessage, ChannelProxy,
+    // Claude invocation
+    askClaude, runClaudeWithContinuation,
+    // Process management
+    forceKillProcess, freshProgress, processQueue,
+    // Personality & identity
+    getPersonalityFile, listPersonalities,
+    // Error alerting
+    sendErrorAlert,
+    // Scheduling & schedules
+    addSchedule, removeSchedule, getUserSchedules, formatScheduleList,
+    registerJob, cancelJob, parseFrequency,
+    startWizard, cancelWizard,
+    // Monitors
+    addMonitor, removeMonitor, listMonitors, getMonitor, updateMonitor,
+    // Heartbeat & standing orders
+    startHeartbeat, stopHeartbeat, getHeartbeatStatus, loadStandingOrders,
+    // Skills
+    getSkill, listSkills,
+    // Audit prompt builder
+    buildAuditPrompt,
+    // Wizards
+    startHangoutWizard, startTripPlannerWizard,
+    // Signal
+    get signalAdapter() { return signalAdapter; },
+    // Spotify (optional)
+    spotifyAuth,
+    // Workspace
+    listWorkspaceDirs, DEFAULT_WORKSPACE,
+    // Loop-related constants & helpers
+    MAX_LOOP_COST_USD, LOOP_ITERATION_COOLDOWN_MS,
+    MAX_LOOP_WALLCLOCK_MS, MAX_LOOP_ITERATIONS_PER_DAY,
+    _bumpLoopIterationCount,
+    // Config constants
+    DEFAULT_MAX_TURNS, MAX_AUTO_CONTINUES, MAX_TIMEOUT,
+    STALL_THRESHOLDS, CHECKIN_INTERVAL,
+    // Progress display
+    TOOL_LABELS,
+    // Access control
+    isAdmin, isAllowed,
+  };
+}
+
+// Lazy-initialized — built once on first use so that all bot.js globals
+// (including signalAdapter which is set up later) are captured.
+let _commandCtx = null;
+function getCommandCtx() {
+  if (!_commandCtx) _commandCtx = buildCommandCtx();
+  return _commandCtx;
+}
 
 async function handleCommand(message) {
   const parts = message.content.trim().split(/\s+/);
-  const cmd = parts[0].toLowerCase();
+  const cmdName = parts[0].toLowerCase();
   const arg = parts.slice(1).join(' ').trim();
   const state = getChannel(message.channel.id);
+
+  const cmd = commands.get(cmdName);
+  if (!cmd) return false;
 
   // Gate admin-only commands. Signal messages go through a proxy that sets
   // `_signalSenderId`; for Signal, admin = `isSignalOwner(senderId)`. Discord
   // uses the fail-closed ADMIN_USER_IDS allowlist.
-  if (ADMIN_COMMANDS.has(cmd)) {
+  if (cmd.adminOnly) {
     let isAdminCaller;
     if (message._signalSenderId) {
       const { isSignalOwner } = require('./project-permissions');
@@ -696,1678 +846,12 @@ async function handleCommand(message) {
       isAdminCaller = isAdmin(message.author.id);
     }
     if (!isAdminCaller) {
-      await message.reply('🚫 Owner only — that command requires admin access.');
+      await _dreply(message, '🚫 Owner only — that command requires admin access.');
       return true;
     }
   }
 
-  switch (cmd) {
-    case '!stop': {
-      const wasLooping = state.loopActive;
-      if (state.process) {
-        state._userStopped = true;
-        await forceKillProcess(state.process);
-        state.process = null;
-        state.busy = false;
-        state.loopActive = false;
-        state.startedAt = null;
-        state.progress = freshProgress();
-        const dropped = state.queue.length;
-        state.queue = [];
-        const extra = dropped ? ` (${dropped} queued message${dropped > 1 ? 's' : ''} cleared)` : '';
-        await message.reply(`Stopped${wasLooping ? ' loop' : ''}. Session preserved — send another message to continue.${extra}`);
-      } else if (state.busy || state.loopActive) {
-        // Process died silently but busy/loop flag is stuck — force clear it
-        state.busy = false;
-        state.loopActive = false;
-        state.startedAt = null;
-        state.progress = freshProgress();
-        const dropped = state.queue.length;
-        state.queue = [];
-        saveChannelState(message.channel.id, state, { critical: true });
-        const extra = dropped ? ` (${dropped} queued message${dropped > 1 ? 's' : ''} cleared)` : '';
-        await message.reply(`Cleared stuck state${wasLooping ? ' (loop ended)' : ''}.${extra} You're good to go.`);
-      } else {
-        await message.reply('Nothing is running in this channel.');
-      }
-      break;
-    }
-
-    case '!clear': {
-      if (state.process) {
-        state._userStopped = true;
-        await forceKillProcess(state.process);
-        state.process = null;
-        state.busy = false;
-        state.startedAt = null;
-        state.progress = freshProgress();
-      }
-      state.loopActive = false;
-      state.sessionId = null;
-      state.queue = [];
-      state.activeTask = null;
-      saveChannelState(message.channel.id, state, { critical: true });
-      await message.reply('Context cleared. Next message starts a fresh conversation (no memory of previous messages).');
-      break;
-    }
-
-    case '!kill': {
-      if (state.process) {
-        await forceKillProcess(state.process);
-        state.process = null;
-        state.busy = false;
-        state.startedAt = null;
-        state.progress = freshProgress();
-      }
-      state.loopActive = false;
-      state.sessionId = null;
-      state.queue = [];
-      state.activeTask = null;
-      saveChannelState(message.channel.id, state, { critical: true });
-      await message.reply('Process killed and session destroyed. Full reset — starting from scratch.');
-      break;
-    }
-
-    case '!config': {
-      const configParts = arg ? arg.trim().split(/\s+/) : [];
-      const configKey = configParts[0];
-      const configVal = configParts[1];
-
-      if (!configKey || configKey === 'show') {
-        const c = state.config || {};
-        const lines = [
-          `**Channel Config:**`,
-          `Max turns: ${c.maxTurns || DEFAULT_MAX_TURNS} ${c.maxTurns ? '(custom)' : '(default)'}`,
-          `Auto-continues: ${c.maxContinues || MAX_AUTO_CONTINUES} ${c.maxContinues ? '(custom)' : '(default)'}`,
-          `Timeout: ${c.maxTimeout ? c.maxTimeout / 60000 : MAX_TIMEOUT / 60000}min ${c.maxTimeout ? '(custom)' : '(default)'}`,
-        ];
-        await message.reply(lines.join('\n'));
-      } else if (configKey === 'turns' && configVal) {
-        state.config = state.config || {};
-        state.config.maxTurns = parseInt(configVal, 10);
-        saveChannelState(message.channel.id, state);
-        await message.reply(`Max turns set to **${state.config.maxTurns}** for this channel.`);
-      } else if (configKey === 'continues' && configVal) {
-        state.config = state.config || {};
-        state.config.maxContinues = parseInt(configVal, 10);
-        saveChannelState(message.channel.id, state);
-        await message.reply(`Auto-continues set to **${state.config.maxContinues}** for this channel.`);
-      } else if (configKey === 'timeout' && configVal) {
-        state.config = state.config || {};
-        state.config.maxTimeout = parseInt(configVal, 10) * 60 * 1000;
-        saveChannelState(message.channel.id, state);
-        await message.reply(`Timeout set to **${configVal} minutes** for this channel.`);
-      } else {
-        await message.reply('Usage: `!config show` | `!config turns <N>` | `!config continues <N>` | `!config timeout <minutes>`');
-      }
-      break;
-    }
-
-    case '!cd': {
-      if (!arg) {
-        await message.reply(`Current working directory: \`${state.cwd}\``);
-      } else {
-        const target = arg.startsWith('/') ? arg : path.join(state.cwd, arg);
-        // Restrict to /workspace to prevent filesystem traversal
-        const resolved = path.resolve(target);
-        if (!resolved.startsWith('/workspace')) {
-          await message.reply('Cannot navigate outside `/workspace/`.');
-          break;
-        }
-        if (fs.existsSync(target) && fs.statSync(target).isDirectory()) {
-          state.cwd = resolved;
-          state.sessionId = null;
-          saveChannelState(message.channel.id, state);
-          await message.reply(`Working directory: \`${target}\`\nSession cleared for new project context.`);
-        } else {
-          await message.reply(`Directory not found: \`${target}\`\nAvailable in /workspace:\n${listWorkspaceDirs()}`);
-        }
-      }
-      break;
-    }
-
-    case '!ls': {
-      let target = arg ? (arg.startsWith('/') ? arg : path.join(state.cwd, arg)) : state.cwd;
-      target = path.resolve(target);
-      if (!target.startsWith('/workspace')) {
-        await message.reply('Cannot list outside `/workspace/`.');
-        break;
-      }
-      try {
-        const entries = fs.readdirSync(target);
-        const formatted = entries.map(e => {
-          try {
-            const full = path.join(target, e);
-            const isDir = fs.statSync(full).isDirectory();
-            return isDir ? `📁 ${e}/` : `📄 ${e}`;
-          } catch { return `  ${e}`; }
-        }).join('\n');
-        await message.reply(`\`${target}\`:\n${formatted || '(empty)'}`);
-      } catch {
-        await message.reply(`Cannot read: \`${target}\``);
-      }
-      break;
-    }
-
-    case '!personality': {
-      if (!arg) {
-        await message.reply(`Current personality: **${state.personality}**`);
-      } else {
-        const file = getPersonalityFile(arg);
-        if (!file) {
-          const available = listPersonalities().join(', ');
-          await message.reply(`Personality "${arg}" not found. Available: **${available}**`);
-        } else {
-          state.personality = arg;
-          state.sessionId = null;
-          saveChannelState(message.channel.id, state);
-          await message.reply(`Personality switched to **${arg}**! Session cleared.`);
-        }
-      }
-      break;
-    }
-
-    case '!personalities': {
-      const available = listPersonalities();
-      const list = available.map(p => p === state.personality ? `**${p}** (active)` : p).join('\n- ');
-      await message.reply(`Available personalities:\n- ${list}`);
-      break;
-    }
-
-    case '!status': {
-      const allChannels = [];
-      for (const [chId, s] of channels) {
-        const ch = client.channels.cache.get(chId);
-        const chName = ch ? `#${ch.name}` : chId;
-        const status = s.busy ? '🔄 WORKING' : (s.sessionId ? '💤 idle' : '⚫ no session');
-        allChannels.push(`${chName}: ${status} | **${s.identity.name}** | ${s.personality} | \`${s.cwd}\`${s.sessionId ? ` | session \`${s.sessionId.substring(0, 8)}...\`` : ''}`);
-      }
-      await message.reply(
-        `**Bot Status:**\n` +
-        (allChannels.length ? allChannels.join('\n') : 'No channels active.') +
-        `\n\nHard cap: ${MAX_TIMEOUT / 60000}min | Stall: ${STALL_THRESHOLDS.thinking / 60000}-${STALL_THRESHOLDS.browser / 60000}min (tiered) | Check-in: ${CHECKIN_INTERVAL / 60000}min | Max turns: ${DEFAULT_MAX_TURNS}`
-      );
-      break;
-    }
-
-    case '!restart': {
-      await message.reply('Restarting... be right back.');
-      // Save channel ID so we can notify when we're back
-      try { fs.writeFileSync(path.join(__dirname, '.restart-channel'), message.channel.id); } catch {}
-      // Mark as clean shutdown so auto-resume doesn't kick in
-      try { fs.writeFileSync(path.join('/home/node/.claude', '.clean-shutdown'), Date.now().toString()); } catch {}
-      // Clear active tasks — this is intentional, not a crash
-      for (const [chId, s] of channels) {
-        s.activeTask = null;
-        saveChannelState(chId, s);
-      }
-      // Flush persisted state before shutdown
-      flushPendingWrites();
-      // Kill all active processes with escalation
-      const restartKills = [];
-      for (const [, s] of channels) {
-        if (s.process) restartKills.push(forceKillProcess(s.process));
-      }
-      await Promise.all(restartKills);
-      // Exit cleanly — Docker restart policy will bring the container back up
-      setTimeout(() => process.exit(0), 500);
-      break;
-    }
-
-    case '!killall': {
-      const killAllPromises = [];
-      for (const [chId, s] of channels) {
-        if (s.process) killAllPromises.push(forceKillProcess(s.process));
-        s.process = null;
-        s.busy = false;
-        s.queue = [];
-        s.sessionId = null;
-        s.activeTask = null;
-        saveChannelState(chId, s);
-      }
-      await Promise.all(killAllPromises);
-      flushPendingWrites();
-      channels.clear();
-      await message.reply('All processes killed and all sessions destroyed across every channel.');
-      break;
-    }
-
-    case '!refresh': {
-      // Nuclear reset: kill all processes, clear all state, clear CLI session cache, restart
-      const statusMsg = await message.reply('Refreshing... killing processes, clearing all state, and restarting.');
-      // Kill all active processes with escalation
-      const refreshKills = [];
-      for (const [, s] of channels) {
-        if (s.process) refreshKills.push(forceKillProcess(s.process));
-      }
-      await Promise.all(refreshKills);
-      // Clear all channel state
-      for (const [chId, s] of channels) {
-        s.sessionId = null;
-        s.busy = false;
-        s.process = null;
-        s.queue = [];
-        s.activeTask = null;
-        s.progress = freshProgress();
-        saveChannelState(chId, s);
-      }
-      flushPendingWrites();
-      // Clear CLI session files to prevent stale session resume issues
-      try {
-        const sessionDirs = ['/home/node/.claude/projects'];
-        for (const dir of sessionDirs) {
-          if (fs.existsSync(dir)) {
-            const { execFileSync } = require('child_process');
-            // Remove .jsonl session files (not CLAUDE.md or other configs)
-            execFileSync('find', [dir, '-name', '*.jsonl', '-delete'], { timeout: 5000 });
-          }
-        }
-        console.log('[refresh] Cleared CLI session files');
-      } catch (err) {
-        console.error('[refresh] Failed to clear sessions:', err.message);
-      }
-      // Mark clean shutdown and restart
-      try { fs.writeFileSync(path.join('/home/node/.claude', '.clean-shutdown'), Date.now().toString()); } catch {}
-      try { fs.writeFileSync(path.join(__dirname, '.restart-channel'), message.channel.id); } catch {}
-      setTimeout(() => process.exit(0), 500);
-      break;
-    }
-
-    case '!imagine': {
-      if (!arg) {
-        await message.reply('Usage: `!imagine <description>` — e.g. `!imagine a cow in a spacesuit on the moon`');
-        break;
-      }
-      if (!process.env.OPENAI_API_KEY) {
-        await message.reply('No OpenAI API key configured.');
-        break;
-      }
-      const imgParams = { model: 'gpt-image-1', prompt: arg, n: 1, size: '1024x1024', quality: 'low' };
-      await message.reply(`**Sending to OpenAI:**\n\`\`\`json\n${JSON.stringify(imgParams, null, 2)}\n\`\`\``);
-      await message.channel.sendTyping();
-      try {
-        const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
-        const response = await openai.images.generate(imgParams);
-        const base64 = response.data[0].b64_json;
-        const buffer = Buffer.from(base64, 'base64');
-        const attachment = new AttachmentBuilder(buffer, { name: 'imagine.png' });
-        await message.channel.send({ files: [attachment] });
-      } catch (err) {
-        console.error('Image generation error:', err.message);
-        await message.reply(`Image generation failed: ${err.message}`);
-      }
-      break;
-    }
-
-    case '!help': {
-      const helpText =
-        `**Claude Code Bot — Commands:**\n\n` +
-        `**Control:**\n` +
-        `\`!stop\` — Pause Claude (session preserved)\n` +
-        `\`!clear\` — Clear conversation context\n` +
-        `\`!kill\` — Hard kill + destroy session\n` +
-        `\`!killall\` — Kill everything across all channels\n` +
-        `\`!restart\` — Restart bot container\n` +
-        `\`!refresh\` — Nuclear reset: kill all, clear state, restart\n` +
-        `\`!status\` — Show session info\n` +
-        `\`!processes\` — Show active Claude processes\n` +
-        `\`!btw\` — Peek at progress while working\n` +
-        `\`!cancel\` — Cancel an active wizard\n\n` +
-        `**Workspace:**\n` +
-        `\`!cd [path]\` — Show or change project directory\n` +
-        `\`!ls [path]\` — List files\n` +
-        `\`!startproject\` — Create a new project with template\n` +
-        `\`!audit [focus]\` — Full project audit (design, qa, security, analytics, performance)\n\n` +
-        `**Identity:**\n` +
-        `\`!name [name]\` — Show or set bot name\n` +
-        `\`!identity [Name is desc]\` — Show or set identity\n` +
-        `\`!personality <name>\` — Switch personality\n` +
-        `\`!personalities\` — List available\n\n` +
-        `**Tasks:** \`!tasks\` · \`!done <#>\` · \`!done all\`\n` +
-        `**Schedule:** \`!schedule\` · \`!schedules\` · \`!unschedule <#>\` · \`!autoschedule <freq> | <task>\`\n` +
-        `**Queue:** \`!queue <task>\` · \`!queued\` · \`!dequeue <#>\`\n` +
-        `**Monitors:** \`!monitor ci <repo>\` · \`!monitor health <url>\` · \`!monitors\` · \`!monitor remove/pause/resume/check <#>\`\n` +
-        `**Briefing:** \`!briefing\` · \`!weekly\`\n` +
-        `**Preview:** \`!preview <port>\` — smart preview (asks device) · \`!preview <port> local\` — localhost link · \`!preview <port> phone\` — tunnel + magic link · \`!preview stop\`\n` +
-        `**Services:** \`!services\` — list PM2 background services · \`!service stop|logs <name>\`\n` +
-        `**Config:** \`!config show\` · \`!config turns|continues|timeout <N>\` — per-channel limits\n` +
-        `**Other:** \`!email <request>\` · \`!imagine <desc>\` · \`!ainews\`\n\n` +
-        `Just type what you want built. Claude runs autonomously — reads, writes, commits, pushes. Use \`!stop\` to interrupt, \`!clear\` to start over.\n\n` +
-        `Current: **${state.identity.name}** | ${state.personality} | \`${state.cwd}\` | ${state.busy ? '🔄 WORKING' : (state.sessionId ? '💤 idle' : '⚫ no session')}`;
-      await sendLongMessage(message, helpText, state.cwd);
-      break;
-    }
-
-    case '!name': {
-      if (!arg) {
-        await message.reply(`My name is **${state.identity.name}**`);
-      } else {
-        const newName = arg.trim().substring(0, 50);
-        state.identity.name = newName;
-        state.sessionId = null;
-        saveChannelState(message.channel.id, state);
-        await message.reply(`Name changed to **${state.identity.name}**! Session cleared.`);
-      }
-      break;
-    }
-
-    case '!identity': {
-      if (!arg) {
-        await message.reply(`**${state.identity.name}** — ${state.identity.description}`);
-      } else {
-        if (arg.length > 300) {
-          await message.reply('Identity description too long (max 300 chars).');
-          break;
-        }
-        // Parse "Name is description" or just set as description
-        const isMatch = arg.match(/^(\S+)\s+is\s+(.+)$/i);
-        if (isMatch) {
-          state.identity.name = isMatch[1].substring(0, 50);
-          state.identity.description = isMatch[2].trim().substring(0, 250);
-        } else {
-          state.identity.description = arg.trim().substring(0, 250);
-        }
-        state.sessionId = null;
-        saveChannelState(message.channel.id, state);
-        await message.reply(`Identity updated: **${state.identity.name}** — ${state.identity.description}\nSession cleared.`);
-      }
-      break;
-    }
-
-    case '!ainews': {
-      const aiNews = require('./ai-news');
-      await message.reply('Scanning AI news now...');
-      aiNews.sendAINews(client).catch(err => {
-        message.reply(`AI news failed: ${err.message}`).catch(() => {});
-      });
-      break;
-    }
-
-    case '!briefing': {
-      const briefings = require('./briefings');
-      await message.reply('Running briefing now...');
-      briefings.sendBriefing(client).catch(err => {
-        message.reply(`Briefing failed: ${err.message}`).catch(() => {});
-      });
-      break;
-    }
-
-    case '!weekly': {
-      const briefings = require('./briefings');
-      await message.reply('Running weekly preview now...');
-      briefings.sendWeeklyPreview(client).catch(err => {
-        message.reply(`Weekly preview failed: ${err.message}`).catch(() => {});
-      });
-      break;
-    }
-
-    case '!email': {
-      if (!arg) {
-        await message.reply('Usage: `!email <who and what>` — e.g. `!email my manager about needing Friday off`');
-        break;
-      }
-      // Don't treat this as a command — fall through to Claude with email-drafting instructions
-      const emailPrompt = `Draft 3 email options for the following request. Each option should be a different tone/approach (e.g. direct, warm, formal). For each option:\n- Subject line\n- Body\n\nKeep them professional, clear, and concise. No fluff.\n\nRequest: ${arg}`;
-      // Send to Claude like a normal message
-      const emailState = getChannel(message.channel.id);
-      if (emailState.busy) {
-        await message.reply('Claude is still working. Use `!stop` first.');
-        break;
-      }
-      const personalityFile = getPersonalityFile(emailState.personality);
-      await message.channel.sendTyping();
-      const typingInterval = setInterval(() => { message.channel.sendTyping().catch(() => {}); }, 8000);
-      try {
-        const result = await askClaude(emailPrompt, {
-          sessionId: emailState.sessionId,
-          personalityFile,
-          identity: emailState.identity,
-          cwd: emailState.cwd,
-          channelState: emailState,
-          discordChannel: message.channel,
-        });
-        if (result.sessionId) emailState.sessionId = result.sessionId;
-        if (!result.stopped) await sendLongMessage(message, result.text, emailState.cwd);
-      } catch (err) {
-        const errorMsg = err.message.length > 500 ? err.message.substring(0, 500) + '...' : err.message;
-        await message.reply(`Error: ${errorMsg}`).catch(() => {});
-        sendErrorAlert(err, { source: 'email command', channel: message.channel.id });
-      } finally {
-        clearInterval(typingInterval);
-      }
-      break;
-    }
-
-    case '!btw': {
-      if (!state.busy && !state.process) {
-        await message.reply('Nothing running right now.');
-        break;
-      }
-      const elapsed = state.startedAt ? Math.round((Date.now() - state.startedAt) / 1000) : 0;
-      const mins = Math.floor(elapsed / 60);
-      const secs = elapsed % 60;
-      const runtime = mins > 0 ? `${mins}m ${secs}s` : `${secs}s`;
-
-      const p = state.progress;
-      const costStr = p._lastCost ? ` | $${p._lastCost.toFixed(4)}` : '';
-      const lines = [`**Running ${runtime} | Turn ${p.turnCount || 1}/${DEFAULT_MAX_TURNS}${costStr}**`];
-
-      // Current main thread activity
-      if (p.currentTool) {
-        const label = TOOL_LABELS[p.currentTool] || p.currentTool;
-        lines.push(`📋 **Main:** ${label}${p.toolDetail ? ` — \`${p.toolDetail}\`` : ''}`);
-      } else {
-        lines.push(`📋 **Main:** Thinking...`);
-      }
-
-      // Agents section — active + completed
-      const activeCount = p.activeAgents.size;
-      const doneCount = p.completedAgents.length;
-      if (activeCount > 0 || doneCount > 0) {
-        lines.push('');
-        lines.push(`🤖 **Agents (${activeCount} active, ${doneCount} done):**`);
-        for (const [, agent] of p.activeAgents) {
-          const agentElapsed = Math.round((Date.now() - agent.startedAt) / 1000);
-          const toolInfo = agent.lastTool ? `${TOOL_LABELS[agent.lastTool] || agent.lastTool}` : 'Starting...';
-          const typeTag = agent.type ? `\`${agent.type}\` ` : '';
-          lines.push(`  🟢 ${typeTag}"${agent.description}" — ${toolInfo} (${agentElapsed}s)`);
-        }
-        for (const agent of p.completedAgents.slice(-5)) {
-          const typeTag = agent.type ? `\`${agent.type}\` ` : '';
-          lines.push(`  ✅ ${typeTag}"${agent.description}" — Done`);
-        }
-      }
-
-      // Recent activity log — last 10 entries
-      if (p.rawLog.length > 0) {
-        lines.push('');
-        lines.push(`📜 **Recent (last 10):**`);
-        const visible = p.rawLog.slice(-10);
-        lines.push('```');
-        for (const entry of visible) {
-          lines.push(`[${entry.ts}] ${entry.text}`);
-        }
-        lines.push('```');
-      }
-
-      await sendLongMessage(message, lines.join('\n'), state.cwd);
-      break;
-    }
-
-    case '!tasks': {
-      const { loadActiveTasks, formatTaskList } = require('./tasks-storage');
-      const active = loadActiveTasks();
-      if (active.length === 0) {
-        await message.reply('No active tasks. Add some via the evening check-in or they\'ll show up after you chat with me about your plans!');
-      } else {
-        await message.reply(`**Active Tasks:**\n${formatTaskList(active)}\n\nUse \`!done <#>\` to mark done, \`!done all\` to clear all.`);
-      }
-      break;
-    }
-
-    case '!done': {
-      const { markDone } = require('./tasks-storage');
-      const result = markDone(arg || '');
-      await message.reply(result);
-      break;
-    }
-
-    case '!cancel': {
-      await cancelWizard(state, message);
-      break;
-    }
-
-    case '!processes': {
-      try {
-        const output = execSync(
-          'ps aux --sort=-%mem | head -1; ps aux --sort=-%mem | grep "[c]laude" || echo "No Claude processes running"',
-          { encoding: 'utf-8', timeout: 5000 }
-        ).trim();
-
-        const activeChannels = [];
-        for (const [chId, s] of channels) {
-          if (s.busy && s.process) {
-            const ch = client.channels.cache.get(chId);
-            const chName = ch ? `#${ch.name}` : chId;
-            activeChannels.push(`${chName}: PID ${s.process.pid}`);
-          }
-        }
-
-        const channelInfo = activeChannels.length
-          ? `\n\n**Active bot tasks:**\n${activeChannels.join('\n')}`
-          : '\n\n**No active bot tasks**';
-
-        await message.reply(`**System Processes:**\n\`\`\`\n${output}\n\`\`\`${channelInfo}`);
-      } catch (err) {
-        await message.reply(`Error checking processes: ${err.message}`);
-      }
-      break;
-    }
-
-    case '!services': {
-      try {
-        const pm2Env = { ...process.env, PM2_HOME: '/home/node/.claude/.pm2' };
-        const output = execSync('pm2 jlist', { encoding: 'utf-8', timeout: 5000, env: pm2Env });
-        const processes = JSON.parse(output);
-        if (processes.length === 0) {
-          await message.reply('No background services running. Claude can start dev servers with PM2.');
-          break;
-        }
-        const lines = processes.map(p => {
-          const status = p.pm2_env?.status || 'unknown';
-          const mem = p.monit ? Math.round(p.monit.memory / 1024 / 1024) : 0;
-          const uptime = p.pm2_env?.pm_uptime ? Math.round((Date.now() - p.pm2_env.pm_uptime) / 1000) : 0;
-          const uptimeStr = uptime > 3600 ? `${Math.round(uptime / 3600)}h` : uptime > 60 ? `${Math.round(uptime / 60)}m` : `${uptime}s`;
-          return `**${p.name}** — ${status} | PID ${p.pid} | ${mem}MB | up ${uptimeStr} | \`${p.pm2_env?.cwd || '?'}\``;
-        });
-        await message.reply(`**Background Services (PM2):**\n${lines.join('\n')}`);
-      } catch (err) {
-        await message.reply(`Error listing services: ${err.message.substring(0, 200)}`);
-      }
-      break;
-    }
-
-    case '!service': {
-      const svcParts = arg ? arg.trim().split(/\s+/) : [];
-      const svcAction = svcParts[0];
-      const svcName = svcParts.slice(1).join(' ');
-      const pm2Env = { ...process.env, PM2_HOME: '/home/node/.claude/.pm2' };
-
-      // SECURITY (C3): use execFileSync with an argv array so `svcName` is
-      // passed as a single literal argument. No shell, so `$(...)`, backticks,
-      // `;`, `|`, `>`, etc. are all literal characters — no injection possible.
-      if (svcAction === 'stop' && svcName) {
-        try {
-          execFileSync('pm2', ['delete', svcName], { encoding: 'utf-8', timeout: 5000, env: pm2Env });
-          execFileSync('pm2', ['dump'], { encoding: 'utf-8', timeout: 5000, env: pm2Env });
-          await message.reply(`Service **${svcName}** stopped and removed.`);
-        } catch (err) {
-          await message.reply(`Failed to stop service: ${err.message.substring(0, 200)}`);
-        }
-      } else if (svcAction === 'logs' && svcName) {
-        try {
-          const logs = execFileSync('pm2', ['logs', svcName, '--nostream', '--lines', '20'], { encoding: 'utf-8', timeout: 5000, env: pm2Env });
-          await message.reply(`**Logs for ${svcName}:**\n\`\`\`\n${logs.substring(0, 1800)}\n\`\`\``);
-        } catch (err) {
-          await message.reply(`Failed to get logs: ${err.message.substring(0, 200)}`);
-        }
-      } else {
-        await message.reply('Usage: `!service stop <name>` or `!service logs <name>`');
-      }
-      break;
-    }
-
-    case '!preview': {
-      // !preview <port> — ask what device, then either show localhost or start tunnel
-      // !preview <port> local — show localhost link (same PC)
-      // !preview <port> phone|tunnel|mobile — create Cloudflare tunnel + magic link
-      // !preview stop — stop the active tunnel
-      // !preview — show current tunnel status
-
-      if (arg === 'stop') {
-        if (state._tunnel) {
-          state._tunnel.kill();
-          state._tunnel = null;
-          state._tunnelPort = null;
-          state._tunnelUrl = null;
-          state._pendingPreview = null;
-          await message.reply('Tunnel stopped.');
-        } else {
-          await message.reply('No tunnel is running.');
-        }
-        break;
-      }
-
-      // Parse args — could be "3000", "3000 local", "3000 phone"
-      const previewParts = arg ? arg.trim().split(/\s+/) : [];
-      const previewPort = parseInt(previewParts[0], 10);
-      const previewMode = previewParts[1] ? previewParts[1].toLowerCase() : null;
-
-      if (!arg || isNaN(previewPort)) {
-        if (state._tunnelUrl) {
-          await message.reply(`**Active tunnel:** ${state._tunnelUrl} → localhost:${state._tunnelPort}\nUse \`!preview stop\` to close it.`);
-        } else {
-          await message.reply('No tunnel running. Usage: `!preview <port>` — e.g. `!preview 3000`');
-        }
-        break;
-      }
-
-      if (previewPort < 1 || previewPort > 65535) {
-        await message.reply('Provide a valid port number. Usage: `!preview 3000`');
-        break;
-      }
-
-      // If no mode specified, ask what device they're on
-      if (!previewMode) {
-        state._pendingPreview = previewPort;
-        await message.reply(
-          `What device are you viewing on?\n` +
-          `• Reply \`local\` — same PC (I'll give you a localhost link)\n` +
-          `• Reply \`phone\` — mobile/tablet (I'll create a tunnel + magic link)`
-        );
-        break;
-      }
-
-      // Handle local mode
-      if (previewMode === 'local') {
-        state._pendingPreview = null;
-        await message.reply(`**Open on this PC:** http://localhost:${previewPort}`);
-        break;
-      }
-
-      // Handle phone/tunnel/mobile mode — create Cloudflare tunnel + magic link
-      if (['phone', 'tunnel', 'mobile', 'remote'].includes(previewMode)) {
-        state._pendingPreview = null;
-
-        // Kill existing tunnel if any
-        if (state._tunnel) {
-          state._tunnel.kill();
-          state._tunnel = null;
-        }
-
-        await message.reply(`Creating tunnel to localhost:${previewPort}...`);
-
-        // Fetch public IP for the magic link bypass
-        let publicIp = null;
-        try {
-          const { execSync } = require('child_process');
-          publicIp = execSync('curl -sf --max-time 5 https://api.ipify.org', { encoding: 'utf8' }).trim();
-        } catch {}
-
-        const tunnel = spawn('cloudflared', ['tunnel', '--url', `http://localhost:${previewPort}`], {
-          stdio: ['ignore', 'pipe', 'pipe'],
-        });
-
-        let urlFound = false;
-        const onData = (data) => {
-          const text = data.toString();
-          const urlMatch = text.match(/https:\/\/[a-z0-9-]+\.trycloudflare\.com/);
-          if (urlMatch && !urlFound) {
-            urlFound = true;
-            state._tunnelUrl = urlMatch[0];
-            state._tunnelPort = previewPort;
-            const baseUrl = urlMatch[0];
-            const magicUrl = publicIp ? `${baseUrl}?access=${publicIp}` : baseUrl;
-            const ipNote = publicIp ? `\nYour public IP \`${publicIp}\` is pre-injected — just tap the link, no password needed.` : '';
-            message.channel.send(
-              `**Tunnel live! Tap this on your phone:**\n${magicUrl}${ipNote}\n\nUse \`!preview stop\` to close.`
-            ).catch(() => {});
-          }
-        };
-
-        tunnel.stdout.on('data', onData);
-        tunnel.stderr.on('data', onData);
-
-        tunnel.on('close', () => {
-          if (state._tunnel === tunnel) {
-            state._tunnel = null;
-            state._tunnelPort = null;
-            state._tunnelUrl = null;
-          }
-        });
-
-        state._tunnel = tunnel;
-
-        setTimeout(() => {
-          if (!urlFound && state._tunnel === tunnel) {
-            tunnel.kill();
-            state._tunnel = null;
-            message.channel.send(`Failed to start tunnel — is anything running on port ${previewPort}?`).catch(() => {});
-          }
-        }, 15000);
-        break;
-      }
-
-      await message.reply(`Unknown mode \`${previewMode}\`. Use \`local\` or \`phone\`.`);
-      break;
-    }
-
-    case '!startproject': {
-      if (state.busy) {
-        await message.reply('Claude is still working. Use `!stop` first.');
-        break;
-      }
-      if (state.wizard) {
-        await message.reply('A wizard is already active. Use `!cancel` to cancel it first.');
-        break;
-      }
-      const { startProjectWizard } = require('./wizards/startproject');
-      await startProjectWizard(state, message);
-      break;
-    }
-
-    case '!schedule': {
-      if (state.busy) {
-        await message.reply('Claude is still working. Use `!stop` first.');
-        break;
-      }
-      if (state.wizard) {
-        await message.reply('A wizard is already active. Use `!cancel` to cancel it first.');
-        break;
-      }
-      await startWizard(state, message, {
-        type: 'schedule',
-        steps: [
-          {
-            key: 'message',
-            prompt: 'What message should I send you? (e.g. "Time to check your stocks!" or "Drink water and stretch")',
-          },
-          {
-            key: 'frequency',
-            prompt: 'How often? Pick one:\n' +
-              '• `daily at 9am` — every day at a specific time\n' +
-              '• `every 2 hours` — repeating interval\n' +
-              '• `weekdays at 8:30am` — Mon-Fri only\n' +
-              '• `monday at 10am` — specific day of week\n' +
-              '• Or a cron expression like `0 */3 * * *`',
-            validate: (input) => {
-              const parsed = parseFrequency(input);
-              if (!parsed) return 'Could not understand that frequency. Try something like `daily at 9am`, `every 3 hours`, `weekdays at 8:30am`, or a cron expression.';
-              return true;
-            },
-          },
-        ],
-        onComplete: async (data, msg) => {
-          const parsed = parseFrequency(data.frequency);
-          const sched = addSchedule({
-            userId: msg.author.id,
-            channelId: msg.channel.id,
-            message: data.message,
-            cronRule: parsed.cron,
-            description: parsed.description,
-            timezone: 'America/Los_Angeles',
-          });
-          registerJob(sched, client);
-          await msg.reply(
-            `Scheduled! **#${sched.id}**\n` +
-            `📝 "${sched.message}"\n` +
-            `⏰ ${parsed.description}\n` +
-            `I'll DM you each time. Use \`!schedules\` to see all, \`!unschedule ${sched.id}\` to remove.`
-          );
-        },
-      });
-      break;
-    }
-
-    case '!schedules': {
-      const userSchedules = getUserSchedules(message.author.id);
-      if (userSchedules.length === 0) {
-        await message.reply('You have no scheduled messages. Use `!schedule` to create one.');
-      } else {
-        await message.reply(`**Your Schedules:**\n${formatScheduleList(userSchedules)}\n\nUse \`!unschedule <#>\` to remove one.`);
-      }
-      break;
-    }
-
-    case '!unschedule': {
-      if (!arg) {
-        await message.reply('Usage: `!unschedule <#>` — e.g. `!unschedule 1`');
-        break;
-      }
-      const id = parseInt(arg, 10);
-      if (isNaN(id)) {
-        await message.reply('Usage: `!unschedule <#>` — provide the schedule number.');
-        break;
-      }
-      const removed = removeSchedule(id, message.author.id);
-      if (!removed) {
-        await message.reply(`No schedule #${id} found for you. Use \`!schedules\` to see your list.`);
-      } else {
-        cancelJob(id);
-        await message.reply(`Removed schedule **#${id}**: "${removed.description}"`);
-      }
-      break;
-    }
-
-    case '!autoschedule': {
-      // Usage: !autoschedule <frequency> | <task prompt>
-      if (!arg || !arg.includes('|')) {
-        await message.reply('Usage: `!autoschedule <frequency> | <task>`\nExample: `!autoschedule daily at 9am | check all projects for failing tests and fix them`');
-        break;
-      }
-      const [freqPart, ...taskParts] = arg.split('|');
-      const freq = freqPart.trim();
-      const task = taskParts.join('|').trim();
-      if (!freq || !task) {
-        await message.reply('Both frequency and task required. Example: `!autoschedule every 2 hours | run the test suite`');
-        break;
-      }
-      const parsed = parseFrequency(freq);
-      if (!parsed) {
-        await message.reply(`Couldn't parse frequency: "${freq}". Try: daily at 9am, every 2 hours, weekdays at 8:30am`);
-        break;
-      }
-      const autoSched = addSchedule({
-        userId: message.author.id,
-        channelId: message.channel.id,
-        message: task,
-        cronRule: parsed.cron,
-        description: parsed.description,
-        type: 'task',
-        cwd: state.cwd,
-        timezone: 'America/Los_Angeles',
-      });
-      registerJob(autoSched, client);
-      await message.reply(
-        `Autonomous task scheduled! **#${autoSched.id}**\n` +
-        `⏰ ${parsed.description}\n` +
-        `📋 "${task.substring(0, 100)}"\n` +
-        `📁 \`${state.cwd}\`\n` +
-        `I'll execute this autonomously each time. Use \`!schedules\` to see all, \`!unschedule ${autoSched.id}\` to remove.`
-      );
-      break;
-    }
-
-    case '!queue': {
-      if (!arg) {
-        await message.reply('Usage: `!queue <task>` — Add work to the background queue.\nExample: `!queue build a hello world express app`');
-        break;
-      }
-      const { addItem } = require('./queue-storage');
-      const item = addItem({
-        prompt: arg,
-        channelId: message.channel.id,
-        userId: message.author.id,
-        cwd: state.cwd,
-        personality: state.personality,
-        identity: { ...state.identity },
-      });
-      await message.reply(
-        `Queued background task **#${item.id}**\n` +
-        `📋 "${arg.substring(0, 100)}"\n` +
-        `📁 \`${state.cwd}\`\n` +
-        `Use \`!queued\` to check status, \`!dequeue ${item.id}\` to remove.`
-      );
-      break;
-    }
-
-    case '!queued': {
-      const { getQueue } = require('./queue-storage');
-      const queue = getQueue();
-      if (queue.length === 0) {
-        await message.reply('Background queue is empty. Use `!queue <task>` to add work.');
-        break;
-      }
-      const lines = queue.map(item => {
-        const status = item.status === 'running' ? '🔄' : item.status === 'done' ? '✅' : item.status === 'failed' ? '❌' : '⏳';
-        const prompt = item.prompt.length > 60 ? item.prompt.substring(0, 57) + '...' : item.prompt;
-        return `${status} **#${item.id}** — ${prompt}\n  Status: ${item.status} | \`${item.cwd}\`${item.resultSummary ? `\n  Result: ${item.resultSummary}` : ''}`;
-      });
-      await sendLongMessage(message, `**Background Queue:**\n${lines.join('\n')}`, state.cwd);
-      break;
-    }
-
-    case '!dequeue': {
-      if (!arg) {
-        await message.reply('Usage: `!dequeue <#>` — Remove a pending item from the queue.');
-        break;
-      }
-      const dequeueId = parseInt(arg, 10);
-      if (isNaN(dequeueId)) {
-        await message.reply('Usage: `!dequeue <#>` — provide the queue item number.');
-        break;
-      }
-      const { removeItem } = require('./queue-storage');
-      const removed = removeItem(dequeueId);
-      if (!removed) {
-        await message.reply(`No pending queue item #${dequeueId} found. Use \`!queued\` to see the list.`);
-      } else {
-        await message.reply(`Removed queue item **#${dequeueId}**: "${removed.prompt.substring(0, 80)}"`);
-      }
-      break;
-    }
-
-    case '!loop': {
-      if (!arg) {
-        await message.reply('Usage: `!loop <task description>` — runs Claude in a loop until the task is done (max 10 iterations).');
-        break;
-      }
-      if (state.busy || state.loopActive) {
-        await message.reply('Already working. Use `!stop` first.');
-        break;
-      }
-
-      const maxIterations = 10;
-      const personalityFile = getPersonalityFile(state.personality);
-      const proxy = message.channel.send ? ChannelProxy.fromDiscord(message.channel) : null;
-      const channelId = message.channel.id;
-      const nsPath = path.join(state.cwd, 'NextSteps.md');
-
-      // L-Fix-2: hold loopActive + busy for the ENTIRE loop. Per-iteration
-      // finally must NOT clear these — only the outer finally below does.
-      state.loopActive = true;
-      state.busy = true;
-      saveChannelState(channelId, state, { critical: true });
-
-      await message.reply(`Starting autonomous loop: "${arg.substring(0, 100)}"\nMax ${maxIterations} iterations · cost cap $${MAX_LOOP_COST_USD} · wallclock cap ${Math.round(MAX_LOOP_WALLCLOCK_MS / 60000)}m · daily cap ${MAX_LOOP_ITERATIONS_PER_DAY}. Use \`!stop\` to interrupt.\nWrite \`<<TASK_COMPLETE>>\` in NextSteps.md to signal done.`);
-
-      // M3: record wall-start so we can bail even if individual iterations
-      // keep returning successfully within their own 90m hard cap.
-      const loopStartedAt = Date.now();
-
-      // L-Fix-1: top-level try/catch — no more silent error swallowing.
-      (async () => {
-        let totalCost = 0;
-        let lastNsHash = null;
-        let unchangedIterations = 0;
-        let exitReason = 'max-iterations';
-
-        try {
-          for (let i = 1; i <= maxIterations; i++) {
-            // L-Fix-2: !stop sets loopActive=false; honor it between iterations.
-            if (!state.loopActive) {
-              exitReason = 'user-stopped';
-              break;
-            }
-
-            // M3: hard wallclock ceiling across the whole !loop run.
-            if (Date.now() - loopStartedAt > MAX_LOOP_WALLCLOCK_MS) {
-              await message.channel.send(`🛑 !loop wallclock cap reached (${Math.round(MAX_LOOP_WALLCLOCK_MS / 60000)}m) — stopping. Total cost: $${totalCost.toFixed(4)}.`);
-              exitReason = 'wallclock-cap';
-              break;
-            }
-
-            // M3: per-channel daily iteration counter. Bumps BEFORE the iteration
-            // runs so a runaway that keeps restarting still burns its daily budget.
-            const iterationsToday = _bumpLoopIterationCount(channelId);
-            if (iterationsToday > MAX_LOOP_ITERATIONS_PER_DAY) {
-              await message.channel.send(`🛑 !loop daily iteration cap reached (${MAX_LOOP_ITERATIONS_PER_DAY}) — try again tomorrow. Total cost this run: $${totalCost.toFixed(4)}.`);
-              exitReason = 'daily-iter-cap';
-              break;
-            }
-
-            // L-Fix-3 + L-Fix-4: done detection at start of every iteration after the first.
-            // Two signals: (a) sentinel <<TASK_COMPLETE>> in NextSteps.md, (b) NextSteps.md
-            // hash unchanged for 2 consecutive iterations → assume stuck.
-            if (i > 1 && fs.existsSync(nsPath)) {
-              const ns = fs.readFileSync(nsPath, 'utf-8');
-              if (ns.includes('<<TASK_COMPLETE>>')) {
-                await message.channel.send(`*Loop completed after ${i - 1} iteration${i === 2 ? '' : 's'} — \`<<TASK_COMPLETE>>\` sentinel found in NextSteps.md. Total cost: $${totalCost.toFixed(4)}.*`);
-                exitReason = 'sentinel';
-                break;
-              }
-              const crypto = require('crypto');
-              const nsHash = crypto.createHash('sha256').update(ns).digest('hex');
-              if (lastNsHash && nsHash === lastNsHash) {
-                unchangedIterations++;
-                if (unchangedIterations >= 2) {
-                  await message.channel.send(`*Loop appears stalled — NextSteps.md unchanged for 2 iterations. Stopping after ${i - 1} iterations. Total cost: $${totalCost.toFixed(4)}.*`);
-                  exitReason = 'idle';
-                  break;
-                }
-              } else {
-                unchangedIterations = 0;
-              }
-              lastNsHash = nsHash;
-            } else if (i === 1 && fs.existsSync(nsPath)) {
-              const crypto = require('crypto');
-              lastNsHash = crypto.createHash('sha256').update(fs.readFileSync(nsPath, 'utf-8')).digest('hex');
-            }
-
-            // L-Fix-5: cumulative cost cap.
-            if (totalCost > MAX_LOOP_COST_USD) {
-              await message.channel.send(`*Loop bailed: cumulative cost $${totalCost.toFixed(4)} exceeds cap of $${MAX_LOOP_COST_USD}. Update NextSteps.md is up to Claude. Resume manually if needed.*`);
-              exitReason = 'cost-cap';
-              break;
-            }
-
-            const iterPrompt = i === 1
-              ? `${arg}\n\nThis is iteration 1 of an autonomous loop (max ${maxIterations}). When the task is FULLY DONE, write the literal token "<<TASK_COMPLETE>>" on its own line in NextSteps.md. Otherwise, update NextSteps.md with progress and what's left.`
-              : `Continue working on this task: "${arg}"\n\nThis is iteration ${i}/${maxIterations}. Read NextSteps.md for context from previous iterations. When the task is FULLY DONE, write the literal token "<<TASK_COMPLETE>>" on its own line in NextSteps.md. Otherwise, update NextSteps.md with progress and what's left.`;
-
-            // L-Fix-6: per-iteration retry on transient error.
-            const runIteration = async () => runClaudeWithContinuation(iterPrompt, {
-              sessionId: state.sessionId,
-              personalityFile,
-              identity: state.identity,
-              cwd: state.cwd,
-              channelState: state,
-              discordChannel: message.channel,
-            }, proxy);
-
-            let result;
-            state.activeTask = { prompt: iterPrompt.substring(0, 500), channelId, startedAt: new Date().toISOString(), resumeAttempts: 0 };
-            saveChannelState(channelId, state, { critical: true });
-
-            try {
-              result = await runIteration();
-            } catch (err) {
-              await message.channel.send(`*Loop iteration ${i} hit an error (${err.message.substring(0, 150)}). Retrying once after 30s...*`);
-              await new Promise(r => setTimeout(r, 30000));
-              if (!state.loopActive) {
-                exitReason = 'user-stopped';
-                break;
-              }
-              try {
-                result = await runIteration();
-              } catch (retryErr) {
-                await message.channel.send(`*Loop iteration ${i} failed twice: ${retryErr.message.substring(0, 200)}. Stopping.*`);
-                sendErrorAlert(retryErr, { source: '!loop iteration retry', channel: channelId });
-                exitReason = 'iteration-error';
-                break;
-              }
-            }
-
-            if (result.sessionId) state.sessionId = result.sessionId;
-            if (result.cost) totalCost += result.cost;
-
-            if (result.stopped) {
-              await message.channel.send('*Loop stopped by user.*');
-              exitReason = 'user-stopped';
-              break;
-            }
-
-            await sendLongMessage(message, result.text, state.cwd);
-            await message.channel.send(`*— Loop iteration ${i}/${maxIterations} complete · cumulative $${totalCost.toFixed(4)} —*`);
-
-            // L-Fix-7: configurable cooldown.
-            await new Promise(r => setTimeout(r, LOOP_ITERATION_COOLDOWN_MS));
-          }
-
-          if (exitReason === 'max-iterations') {
-            await message.channel.send(`*Loop hit ${maxIterations} iteration limit without seeing <<TASK_COMPLETE>>. Total cost: $${totalCost.toFixed(4)}. Send another message to continue.*`);
-          }
-        } catch (err) {
-          // L-Fix-1: top-level safety net — any unhandled error goes here.
-          console.error('[!loop] Unhandled error:', err);
-          sendErrorAlert(err, { source: '!loop top-level', channel: channelId });
-          try {
-            await message.channel.send(`*Loop crashed: ${err.message.substring(0, 300)}*`).catch(() => {});
-          } catch {}
-        } finally {
-          // ONLY place that clears loopActive — restores normal channel state.
-          state.loopActive = false;
-          state.busy = false;
-          state.startedAt = null;
-          state.progress = freshProgress();
-          state.activeTask = null;
-          saveChannelState(channelId, state, { critical: true });
-          // Drain any messages queued during the loop so they don't sit forever.
-          if (state.queue.length > 0) {
-            try { await processQueue(state); } catch (e) { console.error('[!loop] post-loop drain error:', e.message); }
-          }
-        }
-      })().catch(err => {
-        // Belt-and-suspenders: if even the IIFE wrapper throws, log it.
-        console.error('[!loop] IIFE rejection:', err);
-        state.loopActive = false;
-        state.busy = false;
-        saveChannelState(channelId, state, { critical: true });
-      });
-      break;
-    }
-
-    case '!joingroup': {
-      // Bypass for the broken "Cannot find service ID for self to accept invite"
-      // signal-cli bug. Instead of accepting a pending invite (the broken path),
-      // the user gets a Signal group invite LINK and pastes it here. signal-cli's
-      // joinGroup-via-uri uses a totally different code path that DOES work on
-      // standalone-registered accounts.
-      //
-      // To get the link in Signal: open the group → tap the group name → Group
-      // Link → "Share group via link" toggle on → copy. Then send to Bianca:
-      // !joingroup https://signal.group/#CjQK...
-      if (!signalAdapter) {
-        await message.reply('Signal adapter not running.');
-        break;
-      }
-      if (!arg) {
-        await message.reply('Usage: `!joingroup <signal-group-invite-link>`\nGet the link from Signal: open the group → tap the name → Group Link → enable + copy.\nExample: `!joingroup https://signal.group/#CjQK...`');
-        break;
-      }
-      const uri = arg.trim();
-      if (!/^https?:\/\/signal\.group\/#/.test(uri)) {
-        await message.reply('That doesn\'t look like a Signal group link. It should start with `https://signal.group/#`');
-        break;
-      }
-      await message.reply('Trying to join the group via invite link...');
-      try {
-        const result = await signalAdapter.joinGroupByLink(uri);
-        // Refresh group cache so future sends know about it
-        await signalAdapter._loadGroups().catch(() => {});
-        const groupId = result?.groupId || result?.group_id || '(unknown)';
-        await message.reply(`✅ Joined! Internal group ID: \`${groupId}\`. You can now message me in that group.`);
-      } catch (err) {
-        await message.reply(`❌ Couldn't join: ${err.message.substring(0, 400)}`);
-        sendErrorAlert(err, { source: '!joingroup', channel: message.channel.id, detail: uri.substring(0, 100) });
-      }
-      break;
-    }
-
-    case '!heartbeat': {
-      if (!arg || arg === 'status') {
-        const hb = getHeartbeatStatus(message.channel.id);
-        if (hb) {
-          await message.reply(`Heartbeat **active** — every ${hb.intervalMinutes}min in \`${hb.cwd}\``);
-        } else {
-          await message.reply('No heartbeat active. Use `!heartbeat <minutes>` to start (e.g. `!heartbeat 30`).');
-        }
-        break;
-      }
-      if (arg === 'off' || arg === 'stop') {
-        stopHeartbeat(message.channel.id);
-        await message.reply('Heartbeat stopped.');
-        break;
-      }
-      const interval = parseInt(arg, 10);
-      if (isNaN(interval) || interval < 5) {
-        await message.reply('Usage: `!heartbeat <minutes>` (min 5) | `!heartbeat off` | `!heartbeat status`');
-        break;
-      }
-      const personalityFile = getPersonalityFile(state.personality);
-      startHeartbeat(message.channel.id, {
-        cwd: state.cwd,
-        intervalMinutes: interval,
-        onWake: (prompt) => askClaude(prompt, {
-          sessionId: state.sessionId,
-          personalityFile,
-          identity: state.identity,
-          cwd: state.cwd,
-          channelState: state,
-          discordChannel: message.channel,
-        }),
-        onResult: async (result) => {
-          if (result.sessionId) { state.sessionId = result.sessionId; saveChannelState(message.channel.id, state); }
-          await sendLongMessage(message, result.text, state.cwd);
-        },
-      });
-      await message.reply(`Heartbeat started — checking every **${interval} minutes**. Reads AGENTS.md for standing orders. Use \`!heartbeat off\` to stop.`);
-      break;
-    }
-
-    case '!orders': {
-      const orders = loadStandingOrders(state.cwd);
-      if (!orders) {
-        await message.reply(`No standing orders found. Create \`AGENTS.md\` in \`${state.cwd}\` with instructions for autonomous work.`);
-      } else {
-        await sendLongMessage(message, `**Standing Orders (AGENTS.md):**\n${orders}`, state.cwd);
-      }
-      break;
-    }
-
-    case '!monitor': {
-      const monArgs = parts.slice(1);
-      const subCmd = (monArgs[0] || '').toLowerCase();
-
-      if (subCmd === 'ci') {
-        // !monitor ci [repo] [--branch=X] [--action=fix|notify] [--interval=N]
-        const repo = monArgs[1] || '*';
-        if (repo !== '*' && !/^[a-zA-Z0-9._-]+\/[a-zA-Z0-9._-]+$/.test(repo)) {
-          await message.reply('Invalid repo format. Use `owner/repo` (e.g. `myuser/myrepo`).');
-          break;
-        }
-        const flags = monArgs.slice(2).join(' ');
-        const branchMatch = flags.match(/--branch[= ](\S+)/);
-        const actionMatch = flags.match(/--action[= ](fix|notify)/);
-        const intervalMatch = flags.match(/--interval[= ](\d+)/);
-        const mon = addMonitor({
-          type: 'github-ci',
-          channelId: message.channel.id,
-          action: actionMatch ? actionMatch[1] : 'notify',
-          config: { repo, branch: branchMatch ? branchMatch[1] : 'main' },
-          pollInterval: intervalMatch ? parseInt(intervalMatch[1], 10) : 5,
-          cwd: state.cwd,
-        });
-        const { scheduleMonitor } = require('./monitor-runner');
-        scheduleMonitor(mon, client);
-        await message.reply(
-          `Monitor **#${mon.id}** created!\n` +
-          `🔄 **github-ci** — ${repo} (${mon.config.branch})\n` +
-          `⚡ Action: ${mon.action} | Every ${mon.pollInterval}min\n` +
-          `Use \`!monitors\` to list, \`!monitor remove ${mon.id}\` to delete.`
-        );
-      } else if (subCmd === 'health') {
-        // !monitor health <url> [--action=fix|notify] [--status=200] [--interval=N]
-        const url = monArgs[1];
-        if (!url) {
-          await message.reply('Usage: `!monitor health <url>` — e.g. `!monitor health http://localhost:3400/health`');
-          break;
-        }
-        // Validate URL scheme — prevent SSRF to internal services
-        try {
-          const parsed = new URL(url);
-          if (!['http:', 'https:'].includes(parsed.protocol)) {
-            await message.reply('Only `http` and `https` URLs are supported.');
-            break;
-          }
-        } catch {
-          await message.reply('Invalid URL format.');
-          break;
-        }
-        const flags = monArgs.slice(2).join(' ');
-        const actionMatch = flags.match(/--action[= ](fix|notify)/);
-        const statusMatch = flags.match(/--status[= ](\d+)/);
-        const intervalMatch = flags.match(/--interval[= ](\d+)/);
-        const mon = addMonitor({
-          type: 'url-health',
-          channelId: message.channel.id,
-          action: actionMatch ? actionMatch[1] : 'notify',
-          config: { url, expectStatus: statusMatch ? parseInt(statusMatch[1], 10) : 200 },
-          pollInterval: intervalMatch ? parseInt(intervalMatch[1], 10) : 5,
-          cwd: state.cwd,
-        });
-        const { scheduleMonitor } = require('./monitor-runner');
-        scheduleMonitor(mon, client);
-        await message.reply(
-          `Monitor **#${mon.id}** created!\n` +
-          `🔄 **url-health** — ${url}\n` +
-          `⚡ Action: ${mon.action} | Every ${mon.pollInterval}min\n` +
-          `Use \`!monitors\` to list, \`!monitor remove ${mon.id}\` to delete.`
-        );
-      } else if (subCmd === 'remove') {
-        const id = parseInt(monArgs[1], 10);
-        if (isNaN(id)) {
-          await message.reply('Usage: `!monitor remove <id>`');
-          break;
-        }
-        const removed = removeMonitor(id);
-        if (!removed) {
-          await message.reply(`No monitor #${id} found.`);
-        } else {
-          const { cancelMonitor } = require('./monitor-runner');
-          cancelMonitor(id);
-          await message.reply(`Removed monitor **#${id}** (${removed.type}).`);
-        }
-      } else if (subCmd === 'pause') {
-        const id = parseInt(monArgs[1], 10);
-        if (isNaN(id)) { await message.reply('Usage: `!monitor pause <id>`'); break; }
-        const mon = updateMonitor(id, { enabled: false });
-        if (!mon) { await message.reply(`No monitor #${id} found.`); break; }
-        const { cancelMonitor } = require('./monitor-runner');
-        cancelMonitor(id);
-        await message.reply(`Paused monitor **#${id}**. Use \`!monitor resume ${id}\` to re-enable.`);
-      } else if (subCmd === 'resume') {
-        const id = parseInt(monArgs[1], 10);
-        if (isNaN(id)) { await message.reply('Usage: `!monitor resume <id>`'); break; }
-        const mon = updateMonitor(id, { enabled: true });
-        if (!mon) { await message.reply(`No monitor #${id} found.`); break; }
-        const { scheduleMonitor } = require('./monitor-runner');
-        scheduleMonitor(mon, client);
-        await message.reply(`Resumed monitor **#${id}**.`);
-      } else if (subCmd === 'check') {
-        const id = parseInt(monArgs[1], 10);
-        if (isNaN(id)) { await message.reply('Usage: `!monitor check <id>`'); break; }
-        const mon = getMonitor(id);
-        if (!mon) { await message.reply(`No monitor #${id} found.`); break; }
-        await message.reply(`Running immediate check for monitor **#${id}**...`);
-        const { runPoll } = require('./monitor-runner');
-        runPoll(id, client).catch(err => {
-          message.reply(`Check failed: ${err.message}`).catch(() => {});
-        });
-      } else {
-        await message.reply(
-          `**Monitor Commands:**\n` +
-          `\`!monitor ci <repo> [--branch=main] [--action=fix|notify]\`\n` +
-          `\`!monitor health <url> [--action=fix|notify]\`\n` +
-          `\`!monitor remove <id>\` · \`!monitor pause <id>\` · \`!monitor resume <id>\`\n` +
-          `\`!monitor check <id>\` — force immediate poll\n` +
-          `\`!monitors\` — list all monitors`
-        );
-      }
-      break;
-    }
-
-    case '!monitors': {
-      const allMonitors = listMonitors();
-      if (allMonitors.length === 0) {
-        await message.reply('No monitors configured. Use `!monitor ci <repo>` or `!monitor health <url>` to set one up.');
-        break;
-      }
-      const lines = allMonitors.map(m => {
-        const status = m.enabled ? '🔄' : '⏸️';
-        const lastAgo = m.lastCheck
-          ? `${Math.round((Date.now() - new Date(m.lastCheck).getTime()) / 60000)}min ago`
-          : 'never';
-        const typeLabel = m.type === 'github-ci'
-          ? `github-ci ${m.config.repo} (${m.config.branch || '*'})`
-          : `url-health ${m.config.url}`;
-        return `**#${m.id}** ${status} ${typeLabel} → ${m.action} | every ${m.pollInterval}min | last: ${lastAgo}`;
-      });
-      await sendLongMessage(message, `**Monitors:**\n${lines.join('\n')}`, state.cwd);
-      break;
-    }
-
-    case '!audit': {
-      if (state.busy) {
-        await message.reply('Claude is still working. Use `!stop` first.');
-        break;
-      }
-      const validFocuses = ['full', 'design', 'qa', 'security', 'analytics', 'performance', 'product'];
-      const auditFocus = arg ? arg.toLowerCase() : 'full';
-      if (!validFocuses.includes(auditFocus)) {
-        await message.reply(`Unknown focus: "${arg}". Options: ${validFocuses.join(', ')}`);
-        break;
-      }
-      state.sessionId = null; // audit starts fresh
-      const auditPrompt = buildAuditPrompt(auditFocus, state.cwd);
-      const auditLabel = auditFocus === 'full' ? 'full audit' : `${auditFocus} audit`;
-      await message.reply(`Starting **${auditLabel}** of \`${state.cwd}\`...`);
-      const auditPersonalityFile = getPersonalityFile(state.personality);
-      await message.channel.sendTyping();
-      const auditTypingInterval = setInterval(() => { message.channel.sendTyping().catch(() => {}); }, 8000);
-      try {
-        const auditResult = await runClaudeWithContinuation(auditPrompt, {
-          personalityFile: auditPersonalityFile,
-          identity: state.identity,
-          cwd: state.cwd,
-          channelState: state,
-          discordChannel: message.channel,
-        }, ChannelProxy.fromDiscord(message.channel));
-        if (auditResult.sessionId) {
-          state.sessionId = auditResult.sessionId;
-          saveChannelState(message.channel.id, state);
-        }
-        if (!auditResult.stopped) await sendLongMessage(message, auditResult.text, state.cwd);
-      } catch (err) {
-        const errorMsg = err.message.length > 500 ? err.message.substring(0, 500) + '...' : err.message;
-        await message.reply(`Audit error: ${errorMsg}`).catch(() => {});
-        sendErrorAlert(err, { source: 'audit command', channel: message.channel.id });
-      } finally {
-        clearInterval(auditTypingInterval);
-      }
-      break;
-    }
-
-    case '!bugs': {
-      // Load and run the bug-list orchestration skill
-      const bugSkill = getSkill('bug-list');
-      if (!bugSkill) {
-        await message.reply('Bug list skill not found. Make sure `skills/core/bug-list.md` exists.');
-        break;
-      }
-      if (state.busy) {
-        await message.reply('Already working on something. Use `!stop` first.');
-        break;
-      }
-
-      state.busy = true;
-      state.startedAt = Date.now();
-      state.progress = freshProgress();
-      await message.channel.sendTyping();
-      const bugTypingInterval = setInterval(() => { message.channel.sendTyping().catch(() => {}); }, 8000);
-
-      // Combine skill instructions with any provided context
-      const bugPrompt = `${bugSkill.instructions}\n\n${arg ? `Initial context/bugs to address:\n${arg}` : 'Ready to receive bugs. List them one by one and I will orchestrate agents to fix them.'}`;
-      const personalityFile = getPersonalityFile(state.personality);
-
-      try {
-        const result = await askClaude(bugPrompt, {
-          sessionId: state.sessionId,
-          personalityFile,
-          identity: state.identity,
-          cwd: state.cwd,
-          maxTurns: 100,  // Higher limit for orchestration
-          channelState: state,
-          discordChannel: message.channel,
-        });
-
-        if (result.sessionId) state.sessionId = result.sessionId;
-        if (!result.stopped) {
-          await sendLongMessage(message, result.text, state.cwd);
-        }
-      } catch (err) {
-        const errorMsg = err.message.length > 500 ? err.message.substring(0, 500) + '...' : err.message;
-        await message.reply(`Bug orchestrator error: ${errorMsg}`).catch(() => {});
-        sendErrorAlert(err, { source: 'bugs command', channel: message.channel.id });
-      } finally {
-        clearInterval(bugTypingInterval);
-        state.busy = false;
-        state.startedAt = null;
-        state.progress = freshProgress();
-      }
-      break;
-    }
-
-    case '!skills': {
-      try {
-        const skills = listSkills();
-        if (skills.length === 0) {
-          await message.reply('No skills loaded. Skills are loaded from `skills/core/` directory.');
-        } else {
-          const list = skills.map(s => `• **${s.name}** — ${s.description}`).join('\n');
-          await message.reply(`**Available Skills:**\n${list}`);
-        }
-      } catch (err) {
-        await message.reply(`Error loading skills: ${err.message}`);
-      }
-      break;
-    }
-
-    case '!plan': {
-      if (!arg) {
-        await message.reply('Usage: `!plan <link or description>` — paste a TikTok, Instagram, Maps, Yelp, or Eventbrite link, or describe a place/event.');
-        break;
-      }
-      if (state.busy) {
-        await message.reply('Already working. Use `!stop` first.');
-        break;
-      }
-      // Detect any links, pre-fetch metadata, and build action prompt
-      const links = detectLinks(arg);
-      let planPrompt;
-      if (links.length > 0) {
-        const enriched = await enrichLinks(links);
-        planPrompt = buildSmartPrompt(enriched) + arg;
-      } else {
-        planPrompt = `[PLANNING MODE]\nThe user wants to plan around this:\n${arg}\n\nUse WebSearch to research this destination/event. Provide: what it is, address, pet-friendly status, things to do nearby, distance from Alameda CA (drive/fly), weather, budget estimate. Check the user's calendar for good times to visit. Keep output Discord-concise.`;
-      }
-
-      state.busy = true;
-      state.startedAt = Date.now();
-      state.progress = freshProgress();
-      await message.channel.sendTyping();
-      const planTyping = setInterval(() => { message.channel.sendTyping().catch(() => {}); }, 8000);
-
-      try {
-        const personalityFile = getPersonalityFile(state.personality);
-        const result = await askClaude(planPrompt, {
-          sessionId: state.sessionId,
-          personalityFile,
-          identity: state.identity,
-          cwd: state.cwd,
-          maxTurns: 20,
-          channelState: state,
-          discordChannel: message.channel,
-        });
-        if (result.sessionId) state.sessionId = result.sessionId;
-        if (!result.stopped) await sendLongMessage(message, result.text, state.cwd);
-      } catch (err) {
-        await message.reply(`Plan failed: ${err.message.substring(0, 300)}`).catch(() => {});
-        sendErrorAlert(err, { source: 'plan command', channel: message.channel.id });
-      } finally {
-        clearInterval(planTyping);
-        state.busy = false;
-        state.startedAt = null;
-        state.progress = freshProgress();
-      }
-      break;
-    }
-
-    case '!hangout': {
-      startHangoutWizard(state, message);
-      break;
-    }
-
-    case '!trip': {
-      startTripPlannerWizard(state, message);
-      break;
-    }
-
-    case '!connect': {
-      try {
-        const googleAuth = require('./google-auth');
-        if (!process.env.GOOGLE_CLIENT_ID) {
-          await message.reply('Google OAuth is not configured. Set `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, and `GOOGLE_REDIRECT_URI` env vars.');
-          break;
-        }
-        const authUrl = googleAuth.getAuthUrl(message.author.id);
-        // DM the user the auth link (don't post tokens publicly)
-        try {
-          await message.author.send(`Connect your Google Calendar to the bot:\n${authUrl}\n\nThis lets the bot check your availability for group planning.`);
-          await message.reply('Sent you a DM with the Google authorization link!');
-        } catch {
-          await message.reply(`I couldn't DM you. Here's the link (authorize within 10 min):\n${authUrl}`);
-        }
-      } catch (err) {
-        await message.reply(`Connect failed: ${err.message.substring(0, 200)}`);
-      }
-      break;
-    }
-
-    // ── Signal permission & profile commands ──────────────────────────────────
-
-    case '!permit': {
-      // Only the Signal owner can grant permissions
-      const { isSignalOwner: _iso, grantPermission } = require('./project-permissions');
-      const senderId = message.author?.id || message._signalSenderId;
-      if (!_iso(senderId)) {
-        await message.reply('Only the owner can grant permissions.');
-        break;
-      }
-      const target = arg.trim();
-      if (!target) { await message.reply('Usage: `!permit +1234567890`'); break; }
-      grantPermission(target, state.cwd);
-      await message.reply(`Granted ${target} access to ${path.basename(state.cwd) || state.cwd}.`);
-      break;
-    }
-
-    case '!revoke': {
-      const { isSignalOwner: _iso2, revokePermission } = require('./project-permissions');
-      const senderId = message.author?.id || message._signalSenderId;
-      if (!_iso2(senderId)) {
-        await message.reply('Only the owner can revoke permissions.');
-        break;
-      }
-      const target = arg.trim();
-      if (!target) { await message.reply('Usage: `!revoke +1234567890`'); break; }
-      revokePermission(target, state.cwd);
-      await message.reply(`Revoked ${target}'s access to ${path.basename(state.cwd) || state.cwd}.`);
-      break;
-    }
-
-    case '!perms': {
-      const { listPermissions: _lp } = require('./project-permissions');
-      const { allowed, owner } = _lp(state.cwd);
-      const projectName = path.basename(state.cwd) || state.cwd;
-      const lines = [`**Permissions for ${projectName}:**`, `Owner (full access): ${owner}`];
-      if (allowed.length > 0) lines.push(`Also allowed: ${allowed.join(', ')}`);
-      else lines.push('No additional users granted access.');
-      await message.reply(lines.join('\n'));
-      break;
-    }
-
-    case '!profile': {
-      const { getProfile: _gp, setProfile: _sp, getAllProfiles: _gap } = require('./user-profiles');
-      const senderId = message.author?.id || message._signalSenderId;
-      const { isSignalOwner: _iso3 } = require('./project-permissions');
-      const parts = arg.trim().split(/\s+/);
-
-      // !profile @+1234567890 set field value  (owner only, for others)
-      // !profile set field value               (set own field)
-      // !profile                               (view own profile)
-      // !profile all                           (owner only, view all)
-
-      if (parts[0] === 'all' && _iso3(senderId)) {
-        const all = _gap();
-        const keys = Object.keys(all);
-        if (keys.length === 0) { await message.reply('No profiles saved yet.'); break; }
-        const summary = keys.map(k => {
-          const p = all[k];
-          return `${k}: ${p.name || '(unnamed)'}, ${p.location || 'no location'}${p.gcal_connected ? ', cal ✓' : ''}`;
-        }).join('\n');
-        await message.reply(`**All profiles:**\n${summary}`);
-        break;
-      }
-
-      // Determine target: could be "set field value" (own) or "+phone set field value" (owner for others)
-      let targetPhone = senderId;
-      let rest = parts;
-      if (_iso3(senderId) && parts[0] && parts[0].startsWith('+') && parts[1] === 'set') {
-        targetPhone = parts[0];
-        rest = parts.slice(1);
-      }
-
-      if (rest[0] === 'set') {
-        const field = rest[1];
-        const value = rest.slice(2).join(' ');
-        const allowed = ['name', 'location', 'timezone'];
-        if (!allowed.includes(field)) {
-          await message.reply(`Can set: ${allowed.join(', ')}`);
-          break;
-        }
-        if (!value) { await message.reply(`Usage: !profile set ${field} <value>`); break; }
-        _sp(targetPhone, { [field]: value });
-        await message.reply(`Profile updated: ${field} = ${value}`);
-      } else {
-        const p = _gp(targetPhone);
-        if (!p) { await message.reply('No profile yet. Use `!setup` to create one.'); break; }
-        const lines = [`**Profile for ${targetPhone}:**`];
-        if (p.name)     lines.push(`Name: ${p.name}`);
-        if (p.location) lines.push(`Location: ${p.location}`);
-        if (p.timezone) lines.push(`Timezone: ${p.timezone}`);
-        lines.push(`Google Calendar: ${p.gcal_connected ? `${p.gcal_email} ✓` : 'not connected'}`);
-        await message.reply(lines.join('\n'));
-      }
-      break;
-    }
-
-    case '!setup': {
-      // Generate a setup link for the sender (or a target number if owner specifies one)
-      const senderId = message.author?.id || message._signalSenderId;
-      const { isSignalOwner: _iso4 } = require('./project-permissions');
-      const targetPhone = (arg.trim() && _iso4(senderId)) ? arg.trim() : senderId;
-      const baseUrl = process.env.PUBLIC_URL || `http://localhost:3400`;
-      const setupUrl = `${baseUrl}/setup/${encodeURIComponent(targetPhone)}`;
-      await message.reply(`Setup link for ${targetPhone}:\n${setupUrl}\n\nTap it on your phone to set your name, location, and connect Google Calendar.`);
-      break;
-    }
-
-    // ─────────────────────────────────────────────────────────────────────────
-
-    case '!spotify': {
-      try {
-        if (!spotifyAuth) {
-          await message.reply('Spotify module not loaded.');
-          break;
-        }
-        if (!process.env.SPOTIFY_CLIENT_ID) {
-          await message.reply('Spotify not configured. Set `SPOTIFY_CLIENT_ID`, `SPOTIFY_CLIENT_SECRET`, and `SPOTIFY_REDIRECT_URI` env vars.');
-          break;
-        }
-        const authUrl = spotifyAuth.getAuthUrl(message.author.id);
-        try {
-          await message.author.send(`Connect your Spotify to the bot:\n${authUrl}\n\nThis lets the bot create collaborative playlists and see your music taste for trip planning.`);
-          await message.reply('Sent you a DM with the Spotify authorization link!');
-        } catch {
-          await message.reply(`I couldn't DM you. Here's the link:\n${authUrl}`);
-        }
-      } catch (err) {
-        await message.reply(`Spotify connect failed: ${err.message.substring(0, 200)}`);
-      }
-      break;
-    }
-
-    case '!commands': {
-      await message.reply(
-        `**Available Commands:**\n` +
-        `\`!stop\` \`!clear\` \`!kill\` \`!killall\` \`!restart\` \`!cancel\`\n` +
-        `\`!status\` \`!processes\` \`!btw\` \`!cd\` \`!ls\`\n` +
-        `\`!startproject\` \`!audit\` \`!name\` \`!identity\`\n` +
-        `\`!personality\` \`!personalities\`\n` +
-        `\`!tasks\` \`!done\` \`!bugs\` \`!skills\`\n` +
-        `\`!plan\` \`!trip\` \`!hangout\` \`!connect\` \`!spotify\`\n` +
-        `\`!schedule\` \`!schedules\` \`!unschedule\` \`!autoschedule\`\n` +
-        `\`!queue\` \`!queued\` \`!dequeue\`\n` +
-        `\`!monitor\` \`!monitors\`\n` +
-        `\`!briefing\` \`!weekly\` \`!email\` \`!help\` \`!commands\`\n\n` +
-        `Use \`!help\` for detailed descriptions.`
-      );
-      break;
-    }
-
-    default:
-      return false;
-  }
+  await cmd.run(message, arg, state, getCommandCtx());
   return true;
 }
 
@@ -2400,6 +884,13 @@ process.on('uncaughtException', (err) => {
 });
 
 client.on('clientReady', () => {
+  // F23: Initialize DiscordAdapter wrapping the existing client (avoids a second Client instance).
+  // From this point, sendMessage/sendLongMessage/sendTyping go through the adapter for symmetry
+  // with the Signal path.
+  discordAdapter = new DiscordAdapter({ client });
+  discordAdapter.ready = true;
+  module.exports.discordAdapter = discordAdapter;
+
   // F16: sweep orphaned .tmp files from previous crash before reading stores
   try { sweepOrphanTmpFiles(['/app/data', '/home/node/.claude']); } catch {}
 
@@ -2432,7 +923,7 @@ client.on('clientReady', () => {
       const channelId = fs.readFileSync(restartFile, 'utf-8').trim();
       fs.unlinkSync(restartFile);
       const ch = client.channels.cache.get(channelId);
-      if (ch) ch.send("I'm back! Restart complete.").catch(() => {});
+      if (ch) _dsend(ch, "I'm back! Restart complete.").catch(() => {});
     } catch {}
   }
 
@@ -2577,7 +1068,7 @@ async function resumeChannel(channelId, savedState) {
     saveChannelState(channelId, state, { critical: true });
     const ch = client.channels.cache.get(channelId);
     if (ch) {
-      ch.send(buildRestartMessage()).catch(() => {});
+      _dsend(ch, buildRestartMessage()).catch(() => {});
       console.log(`[auto-resume] Notified Discord channel ${channelId} of restart (no resumable task)`);
     }
     return;
@@ -2590,7 +1081,7 @@ async function resumeChannel(channelId, savedState) {
     state.busy = false;
     saveChannelState(channelId, state, { critical: true });
     const ch = client.channels.cache.get(channelId);
-    if (ch) ch.send('*I crashed while working and failed to resume after 2 attempts. Send your request again if needed.*').catch(() => {});
+    if (ch) _dsend(ch, '*I crashed while working and failed to resume after 2 attempts. Send your request again if needed.*').catch(() => {});
     return;
   }
 
@@ -2615,9 +1106,9 @@ async function resumeChannel(channelId, savedState) {
   flushPendingWrites();
 
   console.log(`[auto-resume] Resuming work in channel ${channelId} (attempt ${task.resumeAttempts}/2)`);
-  await ch.send(`*I crashed while working on your request. Resuming now... (attempt ${task.resumeAttempts}/2)*`).catch(() => {});
-  await ch.sendTyping().catch(() => {});
-  const typingInterval = setInterval(() => ch.sendTyping().catch(() => {}), 8000);
+  await _dsend(ch, `*I crashed while working on your request. Resuming now... (attempt ${task.resumeAttempts}/2)*`).catch(() => {});
+  await _dtyping(ch).catch(() => {});
+  const typingInterval = setInterval(() => _dtyping(ch).catch(() => {}), 8000);
 
   const pendingQueue = savedState.pendingQueue || [];
   let resumePrompt = 'You were interrupted by a system crash. Continue where you left off. If you were nearly done, just wrap up and summarize what you accomplished.';
@@ -2668,18 +1159,18 @@ async function resumeChannel(channelId, savedState) {
         resultSummary: result.text,
         turnCount: result.numTurns || 0,
       });
-      // Send result to the channel directly
+      // Send result to the channel directly — F23: route through adapter
       const lines = result.text.split('\n');
       let chunk = '';
       for (const line of lines) {
         if ((chunk + '\n' + line).length > 1990) {
-          await ch.send(chunk).catch(() => {});
+          await _dsend(ch, chunk).catch(() => {});
           chunk = line;
         } else {
           chunk = chunk ? chunk + '\n' + line : line;
         }
       }
-      if (chunk) await ch.send(chunk).catch(() => {});
+      if (chunk) await _dsend(ch, chunk).catch(() => {});
     }
 
     // Success — clear active task
@@ -2688,7 +1179,7 @@ async function resumeChannel(channelId, savedState) {
     console.log(`[auto-resume] Successfully resumed work in channel ${channelId}`);
   } catch (err) {
     console.error(`[auto-resume] Failed for channel ${channelId}:`, err.message);
-    await ch.send(`*Auto-resume failed: ${err.message.substring(0, 200)}. Send another message to retry manually.*`).catch(() => {});
+    await _dsend(ch, `*Auto-resume failed: ${err.message.substring(0, 200)}. Send another message to retry manually.*`).catch(() => {});
     sendErrorAlert(err, { source: 'auto-resume', channel: channelId });
   } finally {
     clearInterval(typingInterval);
@@ -2714,9 +1205,9 @@ async function processQueue(state) {
   const replyTarget = queued[queued.length - 1].message;
   const personalityFile = getPersonalityFile(state.personality);
 
-  await replyTarget.channel.sendTyping();
+  await _dtyping(replyTarget.channel);
   const typingInterval = setInterval(() => {
-    replyTarget.channel.sendTyping().catch(() => {});
+    _dtyping(replyTarget.channel).catch(() => {});
   }, 8000);
 
   try {
@@ -2757,7 +1248,7 @@ async function processQueue(state) {
 
     if (result.stopped) {
       if (!state._userStopped) {
-        await replyTarget.channel.send('*Process was interrupted unexpectedly — I stopped without finishing. Send another message to continue.*').catch(() => {});
+        await _dsend(replyTarget.channel, '*Process was interrupted unexpectedly — I stopped without finishing. Send another message to continue.*').catch(() => {});
       }
       state._userStopped = false;
     } else {
@@ -2788,7 +1279,7 @@ async function processQueue(state) {
         const topTools = Object.entries(toolCounts).sort((a, b) => b[1] - a[1]).slice(0, 3)
           .map(([t, c]) => `${c} ${TOOL_LABELS[t] || t}`).join(', ');
         if (topTools) parts.push(topTools);
-        await replyTarget.channel.send(`*— ${parts.join(' · ')} —*`).catch(() => {});
+        await _dsend(replyTarget.channel, `*— ${parts.join(' · ')} —*`).catch(() => {});
       }
 
       const meta = [];
@@ -2866,7 +1357,7 @@ client.on('messageCreate', async (message) => {
       if (handled) return;
     } catch (err) {
       console.error('Command error:', err.message);
-      await message.reply(`Command failed: ${err.message}`).catch(() => {});
+      await _dreply(message, `Command failed: ${err.message}`).catch(() => {});
       return;
     }
   }
@@ -2877,7 +1368,7 @@ client.on('messageCreate', async (message) => {
     const port = state._pendingPreview;
     if (['local', 'localhost', 'pc', 'computer', 'same'].includes(reply)) {
       state._pendingPreview = null;
-      await message.reply(`**Open on this PC:** http://localhost:${port}`);
+      await _dreply(message,`**Open on this PC:** http://localhost:${port}`);
       return;
     }
     if (['phone', 'mobile', 'tablet', 'remote', 'tunnel'].includes(reply)) {
@@ -2914,7 +1405,12 @@ client.on('messageCreate', async (message) => {
   const discordText = message.content.trim();
   if (discordText.length < 50 && GREETING_RE.test(discordText) && !discordText.startsWith('!')) {
     const personality = state.personality || DEFAULT_PERSONALITY;
-    await message.reply(_pickGreetingResponse(personality));
+    // F23: Route through adapter
+    if (discordAdapter) {
+      await discordAdapter.sendMessage(message.channel.id, _pickGreetingResponse(personality), { rawMessage: message });
+    } else {
+      await _dreply(message,_pickGreetingResponse(personality));
+    }
     return;
   }
 
@@ -2927,20 +1423,30 @@ client.on('messageCreate', async (message) => {
     saveChannelState(message.channel.id, state, { critical: true }); // persist queue immediately
     const pos = state.queue.length;
     const ctx = state.loopActive ? ' (loop in progress — use `!stop` to interrupt)' : '';
-    if (pos >= 5) {
-      await message.reply(`Queued (#${pos}) — queue is getting long. Use \`!stop\` to interrupt if needed.${ctx}`);
+    // F23: Route through adapter
+    const queueMsg = pos >= 5
+      ? `Queued (#${pos}) — queue is getting long. Use \`!stop\` to interrupt if needed.${ctx}`
+      : `Queued (#${pos}) — I'll get to that next.${ctx}`;
+    if (discordAdapter) {
+      await discordAdapter.sendMessage(message.channel.id, queueMsg, { rawMessage: message });
     } else {
-      await message.reply(`Queued (#${pos}) — I'll get to that next.${ctx}`);
+      await _dreply(message,queueMsg);
     }
     return;
   }
 
   const personalityFile = getPersonalityFile(state.personality);
 
-  // Keep typing indicator alive
-  await message.channel.sendTyping();
+  // Keep typing indicator alive — F23: route through adapter
+  const _channelId = message.channel.id;
+  if (discordAdapter) {
+    await discordAdapter.sendTyping(_channelId);
+  } else {
+    await message.channel.sendTyping();
+  }
   const typingInterval = setInterval(() => {
-    message.channel.sendTyping().catch(() => {});
+    if (discordAdapter) discordAdapter.sendTyping(_channelId).catch(() => {});
+    else message.channel.sendTyping().catch(() => {});
   }, 8000);
 
   try {
@@ -2977,7 +1483,7 @@ client.on('messageCreate', async (message) => {
       if (state.sessionId) {
         console.log('Session resume failed, retrying fresh:', err.message);
         state.sessionId = null;
-        await message.channel.send('*Session error — retrying fresh (1/2)...*').catch(() => {});
+        await _dsend(message.channel, '*Session error — retrying fresh (1/2)...*').catch(() => {});
         try {
           result = await askClaude(message.content, {
             personalityFile,
@@ -2989,7 +1495,7 @@ client.on('messageCreate', async (message) => {
         } catch (freshErr) {
           // Fresh call also failed — wait 3s and try once more
           console.log('Fresh call also failed, retrying after delay:', freshErr.message);
-          await message.channel.send('*Still failing — retrying one more time (2/2)...*').catch(() => {});
+          await _dsend(message.channel, '*Still failing — retrying one more time (2/2)...*').catch(() => {});
           await new Promise(r => setTimeout(r, 3000));
           result = await askClaude(message.content, {
             personalityFile,
@@ -3002,7 +1508,7 @@ client.on('messageCreate', async (message) => {
       } else {
         // No session — wait 3s and retry once
         console.log('CLI failed, retrying after delay:', err.message);
-        await message.channel.send('*Hit an error — retrying in 3s...*').catch(() => {});
+        await _dsend(message.channel, '*Hit an error — retrying in 3s...*').catch(() => {});
         await new Promise(r => setTimeout(r, 3000));
         try {
           result = await askClaude(message.content, {
@@ -3027,7 +1533,7 @@ client.on('messageCreate', async (message) => {
     if (result.stopped) {
       // If stop was NOT initiated by the user (external kill, OOM, container restart), alert them
       if (!state._userStopped) {
-        await message.channel.send('*Process was interrupted unexpectedly — I stopped without finishing. Send another message to continue.*').catch(() => {});
+        await _dsend(message.channel, '*Process was interrupted unexpectedly ��� I stopped without finishing. Send another message to continue.*').catch(() => {});
       }
       state._userStopped = false;
     } else {
@@ -3061,7 +1567,7 @@ client.on('messageCreate', async (message) => {
         const topTools = Object.entries(toolCounts).sort((a, b) => b[1] - a[1]).slice(0, 3)
           .map(([t, c]) => `${c} ${TOOL_LABELS[t] || t}`).join(', ');
         if (topTools) parts.push(topTools);
-        await message.channel.send(`*— ${parts.join(' · ')} —*`).catch(() => {});
+        await _dsend(message.channel, `*— ${parts.join(' · ')} —*`).catch(() => {});
       }
 
       // Show cost and turns info
@@ -3076,7 +1582,7 @@ client.on('messageCreate', async (message) => {
     // Step 4: Error recovery — retry once with session context
     if (state.sessionId && !err.message.includes('stalled') && !state._retried) {
       state._retried = true;
-      await message.reply('*Hit an error — retrying with session context...*').catch(() => {});
+      await _dreply(message, '*Hit an error — retrying with session context...*').catch(() => {});
       try {
         const retryResult = await askClaude(
           'You were interrupted by an error. Continue where you left off. If you were stuck, try a different approach.',
@@ -3107,7 +1613,7 @@ client.on('messageCreate', async (message) => {
     if (lastLogs) errorParts.push(`\nLast activity:\n${lastLogs}`);
     if (state.sessionId) errorParts.push('\n*Session preserved — send another message to retry, or `!refresh` to reset everything.*');
     else errorParts.push('\n*Try again, or `!refresh` to reset everything.*');
-    await message.reply(errorParts.join(' · ')).catch(() => {});
+    await _dreply(message, errorParts.join(' · ')).catch(() => {});
     sendErrorAlert(err, { source: 'message handler', channel: message.channel.id, detail: message.content.substring(0, 100) });
   } finally {
     clearInterval(typingInterval);
@@ -3474,4 +1980,4 @@ function start() {
   startSignalAdapter();
 }
 
-module.exports = { start, askClaude, runClaudeWithContinuation, client, getChannelState, getPersonalityFile, sendLongMessage, freshProgress, channels, signalAdapter };
+module.exports = { start, askClaude, runClaudeWithContinuation, client, getChannelState, getPersonalityFile, sendLongMessage, freshProgress, channels, signalAdapter, discordAdapter };

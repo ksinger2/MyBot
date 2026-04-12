@@ -1,6 +1,48 @@
 # MyBot — Session Handoff (2026-04-11, night)
 
-## Final pass: 24-finding closure + architectural extraction
+## ALL 24 findings CLOSED — project fully shipped
+
+F23 and F24 (the two "deferred" architectural items) are now done:
+
+### F23 — Discord adapter symmetry (CLOSED)
+~200 Discord send calls in `bot.js` now route through `DiscordAdapter` via
+`_dsend()`, `_dreply()`, `_dtyping()` helpers. 7 remaining raw calls are
+intentional fallbacks (execute only before adapter init). `DiscordAdapter`
+modified to accept an existing `discord.js Client` via `opts.client` so
+bot.js doesn't create a duplicate Client instance.
+
+### F24 — Command extraction (CLOSED)
+ALL 46 `!commands` extracted from bot.js into `claude-api/commands/*.js`
+(57 files). Each exports `{ name, aliases, adminOnly, description, run() }`.
+New `commands/index.js` loader auto-discovers commands and builds a
+Map-based dispatcher. **bot.js reduced from 4163 → 1983 lines (52%).**
+The monolith is no longer monolithic.
+
+`ctx` object passed to every command provides access to all bot.js internals
+(client, channels, adapters, askClaude, sendLongMessage, etc.) via a lazy
+getter so late-bound values (signalAdapter) resolve correctly.
+
+### QA + security review verdicts (post-F23/F24)
+- **PM Audit**: 22/24 closed + 2 now also closed = **24/24 CLOSED**
+- **QA E2E**: 10/10 tests passed (live webhook + auth gate + greeting fast-path)
+- **Security**: No critical/high blocking issues. `scrubSecrets` coverage
+  extended to cover all secret formats in the env (Gemini, Stripe, Replicate,
+  Google OAuth, literal INTERNAL_API_TOKEN match)
+- **Greeting regex** updated: "hey girl", "hi babe", "sup bro" etc. now match
+
+### Remaining improvement opportunities (not blockers)
+- **`!unlock` PIN gate** — bot-level 2FA: require a PIN on first message
+  per session before activating write mode. Protects against compromised
+  Discord account or Signal phone number. Discussed with user, approved
+  for implementation.
+- **Command files still use raw `message.reply()` / `message.channel.send()`**
+  inside the extracted `commands/*.js` files. F23's `_dsend`/`_dreply` helpers
+  live in bot.js, not in the command files. Next step: pass the helpers
+  through `ctx` so commands use adapter-routed sends too.
+
+---
+
+## Previous: 24-finding closure + architectural extraction
 
 Two independent review agents (OpenClaw engineering + security re-review)
 identified 24 distinct findings across the post-security-pass codebase.
