@@ -13,6 +13,10 @@ services:
       # MUST be set to a long random value in .env — if unset, all authenticated
       # routes fail with HTTP 503 (we refuse to fail open).
       - INTERNAL_API_TOKEN=${INTERNAL_API_TOKEN:-}
+      # Bot-level 2FA PIN. When set, every channel starts LOCKED — the user must
+      # send `!unlock <PIN>` before the bot responds. Protects against compromised
+      # Discord accounts or Signal phone numbers. If unset, the gate is disabled.
+      - BOT_UNLOCK_PIN=${BOT_UNLOCK_PIN:-}
       # Access control — comma-separated IDs/numbers (empty = DENY ALL after the
       # 2026-04-11 fail-closed flip). SIGNAL_OWNER_NUMBER always bypasses the
       # Signal allowlist so the owner can never lock themselves out.
