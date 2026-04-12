@@ -17,6 +17,7 @@ const { detectLinks, buildExtractionPrompt, buildSmartPrompt, enrichLinks } = re
 const { startHangoutWizard, processHangoutStep } = require('./wizards/hangout');
 const { startTripPlannerWizard, runResearchPhase } = require('./wizards/trip-planner');
 const { handleComponentInteraction } = require('./discord-components');
+const { sweepOrphanTmpFiles } = require('./atomic-write');
 let startSocialPlanWizard, processSocialPlanStep;
 try { ({ startSocialPlanWizard, processSocialPlanStep } = require('./wizards/social-plan')); } catch {}
 let spotifyAuth;
@@ -4149,6 +4150,9 @@ function createSignalMessageProxy(msg, chatId, state) {
 }
 
 function start() {
+  // Sweep orphaned .tmp files from previous crashes before any store reads
+  sweepOrphanTmpFiles(['/app/data', '/home/node/.claude']);
+
   const token = process.env.DISCORD_BOT_TOKEN;
   if (!token) {
     console.warn('DISCORD_BOT_TOKEN not set — Discord bot disabled');
