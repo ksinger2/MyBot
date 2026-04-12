@@ -1927,6 +1927,29 @@ function startSignalAdapter() {
 
       const result = await runClaudeWithContinuation(signalPrompt, claudeOpts, signalProxy);
 
+      // Auto-learn extraction — strip [LEARNED: ...] tags, store preferences, notify user
+      const { addPreference } = require('./user-profiles');
+      const learnedRe = /\[LEARNED:\s*(.+?)\]/gi;
+      const learned = [];
+      let cleanResultText = result.text || '';
+      let learnedMatch;
+      while ((learnedMatch = learnedRe.exec(cleanResultText)) !== null) {
+        learned.push(learnedMatch[1].trim());
+      }
+      cleanResultText = cleanResultText.replace(learnedRe, '').trim();
+      // Use cleanResultText instead of result.text for all subsequent operations
+      result.text = cleanResultText;
+
+      // Store learned facts and notify
+      for (const fact of learned) {
+        try {
+          addPreference(msg.senderId, fact, 'conversation');
+          await signalAdapter.sendMessage(msg.chatId, `\u{1F4DD} I noted: ${fact}. Say \`!forget ${fact}\` to remove.`);
+        } catch (e) {
+          console.warn(`[auto-learn] failed to store preference: ${e.message}`);
+        }
+      }
+
       if (result.sessionId) {
         state.sessionId = result.sessionId;
       }
