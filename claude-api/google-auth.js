@@ -71,7 +71,7 @@ const SCOPES = [
   'https://www.googleapis.com/auth/userinfo.profile',
 ];
 
-const REDIRECT_URI = process.env.GOOGLE_REDIRECT_URI || 'http://localhost:3400/auth/google/callback';
+const REDIRECT_URI = process.env.GOOGLE_REDIRECT_URI || `${process.env.BOT_PUBLIC_URL || 'http://localhost:3400'}/auth/google/callback`;
 
 function getOAuth2Client() {
   return new google.auth.OAuth2(

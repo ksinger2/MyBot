@@ -75,7 +75,7 @@ function buildOnboardingWizard(targetPhone) {
       // Calendar opt-in: send the OAuth link (cannot do OAuth in chat)
       const wantsCal = /^(yes|y|sure|ok|okay|yep|yeah|please|do it)$/i.test(data.wantsCalendar.trim());
       if (wantsCal) {
-        const baseUrl = process.env.PUBLIC_URL || 'http://localhost:3400';
+        const baseUrl = process.env.BOT_PUBLIC_URL || process.env.PUBLIC_URL || 'http://localhost:3400';
         // Get an ephemeral token so the OAuth link actually works
         let oauthUrl = `${baseUrl}/auth/google/calendar/${encodeURIComponent(phone)}`;
         try {

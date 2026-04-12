@@ -285,6 +285,30 @@ class SignalAdapter extends MessagePlatform {
     }
   }
 
+  /**
+   * Send a read receipt for a message so the sender sees the blue double-check.
+   * Best-effort — errors are swallowed because receipts are not critical.
+   */
+  async sendReadReceipt(senderIdOrUuid, timestamp) {
+    if (!senderIdOrUuid || !timestamp || !this.ready) return;
+    const recipient = this._resolveRecipient(senderIdOrUuid.replace(/^signal:/, ''));
+    // Don't send read receipts for group messages (only DMs)
+    if (this._isGroupId(recipient)) return;
+    try {
+      await this._fetch(`/v1/receipts/${encodeURIComponent(this.phoneNumber)}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          receipt_type: 'read',
+          recipient,
+          timestamp,
+        }),
+      });
+    } catch {
+      // Best-effort — read receipts are not critical
+    }
+  }
+
   async fetchChat(chatId) {
     const cached = this._chats.get(chatId);
     if (cached) return cached;

@@ -326,6 +326,64 @@ class ChannelProxy {
     });
   }
 
+  /**
+   * Create a streaming-capable Discord proxy that edits a single message
+   * as text arrives, instead of sending one message per chunk.
+   * - First chunk: sends a new message
+   * - Subsequent chunks: edits the message (debounced every 2s to avoid rate limits)
+   * - When text exceeds 1800 chars: finalizes current message, starts a new one
+   * - flush(): must be called after streaming ends to remove the trailing cursor
+   */
+  static fromDiscordStreaming(channel) {
+    let currentMsg = null;
+    let buffer = '';
+    let dirty = false;
+    let flushTimer = null;
+
+    async function doFlush(final = false) {
+      if (!buffer) return;
+      if (!dirty && !final) return;
+      dirty = false;
+      try {
+        if (currentMsg && buffer.length > 1800) {
+          // Finalize the current message with its portion of text
+          await currentMsg.edit(buffer.substring(0, 1800)).catch(() => {});
+          buffer = buffer.substring(1800);
+          currentMsg = null;
+        }
+        const display = buffer.length > 1800 ? buffer.substring(0, 1800) : buffer;
+        const text = final ? display : display + ' \u2588';
+        if (!currentMsg) {
+          currentMsg = await channel.send(text);
+        } else {
+          await currentMsg.edit(text).catch(() => {});
+        }
+      } catch (err) {
+        console.error('[discord-stream] flush error:', err.message);
+      }
+    }
+
+    const proxy = new ChannelProxy({
+      sendFn: (text) => {
+        buffer += (buffer && !buffer.endsWith('\n') ? '\n' : '') + text;
+        dirty = true;
+        if (flushTimer) clearTimeout(flushTimer);
+        flushTimer = setTimeout(() => doFlush(false), 2000);
+        return Promise.resolve();
+      },
+      typingFn: () => discordAdapter ? discordAdapter.sendTyping(channel.id) : channel.sendTyping(),
+      platform: 'discord',
+      chatId: channel.id,
+    });
+
+    proxy.flush = async () => {
+      if (flushTimer) clearTimeout(flushTimer);
+      await doFlush(true);
+    };
+
+    return proxy;
+  }
+
   /** Create a ChannelProxy for a Signal conversation */
   static fromSignal(adapter, recipientChatId) {
     return new ChannelProxy({
@@ -1055,18 +1113,15 @@ client.on('clientReady', () => {
   // All channels resume IN PARALLEL so one doesn't block the others
   if (!wasCleanShutdown && !wasRolledBack) {
     setTimeout(() => {
-      // A channel needs notification if EITHER:
-      //   (a) it had an activeTask in flight when we went down, OR
-      //   (b) it had a non-empty pendingQueue (user messages we never got to), OR
-      //   (c) it was explicitly flagged by /rebuild via wantsRestartNotification
-      // The user's complaint was that channels mid-conversation got silent
-      // restarts — case (b)/(c) ensure we always announce when there was
-      // active back-and-forth, not just an unfinished task.
+      // A channel needs notification if it had actual interrupted work:
+      //   (a) an activeTask in flight when we went down, OR
+      //   (b) a non-empty pendingQueue (user messages we never got to)
+      // Rebuild-triggered notifications were removed — too noisy for users
+      // in channels that weren't actively talking to the bot.
       const channelsToNotify = Object.entries(_savedChannelStates).filter(([, s]) => {
         if (!s) return false;
         if (s.activeTask) return true;
         if (s.pendingQueue && s.pendingQueue.length > 0) return true;
-        if (s.wantsRestartNotification) return true;
         return false;
       });
       if (channelsToNotify.length === 0) return;
@@ -1556,6 +1611,7 @@ client.on('messageCreate', async (message) => {
       messagePrompt = buildSmartPrompt(enriched) + message.content;
     }
 
+    const streamingProxy = ChannelProxy.fromDiscordStreaming(message.channel);
     const claudeOpts = {
       sessionId: state.sessionId,
       personalityFile,
@@ -1563,14 +1619,16 @@ client.on('messageCreate', async (message) => {
       cwd: state.cwd,
       channelState: state,
       discordChannel: message.channel,
+      channelProxy: streamingProxy,
       discordUserId: message.author.id,
+      streamReplies: true,
       // Sudo-style PIN gate: when BOT_UNLOCK_PIN is set, Claude starts in
       // read-only mode (can chat/search/browse but not Edit/Write/Bash) until
       // the channel is elevated via !unlock <PIN>.
       readOnly: !_isChannelElevated(message.channel.id),
     };
     try {
-      result = await runClaudeWithContinuation(messagePrompt, claudeOpts, ChannelProxy.fromDiscord(message.channel));
+      result = await runClaudeWithContinuation(messagePrompt, claudeOpts, streamingProxy);
     } catch (err) {
       if (state.sessionId) {
         console.log('Session resume failed, retrying fresh:', err.message);
@@ -1622,10 +1680,13 @@ client.on('messageCreate', async (message) => {
       saveChannelState(message.channel.id, state);
     }
 
+    // Flush the streaming proxy so the last edit lands (removes trailing cursor)
+    if (streamingProxy.flush) await streamingProxy.flush().catch(() => {});
+
     if (result.stopped) {
       // If stop was NOT initiated by the user (external kill, OOM, container restart), alert them
       if (!state._userStopped) {
-        await _dsend(message.channel, '*Process was interrupted unexpectedly ��� I stopped without finishing. Send another message to continue.*').catch(() => {});
+        await _dsend(message.channel, '*Process was interrupted unexpectedly — I stopped without finishing. Send another message to continue.*').catch(() => {});
       }
       state._userStopped = false;
     } else {
@@ -1637,7 +1698,28 @@ client.on('messageCreate', async (message) => {
         turnCount: result.numTurns || 0,
       });
 
-      await sendLongMessage(message, result.text, state.cwd);
+      // If text was streamed live, skip re-sending it. But still send any
+      // image attachments that were referenced in the response text.
+      if (result.streamed) {
+        const imagePaths = extractImageAttachments(result.text || '');
+        if (imagePaths.length > 0) {
+          const imageBuffers = [];
+          const imageNames = [];
+          for (const imgPath of imagePaths) {
+            try {
+              imageBuffers.push(fs.readFileSync(imgPath));
+              imageNames.push(path.basename(imgPath));
+            } catch {}
+          }
+          if (imageBuffers.length > 0 && discordAdapter) {
+            await discordAdapter.sendMessage(message.channel.id, '', {
+              attachments: imageBuffers, attachmentNames: imageNames,
+            }).catch(() => {});
+          }
+        }
+      } else {
+        await sendLongMessage(message, result.text, state.cwd);
+      }
 
       // Step 3: Completion summary for non-trivial tasks
       const elapsed = state.startedAt ? Math.round((Date.now() - state.startedAt) / 1000) : 0;
@@ -1780,6 +1862,10 @@ function startSignalAdapter() {
       console.log(`[signal] blocked DM from non-allowlisted sender ${_redactId(msg.senderId)}`);
       return;
     }
+
+    // Send read receipt so the sender sees blue double-check on Signal.
+    // Best-effort, fire-and-forget — don't block message handling.
+    signalAdapter.sendReadReceipt(msg.senderId, msg.timestamp).catch(() => {});
 
     // Build a synthesized text body that includes attachment file paths so
     // Claude can Read them. The user reported that images sent over Signal
@@ -2141,7 +2227,25 @@ function startSignalAdapter() {
     }
   });
 
-  signalAdapter.start().catch(err => {
+  signalAdapter.start().then(() => {
+    // Notify the owner via Signal if this was an unexpected restart (crash).
+    // Clean shutdowns (!restart) and rollbacks are excluded — only genuine
+    // crashes or container kills trigger this. Lets the user know from their
+    // phone that the bot went down and came back.
+    const cleanFile = path.join('/home/node/.claude', '.clean-shutdown');
+    const rolledBackFile = '/tmp/.rolled-back';
+    const wasClean = fs.existsSync(cleanFile);
+    const wasRolledBack = fs.existsSync(rolledBackFile);
+    if (!wasClean && !wasRolledBack) {
+      const { SIGNAL_OWNER } = require('./project-permissions');
+      if (SIGNAL_OWNER) {
+        signalAdapter.sendMessage(SIGNAL_OWNER,
+          '*Bot restarted unexpectedly (possible crash). I\u2019m back online now.*'
+        ).catch(() => {});
+        console.log('[signal] Sent crash notification to owner');
+      }
+    }
+  }).catch(err => {
     console.error(`[signal] Failed to start: ${err.message}`);
   });
 }

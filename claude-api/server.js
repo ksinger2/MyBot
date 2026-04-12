@@ -279,15 +279,46 @@ app.post('/remind', requireInternalToken, async (req, res) => {
 // which is fine — they're short-lived coordination state, not durable data).
 const _pendingGroupEvents = new Map(); // chatId → { title, datetime, end_datetime, location, description, createdAt, createdBy, attendees }
 const PENDING_EVENT_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
+const PENDING_EVENTS_FILE = path.join('/app/data', 'pending-events.json');
+
+// Load persisted pending events on startup
+try {
+  if (fs.existsSync(PENDING_EVENTS_FILE)) {
+    const saved = JSON.parse(fs.readFileSync(PENDING_EVENTS_FILE, 'utf-8'));
+    const now = Date.now();
+    for (const [chatId, ev] of Object.entries(saved)) {
+      if (now - ev.createdAt < PENDING_EVENT_TTL_MS) {
+        _pendingGroupEvents.set(chatId, ev);
+      }
+    }
+    console.log(`[events] Loaded ${_pendingGroupEvents.size} pending event(s) from disk`);
+  }
+} catch (err) {
+  console.warn(`[events] Could not load pending events: ${err.message}`);
+}
+
+function _savePendingEvents() {
+  try {
+    const obj = Object.fromEntries(_pendingGroupEvents);
+    fs.writeFileSync(PENDING_EVENTS_FILE, JSON.stringify(obj, null, 2));
+  } catch (err) {
+    console.warn(`[events] Could not save pending events: ${err.message}`);
+  }
+}
 
 // Sweep expired pending events every hour
 if (!global.__mybotPendingEventSweeper) {
   global.__mybotPendingEventSweeper = true;
   setInterval(() => {
     const now = Date.now();
+    let swept = false;
     for (const [chatId, ev] of _pendingGroupEvents.entries()) {
-      if (now - ev.createdAt > PENDING_EVENT_TTL_MS) _pendingGroupEvents.delete(chatId);
+      if (now - ev.createdAt > PENDING_EVENT_TTL_MS) {
+        _pendingGroupEvents.delete(chatId);
+        swept = true;
+      }
     }
+    if (swept) _savePendingEvents();
   }, 60 * 60 * 1000).unref();
 }
 
@@ -353,6 +384,7 @@ app.post('/event', requireInternalToken, async (req, res) => {
       createdBy: user_ids[0],
       attendees: created.map(c => c.userId),
     });
+    _savePendingEvents();
   }
 
   res.json({ created, failed, pending_stored: !!chat_id });
@@ -406,7 +438,10 @@ app.post('/event/join', requireInternalToken, async (req, res) => {
     });
 
     // Update pending event attendees list
-    if (!pending.attendees.includes(user_id)) pending.attendees.push(user_id);
+    if (!pending.attendees.includes(user_id)) {
+      pending.attendees.push(user_id);
+      _savePendingEvents();
+    }
     const tok = userTokens.getToken(user_id);
 
     res.json({
@@ -479,48 +514,11 @@ app.post('/rebuild', requireInternalToken, async (req, res) => {
     console.error('[rebuild] flushPendingWrites failed:', err.message);
   }
 
-  // 3. Mark every busy channel as needing a restart notification
-  try {
-    const bot = require('./bot');
-    const channels = bot.channels || new Map();
-    const { saveChannelState } = require('./channel-persistence');
-    let marked = 0;
-    for (const [chanId, state] of channels.entries()) {
-      if (state && (state.busy || (state.queue && state.queue.length > 0))) {
-        state.wantsRestartNotification = {
-          reason: 'rebuild',
-          at: new Date().toISOString(),
-          summary: state.activeTask?.prompt?.substring(0, 100) || null,
-        };
-        saveChannelState(chanId, state, { critical: true });
-        marked++;
-      }
-    }
-    console.log(`[rebuild] Marked ${marked} channel(s) for restart notification`);
-  } catch (err) {
-    console.error('[rebuild] could not mark channels:', err.message);
-  }
+  // 3. (Removed) Rebuild-triggered restart notifications were annoying users in
+  //    channels that weren't actively talking to the bot. Auto-resume still
+  //    notifies channels that had an activeTask or pendingQueue (crash recovery).
 
-  // 3b. Notify all active Signal chats that the bot is about to restart.
-  // Without this, Signal users see the bot go silent with no explanation.
-  try {
-    const bot = require('./bot');
-    const adapter = bot.signalAdapter;
-    const channels = bot.channels || new Map();
-    if (adapter && adapter.ready) {
-      const notified = new Set();
-      for (const [chanId, state] of channels.entries()) {
-        if (!chanId.startsWith('signal:')) continue;
-        const signalChatId = chanId.replace(/^signal:/, '');
-        if (notified.has(signalChatId)) continue;
-        notified.add(signalChatId);
-        adapter.sendMessage(signalChatId, '🔄 Rebuilding myself — back in ~30 seconds. Resend anything if I miss it.').catch(() => {});
-      }
-      console.log(`[rebuild] Sent pre-rebuild notice to ${notified.size} Signal chat(s)`);
-    }
-  } catch (err) {
-    console.error('[rebuild] signal pre-notify failed:', err.message);
-  }
+  // Pre-rebuild Signal notifications removed — too noisy for users.
 
   // L4: validate HOST_PROJECT_PATH before we commit to spawning anything.
   // Even though flipping this env var requires container access, validating

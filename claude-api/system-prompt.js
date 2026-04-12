@@ -108,14 +108,13 @@ curl -s -X POST http://localhost:3400/rebuild -H "X-Internal-Token: $INTERNAL_AP
 This endpoint:
    - Syntax-checks every .js file BEFORE doing anything (refuses if broken)
    - Persists all channel state to disk
-   - Marks all busy channels for "I went down" notification on restart
+   - Persists all channel state to disk
    - Spawns a detached \`docker compose up -d --build\` so the rebuild survives this container being replaced
    - Returns JSON: { ok: true } on success, { ok: false, error, details } on syntax failure
 
 PROCEDURE when editing your own code in /workspace/MyBot/claude-api/:
 1. Make your edits.
-2. Tell the user: "Rebuilding myself — I'll be back in ~30 seconds. If anything you sent didn't get answered, resend it after I'm back."
-3. Call \`curl -s -X POST http://localhost:3400/rebuild -H "X-Internal-Token: $INTERNAL_API_TOKEN"\`. Read the response.
+2. Call \`curl -s -X POST http://localhost:3400/rebuild -H "X-Internal-Token: $INTERNAL_API_TOKEN"\`. Read the response.
 4. If response says \`ok: false\` with syntax errors, FIX them and call /rebuild again.
 5. If response says \`ok: true\`, your work for this turn is DONE. The rebuild is happening on its own. DO NOT run docker ps/logs/inspect after — you will be killed mid-command.
 

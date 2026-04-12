@@ -7,7 +7,7 @@ module.exports = {
     const senderId = message.author?.id || message._signalSenderId;
     const { isSignalOwner: _iso4 } = require('../project-permissions');
     const targetPhone = (arg.trim() && _iso4(senderId)) ? arg.trim() : senderId;
-    const baseUrl = process.env.PUBLIC_URL || `http://localhost:3400`;
+    const baseUrl = process.env.BOT_PUBLIC_URL || process.env.PUBLIC_URL || `http://localhost:3400`;
 
     // Request an ephemeral token from the internal API so the setup URL
     // actually works (the /setup/:userId page requires ?t= to load).
