@@ -534,7 +534,10 @@ class Runner {
                 // text is excluded by the parentId routing above). F5: scrubSecrets
                 // redacts any leaked tokens. F4: serialized via _sendQueue.
                 if (streamReplies && channelProxy) {
-                  const chunk = scrubSecrets(block.text.trim());
+                  let chunk = scrubSecrets(block.text.trim());
+                  // Strip auto-learn tags from streamed output (the post-result handler
+                  // will extract them from the full result.text for storage)
+                  chunk = chunk.replace(/\[LEARNED:\s*.+?\]/gi, '').trim();
                   if (chunk.length > 0) {
                     streamedAny = true;
                     if (!channelState._sendQueue) channelState._sendQueue = Promise.resolve();
