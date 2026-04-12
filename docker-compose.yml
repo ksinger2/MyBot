@@ -34,10 +34,12 @@ services:
       # /app/data/user-tokens.json and /app/data/spotify-tokens.json. If unset,
       # tokens are stored in plaintext (dev fallback) and the modules warn.
       - TOKEN_ENCRYPTION_KEY=${TOKEN_ENCRYPTION_KEY:-}
+      # Public URL for OAuth callbacks and user-facing links
+      - BOT_PUBLIC_URL=${BOT_PUBLIC_URL:-https://mybot.backtoirl.com}
       # Google OAuth for multi-user calendar coordination
       - GOOGLE_CLIENT_ID=${GOOGLE_CLIENT_ID:-}
       - GOOGLE_CLIENT_SECRET=${GOOGLE_CLIENT_SECRET:-}
-      - GOOGLE_REDIRECT_URI=${GOOGLE_REDIRECT_URI:-}
+      - GOOGLE_REDIRECT_URI=${GOOGLE_REDIRECT_URI:-https://mybot.backtoirl.com/auth/google/callback}
       # Spotify OAuth for collaborative playlists
       - SPOTIFY_CLIENT_ID=${SPOTIFY_CLIENT_ID:-}
       - SPOTIFY_CLIENT_SECRET=${SPOTIFY_CLIENT_SECRET:-}
@@ -78,6 +80,8 @@ services:
     # tool + --dangerously-skip-permissions. `gh` CLI now authenticates via
     # GH_TOKEN (set in .env). See NextStep.md finding H3.
     #
+    ports:
+      - "3400:3400"
     # CRITICAL: these MUST use HOST_HOME (an absolute host path), NOT ${HOME}.
     # The /rebuild flow spawns a host-side `docker:27-cli` container where
     # HOME=/root, so any ${HOME} interpolation at compose-up time would

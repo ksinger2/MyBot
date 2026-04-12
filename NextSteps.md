@@ -1,5 +1,23 @@
 # MyBot — Next Steps
 
+## What Was Done (2026-04-12, evening)
+
+### Cloudflare tunnel + public OAuth
+- Exposed port 3400 in `docker-compose.yml` so the Express server is reachable from the host
+- Added `BOT_PUBLIC_URL` env var (defaults to `https://mybot.backtoirl.com`)
+- Set `GOOGLE_REDIRECT_URI` default to `https://mybot.backtoirl.com/auth/google/callback`
+- Cloudflare Tunnel (`MyBot`) routing `mybot.backtoirl.com` → `localhost:3400` — confirmed working
+
+### Discord onboarding wizard
+- `wizards/discord-onboarding.js` — auto-triggers for new Discord users without a profile
+- Collects name, location, and optionally connects Google Calendar
+- Silent mode (no "Step X/Y" prefixes) so it feels like a normal conversation
+
+### Persistent !unlock elevation (24h TTL)
+- `!unlock` PIN gate now persists to `/app/data/elevated-channels.json` across rebuilds
+- Elevations auto-expire after 24 hours (lazy expiry on check + discard on startup)
+- Uses existing `atomicWriteJsonSync` pattern for crash-safe writes
+
 ## What Was Done (2026-04-12)
 
 ### Per-project Signal permissions
@@ -26,8 +44,10 @@
 ## Known Issues / To Do
 - Group members can't self-onboard from group chat — they must DM the bot directly to run `!setup`
 - Signal group calendar coordination (`/event` endpoint) needs real-world testing
+- Cloudflare Tunnel runs as a host process — consider adding as a docker-compose sidecar for resilience
 
 ## Priorities
-1. Test `!listen on` in Family Assisted group — state key bug fixed, should work now
-2. Test `!permit` flow for granting access to a project
-3. Monitor for any edge cases with the `error_max_turns` continuation
+1. Test Google Calendar OAuth end-to-end via `mybot.backtoirl.com`
+2. Test Discord onboarding wizard with a new user
+3. Test `!listen on` in Family Assisted group — state key bug fixed, should work now
+4. Test `!permit` flow for granting access to a project

@@ -22,7 +22,7 @@ try { ({ startSocialPlanWizard, processSocialPlanStep } = require('./wizards/soc
 let spotifyAuth;
 try { spotifyAuth = require('./spotify-auth'); } catch {}
 const { Runner } = require('./runner');
-const { sweepOrphanTmpFiles } = require('./atomic-write');
+const { sweepOrphanTmpFiles, atomicWriteJsonSync } = require('./atomic-write');
 const { extractImageAttachments } = require('./adapters/base');
 const { DiscordAdapter } = require('./adapters/discord');
 const { loadCommands } = require('./commands');
@@ -82,11 +82,39 @@ function _redactId(id) {
 // When BOT_UNLOCK_PIN is unset, the gate is disabled (everyone gets full access
 // as before, subject to the existing owner/allowlist checks).
 const BOT_UNLOCK_PIN = process.env.BOT_UNLOCK_PIN || '';
-const _elevatedChannels = new Set();
+const ELEVATED_FILE = path.join('/app/data', 'elevated-channels.json');
+const ELEVATION_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
+
+// Load persisted elevations from disk, discarding expired entries
+const _elevatedChannels = new Map();
+try {
+  const raw = JSON.parse(fs.readFileSync(ELEVATED_FILE, 'utf8'));
+  const now = Date.now();
+  for (const [chId, ts] of Object.entries(raw)) {
+    if (now - ts < ELEVATION_TTL_MS) _elevatedChannels.set(chId, ts);
+  }
+  console.log(`[unlock] Loaded ${_elevatedChannels.size} persisted elevation(s) from disk`);
+} catch {}
+
+function _persistElevated() {
+  try {
+    atomicWriteJsonSync(ELEVATED_FILE, Object.fromEntries(_elevatedChannels));
+  } catch (err) {
+    console.warn(`[unlock] Failed to persist elevations: ${err.message}`);
+  }
+}
 
 function _isChannelElevated(channelId) {
   if (!BOT_UNLOCK_PIN) return true; // gate disabled → always elevated
-  return _elevatedChannels.has(channelId);
+  const ts = _elevatedChannels.get(channelId);
+  if (!ts) return false;
+  if (Date.now() - ts >= ELEVATION_TTL_MS) {
+    _elevatedChannels.delete(channelId);
+    _persistElevated();
+    console.log(`[unlock] Channel ${channelId} elevation expired (24h)`);
+    return false;
+  }
+  return true;
 }
 
 function _tryUnlock(channelId, suppliedPin) {
@@ -97,8 +125,9 @@ function _tryUnlock(channelId, suppliedPin) {
   const b = Buffer.from(suppliedPin);
   if (a.length !== b.length) return false;
   if (!crypto.timingSafeEqual(a, b)) return false;
-  _elevatedChannels.add(channelId);
-  console.log(`[unlock] Channel ${channelId} elevated to full write access`);
+  _elevatedChannels.set(channelId, Date.now());
+  _persistElevated();
+  console.log(`[unlock] Channel ${channelId} elevated to full write access (expires in 24h)`);
   return true;
 }
 
@@ -1444,6 +1473,21 @@ client.on('messageCreate', async (message) => {
 
   // Ignore empty messages (e.g. stickers, attachments with no text)
   if (!message.content.trim()) return;
+
+  // Auto-onboard Discord users who haven't set up a profile yet
+  if (!message.content.startsWith('!') && !state.wizard) {
+    const { getProfile: _gpDiscord } = require('./user-profiles');
+    const discordProfile = _gpDiscord(message.author.id);
+    if (!discordProfile?.setup_complete) {
+      const { buildDiscordOnboardingWizard } = require('./wizards/discord-onboarding');
+      try {
+        await startWizard(state, message, buildDiscordOnboardingWizard());
+      } catch (err) {
+        console.warn(`[discord] onboarding wizard kickoff failed: ${err.message}`);
+      }
+      return;
+    }
+  }
 
   // F10: Deterministic greeting fast-path for Discord too
   const discordText = message.content.trim();
