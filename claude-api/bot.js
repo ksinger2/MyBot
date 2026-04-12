@@ -69,34 +69,36 @@ function _redactId(id) {
   return id;
 }
 
-// ── !unlock PIN gate — bot-level 2FA ────────────────────────────────────────
-// When BOT_UNLOCK_PIN is set in the environment, every channel starts LOCKED.
-// The user must send `!unlock <PIN>` before the bot activates for that channel.
-// This protects against compromised Discord accounts or Signal phone numbers —
-// even if an attacker has the user's platform credentials, they also need the
-// PIN. State is per-channel, per-boot (resets on container restart).
+// ── !unlock PIN gate — sudo-style elevation for file mutations ──────────────
+// When BOT_UNLOCK_PIN is set, every channel starts in READ-ONLY mode: Claude
+// can chat, search the web, access calendars, parse videos, teach, answer
+// questions — but cannot Edit/Write/Bash (file-mutating tools are blocked via
+// the --allowedTools flag). Users send `!unlock <PIN>` to elevate the channel
+// to full write access for the session.
 //
-// The PIN is compared using crypto.timingSafeEqual to prevent timing attacks.
-// When BOT_UNLOCK_PIN is unset, the gate is disabled and everything works
-// as before (no unlock required).
+// This is NOT a login gate — the bot responds to everyone normally. The PIN
+// only gates destructive filesystem operations. Think `sudo`, not login.
+//
+// When BOT_UNLOCK_PIN is unset, the gate is disabled (everyone gets full access
+// as before, subject to the existing owner/allowlist checks).
 const BOT_UNLOCK_PIN = process.env.BOT_UNLOCK_PIN || '';
-const _unlockedChannels = new Set();
+const _elevatedChannels = new Set();
 
-function _isChannelLocked(channelId) {
-  if (!BOT_UNLOCK_PIN) return false; // gate disabled
-  return !_unlockedChannels.has(channelId);
+function _isChannelElevated(channelId) {
+  if (!BOT_UNLOCK_PIN) return true; // gate disabled → always elevated
+  return _elevatedChannels.has(channelId);
 }
 
 function _tryUnlock(channelId, suppliedPin) {
-  if (!BOT_UNLOCK_PIN) return true; // gate disabled
+  if (!BOT_UNLOCK_PIN) return true;
   if (typeof suppliedPin !== 'string' || suppliedPin.length === 0) return false;
   const crypto = require('crypto');
   const a = Buffer.from(BOT_UNLOCK_PIN);
   const b = Buffer.from(suppliedPin);
   if (a.length !== b.length) return false;
   if (!crypto.timingSafeEqual(a, b)) return false;
-  _unlockedChannels.add(channelId);
-  console.log(`[unlock] Channel ${channelId} unlocked`);
+  _elevatedChannels.add(channelId);
+  console.log(`[unlock] Channel ${channelId} elevated to full write access`);
   return true;
 }
 
@@ -845,6 +847,8 @@ function buildCommandCtx() {
     TOOL_LABELS,
     // Access control
     isAdmin, isAllowed,
+    // F23 adapter helpers
+    _dsend, _dreply, _dtyping,
   };
 }
 
@@ -936,7 +940,7 @@ client.on('clientReady', () => {
   console.log(`Workspace: ${DEFAULT_WORKSPACE}`);
   console.log(`Max turns: ${DEFAULT_MAX_TURNS} | Timeout: ${MAX_TIMEOUT / 60000}min`);
   if (BOT_UNLOCK_PIN) {
-    console.log('[security] !unlock PIN gate is ACTIVE — every channel starts locked. Send !unlock <PIN> to activate.');
+    console.log('[security] !unlock PIN gate is ACTIVE — channels start read-only (chat/search/browse OK, file edits blocked). Send !unlock <PIN> to elevate.');
   } else {
     console.log('[security] !unlock PIN gate is disabled (BOT_UNLOCK_PIN not set).');
   }
@@ -1351,23 +1355,6 @@ client.on('messageCreate', async (message) => {
   // Access control — reject unauthorized users
   if (!isAllowed(message.author.id)) return;
 
-  // !unlock PIN gate — must be checked before guild-mention filter so
-  // `!unlock` works in guild channels without an @mention.
-  if (_isChannelLocked(message.channel.id)) {
-    if (message.content.startsWith('!unlock ')) {
-      const pin = message.content.slice(8).trim();
-      if (_tryUnlock(message.channel.id, pin)) {
-        await message.reply('🔓 Unlocked — I\'m ready to work.');
-      } else {
-        await message.reply('🔒 Wrong PIN.');
-      }
-      return;
-    }
-    // Don't respond at all to non-unlock messages when locked — be silent
-    // so the bot's existence isn't obvious to someone who doesn't have the PIN.
-    return;
-  }
-
   // In guild channels, only respond when @mentioned (or a ! command)
   const isGuild = !!message.guild;
   const isMentioned = message.mentions.has(client.user);
@@ -1529,6 +1516,10 @@ client.on('messageCreate', async (message) => {
       channelState: state,
       discordChannel: message.channel,
       discordUserId: message.author.id,
+      // Sudo-style PIN gate: when BOT_UNLOCK_PIN is set, Claude starts in
+      // read-only mode (can chat/search/browse but not Edit/Write/Bash) until
+      // the channel is elevated via !unlock <PIN>.
+      readOnly: !_isChannelElevated(message.channel.id),
     };
     try {
       result = await runClaudeWithContinuation(messagePrompt, claudeOpts, ChannelProxy.fromDiscord(message.channel));
@@ -1732,24 +1723,6 @@ function startSignalAdapter() {
       return;
     }
 
-    // !unlock PIN gate for Signal — same logic as Discord.
-    // Uses the signal:chatId as the channel key so DMs and groups unlock independently.
-    const signalChannelKey = `signal:${msg.chatId}`;
-    if (_isChannelLocked(signalChannelKey)) {
-      const rawText = (msg.text || '').trim();
-      if (rawText.startsWith('!unlock ')) {
-        const pin = rawText.slice(8).trim();
-        if (_tryUnlock(signalChannelKey, pin)) {
-          await signalAdapter.sendMessage(msg.chatId, '🔓 Unlocked — I\'m ready to work.');
-        } else {
-          await signalAdapter.sendMessage(msg.chatId, '🔒 Wrong PIN.');
-        }
-        return;
-      }
-      // Silent when locked — don't reveal the bot is active
-      return;
-    }
-
     // Build a synthesized text body that includes attachment file paths so
     // Claude can Read them. The user reported that images sent over Signal
     // were silently dropped — this is the fix: we hand Claude the local
@@ -1932,7 +1905,9 @@ function startSignalAdapter() {
         channelState: state,
         channelProxy: signalProxy,
         discordUserId: msg.senderId,
-        readOnly: !senderIsOwner,
+        // Read-only if: (a) not the owner (existing rule), OR (b) PIN gate is
+        // set and this channel hasn't been elevated via !unlock.
+        readOnly: !senderIsOwner || !_isChannelElevated(chatId),
         profileContext: combinedProfileContext,
         // Stream each text block straight to Signal as it arrives instead of
         // waiting for the whole run to complete. Massively improves perceived
@@ -2051,4 +2026,4 @@ function start() {
   startSignalAdapter();
 }
 
-module.exports = { start, askClaude, runClaudeWithContinuation, client, getChannelState, getPersonalityFile, sendLongMessage, freshProgress, channels, signalAdapter, discordAdapter };
+module.exports = { start, askClaude, runClaudeWithContinuation, client, getChannelState, getPersonalityFile, sendLongMessage, freshProgress, channels, signalAdapter, discordAdapter, _tryUnlock, _isChannelElevated };
