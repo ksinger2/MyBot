@@ -13,6 +13,10 @@ const spotifyTokens = require('./spotify-tokens');
 const STATE_TTL_MS = 15 * 60 * 1000; // 15 minutes
 const _stateMap = new Map();
 
+// F3/F14: hard-cap _stateMap at 1000 entries. Evict oldest (FIFO) on overflow.
+const _STATE_MAP_CAP = 1000;
+let _stateMapLastEvictWarn = 0;
+
 function _putState(userId) {
   const stateToken = crypto.randomBytes(24).toString('hex');
   _stateMap.set(stateToken, {
@@ -20,6 +24,19 @@ function _putState(userId) {
     provider: 'spotify',
     expiresAt: Date.now() + STATE_TTL_MS,
   });
+  // F3/F14: enforce cap
+  if (_stateMap.size > _STATE_MAP_CAP) {
+    const excess = _stateMap.size - _STATE_MAP_CAP;
+    const iter = _stateMap.keys();
+    for (let i = 0; i < excess; i++) {
+      _stateMap.delete(iter.next().value);
+    }
+    const now = Date.now();
+    if (now - _stateMapLastEvictWarn > 60000) {
+      _stateMapLastEvictWarn = now;
+      console.warn(`[spotify-auth] _stateMap overflow — evicted ${excess} oldest entries (cap: ${_STATE_MAP_CAP})`);
+    }
+  }
   return stateToken;
 }
 
