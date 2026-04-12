@@ -24,11 +24,10 @@
 - Group chats capped at 5 turns
 
 ## Known Issues / To Do
-- Verify `!listen on` actually works end-to-end after the state key fix (needs Signal group test)
 - Group members can't self-onboard from group chat — they must DM the bot directly to run `!setup`
 - Signal group calendar coordination (`/event` endpoint) needs real-world testing
 
 ## Priorities
-1. Confirm `!listen on` fix works in the Family Assisted group
+1. Test `!listen on` in Family Assisted group — state key bug fixed, should work now
 2. Test `!permit` flow for granting access to a project
 3. Monitor for any edge cases with the `error_max_turns` continuation
