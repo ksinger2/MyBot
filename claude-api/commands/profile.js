@@ -4,8 +4,16 @@ module.exports = {
   adminOnly: false,
   description: 'View or set user profile',
   async run(message, arg, state, ctx) {
-    const { getProfile: _gp, setProfile: _sp, getAllProfiles: _gap } = require('../user-profiles');
+    const { getProfile: _gp, setProfile: _sp, getAllProfiles: _gap, getUserData } = require('../user-profiles');
     const senderId = message.author?.id || message._signalSenderId;
+    const phone = message._signalSenderId || null;
+
+    // Discord users — no profile system
+    if (!phone) {
+      await message.reply('Profiles are Signal-only. DM me on Signal to set up your profile!');
+      return;
+    }
+
     const { isSignalOwner: _iso3 } = require('../project-permissions');
     const parts = arg.trim().split(/\s+/);
 
@@ -40,13 +48,22 @@ module.exports = {
       _sp(targetPhone, { [field]: value });
       await message.reply(`Profile updated: ${field} = ${value}`);
     } else {
-      const p = _gp(targetPhone);
-      if (!p) { await message.reply('No profile yet. Use `!setup` to create one.'); return; }
-      const lines = [`**Profile for ${targetPhone}:**`];
-      if (p.name)     lines.push(`Name: ${p.name}`);
-      if (p.location) lines.push(`Location: ${p.location}`);
-      if (p.timezone) lines.push(`Timezone: ${p.timezone}`);
-      lines.push(`Google Calendar: ${p.gcal_connected ? `${p.gcal_email} ✓` : 'not connected'}`);
+      const data = getUserData(targetPhone);
+      if (!data) { await message.reply('No profile found. Send me a message on Signal to start onboarding!'); return; }
+      const lines = [];
+      lines.push('**Your Profile**');
+      lines.push(`Name: ${data.name || '(not set)'}`);
+      lines.push(`Location: ${data.location || '(not set)'}`);
+      lines.push(`Timezone: ${data.timezone || '(not set)'}`);
+      lines.push(`Calendar: ${data.gcal_connected ? `connected (${data.gcal_email})` : 'not connected'}`);
+      if (data.preferences && data.preferences.length > 0) {
+        lines.push(`\n**Preferences** (${data.preferences.length}):`);
+        data.preferences.forEach((p, i) => {
+          lines.push(`  ${i + 1}. ${p.fact} (${p.source}, ${new Date(p.learnedAt).toLocaleDateString()})`);
+        });
+      } else {
+        lines.push('\nNo preferences stored yet. I\'ll learn about you as we chat!');
+      }
       await message.reply(lines.join('\n'));
     }
   }
