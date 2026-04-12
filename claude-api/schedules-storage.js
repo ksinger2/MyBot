@@ -63,4 +63,27 @@ function formatScheduleList(schedules) {
   }).join('\n');
 }
 
-module.exports = { loadSchedules, addSchedule, removeSchedule, getUserSchedules, formatScheduleList };
+function updateSchedule(id, userId, fields) {
+  const store = readStore();
+  const sched = store.schedules.find(s => s.id === id && s.userId === userId);
+  if (!sched) return null;
+  const allowed = ['message', 'cronRule', 'description', 'active', 'timezone'];
+  for (const key of allowed) {
+    if (key in fields) sched[key] = fields[key];
+  }
+  sched.updatedAt = new Date().toISOString();
+  writeStore(store);
+  return sched;
+}
+
+function toggleSchedule(id, userId) {
+  const store = readStore();
+  const sched = store.schedules.find(s => s.id === id && s.userId === userId);
+  if (!sched) return null;
+  sched.active = !sched.active;
+  sched.updatedAt = new Date().toISOString();
+  writeStore(store);
+  return sched;
+}
+
+module.exports = { loadSchedules, addSchedule, removeSchedule, getUserSchedules, formatScheduleList, updateSchedule, toggleSchedule };

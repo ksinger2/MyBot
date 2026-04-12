@@ -27,6 +27,65 @@ function registerJob(sched, client) {
   const job = schedule.scheduleJob(
     { rule: sched.cronRule, tz: sched.timezone },
     async () => {
+      // Guard: check schedule is still active (may have been toggled off)
+      const { getUserSchedules } = require('./schedules-storage');
+      const current = getUserSchedules(sched.userId).find(s => s.id === sched.id);
+      if (current && !current.active) return;
+
+      if (sched.type === 'dm-task') {
+        // Run prompt through Claude, send result to user's DM
+        const isSignal = sched.userId.startsWith('+');
+        try {
+          const { askClaude, signalAdapter } = require('./bot');
+          const { buildProfileContext } = require('./user-profiles');
+          const profileContext = buildProfileContext(sched.userId);
+          console.log(`[dm-task] Running job #${sched.id} "${sched.description}" for ${isSignal ? 'Signal' : 'Discord'} user`);
+
+          const result = await askClaude(sched.message, {
+            cwd: '/app',
+            maxTurns: 10,
+            profileContext,
+          });
+
+          if (!result.text) {
+            console.log(`[dm-task] Job #${sched.id} returned no text`);
+            return;
+          }
+
+          if (isSignal) {
+            if (signalAdapter && signalAdapter.ready) {
+              await signalAdapter.sendLongMessage(sched.userId, result.text);
+              console.log(`[dm-task] Job #${sched.id} sent to Signal DM`);
+            } else {
+              console.warn(`[dm-task] Job #${sched.id} — Signal adapter not ready, skipping`);
+            }
+          } else {
+            const user = await client.users.fetch(sched.userId).catch(() => null);
+            if (user) {
+              const dm = await user.createDM().catch(() => null);
+              if (dm) {
+                // Chunk for Discord 2000-char limit
+                const text = result.text;
+                if (text.length <= 1900) {
+                  await dm.send(text);
+                } else {
+                  let remaining = text;
+                  while (remaining.length > 0) {
+                    const splitAt = remaining.length <= 1900 ? remaining.length : (remaining.lastIndexOf('\n', 1900) > 500 ? remaining.lastIndexOf('\n', 1900) : 1900);
+                    await dm.send(remaining.substring(0, splitAt));
+                    remaining = remaining.substring(splitAt);
+                  }
+                }
+                console.log(`[dm-task] Job #${sched.id} sent to Discord DM`);
+              }
+            }
+          }
+        } catch (err) {
+          console.error(`[dm-task] Job #${sched.id} failed: ${err.message}`);
+        }
+        return;
+      }
+
       if (sched.type === 'task') {
         // Autonomous task execution
         const channel = await client.channels.fetch(sched.channelId).catch(() => null);

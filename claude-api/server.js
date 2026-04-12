@@ -769,95 +769,270 @@ app.get('/setup/:userId', (req, res) => {
   // Build preferences list HTML
   const prefs = profile.preferences || [];
   const prefsHtml = prefs.length > 0
-    ? prefs.map((p, i) => `<div class="pref" id="pref-${i}"><span>${escapeHtml(p.fact)}</span><span class="pref-meta">${escapeHtml(p.source || '')}${p.learnedAt ? ' · ' + new Date(p.learnedAt).toLocaleDateString() : ''}</span><button type="button" class="remove-btn" onclick="removePref(${i},'${escapeHtml(p.fact.replace(/'/g, "\\'"))}')">×</button></div>`).join('')
-    : '<p class="empty">No saved preferences yet. The bot learns these from your conversations.</p>';
+    ? prefs.map((p, i) => `<div class="pref" id="pref-${i}"><span>${escapeHtml(p.fact)}</span><span class="pref-meta">${escapeHtml(p.source || '')}${p.learnedAt ? ' \u00b7 ' + new Date(p.learnedAt).toLocaleDateString() : ''}</span><button type="button" class="remove-btn" onclick="removePref(${i},'${escapeHtml(p.fact.replace(/'/g, "\\'"))}')">×</button></div>`).join('')
+    : '<p class="empty-msg">No preferences yet — I learn these from our chats.</p>';
+
+  // Build tags HTML
+  const tags = profile.tags || [];
+  const tagsHtml = tags.map((t, i) => `<span class="tag-pill" id="tag-${i}"><span class="tag-cat">${escapeHtml(t.category)}</span>${escapeHtml(t.label)}<button type="button" onclick="removeTag(${i},'${escapeHtml(t.label.replace(/'/g, "\\'"))}')">\u00d7</button></span>`).join('');
+
+  // Build jobs HTML
+  const { getUserSchedules } = require('./schedules-storage');
+  const userJobs = getUserSchedules(userId).filter(s => s.type === 'dm-task');
+  const jobsHtml = userJobs.map(j => `<div class="job-card" id="job-${j.id}">
+    <div class="job-header"><span class="job-name">${escapeHtml(j.description)}</span>
+    <label class="toggle"><input type="checkbox" ${j.active ? 'checked' : ''} onchange="toggleJob(${j.id})"><span class="toggle-track"><span class="toggle-thumb"></span></span></label></div>
+    <p class="job-prompt">${escapeHtml((j.message || '').substring(0, 120))}${j.message && j.message.length > 120 ? '...' : ''}</p>
+    <p class="job-schedule">${escapeHtml(j.description)} \u00b7 <code>${escapeHtml(j.cronRule)}</code></p>
+    <div class="job-actions"><button onclick="editJob(${j.id})">Edit</button><button class="btn-danger" onclick="deleteJob(${j.id})">Delete</button></div>
+  </div>`).join('');
 
   res.send(`<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
-  <title>Bot Setup</title>
+  <title>Profile Setup</title>
   <style>
-    body { font-family: -apple-system, sans-serif; max-width: 480px; margin: 40px auto; padding: 0 20px; background: #f5f5f5; }
-    h1 { font-size: 24px; margin-bottom: 4px; }
-    .sub { color: #666; margin-bottom: 32px; font-size: 14px; }
-    label { display: block; font-weight: 600; margin: 16px 0 4px; }
-    input, select { width: 100%; padding: 10px; border: 1px solid #ccc; border-radius: 6px; font-size: 16px; box-sizing: border-box; }
-    button[type="submit"] { margin-top: 20px; width: 100%; background: #222; color: #fff; border: none; padding: 14px; border-radius: 6px; font-size: 16px; cursor: pointer; }
-    .section { background: #fff; border-radius: 10px; padding: 20px; margin-bottom: 20px; box-shadow: 0 1px 3px rgba(0,0,0,.1); }
-    .section-title { font-weight: 600; font-size: 16px; margin-bottom: 12px; }
-    .success { color: #4caf50; font-weight: bold; }
-    .pref { display: flex; align-items: center; gap: 8px; padding: 10px 0; border-bottom: 1px solid #eee; }
-    .pref:last-child { border-bottom: none; }
-    .pref span:first-child { flex: 1; font-size: 15px; }
-    .pref-meta { color: #999; font-size: 12px; white-space: nowrap; }
-    .remove-btn { background: none; border: 1px solid #ddd; color: #999; width: 28px; height: 28px; border-radius: 50%; cursor: pointer; font-size: 16px; line-height: 1; padding: 0; flex-shrink: 0; }
-    .remove-btn:hover { background: #fee; color: #c00; border-color: #c00; }
-    .empty { color: #999; font-size: 14px; font-style: italic; }
-    .updated { color: #999; font-size: 12px; margin-top: 8px; }
+    *{box-sizing:border-box;margin:0;padding:0;}
+    body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#f0f2f5;color:#1a1a2e;min-height:100vh;}
+    .header{background:linear-gradient(135deg,#1a1a2e 0%,#2d2b55 100%);color:#fff;padding:32px 20px 28px;text-align:center;}
+    .header h1{font-size:26px;font-weight:700;margin-bottom:4px;}
+    .header p{opacity:.7;font-size:14px;}
+    .container{max-width:480px;margin:0 auto;padding:16px 16px 40px;}
+    .card{background:#fff;border-radius:14px;padding:22px;margin-bottom:16px;border:1px solid rgba(0,0,0,.06);box-shadow:0 2px 8px rgba(0,0,0,.04);}
+    .card-title{font-size:16px;font-weight:700;margin-bottom:4px;color:#1a1a2e;}
+    .card-desc{font-size:13px;color:#666;margin-bottom:16px;line-height:1.4;}
+    label{display:block;font-size:13px;font-weight:600;color:#444;margin:14px 0 5px;letter-spacing:.3px;text-transform:uppercase;}
+    input[type="text"],select,textarea{width:100%;padding:12px 14px;border:1.5px solid #ddd;border-radius:10px;font-size:15px;background:#fafafa;transition:border-color .2s,box-shadow .2s;font-family:inherit;-webkit-appearance:none;}
+    input:focus,select:focus,textarea:focus{outline:none;border-color:#6c63ff;box-shadow:0 0 0 3px rgba(108,99,255,.12);background:#fff;}
+    textarea{resize:vertical;min-height:72px;}
+    .btn{display:inline-flex;align-items:center;justify-content:center;width:100%;padding:14px;border:none;border-radius:10px;font-size:15px;font-weight:600;cursor:pointer;transition:all .15s;-webkit-tap-highlight-color:transparent;}
+    .btn:active{transform:scale(.98);}
+    .btn-primary{background:linear-gradient(135deg,#6c63ff,#5a52d5);color:#fff;}
+    .btn-primary:hover{box-shadow:0 4px 12px rgba(108,99,255,.3);}
+    .btn-secondary{background:#f0f2f5;color:#444;border:1.5px solid #ddd;}
+    .btn-add{background:#f0eeff;color:#6c63ff;border:1.5px dashed #c4bfff;margin-top:12px;}
+    .btn-add:hover{background:#e8e4ff;}
+    .btn-danger{background:none;color:#e53935;border:1px solid #ffcdd2;font-size:13px;padding:6px 14px;border-radius:8px;width:auto;}
+    .pref{display:flex;align-items:center;gap:8px;padding:10px 0;border-bottom:1px solid #f0f2f5;}
+    .pref:last-child{border-bottom:none;}
+    .pref span:first-child{flex:1;font-size:14px;line-height:1.4;}
+    .pref-meta{color:#aaa;font-size:11px;white-space:nowrap;}
+    .remove-btn{background:none;border:none;color:#ccc;width:28px;height:28px;border-radius:50%;cursor:pointer;font-size:18px;display:flex;align-items:center;justify-content:center;flex-shrink:0;transition:all .15s;}
+    .remove-btn:hover{background:#fef2f2;color:#e53935;}
+    .empty-msg{color:#999;font-size:14px;font-style:italic;padding:8px 0;}
+    .tag-pills{display:flex;flex-wrap:wrap;gap:8px;margin-top:8px;}
+    .tag-pill{display:inline-flex;align-items:center;gap:4px;background:#f0eeff;color:#4a3f8f;border-radius:20px;padding:6px 10px 6px 12px;font-size:13px;font-weight:500;transition:all .2s;}
+    .tag-pill .tag-cat{font-size:10px;color:#8a7fc0;margin-right:2px;text-transform:uppercase;letter-spacing:.5px;}
+    .tag-pill button{background:none;border:none;color:#a89ee0;cursor:pointer;font-size:15px;padding:0 2px;line-height:1;}
+    .tag-pill button:hover{color:#e53935;}
+    .suggestions{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:12px;}
+    .chip{display:inline-flex;align-items:center;padding:7px 14px;background:#f8f7ff;border:1.5px solid #e0ddf5;border-radius:20px;font-size:13px;color:#6c63ff;cursor:pointer;transition:all .15s;font-weight:500;}
+    .chip:hover{background:#ede9ff;border-color:#c4bfff;}
+    .tag-input-row{display:flex;gap:8px;margin-top:8px;}
+    .tag-input-row input{flex:1;}
+    .tag-input-row .btn{width:48px;flex-shrink:0;font-size:20px;padding:0;}
+    .job-card{background:#f8f7ff;border:1px solid #e8e6f0;border-radius:12px;padding:16px;margin-bottom:12px;}
+    .job-header{display:flex;align-items:center;justify-content:space-between;margin-bottom:8px;}
+    .job-name{font-weight:600;font-size:15px;color:#1a1a2e;}
+    .job-prompt{font-size:13px;color:#666;line-height:1.4;margin-bottom:6px;}
+    .job-schedule{font-size:12px;color:#999;}
+    .job-schedule code{background:#f0f2f5;padding:2px 6px;border-radius:4px;font-size:11px;}
+    .job-actions{display:flex;gap:8px;margin-top:10px;}
+    .job-actions button{background:#f0f2f5;border:1px solid #ddd;color:#444;padding:6px 14px;border-radius:8px;font-size:13px;cursor:pointer;transition:all .15s;}
+    .job-actions button:hover{background:#e8e6f0;}
+    .job-form{margin-top:12px;padding-top:12px;border-top:1px solid #eee;}
+    .form-row{display:flex;gap:8px;margin-top:12px;}
+    .form-row .btn{width:auto;flex:1;}
+    .input-hint{font-size:12px;color:#999;margin-top:4px;}
+    .toggle{position:relative;display:inline-block;cursor:pointer;}
+    .toggle input{position:absolute;opacity:0;width:0;height:0;}
+    .toggle-track{display:block;width:44px;height:24px;background:#ddd;border-radius:12px;transition:background .2s;position:relative;}
+    .toggle input:checked+.toggle-track{background:#6c63ff;}
+    .toggle-thumb{position:absolute;top:2px;left:2px;width:20px;height:20px;background:#fff;border-radius:50%;transition:transform .2s;box-shadow:0 1px 3px rgba(0,0,0,.2);}
+    .toggle input:checked+.toggle-track .toggle-thumb{transform:translateX(20px);}
+    .gcal-btn{display:inline-flex;align-items:center;gap:8px;background:#fff;color:#444;border:1.5px solid #ddd;padding:12px 20px;border-radius:10px;text-decoration:none;font-size:15px;font-weight:500;transition:all .15s;}
+    .gcal-btn:hover{border-color:#4285f4;color:#4285f4;box-shadow:0 2px 8px rgba(66,133,244,.15);}
+    .gcal-connected{display:flex;align-items:center;gap:8px;color:#2e7d32;font-weight:600;font-size:14px;margin-bottom:8px;}
+    @keyframes fadeIn{from{opacity:0;transform:translateY(8px);}to{opacity:1;transform:none;}}
+    .card{animation:fadeIn .3s ease;}
   </style>
 </head>
 <body>
-  <h1>${profile.name ? 'Edit Your Profile' : 'Set Up Your Profile'}</h1>
-  <p class="sub">${escapeHtml(userId)}</p>
+  <div class="header">
+    <h1>${profile.name ? escapeHtml(profile.name) + '\u2019s Profile' : 'Set Up Your Profile'}</h1>
+    <p>${escapeHtml(userId)}</p>
+  </div>
+  <div class="container">
 
-  <div class="section">
+  <div class="card">
+    <div class="card-title">Profile</div>
     <form method="POST" action="/setup/${encodeURIComponent(userId)}?t=${encodeURIComponent(setupToken)}">
       <input type="hidden" name="_csrf" value="${escapeHtml(csrfToken)}">
-      <input type="hidden" name="_t" value="${escapeHtml(setupToken)}">
-      <label for="name">Your Name</label>
+      <label for="name">Name</label>
       <input type="text" id="name" name="name" value="${escapeHtml(profile.name || '')}" placeholder="e.g. Mike" required>
-
-      <label for="location">Your City / Location</label>
+      <label for="location">Location</label>
       <input type="text" id="location" name="location" value="${escapeHtml(profile.location || '')}" placeholder="e.g. Austin, TX" required>
-
       <label for="timezone">Timezone</label>
       <select id="timezone" name="timezone">
-        ${[
-          'America/New_York','America/Chicago','America/Denver','America/Los_Angeles',
-          'America/Phoenix','America/Anchorage','Pacific/Honolulu',
-          'Europe/London','Europe/Paris','Europe/Berlin','Asia/Tokyo','Asia/Seoul','Australia/Sydney'
-        ].map(tz => `<option value="${escapeHtml(tz)}"${profile.timezone === tz ? ' selected' : ''}>${escapeHtml(tz.replace('_',' '))}</option>`).join('')}
+        ${['America/New_York','America/Chicago','America/Denver','America/Los_Angeles','America/Phoenix','America/Anchorage','Pacific/Honolulu','Europe/London','Europe/Paris','Europe/Berlin','Asia/Tokyo','Asia/Seoul','Australia/Sydney'
+        ].map(tz => `<option value="${escapeHtml(tz)}"${profile.timezone === tz ? ' selected' : ''}>${escapeHtml(tz.replace(/_/g,' '))}</option>`).join('')}
       </select>
-
-      <button type="submit">Save Profile</button>
+      <button type="submit" class="btn btn-primary" style="margin-top:18px;">Save Profile</button>
     </form>
-    ${profile.updatedAt ? `<p class="updated">Last updated: ${new Date(profile.updatedAt).toLocaleDateString()}</p>` : ''}
+    ${profile.updatedAt ? `<p style="color:#999;font-size:12px;margin-top:8px;text-align:center;">Last updated ${new Date(profile.updatedAt).toLocaleDateString()}</p>` : ''}
   </div>
 
-  <div class="section">
-    <div class="section-title">What I Know About You</div>
-    <p style="color:#666;font-size:13px;margin:0 0 12px;">Learned from our conversations. Tap × to remove any.</p>
+  <div class="card">
+    <div class="card-title">Tags</div>
+    <p class="card-desc">Add tags so I can personalize things for you.</p>
+    <div class="suggestions">
+      <span class="chip" onclick="showTagInput('Favorite Sports Team','e.g. 49ers')">+ Sports Team</span>
+      <span class="chip" onclick="showTagInput('Dietary Restriction','e.g. Vegetarian')">+ Diet</span>
+      <span class="chip" onclick="showTagInput('Favorite Cuisine','e.g. Thai')">+ Cuisine</span>
+      <span class="chip" onclick="showTagInput('Hobby','e.g. Rock climbing')">+ Hobby</span>
+      <span class="chip" onclick="showTagInput('Music','e.g. R&amp;B')">+ Music</span>
+      <span class="chip" onclick="showTagInput('Custom','Anything you want')">+ Custom</span>
+    </div>
+    <div id="tag-input-area" style="display:none;">
+      <label id="tag-label">Tag</label>
+      <div class="tag-input-row">
+        <input type="text" id="tag-input" placeholder="Type here...">
+        <button class="btn btn-primary" onclick="addTag()" style="font-size:22px;">+</button>
+      </div>
+    </div>
+    <div class="tag-pills" id="tags-list">${tagsHtml || '<p class="empty-msg">No tags yet.</p>'}</div>
+  </div>
+
+  <div class="card">
+    <div class="card-title">What I Know About You</div>
+    <p class="card-desc">Learned from our conversations. Tap \u00d7 to remove any.</p>
     <div id="prefs-list">${prefsHtml}</div>
   </div>
 
-  <div class="section">
-    <div class="section-title">Google Calendar</div>
-    <p style="color:#666;font-size:14px;margin:4px 0 16px;">Connect so the bot can check your calendar and coordinate events with friends.</p>
-    ${calConnected}
-    ${googleBtn}
+  <div class="card">
+    <div class="card-title">Scheduled Jobs</div>
+    <p class="card-desc">Recurring tasks that run on a schedule and send results to your DM.</p>
+    <div id="jobs-list">${jobsHtml || ''}</div>
+    <div id="job-form" style="display:none;" class="job-form">
+      <input type="hidden" id="job-edit-id" value="">
+      <label for="job-name">Job Name</label>
+      <input type="text" id="job-name" placeholder="e.g. Morning Briefing">
+      <label for="job-prompt">What should I do?</label>
+      <textarea id="job-prompt" placeholder="e.g. Give me the latest AI news and developments"></textarea>
+      <label for="job-freq">Schedule</label>
+      <input type="text" id="job-freq" placeholder="e.g. daily at 8am">
+      <p class="input-hint">Examples: daily at 9am, weekdays at 8:30am, monday at 10am, every 3 hours</p>
+      <div class="form-row">
+        <button class="btn btn-primary" onclick="saveJob()">Save Job</button>
+        <button class="btn btn-secondary" onclick="cancelJobForm()">Cancel</button>
+      </div>
+    </div>
+    <button class="btn btn-add" id="add-job-btn" onclick="showJobForm()">+ Add Job</button>
+    <div style="margin-top:12px;">
+      <p class="card-desc" style="margin-bottom:8px;">Quick templates:</p>
+      <div class="suggestions">
+        <span class="chip" onclick="prefillJob('Morning Briefing','Give me a morning briefing: top news, weather for my area, and anything on my calendar today.','daily at 8am')">Morning Briefing</span>
+        <span class="chip" onclick="prefillJob('AI Pulse','What are the latest AI news and developments from the last few hours? Give me a concise bullet-point summary.','daily at 10am')">AI Pulse</span>
+        <span class="chip" onclick="prefillJob('Weekly Meal Plan','Suggest a weekly meal plan based on my dietary preferences and favorite cuisines. Include a grocery list.','monday at 9am')">Weekly Meal Plan</span>
+      </div>
+    </div>
   </div>
 
-  <script>
-    async function removePref(idx, fact) {
-      if (!confirm('Remove "' + fact + '"?')) return;
-      try {
-        const res = await fetch('/setup/${encodeURIComponent(userId)}/remove-preference', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ fact: fact, _csrf: '${escapeHtml(csrfToken)}' }),
-        });
-        if (res.ok) {
-          const el = document.getElementById('pref-' + idx);
-          if (el) el.remove();
-          if (!document.querySelector('.pref')) {
-            document.getElementById('prefs-list').innerHTML = '<p class="empty">No saved preferences.</p>';
-          }
-        }
-      } catch {}
+  <div class="card">
+    <div class="card-title">Google Calendar</div>
+    <p class="card-desc">Connect so I can check your calendar and coordinate events with friends.</p>
+    ${profile.gcal_connected ? `<div class="gcal-connected"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="20 6 9 17 4 12"/></svg> Connected (${escapeHtml(profile.gcal_email)})</div>` : ''}
+    ${googleConfigured ? `<a href="/auth/google/calendar/${encodeURIComponent(userId)}?t=${encodeURIComponent(gcalToken)}" class="gcal-btn"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#4285f4" stroke-width="2"><rect x="3" y="4" width="18" height="18" rx="2" ry="2"/><line x1="16" y1="2" x2="16" y2="6"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="3" y1="10" x2="21" y2="10"/></svg>${profile.gcal_connected ? 'Reconnect' : 'Connect Google Calendar'}</a>` : '<p class="empty-msg">Google Calendar not configured on this server.</p>'}
+  </div>
+
+  </div>
+<script>
+const CSRF='${escapeHtml(csrfToken)}';
+const UID='${encodeURIComponent(userId)}';
+let _tagCat='Custom';
+
+function showTagInput(cat,ph){
+  _tagCat=cat;
+  document.getElementById('tag-label').textContent=cat;
+  document.getElementById('tag-input').placeholder=ph;
+  document.getElementById('tag-input').value='';
+  document.getElementById('tag-input-area').style.display='block';
+  document.getElementById('tag-input').focus();
+}
+document.addEventListener('keydown',e=>{if(e.key==='Enter'&&document.activeElement.id==='tag-input')addTag();});
+
+async function addTag(){
+  const inp=document.getElementById('tag-input');
+  const label=inp.value.trim();
+  if(!label)return;
+  const res=await fetch('/setup/'+UID+'/add-tag',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({label,category:_tagCat,_csrf:CSRF})});
+  if(res.ok){
+    const d=await res.json();
+    if(d.ok&&d.tag){
+      const list=document.getElementById('tags-list');
+      if(list.querySelector('.empty-msg'))list.innerHTML='';
+      const idx=list.children.length;
+      const s=document.createElement('span');s.className='tag-pill';s.id='tag-'+idx;
+      s.innerHTML='<span class="tag-cat">'+esc(d.tag.category)+'</span>'+esc(d.tag.label)+'<button onclick="removeTag('+idx+',\\''+esc(d.tag.label)+'\\')">\\u00d7</button>';
+      list.appendChild(s);
+      inp.value='';
     }
-  </script>
+  }
+}
+
+async function removeTag(idx,label){
+  const res=await fetch('/setup/'+UID+'/remove-tag',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({label,_csrf:CSRF})});
+  if(res.ok){const el=document.getElementById('tag-'+idx);if(el)el.remove();}
+}
+
+async function removePref(idx,fact){
+  if(!confirm('Remove "'+fact+'"?'))return;
+  const res=await fetch('/setup/'+UID+'/remove-preference',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({fact,_csrf:CSRF})});
+  if(res.ok){const el=document.getElementById('pref-'+idx);if(el)el.remove();if(!document.querySelector('.pref'))document.getElementById('prefs-list').innerHTML='<p class="empty-msg">No preferences.</p>';}
+}
+
+function showJobForm(){document.getElementById('job-form').style.display='block';document.getElementById('add-job-btn').style.display='none';document.getElementById('job-edit-id').value='';document.getElementById('job-name').value='';document.getElementById('job-prompt').value='';document.getElementById('job-freq').value='';document.getElementById('job-name').focus();}
+function cancelJobForm(){document.getElementById('job-form').style.display='none';document.getElementById('add-job-btn').style.display='block';}
+
+function prefillJob(name,prompt,freq){showJobForm();document.getElementById('job-name').value=name;document.getElementById('job-prompt').value=prompt;document.getElementById('job-freq').value=freq;}
+
+async function saveJob(){
+  const id=document.getElementById('job-edit-id').value;
+  const name=document.getElementById('job-name').value.trim();
+  const prompt=document.getElementById('job-prompt').value.trim();
+  const freq=document.getElementById('job-freq').value.trim();
+  if(!name||!prompt||!freq){alert('Fill in all fields.');return;}
+  const url=id?'/setup/'+UID+'/jobs/'+id:'/setup/'+UID+'/jobs';
+  const method=id?'PUT':'POST';
+  const res=await fetch(url,{method,headers:{'Content-Type':'application/json'},body:JSON.stringify({name,prompt,frequency:freq,_csrf:CSRF})});
+  const d=await res.json();
+  if(!res.ok){alert(d.error||'Failed');return;}
+  cancelJobForm();location.reload();
+}
+
+async function toggleJob(id){
+  await fetch('/setup/'+UID+'/jobs/'+id+'/toggle',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({_csrf:CSRF})});
+}
+
+function editJob(id){
+  const card=document.getElementById('job-'+id);if(!card)return;
+  showJobForm();
+  document.getElementById('job-edit-id').value=id;
+  document.getElementById('job-name').value=card.querySelector('.job-name')?.textContent||'';
+  document.getElementById('job-prompt').value=card.querySelector('.job-prompt')?.textContent||'';
+  document.getElementById('job-freq').value='';
+}
+
+async function deleteJob(id){
+  if(!confirm('Delete this job?'))return;
+  const res=await fetch('/setup/'+UID+'/jobs/'+id,{method:'DELETE',headers:{'Content-Type':'application/json'},body:JSON.stringify({_csrf:CSRF})});
+  if(res.ok){const el=document.getElementById('job-'+id);if(el)el.remove();}
+}
+
+function esc(s){const d=document.createElement('div');d.textContent=s;return d.innerHTML;}
+</script>
 </body>
 </html>`);
 });
@@ -937,6 +1112,131 @@ app.post('/setup/:userId/remove-preference', express.json(), (req, res) => {
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
+});
+
+// ── Tag endpoints ──
+
+function _verifyCsrf(userId, csrf) {
+  const entry = _setupCsrfTokens.get(userId);
+  return entry && csrf && safeTokenEqual(entry.token, csrf) && entry.expiresAt > Date.now();
+}
+
+app.post('/setup/:userId/add-tag', express.json(), (req, res) => {
+  const userId = decodeURIComponent(req.params.userId);
+  const { label, category, _csrf } = req.body || {};
+  if (!label) return res.status(400).json({ error: 'label required' });
+  if (!_verifyCsrf(userId, _csrf)) return res.status(403).json({ error: 'invalid csrf' });
+  try {
+    const { addTag } = require('./user-profiles');
+    const tag = addTag(userId, label, category || 'Custom');
+    if (!tag) return res.status(409).json({ error: 'duplicate or limit reached' });
+    res.json({ ok: true, tag });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.post('/setup/:userId/remove-tag', express.json(), (req, res) => {
+  const userId = decodeURIComponent(req.params.userId);
+  const { label, _csrf } = req.body || {};
+  if (!label) return res.status(400).json({ error: 'label required' });
+  if (!_verifyCsrf(userId, _csrf)) return res.status(403).json({ error: 'invalid csrf' });
+  try {
+    const { removeTag } = require('./user-profiles');
+    const removed = removeTag(userId, label);
+    res.json({ ok: true, removed });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// ── Job endpoints (scheduled DM tasks) ──
+
+app.post('/setup/:userId/jobs', express.json(), (req, res) => {
+  const userId = decodeURIComponent(req.params.userId);
+  const { name, prompt, frequency, _csrf } = req.body || {};
+  if (!name || !prompt || !frequency) return res.status(400).json({ error: 'name, prompt, and frequency required' });
+  if (!_verifyCsrf(userId, _csrf)) return res.status(403).json({ error: 'invalid csrf' });
+
+  const { parseFrequency } = require('./parse-frequency');
+  const parsed = parseFrequency(frequency);
+  if (!parsed) return res.status(400).json({ error: 'Could not parse schedule. Try: "daily at 9am", "weekdays at 8:30am", "every 3 hours"' });
+
+  let tz = 'America/Los_Angeles';
+  try { const p = require('./user-profiles').getProfile(userId); if (p?.timezone) tz = p.timezone; } catch {}
+
+  const { addSchedule } = require('./schedules-storage');
+  const sched = addSchedule({ userId, channelId: null, message: prompt, cronRule: parsed.cron, description: name, type: 'dm-task', cwd: null, timezone: tz });
+
+  // Activate immediately
+  try {
+    const { registerJob } = require('./scheduler');
+    const { client } = require('./bot');
+    registerJob(sched, client);
+  } catch (err) { console.warn(`[jobs] Could not register job #${sched.id}: ${err.message}`); }
+
+  res.json({ ok: true, job: sched });
+});
+
+app.put('/setup/:userId/jobs/:jobId', express.json(), (req, res) => {
+  const userId = decodeURIComponent(req.params.userId);
+  const jobId = parseInt(req.params.jobId, 10);
+  const { name, prompt, frequency, _csrf } = req.body || {};
+  if (!_verifyCsrf(userId, _csrf)) return res.status(403).json({ error: 'invalid csrf' });
+
+  const fields = {};
+  if (name) fields.description = name;
+  if (prompt) fields.message = prompt;
+  if (frequency) {
+    const { parseFrequency } = require('./parse-frequency');
+    const parsed = parseFrequency(frequency);
+    if (!parsed) return res.status(400).json({ error: 'Could not parse schedule.' });
+    fields.cronRule = parsed.cron;
+  }
+
+  const { updateSchedule } = require('./schedules-storage');
+  const sched = updateSchedule(jobId, userId, fields);
+  if (!sched) return res.status(404).json({ error: 'Job not found' });
+
+  // Re-register cron
+  try {
+    const { cancelJob, registerJob } = require('./scheduler');
+    const { client } = require('./bot');
+    cancelJob(jobId);
+    if (sched.active) registerJob(sched, client);
+  } catch {}
+
+  res.json({ ok: true, job: sched });
+});
+
+app.delete('/setup/:userId/jobs/:jobId', express.json(), (req, res) => {
+  const userId = decodeURIComponent(req.params.userId);
+  const jobId = parseInt(req.params.jobId, 10);
+  const { _csrf } = req.body || {};
+  if (!_verifyCsrf(userId, _csrf)) return res.status(403).json({ error: 'invalid csrf' });
+
+  const { removeSchedule } = require('./schedules-storage');
+  const removed = removeSchedule(jobId, userId);
+  if (!removed) return res.status(404).json({ error: 'Job not found' });
+
+  try { const { cancelJob } = require('./scheduler'); cancelJob(jobId); } catch {}
+  res.json({ ok: true });
+});
+
+app.post('/setup/:userId/jobs/:jobId/toggle', express.json(), (req, res) => {
+  const userId = decodeURIComponent(req.params.userId);
+  const jobId = parseInt(req.params.jobId, 10);
+  const { _csrf } = req.body || {};
+  if (!_verifyCsrf(userId, _csrf)) return res.status(403).json({ error: 'invalid csrf' });
+
+  const { toggleSchedule } = require('./schedules-storage');
+  const sched = toggleSchedule(jobId, userId);
+  if (!sched) return res.status(404).json({ error: 'Job not found' });
+
+  try {
+    const { cancelJob, registerJob } = require('./scheduler');
+    const { client } = require('./bot');
+    if (sched.active) registerJob(sched, client);
+    else cancelJob(jobId);
+  } catch {}
+
+  res.json({ ok: true, active: sched.active });
 });
 
 // Google Calendar OAuth — phone-number-aware (works for Signal users)

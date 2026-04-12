@@ -220,8 +220,45 @@ function getUserData(phone) {
       source: p.source,
       learnedAt: p.learnedAt,
     })),
+    tags: (profile.tags || []).map(t => ({
+      label: t.label,
+      category: t.category,
+      addedAt: t.addedAt,
+    })),
     setup_complete: !!profile.setup_complete,
   };
+}
+
+// ── Tags helpers ──
+
+/** Add a tag (user-curated identity label). Caps at 30 per user, deduplicates by label. */
+function addTag(phone, label, category = 'Custom') {
+  let profile = getProfile(phone);
+  if (!profile) {
+    setProfile(phone, {});
+    profile = getProfile(phone) || {};
+  }
+  if (!profile.tags) profile.tags = [];
+  const normalizedLabel = label.trim().substring(0, 100);
+  if (!normalizedLabel) return null;
+  // Dedup by label (case-insensitive)
+  if (profile.tags.some(t => t.label.toLowerCase() === normalizedLabel.toLowerCase())) return null;
+  if (profile.tags.length >= 30) return null;
+  const tag = { label: normalizedLabel, category: category.trim().substring(0, 50), addedAt: new Date().toISOString() };
+  profile.tags.push(tag);
+  setProfile(phone, profile);
+  return tag;
+}
+
+/** Remove a tag by exact label match. Returns count removed. */
+function removeTag(phone, label) {
+  const profile = getProfile(phone);
+  if (!profile || !profile.tags) return 0;
+  const before = profile.tags.length;
+  profile.tags = profile.tags.filter(t => t.label !== label);
+  const removed = before - profile.tags.length;
+  if (removed > 0) setProfile(phone, profile);
+  return removed;
 }
 
 // ── System-prompt builder ──
@@ -244,6 +281,10 @@ function buildProfileContext(phoneNumber) {
   } else {
     lines.push(`- Google Calendar: not connected`);
   }
+  if (profile.tags && profile.tags.length > 0) {
+    const tagStr = profile.tags.map(t => t.category !== 'Custom' ? `${t.label} (${t.category})` : t.label).join(', ');
+    lines.push(`- Tags: ${tagStr}`);
+  }
   if (profile.preferences && profile.preferences.length > 0) {
     const facts = profile.preferences.map(p => p.fact).join(', ');
     lines.push(`- Preferences: ${facts}`);
@@ -265,6 +306,8 @@ module.exports = {
   addPreference,
   removePreference,
   clearPreferences,
+  addTag,
+  removeTag,
   deleteUser,
   getUserData,
 };
