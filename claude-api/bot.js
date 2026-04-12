@@ -1882,6 +1882,7 @@ function startSignalAdapter() {
     }, 8000);
 
     try {
+      state._isGroupChat = isGroupMessage; // used by commands (e.g. !btw) to suppress in groups
       state.activeTask = {
         prompt: text.substring(0, 500),
         channelId: chatId,
@@ -1981,7 +1982,7 @@ function startSignalAdapter() {
         groupAllowedTools: isGroupChat ? 'Read,WebSearch,WebFetch,Bash,Task,TodoWrite' : undefined,
         profileContext: (combinedProfileContext || '') + groupOnboardHint + pendingEventContext + (isGroupChat ? `\n\nCHAT_ID: ${msg.chatId}\nSENDER_ID: ${msg.senderId}` : ''),
         streamReplies: true,
-        maxTurns: isGroupChat ? 5 : (senderIsOwner ? (parseInt(process.env.SIGNAL_OWNER_MAX_TURNS, 10) || 200) : undefined),
+        maxTurns: isGroupChat ? 3 : (senderIsOwner ? (parseInt(process.env.SIGNAL_OWNER_MAX_TURNS, 10) || 200) : undefined),
       };
 
       // Auto-detect social/location links — pre-fetch metadata and build action prompt.

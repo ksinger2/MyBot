@@ -4,6 +4,10 @@ module.exports = {
   adminOnly: false,
   description: 'Peek at progress while Claude is working',
   async run(message, arg, state, ctx) {
+    // !btw is an engineering tool — not useful in Signal group chats
+    if (message._signalChatId && state._isGroupChat) {
+      return; // silently ignore in groups
+    }
     if (!state.busy && !state.process) {
       await message.reply('Nothing running right now.');
       return;
