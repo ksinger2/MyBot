@@ -501,6 +501,27 @@ app.post('/rebuild', requireInternalToken, async (req, res) => {
     console.error('[rebuild] could not mark channels:', err.message);
   }
 
+  // 3b. Notify all active Signal chats that the bot is about to restart.
+  // Without this, Signal users see the bot go silent with no explanation.
+  try {
+    const bot = require('./bot');
+    const adapter = bot.signalAdapter;
+    const channels = bot.channels || new Map();
+    if (adapter && adapter.ready) {
+      const notified = new Set();
+      for (const [chanId, state] of channels.entries()) {
+        if (!chanId.startsWith('signal:')) continue;
+        const signalChatId = chanId.replace(/^signal:/, '');
+        if (notified.has(signalChatId)) continue;
+        notified.add(signalChatId);
+        adapter.sendMessage(signalChatId, '🔄 Rebuilding myself — back in ~30 seconds. Resend anything if I miss it.').catch(() => {});
+      }
+      console.log(`[rebuild] Sent pre-rebuild notice to ${notified.size} Signal chat(s)`);
+    }
+  } catch (err) {
+    console.error('[rebuild] signal pre-notify failed:', err.message);
+  }
+
   // L4: validate HOST_PROJECT_PATH before we commit to spawning anything.
   // Even though flipping this env var requires container access, validating
   // here is cheap defense-in-depth — it blocks accidental misconfiguration

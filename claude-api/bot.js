@@ -1778,8 +1778,8 @@ function startSignalAdapter() {
     // against both forms (the adapter's own number, and its UUID if known).
     if (isGroupMessage && !text.startsWith('!')) {
       // Check per-chat listenToAll toggle — if on, skip the mention check
-      const chatState = getChannel(msg.chatId);
-      if (!chatState.listenToAll) {
+      // NOTE: use the same prefixed key used for all Signal state (signal:${chatId})
+      if (!state.listenToAll) {
         const mentionList = (msg.mentions && msg.mentions.length > 0)
           ? msg.mentions
           : (msg.raw?.envelope?.dataMessage?.mentions || []);
@@ -1846,10 +1846,11 @@ function startSignalAdapter() {
       }
     }
 
-    // Handle commands (same !command syntax)
-    if (text.startsWith('!')) {
-      // Create a minimal message-like object for handleCommand
-      const fakeMessage = createSignalMessageProxy(msg, chatId, state);
+    // Handle commands (same !command syntax).
+    // Also handle "@BotName !command" — strip the @mention prefix first.
+    const cmdText = text.replace(/^@\S+\s+/, '').trim();
+    if (cmdText.startsWith('!')) {
+      const fakeMessage = createSignalMessageProxy({ ...msg, text: cmdText }, chatId, state);
       const handled = await handleCommand(fakeMessage);
       if (handled) return;
     }
@@ -1964,7 +1965,7 @@ function startSignalAdapter() {
         groupAllowedTools: isGroupChat ? 'Read,WebSearch,WebFetch,Bash,Task,TodoWrite' : undefined,
         profileContext: (combinedProfileContext || '') + groupOnboardHint + pendingEventContext + (isGroupChat ? `\n\nCHAT_ID: ${msg.chatId}\nSENDER_ID: ${msg.senderId}` : ''),
         streamReplies: true,
-        maxTurns: isGroupChat ? 5 : undefined,
+        maxTurns: isGroupChat ? 5 : (senderIsOwner ? (parseInt(process.env.SIGNAL_OWNER_MAX_TURNS, 10) || 200) : undefined),
       };
 
       // Auto-detect social/location links — pre-fetch metadata and build action prompt.

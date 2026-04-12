@@ -341,6 +341,7 @@ class Runner {
 
       // Stream-json result accumulators
       let resultText = null;
+      let resultSubtype = null;
       let resultSessionId = null;
       let resultCost = null;
       let resultNumTurns = 0;
@@ -378,10 +379,11 @@ class Runner {
             // Final result event
             if (event.type === 'result') {
               resultText = event.result || '';
+              resultSubtype = event.subtype || null;
               resultSessionId = event.session_id || resultSessionId;
               resultCost = event.total_cost_usd != null ? event.total_cost_usd : resultCost;
               resultNumTurns = event.num_turns != null ? event.num_turns : resultNumTurns;
-              console.log(`[result] turns=${resultNumTurns} cost=$${resultCost} text_len=${(resultText || '').length} text=${JSON.stringify((resultText || '').substring(0, 300))}`);
+              console.log(`[result] subtype=${resultSubtype} turns=${resultNumTurns} cost=$${resultCost} text_len=${(resultText || '').length} text=${JSON.stringify((resultText || '').substring(0, 300))}`);
               continue;
             }
 
@@ -701,6 +703,20 @@ class Runner {
         }
 
         if (code !== 0) {
+          // error_max_turns: CLI exits 1 with empty text — treat as graceful turn limit,
+          // not a crash. This lets runClaudeWithContinuation auto-continue as normal.
+          if (resultSubtype === 'error_max_turns') {
+            console.log(`[exit-recovery] error_max_turns after ${resultNumTurns} turns — resolving as hitTurnLimit`);
+            return resolve({
+              text: resultText || '',
+              sessionId: resultSessionId,
+              cost: resultCost,
+              numTurns: resultNumTurns,
+              hitTurnLimit: true,
+              stopped: false,
+              streamed: streamedAny,
+            });
+          }
           console.error(`[exit-error] code=${code} stderr:`, stderr.substring(0, 1000));
           const hasValidResult = resultText && resultText.length > 10;
           if (hasValidResult) {
