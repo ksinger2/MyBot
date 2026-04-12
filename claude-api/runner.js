@@ -197,6 +197,7 @@ class Runner {
     this.channelProxy = channelProxy;
     this.discordUserId = discordUserId;
     this.readOnly = readOnly;
+    this.groupAllowedTools = groupAllowedTools;
     this.profileContext = profileContext;
     this.streamReplies = streamReplies;
     // Use injected functions or local fallbacks
@@ -210,7 +211,7 @@ class Runner {
       const {
         prompt, sessionId, personalityFile, identity, cwd, maxTurns,
         channelState, channelProxy, discordUserId, readOnly,
-        profileContext, streamReplies,
+        groupAllowedTools, profileContext, streamReplies,
       } = this;
 
       // Auto-inject .claude/commands/ into project if missing
