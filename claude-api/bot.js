@@ -1717,9 +1717,15 @@ function startSignalAdapter() {
     // Access control — SECURITY (H1): fail-closed. Owner is ALWAYS allowed
     // (even if SIGNAL_ALLOWED_NUMBERS is empty), otherwise must be explicitly
     // listed. Group messages are allowed if the sender is in the allowlist.
-    const senderAllowed = isSignalOwner(msg.senderId) || allowedNumbers.has(msg.senderId);
+    // Access control: owner is always allowed. For non-owners:
+    // - GROUP messages: always allowed (if you're in the group, you're trusted)
+    // - DM messages: must be in SIGNAL_ALLOWED_NUMBERS (fail-closed for strangers)
+    // This lets group members interact with the bot without being individually
+    // allowlisted, while still blocking random DMs from unknown numbers.
+    const isGroupMessage = msg.chatId !== msg.senderId;
+    const senderAllowed = isSignalOwner(msg.senderId) || isGroupMessage || allowedNumbers.has(msg.senderId);
     if (!senderAllowed) {
-      console.log(`[signal] blocked message from non-allowlisted sender ${_redactId(msg.senderId)}`);
+      console.log(`[signal] blocked DM from non-allowlisted sender ${_redactId(msg.senderId)}`);
       return;
     }
 
@@ -1757,7 +1763,7 @@ function startSignalAdapter() {
     // multi-step wizards over a group chat are confusing for everyone else.
     // Owner is skipped (already known). Group members get profile-less
     // responses until they DM the bot directly to onboard.
-    const isGroupMessage = msg.chatId !== msg.senderId;
+    // (isGroupMessage already declared above in the access control block)
 
     // In Signal group chats, only respond when the bot is @mentioned or it's a !command.
     // Mirrors the Discord guild behaviour (line ~3341). !commands bypass this so group
@@ -1876,7 +1882,7 @@ function startSignalAdapter() {
       // messages, also list all OTHER known members of the group so the bot
       // can answer things like "plan for us" using everyone's calendars.
       let combinedProfileContext = buildProfileContext(msg.senderId);
-      const isGroupMessage = msg.chatId !== msg.senderId; // group ID differs from sender
+      // (isGroupMessage already declared above in the access control block)
       if (isGroupMessage) {
         try {
           const groupInfo = await signalAdapter._fetch(`/v1/groups/${encodeURIComponent(signalAdapter.phoneNumber)}/${encodeURIComponent(signalAdapter._toPublicGroupId(msg.chatId))}`);
