@@ -18,6 +18,18 @@
 const { spawn } = require('child_process');
 const fs = require('fs');
 const path = require('path');
+
+// F5: Output scrubber — redacts secrets that might leak via prompt injection
+// or accidental echoing. Applied to every streamed text block and final result.
+function scrubSecrets(text) {
+  if (typeof text !== 'string') return text;
+  return text
+    .replace(/X-Internal-Token:\s*[\w-]{10,}/gi, 'X-Internal-Token: [REDACTED]')
+    .replace(/Bearer\s+[\w\-.]{20,}/gi, 'Bearer [REDACTED]')
+    .replace(/sk-[A-Za-z0-9_\-]{20,}/g, 'sk-[REDACTED]')
+    .replace(/ghp_[A-Za-z0-9]{20,}/g, 'ghp_[REDACTED]')
+    .replace(/github_pat_[A-Za-z0-9_]{20,}/g, 'github_pat_[REDACTED]');
+}
 const { buildSystemPrompt } = require('./system-prompt');
 const { init: initErrorAlerting, sendErrorAlert } = require('./error-alerting');
 const { appendEntry, getJournalContext } = require('./session-journal');
@@ -253,7 +265,7 @@ class Runner {
           '--allowedTools',
           [
             'Read', 'Grep', 'Glob', 'LS',
-            'WebSearch', 'WebFetch', 'TodoWrite', 'Task',
+            'WebSearch', 'TodoWrite', 'Task', // F7: WebFetch removed — exfil chain with prompt injection
           ].join(',')
         );
       }
@@ -287,6 +299,12 @@ class Runner {
           PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH: process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH || '',
           LANG: process.env.LANG || 'en_US.UTF-8',
           TERM: process.env.TERM || 'xterm-256color',
+          // F1: passed as env var so Claude's Bash tool can expand $INTERNAL_API_TOKEN
+          // in curl examples without the literal value leaking into the system prompt.
+          INTERNAL_API_TOKEN: process.env.INTERNAL_API_TOKEN || '',
+          // F6: owner is trusted; gh capability is documented. Risk: prompt-injection
+          // could exfiltrate via Bash — mitigated by scrubSecrets (F5).
+          GH_TOKEN: process.env.GH_TOKEN || '',
         },
         stdio: ['ignore', 'pipe', 'pipe'],
       });
@@ -308,6 +326,7 @@ class Runner {
       let resultCost = null;
       let resultNumTurns = 0;
       let accumulatedText = '';
+      const subagentText = new Map(); // F11: per-agent text buckets so sub-agent text doesn't bleed into parent's result
       let stdoutBuf = '';
       let stderr = '';
       let currentToolInput = '';
@@ -492,22 +511,33 @@ class Runner {
               channelState.progress.toolDetail = '';
 
             } else if (block.type === 'text' && block.text) {
-              accumulatedText += block.text;
+              // F11: route text to the right bucket — parent vs sub-agent
+              if (parentId) {
+                const existing = subagentText.get(parentId) || '';
+                subagentText.set(parentId, existing + block.text);
+              } else {
+                accumulatedText += block.text;
 
-              // Streaming: push each text block live (parent agent only)
-              if (streamReplies && channelProxy && !agentLabel) {
-                const chunk = block.text.trim();
-                if (chunk.length > 0) {
-                  streamedAny = true;
-                  channelProxy.send(chunk).catch(err => {
-                    console.error('[stream] partial send error:', err.message);
-                  });
+                // Streaming: push each text block live (parent only — sub-agent
+                // text is excluded by the parentId routing above). F5: scrubSecrets
+                // redacts any leaked tokens. F4: serialized via _sendQueue.
+                if (streamReplies && channelProxy) {
+                  const chunk = scrubSecrets(block.text.trim());
+                  if (chunk.length > 0) {
+                    streamedAny = true;
+                    if (!channelState._sendQueue) channelState._sendQueue = Promise.resolve();
+                    channelState._sendQueue = channelState._sendQueue
+                      .then(() => channelProxy.send(chunk))
+                      .catch(err => console.error('[stream] partial send error:', err.message));
+                  }
                 }
               }
 
-              // Flush completed lines for !btw display
-              const textLines = accumulatedText.split('\n');
-              accumulatedText = textLines.pop();
+              // Flush completed lines for !btw display (both parent and sub-agent)
+              const textBucket = parentId ? (subagentText.get(parentId) || '') : accumulatedText;
+              const textLines = textBucket.split('\n');
+              const remainder = textLines.pop();
+              if (parentId) { subagentText.set(parentId, remainder); } else { accumulatedText = remainder; }
               for (const tl of textLines) {
                 const trimmed = tl.trim();
                 if (trimmed.length > 5) {
@@ -654,7 +684,7 @@ class Runner {
           if (hasValidResult) {
             console.log(`[exit-recovery] CLI exited ${code} but has valid result (${resultText.length} chars, $${resultCost}) — using it`);
             return resolve({
-              text: resultText,
+              text: scrubSecrets(resultText),
               sessionId: resultSessionId,
               cost: resultCost,
               numTurns: resultNumTurns,
@@ -669,7 +699,7 @@ class Runner {
         }
 
         resolve({
-          text: resultText || accumulatedText || '',
+          text: scrubSecrets(resultText || accumulatedText || ''),
           sessionId: resultSessionId,
           cost: resultCost,
           numTurns: resultNumTurns,

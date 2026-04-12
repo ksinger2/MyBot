@@ -22,6 +22,29 @@ try { ({ startSocialPlanWizard, processSocialPlanStep } = require('./wizards/soc
 let spotifyAuth;
 try { spotifyAuth = require('./spotify-auth'); } catch {}
 const { Runner } = require('./runner');
+const { sweepOrphanTmpFiles } = require('./atomic-write');
+const { extractImageAttachments } = require('./adapters/base');
+
+// F10: Deterministic greeting fast-path — replies without invoking Claude.
+// 100% reliable, $0, ~50ms. The system prompt rule stays as a backstop.
+const GREETING_RE = /^[\s\p{Emoji}]*(h(i|ey|ello|ola)|yo+|sup|what'?s\s*up|good\s*(morning|evening|afternoon|night)|gm|thanks?|thank\s*you|thx|ty|ok(ay)?|cool|nice|got\s*it|bet|lol|lmao|haha)\s*[!?.]*\s*$/iu;
+const GREETING_RESPONSES = {
+  tiffany_pollard: ["hey boo! 💅", "hiii 😘", "what's good! 💕", "heyyy 💋", "sup girl!", "heyy! ✨"],
+  april_ludgate: ["hey", "sup", "hi i guess", "what", "hey."],
+  _default: ["Hey! What's up?", "Hi there!", "Hey, what can I help with?", "Hey! 👋"],
+};
+function _pickGreetingResponse(personality) {
+  const pool = GREETING_RESPONSES[personality] || GREETING_RESPONSES._default;
+  return pool[Math.floor(Math.random() * pool.length)];
+}
+
+// F15: PII redaction for log output (duplicated from adapters/signal.js to avoid circular dep)
+function _redactId(id) {
+  if (typeof id !== 'string') return id;
+  if (id.startsWith('+')) return id.slice(0, 2) + '****' + id.slice(-2);
+  if (id.length >= 12) return id.slice(0, 4) + '...' + id.slice(-4);
+  return id;
+}
 
 // Access control — comma-separated Discord user IDs.
 // SECURITY: fail-closed. Empty set = deny all (NOT allow all as it used to).
@@ -520,19 +543,7 @@ async function runClaudeWithContinuation(prompt, opts, channelProxy) {
   return { ...result, cost: totalCost, numTurns: totalTurns, streamed: anyStreamed };
 }
 
-function extractImageAttachments(text) {
-  // Match absolute or relative file paths ending in image extensions
-  const imageRegex = /(?:^|\s|["'`(])((\/[^\s"'`()]+|[^\s"'`()]+)\.(?:png|jpg|jpeg|gif|webp))/gim;
-  const found = new Set();
-  let match;
-  while ((match = imageRegex.exec(text)) !== null) {
-    const p = match[1].trim();
-    // Only attach images from safe directories (prevent exfiltrating arbitrary files)
-    const resolved = path.resolve(p);
-    if ((resolved.startsWith('/workspace') || resolved.startsWith('/tmp')) && fs.existsSync(resolved)) found.add(resolved);
-  }
-  return [...found].slice(0, 10); // Discord max 10 attachments
-}
+// extractImageAttachments imported from adapters/base.js (F8/F22)
 
 async function sendLongMessage(message, text, cwd = DEFAULT_WORKSPACE) {
   if (!text || text.length === 0) {
@@ -2389,6 +2400,13 @@ process.on('uncaughtException', (err) => {
 });
 
 client.on('clientReady', () => {
+  // F16: sweep orphaned .tmp files from previous crash before reading stores
+  try { sweepOrphanTmpFiles(['/app/data', '/home/node/.claude']); } catch {}
+
+  // F17: boot warnings for hardcoded fallbacks
+  if (!process.env.HOST_HOME) console.warn('[security] WARNING: HOST_HOME not set in .env — falling back to hardcoded default /home/karen. Set HOST_HOME in .env if your home directory differs.');
+  if (!process.env.SIGNAL_OWNER_NUMBER) console.warn('[security] WARNING: SIGNAL_OWNER_NUMBER not set in .env — falling back to hardcoded default. Set SIGNAL_OWNER_NUMBER in .env.');
+
   console.log(`Discord bot logged in as ${client.user.tag}`);
   console.log(`Bot is in ${client.guilds.cache.size} server(s)`);
   client.guilds.cache.forEach(g => console.log(` - ${g.name} (${g.id})`));
@@ -2892,6 +2910,14 @@ client.on('messageCreate', async (message) => {
   // Ignore empty messages (e.g. stickers, attachments with no text)
   if (!message.content.trim()) return;
 
+  // F10: Deterministic greeting fast-path for Discord too
+  const discordText = message.content.trim();
+  if (discordText.length < 50 && GREETING_RE.test(discordText) && !discordText.startsWith('!')) {
+    const personality = state.personality || DEFAULT_PERSONALITY;
+    await message.reply(_pickGreetingResponse(personality));
+    return;
+  }
+
   // If Claude is already working, queue the message.
   // L-Fix-2: a !loop holds state.busy=true for its whole duration, so messages
   // sent during a loop fall into this path and get queued. processQueue won't
@@ -3143,7 +3169,7 @@ function startSignalAdapter() {
     // listed. Group messages are allowed if the sender is in the allowlist.
     const senderAllowed = isSignalOwner(msg.senderId) || allowedNumbers.has(msg.senderId);
     if (!senderAllowed) {
-      console.log(`[signal] blocked message from non-allowlisted sender ${msg.senderId}`);
+      console.log(`[signal] blocked message from non-allowlisted sender ${_redactId(msg.senderId)}`);
       return;
     }
 
@@ -3201,6 +3227,16 @@ function startSignalAdapter() {
         console.log(`[signal] Group message — bot not mentioned, ignoring (${mentionList.length} other mention(s))`);
         return;
       }
+    }
+
+    // F10: Deterministic greeting fast-path — $0, ~50ms, 100% reliable.
+    // Fires BEFORE onboarding, busy-check, link detection, or Claude invocation.
+    const rawSignalText = (msg.text || '').trim();
+    if (rawSignalText.length < 50 && GREETING_RE.test(rawSignalText) && !rawSignalText.startsWith('!')) {
+      const personality = state.personality || DEFAULT_PERSONALITY;
+      const greeting = _pickGreetingResponse(personality);
+      await signalAdapter.sendMessage(msg.chatId, greeting);
+      return;
     }
 
     if (!senderIsOwner && !isGroupMessage && msg.senderId && msg.senderId.startsWith('+')) {
@@ -3357,6 +3393,23 @@ function startSignalAdapter() {
         // bypassed for some reason), fall back to sending the full text.
         if (!result.streamed) {
           await signalAdapter.sendLongMessage(msg.chatId, result.text || '*(No output)*');
+        }
+        // F8: extract image attachments from result text regardless of streaming
+        // state, and send each as a separate Signal message with the file attached.
+        const imagePaths = extractImageAttachments(result.text || '');
+        if (imagePaths && imagePaths.size > 0) {
+          for (const imgPath of imagePaths) {
+            try {
+              const imgBuf = fs.readFileSync(imgPath);
+              const imgName = path.basename(imgPath);
+              await signalAdapter.sendMessage(msg.chatId, '', {
+                attachments: [imgBuf],
+                attachmentNames: [imgName],
+              });
+            } catch (imgErr) {
+              console.warn(`[signal] Failed to send image attachment ${imgPath}: ${imgErr.message}`);
+            }
+          }
         }
       }
     } catch (err) {
