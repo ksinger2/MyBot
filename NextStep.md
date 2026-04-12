@@ -1,4 +1,65 @@
-# MyBot — Session Handoff (2026-04-11, night)
+# MyBot — Session Handoff (2026-04-11, late night)
+
+## User profiles: auto-learn, encryption, privacy, simplified UX
+
+### Signal profile system enhanced
+- **Preferences array** on each profile — auto-learned facts + explicit
+  `!remember` entries, capped at 50 per user, each fact ≤200 chars
+- **AES-256-GCM encryption at rest** — every profile entry in
+  `user-profiles.json` is an encrypted blob using `TOKEN_ENCRYPTION_KEY`
+  via HKDF-SHA256 (info: `mybot-user-profiles`). `cat` the file → cipher
+  text. Backward-compatible: legacy plain-object entries still readable,
+  re-encrypted on next write.
+- **`buildProfileContext()`** now includes preferences in Claude's system
+  prompt context so Claude knows the user's dietary restrictions, hobbies,
+  schedule patterns, etc.
+- New CRUD: `addPreference`, `removePreference`, `clearPreferences`,
+  `deleteUser`, `getUserData`
+
+### Auto-learn with consent
+- System prompt instructs Claude to append `[LEARNED: <fact>]` at the end
+  of responses when it discovers a new user preference
+- `bot.js` Signal post-result handler strips the tag, stores the fact via
+  `addPreference(phone, fact, 'conversation')`, and sends a notification:
+  "📝 I noted: <fact>. Say `!forget <fact>` to remove."
+- `runner.js` streaming branch also strips `[LEARNED: ...]` tags from
+  each chunk before sending to the user
+- Claude is instructed to only tag genuinely new, useful facts — not
+  trivial conversation context
+
+### New commands
+- `!profile` — view your stored data (name, location, timezone, calendar,
+  preferences). Signal-only; Discord says "profiles are Signal-only."
+- `!remember <fact>` — explicitly store a preference (source: 'explicit')
+- `!forget <keyword>` — remove preferences matching keyword.
+  `!forget all` clears all preferences but keeps the base profile.
+- `!deleteme` / `!deleteme confirm` — two-step full data deletion.
+  Next message triggers fresh onboarding.
+
+### Privacy rules in system prompt
+New USER DATA PRIVACY block in `system-prompt.js`:
+- Claude NEVER reads `user-profiles.json` directly with tools
+- Claude NEVER reveals one user's data to another (except natural group
+  coordination: "Karen prefers mornings")
+- Users see ONLY their own data via `!profile`
+- If asked about another user: "I can only share your own profile."
+
+### Simplified Signal help
+Signal `!help` now shows **9 user-facing commands** + natural language
+examples ("draw me a sunset" • "summarize this TikTok" • "find me
+earbuds under $50") instead of the full 57-command developer list.
+Discord still gets the complete reference. Reasoning: Signal users just
+want to CHAT — they don't need `!cd` or `!monitor` or `!service`.
+
+### `!unlock` PIN gate (sudo-style, NOT login)
+`BOT_UNLOCK_PIN` in `.env` makes channels start **read-only** — Claude
+can chat, search, browse, calendars, video parsing, images, teaching —
+everything EXCEPT Edit/Write/Bash. `!unlock <PIN>` elevates to full
+write access for the session. Resets on container restart. This is
+sudo-style (PIN gates file mutations) not login-style (PIN doesn't
+block the bot). When `BOT_UNLOCK_PIN` is unset, the gate is disabled.
+
+---
 
 ## ALL 24 findings CLOSED — project fully shipped
 
