@@ -1781,7 +1781,10 @@ function startSignalAdapter() {
 
     // F10: Deterministic greeting fast-path — $0, ~50ms, 100% reliable.
     // Fires BEFORE onboarding, busy-check, link detection, or Claude invocation.
-    const rawSignalText = (msg.text || '').trim();
+    // Strip U+FFFC (object replacement character) — Signal inserts this as a
+    // placeholder for @mentions in the text body. Without stripping, "hey ￼"
+    // fails GREETING_RE and falls through to Claude for a 60s+ rate-limited run.
+    const rawSignalText = (msg.text || '').replace(/\uFFFC/g, '').trim();
     if (rawSignalText.length < 50 && GREETING_RE.test(rawSignalText) && !rawSignalText.startsWith('!')) {
       const personality = state.personality || DEFAULT_PERSONALITY;
       const greeting = _pickGreetingResponse(personality);
