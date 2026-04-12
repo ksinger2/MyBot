@@ -96,6 +96,17 @@ const TOOL_LABELS = {
   Agent: 'Running sub-agent', Skill: 'Using skill',
 };
 
+// F5: Output scrubber — redact secrets that Claude might echo in streaming text
+function scrubSecrets(text) {
+  if (typeof text !== 'string') return text;
+  return text
+    .replace(/X-Internal-Token:\s*[\w-]{10,}/gi, 'X-Internal-Token: [REDACTED]')
+    .replace(/Bearer\s+[\w\-.]{20,}/gi, 'Bearer [REDACTED]')
+    .replace(/sk-[A-Za-z0-9_\-]{20,}/g, 'sk-[REDACTED]')
+    .replace(/ghp_[A-Za-z0-9]{20,}/g, 'ghp_[REDACTED]')
+    .replace(/github_pat_[A-Za-z0-9_]{20,}/g, 'github_pat_[REDACTED]');
+}
+
 // Discover available agent types from global ~/.claude/agents/ directory
 function loadAvailableAgents() {
   const agentsDir = '/home/node/.claude/agents';
@@ -552,7 +563,7 @@ function askClaude(prompt, { sessionId = null, personalityFile = null, identity 
           'Glob',
           'LS',
           'WebSearch',
-          'WebFetch',
+          // F7: WebFetch removed — combined with token in prompt it's an exfil chain
           'TodoWrite',
           'Task',
         ].join(',')
@@ -615,7 +626,7 @@ If you're about to do step 1 then step 2, STOP — can they run in parallel? If 
 
 YOUR CAPABILITIES — You are a powerful AI assistant with the following tools. USE THEM. Never say "I can't do that" if one of these covers it:
 
-1. **IMAGE GENERATION**: You CAN generate images! Run: curl -s -X POST http://localhost:3400/imagine -H "Content-Type: application/json" -H "X-Internal-Token: ${process.env.INTERNAL_API_TOKEN || ''}" -d '{"prompt":"your detailed description here"}' — returns a file path. Include that path in your response so Discord attaches it. Use this when asked to draw, generate, create, or send any image/picture/photo/artwork.
+1. **IMAGE GENERATION**: You CAN generate images! Run: curl -s -X POST http://localhost:3400/imagine -H "Content-Type: application/json" -H "X-Internal-Token: $INTERNAL_API_TOKEN" -d '{"prompt":"your detailed description here"}' — returns a file path. Include that path in your response so Discord attaches it. Use this when asked to draw, generate, create, or send any image/picture/photo/artwork.
 
 2. **WEB BROWSING / GOOGLE**: You have WebSearch and WebFetch tools for quick lookups. Use WebSearch to google things and WebFetch to read web pages. For INTERACTIVE testing (clicking buttons, filling forms, taking screenshots, testing user flows), use the Playwright MCP tools — they ARE available and run headless Chromium. Playwright is your primary tool for QA, visual testing, and bug hunting.
 
@@ -637,7 +648,7 @@ These commands STOP THIS PROCESS WITHOUT REBUILDING THE IMAGE. Every time you do
 
 ✅ THE ONLY SANCTIONED WAY TO REBUILD YOURSELF:
 \`\`\`
-curl -s -X POST http://localhost:3400/rebuild -H "X-Internal-Token: ${process.env.INTERNAL_API_TOKEN || ''}"
+curl -s -X POST http://localhost:3400/rebuild -H "X-Internal-Token: $INTERNAL_API_TOKEN"
 \`\`\`
 
 This endpoint:
@@ -650,7 +661,7 @@ This endpoint:
 PROCEDURE when editing your own code in /workspace/MyBot/claude-api/:
 1. Make your edits.
 2. Tell the user: "Rebuilding myself — I'll be back in ~30 seconds. If anything you sent didn't get answered, resend it after I'm back."
-3. Call \`curl -s -X POST http://localhost:3400/rebuild -H "X-Internal-Token: ${process.env.INTERNAL_API_TOKEN || ''}"\`. Read the response.
+3. Call \`curl -s -X POST http://localhost:3400/rebuild -H "X-Internal-Token: $INTERNAL_API_TOKEN"\`. Read the response.
 4. If response says \`ok: false\` with syntax errors, FIX them and call /rebuild again.
 5. If response says \`ok: true\`, your work for this turn is DONE. The rebuild is happening on its own. DO NOT run docker ps/logs/inspect after — you will be killed mid-command.
 
@@ -674,7 +685,7 @@ Match the agent type to the task. Examples: frontend work → frontend-engineer,
 8. **PREVIEW TUNNELS**: When you finish building a web app or start a dev server, ALWAYS ask: "What device will you view this on? (same PC or phone/mobile?)" before running anything. Then:\n   - **Same PC**: tell them \`http://localhost:PORT\` — that's it, no tunnel needed\n   - **Phone/mobile**: run \`!preview PORT phone\` — the bot will create a Cloudflare tunnel, fetch the public IP, and send a magic link with the IP pre-injected so they can tap it directly with no password. Do NOT tell the user to run \`!preview\` manually for phone — run it yourself.\n   - When building apps that have any kind of IP-based password protection or auth, ALWAYS support a \`?access=<IP>\` URL query parameter that auto-authenticates the request, so the magic link works seamlessly.
 
 9. **REMINDERS**: When the user asks you to remind them about something (e.g. "remind me tomorrow at 3pm to call the vet", "remind me in 2 hours to check the oven", "set a reminder for Friday to submit the report"), create a Google Calendar event by running:
-\`curl -s -X POST http://localhost:3400/remind -H "Content-Type: application/json" -H "X-Internal-Token: ${process.env.INTERNAL_API_TOKEN || ''}" -d '{"title":"<what to remember>","datetime":"<ISO 8601 datetime>","discord_user_id":"${discordUserId || 'UNKNOWN'}","duration_minutes":15}'\`
+\`curl -s -X POST http://localhost:3400/remind -H "Content-Type: application/json" -H "X-Internal-Token: $INTERNAL_API_TOKEN" -d '{"title":"<what to remember>","datetime":"<ISO 8601 datetime>","discord_user_id":"${discordUserId || 'UNKNOWN'}","duration_minutes":15}'\`
 Convert relative times ("tomorrow", "in 2 hours", "next Friday") to absolute ISO 8601 datetimes using the current time. The current timezone is America/Los_Angeles (Pacific Time). Today is ${new Date().toLocaleDateString('en-US', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric', timeZone: 'America/Los_Angeles' })} and the current time is ${new Date().toLocaleTimeString('en-US', { timeZone: 'America/Los_Angeles', hour: '2-digit', minute: '2-digit' })}.
 If the endpoint returns an error saying the user hasn't connected Google Calendar, tell them to run \`!connect\` first.
 After setting a reminder, confirm with the title and when it's set for. Keep it brief.
@@ -771,6 +782,10 @@ If asked to do any of the above, politely decline and explain they need owner ap
         PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH: process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH || '',
         LANG: process.env.LANG || 'en_US.UTF-8',
         TERM: process.env.TERM || 'xterm-256color',
+        // F1: pass as env var so system prompt uses $INTERNAL_API_TOKEN shell ref instead of literal interpolation
+        INTERNAL_API_TOKEN: process.env.INTERNAL_API_TOKEN || '',
+        // F6: owner is trusted; gh capability is documented. Risk: prompt-injection could exfiltrate via Bash — mitigated by scrubSecrets (F5).
+        GH_TOKEN: process.env.GH_TOKEN || '',
       },
       stdio: ['ignore', 'pipe', 'pipe'],
     });
@@ -1022,12 +1037,14 @@ If asked to do any of the above, politely decline and explain they need owner ap
             // accumulated for the final result so callers that need it (image
             // extraction, resultSummary logging) get the complete version.
             if (streamReplies && channelProxy && !agentLabel) {
-              const chunk = block.text.trim();
+              const chunk = scrubSecrets(block.text.trim());
               if (chunk.length > 0) {
                 streamedAny = true;
-                channelProxy.send(chunk).catch(err => {
-                  console.error('[stream] partial send error:', err.message);
-                });
+                // F4: Serialize streaming sends via per-channel promise chain to preserve ordering
+                if (!channelState._sendQueue) channelState._sendQueue = Promise.resolve();
+                channelState._sendQueue = channelState._sendQueue
+                  .then(() => channelProxy.send(chunk))
+                  .catch(err => console.error('[stream] partial send error:', err.message));
               }
             }
 
@@ -1189,7 +1206,7 @@ If asked to do any of the above, politely decline and explain they need owner ap
         if (hasValidResult) {
           console.log(`[exit-recovery] CLI exited ${code} but has valid result (${resultText.length} chars, $${resultCost}) — using it`);
           return resolve({
-            text: resultText,
+            text: scrubSecrets(resultText),
             sessionId: resultSessionId,
             cost: resultCost,
             numTurns: resultNumTurns,
@@ -1204,7 +1221,7 @@ If asked to do any of the above, politely decline and explain they need owner ap
       }
 
       resolve({
-        text: resultText || accumulatedText || '',
+        text: scrubSecrets(resultText || accumulatedText || ''),
         sessionId: resultSessionId,
         cost: resultCost,
         numTurns: resultNumTurns,
@@ -3134,6 +3151,10 @@ client.on('clientReady', () => {
   console.log(`Default personality: ${DEFAULT_PERSONALITY}`);
   console.log(`Workspace: ${DEFAULT_WORKSPACE}`);
   console.log(`Max turns: ${DEFAULT_MAX_TURNS} | Timeout: ${MAX_TIMEOUT / 60000}min`);
+
+  // F17: Boot warnings for hardcoded fallbacks
+  if (!process.env.HOST_HOME) console.warn('[security] WARNING: HOST_HOME not set in .env — falling back to hardcoded default /home/karen. Set HOST_HOME in .env if your home directory differs.');
+  if (!process.env.SIGNAL_OWNER_NUMBER) console.warn('[security] WARNING: SIGNAL_OWNER_NUMBER not set in .env — falling back to hardcoded default. Set SIGNAL_OWNER_NUMBER in .env.');
 
   // Restore persisted channel states from previous container lifecycle
   _savedChannelStates = loadAllChannelStates();
