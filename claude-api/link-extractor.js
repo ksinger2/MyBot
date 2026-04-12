@@ -460,6 +460,15 @@ async function fetchVideoTranscript(url) {
         '--no-playlist',
         '--no-warnings',
         '--quiet',
+        // Bypass bot-detection: use a real browser User-Agent and enable
+        // cookies extraction. TikTok/Instagram block default yt-dlp UA.
+        '--user-agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+        '--referer', url,
+        '--add-header', 'Accept-Language:en-US,en;q=0.9',
+        // Proxy support: set YT_DLP_PROXY in .env to route through VPN/proxy.
+        // ExpressVPN on the Windows host auto-routes container traffic, but a
+        // persistent SOCKS5/HTTP proxy can be configured here for reliability.
+        ...(process.env.YT_DLP_PROXY ? ['--proxy', process.env.YT_DLP_PROXY] : []),
         '-o', outputTemplate,
         url,
       ], { stdio: ['ignore', 'pipe', 'pipe'] });
