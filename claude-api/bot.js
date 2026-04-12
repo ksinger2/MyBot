@@ -1727,7 +1727,10 @@ function startSignalAdapter() {
     // Claude can Read them. The user reported that images sent over Signal
     // were silently dropped — this is the fix: we hand Claude the local
     // path that the adapter just downloaded.
-    let text = (msg.text || '').trim();
+    // Strip U+FFFC (object replacement character) from ALL Signal text, not
+    // just the greeting check. Signal inserts ￼ as a placeholder for @mentions.
+    // Claude interprets it as a missing image/attachment and goes investigating.
+    let text = (msg.text || '').replace(/\uFFFC/g, '').trim();
     const downloadedFiles = (msg.attachments || []).filter(a => a.localPath);
     if (downloadedFiles.length > 0) {
       const fileList = downloadedFiles
@@ -1900,22 +1903,24 @@ function startSignalAdapter() {
         }
       }
 
+      // GROUP CHATS = PURE CHATBOT MODE. No tools, no session resume, no
+      // engineering. Claude responds as a conversational assistant only.
+      // Owner status does NOT grant tool access in groups — if the owner
+      // wants to edit code, they use a DM or Discord.
+      const isGroupChat = isGroupMessage;
       const claudeOpts = {
-        sessionId: state.sessionId,
+        sessionId: isGroupChat ? null : state.sessionId, // no session resume in groups
         personalityFile,
         identity: state.identity,
         cwd: state.cwd,
         channelState: state,
         channelProxy: signalProxy,
         discordUserId: msg.senderId,
-        // Read-only if: (a) not the owner (existing rule), OR (b) PIN gate is
-        // set and this channel hasn't been elevated via !unlock.
-        readOnly: !senderIsOwner || !_isChannelElevated(chatId),
+        readOnly: isGroupChat ? true : (!senderIsOwner || !_isChannelElevated(chatId)),
         profileContext: combinedProfileContext,
-        // Stream each text block straight to Signal as it arrives instead of
-        // waiting for the whole run to complete. Massively improves perceived
-        // latency on Signal where the user sees nothing until the run finishes.
         streamReplies: true,
+        // Group chats get 3 turns max — enough for a reply, not enough for a rabbit hole
+        maxTurns: isGroupChat ? 3 : undefined,
       };
 
       // Auto-detect social/location links — pre-fetch metadata and build action prompt.
