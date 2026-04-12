@@ -1,4 +1,69 @@
-# MyBot — Session Handoff (2026-04-11, late night)
+# MyBot — Session Handoff (2026-04-12, early morning)
+
+## Signal group chat: social assistant mode + access control fix
+
+### Group chats are now a social assistant, not an engineer
+Groups use a custom tool allowlist: `Read, WebSearch, WebFetch, Bash,
+Task, TodoWrite`. This means Claude can search the web, read shared
+links, create/edit calendar events (via curl), coordinate plans, parse
+video transcripts, and store user preferences — but CANNOT Edit/Write
+files, Grep/Glob the codebase, or do any engineering work. Max 5 turns
+per group message. No session resume (prevents old engineering sessions
+from carrying over into casual conversations).
+
+### Group members auto-allowed
+Previously `SIGNAL_ALLOWED_NUMBERS` (fail-closed) blocked ALL non-owner
+Signal numbers including group members. Now: group messages are always
+allowed regardless of the allowlist. The allowlist only gates DMs from
+strangers. This means anyone in a group the bot is in can interact with
+it via @mention.
+
+### Proactive group onboarding
+When a message comes from a user with no profile in a group chat, Claude
+is prompted to naturally ask them to introduce themselves (name, location)
+so preferences get stored via the auto-learn system. Casual, not robotic.
+
+### Contextual link reasoning
+System prompt now instructs Claude to think about WHY a user shared a
+link and proactively offer help:
+- Event links → "Want me to add this to your calendar?"
+- Restaurant links → "Want to plan a visit?"
+- Recipe/food videos → Note dietary preferences via auto-learn
+- Product links → "Want me to find the best price?"
+- Travel links → "Want to plan a trip there?"
+- Entertainment → Just engage naturally
+
+### U+FFFC (Signal mention placeholder) fix
+Signal inserts U+FFFC as a placeholder for @mentions in text. This was
+causing two bugs: (1) GREETING_RE didn't match "hey ￼" so greetings
+fell through to Claude, and (2) Claude interpreted ￼ as a missing
+image attachment and started investigating. Now stripped from ALL Signal
+text at the handler entry point.
+
+### yt-dlp browser UA + proxy support
+Added browser User-Agent headers to yt-dlp invocations. Also added
+`YT_DLP_PROXY` env var support — if set, yt-dlp routes through the
+specified proxy (e.g., `socks5://host:port`). When yt-dlp fails (IP
+block), Claude gracefully falls back to WebSearch.
+
+### groupAllowedTools wiring bug fixed
+The `groupAllowedTools` option wasn't stored on `this` or destructured
+in `Runner.run()` — caused `ReferenceError: groupAllowedTools is not
+defined`. Fixed by adding it to the constructor assignment + destructure.
+
+### E2E test results (via Signal webhook simulation)
+| Test | Result |
+|---|---|
+| DM greeting "hey girl" | PASS — instant greeting, 0 turns |
+| Unknown user in group | PASS — not blocked, Claude onboarded them |
+| Group complex ask (sushi + calendar) | PASS — WebSearch + Calendar MCP, 5 turns |
+| DM with image | PASS — Claude Read the PNG, described it |
+| TikTok link "tldr" | PARTIAL — yt-dlp IP-blocked, Claude fell back to WebSearch |
+| Group without @mention | PASS — silently ignored |
+| Webhook without token | PASS — 401 |
+| /health | PASS — 200 |
+
+---
 
 ## User profiles: auto-learn, encryption, privacy, simplified UX
 
