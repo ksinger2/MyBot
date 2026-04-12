@@ -1,13 +1,30 @@
-// Generic wizard engine for multi-step Discord interactions
+// Generic wizard engine for multi-step Signal/Discord interactions.
+// Supports two modes:
+//   - Channel-wide (state.wizard): any message in the channel advances the wizard
+//   - Per-sender (state.senderWizards[phone]): only that specific sender's replies advance it
+//     Used for group-chat onboarding where one person answers while others can still chat.
 
 /**
- * Start a wizard on a channel
- * @param {object} state - channel state object
- * @param {object} message - Discord message that triggered the wizard
- * @param {object} def - wizard definition { type, steps, onComplete }
+ * Start a channel-wide wizard (original behaviour — used for DM onboarding).
  */
 async function startWizard(state, message, def) {
-  state.wizard = {
+  state.wizard = _makeWiz(def);
+  await _sendStep(state.wizard, message);
+}
+
+/**
+ * Start a wizard that only a specific sender can advance.
+ * Used by !onboard in group chats.
+ * @param {string} targetSenderId - phone number (or Discord user ID) of the person being onboarded
+ */
+async function startSenderWizard(state, message, def, targetSenderId) {
+  if (!state.senderWizards) state.senderWizards = {};
+  state.senderWizards[targetSenderId] = _makeWiz(def);
+  await _sendStep(state.senderWizards[targetSenderId], message);
+}
+
+function _makeWiz(def) {
+  return {
     type: def.type,
     step: 0,
     data: { ...(def.initialData || {}) },
@@ -15,28 +32,61 @@ async function startWizard(state, message, def) {
     onComplete: def.onComplete,
     silent: !!def.silent,
   };
-
-  // Find and send the first applicable step
-  await sendCurrentStep(state, message);
 }
 
 /**
- * Handle an incoming message when a wizard is active
+ * Handle an incoming message when a wizard is active.
+ * Checks per-sender wizard first, then channel-wide wizard.
  * @returns {boolean} true if the message was consumed by the wizard
  */
 async function handleWizardMessage(state, message) {
-  if (!state.wizard) return false;
+  const senderId = message._signalSenderId || message.author?.id;
 
-  const wiz = state.wizard;
-  const step = wiz.steps[wiz.step];
-  if (!step) {
-    state.wizard = null;
-    return false;
+  // Per-sender wizard (group onboarding)
+  if (senderId && state.senderWizards && state.senderWizards[senderId]) {
+    const wiz = state.senderWizards[senderId];
+    return _processStep(wiz, message, state, () => {
+      delete state.senderWizards[senderId];
+    });
   }
 
-  const input = message.content.trim();
+  // Channel-wide wizard (DM onboarding, etc.)
+  if (!state.wizard) return false;
+  return _processStep(state.wizard, message, state, () => {
+    state.wizard = null;
+  });
+}
 
-  // Use default if empty and default exists
+/**
+ * Cancel any active wizard for the current sender (or channel-wide).
+ */
+async function cancelWizard(state, message) {
+  const senderId = message._signalSenderId || message.author?.id;
+
+  // Cancel per-sender wizard if there is one for this sender
+  if (senderId && state.senderWizards && state.senderWizards[senderId]) {
+    const type = state.senderWizards[senderId].type;
+    delete state.senderWizards[senderId];
+    await message.reply(`Cancelled **${type}** setup.`);
+    return;
+  }
+
+  if (!state.wizard) {
+    await message.reply('Nothing to cancel.');
+    return;
+  }
+  const type = state.wizard.type;
+  state.wizard = null;
+  await message.reply(`Cancelled **${type}** wizard.`);
+}
+
+// ─── Internal helpers ─────────────────────────────────────────────────────────
+
+async function _processStep(wiz, message, state, onDone) {
+  const step = wiz.steps[wiz.step];
+  if (!step) { onDone(); return false; }
+
+  const input = (message.content || '').trim();
   const value = (input === '' && step.default != null) ? step.default : input;
 
   // Validate
@@ -55,88 +105,57 @@ async function handleWizardMessage(state, message) {
   wiz.step++;
   while (wiz.step < wiz.steps.length) {
     const next = wiz.steps[wiz.step];
-    if (next.condition && !next.condition(wiz.data)) {
-      wiz.step++;
-      continue;
-    }
+    if (next.condition && !next.condition(wiz.data)) { wiz.step++; continue; }
     break;
   }
 
-  // Done?
+  // All steps done
   if (wiz.step >= wiz.steps.length) {
     const data = { ...wiz.data };
     const onComplete = wiz.onComplete;
-    state.wizard = null;
+    onDone();
     if (onComplete) await onComplete(data, message, state);
     return true;
   }
 
-  // Send next step prompt
-  await sendCurrentStep(state, message);
+  // Send next prompt
+  await _sendStep(wiz, message);
   return true;
 }
 
-/**
- * Cancel an active wizard
- */
-async function cancelWizard(state, message) {
-  if (!state.wizard) {
-    await message.reply('Nothing to cancel.');
-    return;
-  }
-  const type = state.wizard.type;
-  state.wizard = null;
-  await message.reply(`Cancelled **${type}** wizard.`);
-}
-
-/**
- * Send the prompt for the current wizard step.
- *
- * Step config:
- *   - prompt:  string OR function(data) => string  — what to ask the user
- *   - silent:  bool — if true, omit the "**Step X/Y:**" prefix (for casual flows)
- *   - condition, validate, default — see handleWizardMessage
- *
- * Wizard config:
- *   - silent:  bool — global silent flag, applies to all steps
- */
-async function sendCurrentStep(state, message) {
-  const wiz = state.wizard;
-  if (!wiz) return;
-
-  // Skip steps whose conditions are not met
+async function _sendStep(wiz, message) {
+  // Skip steps whose conditions aren't met
   while (wiz.step < wiz.steps.length) {
     const step = wiz.steps[wiz.step];
-    if (step.condition && !step.condition(wiz.data)) {
-      wiz.step++;
-      continue;
-    }
+    if (step.condition && !step.condition(wiz.data)) { wiz.step++; continue; }
     break;
   }
-
   if (wiz.step >= wiz.steps.length) return;
 
   const step = wiz.steps[wiz.step];
-  if (step.prompt) {
-    // Support functional prompts that reference prior answers
-    const promptText = typeof step.prompt === 'function' ? step.prompt(wiz.data) : step.prompt;
-    const silent = wiz.silent || step.silent;
-    if (silent) {
-      await message.reply(promptText);
-    } else {
-      const stepNum = getVisibleStepNumber(wiz);
-      const totalVisible = getVisibleStepCount(wiz);
-      const prefix = `**Step ${stepNum}/${totalVisible}:**`;
-      await message.reply(`${prefix} ${promptText}`);
-    }
+  if (!step.prompt) return;
+
+  const promptText = typeof step.prompt === 'function' ? step.prompt(wiz.data) : step.prompt;
+  const silent = wiz.silent || step.silent;
+  if (silent) {
+    await message.reply(promptText);
+  } else {
+    const stepNum = _visibleStepNum(wiz);
+    const total = _visibleStepCount(wiz);
+    await message.reply(`**Step ${stepNum}/${total}:** ${promptText}`);
   }
 }
 
-function getVisibleStepCount(wiz) {
+// Legacy alias so old call sites (sendCurrentStep) still work
+async function sendCurrentStep(state, message) {
+  if (state.wizard) await _sendStep(state.wizard, message);
+}
+
+function _visibleStepCount(wiz) {
   return wiz.steps.filter(s => !s.condition || s.condition(wiz.data)).length;
 }
 
-function getVisibleStepNumber(wiz) {
+function _visibleStepNum(wiz) {
   let num = 0;
   for (let i = 0; i <= wiz.step; i++) {
     const s = wiz.steps[i];
@@ -145,4 +164,4 @@ function getVisibleStepNumber(wiz) {
   return num;
 }
 
-module.exports = { startWizard, handleWizardMessage, cancelWizard };
+module.exports = { startWizard, startSenderWizard, handleWizardMessage, cancelWizard, sendCurrentStep };

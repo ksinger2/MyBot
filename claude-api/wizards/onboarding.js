@@ -15,14 +15,19 @@
 
 const { setProfile } = require('../user-profiles');
 
-function buildOnboardingWizard() {
+/**
+ * @param {string} [targetPhone] - if set (group !onboard), addresses the specific person
+ */
+function buildOnboardingWizard(targetPhone) {
   return {
     type: 'onboarding',
     silent: true, // No "Step X/Y" prefixes — feels like a normal chat
     steps: [
       {
         key: 'name',
-        prompt: "Hey! I don't think we've met yet. I'm Bianca. What should I call you?",
+        prompt: targetPhone
+          ? `Hey! I'm Bianca — I'm going to get you set up real quick. What should I call you?`
+          : "Hey! I don't think we've met yet. I'm Bianca. What should I call you?",
         validate: v => {
           const t = v.trim();
           if (t.length === 0) return "Just type your name.";

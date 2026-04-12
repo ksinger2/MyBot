@@ -49,7 +49,13 @@ module.exports = {
       await message.reply(`Profile updated: ${field} = ${value}`);
     } else {
       const data = getUserData(targetPhone);
-      if (!data) { await message.reply('No profile found. Send me a message on Signal to start onboarding!'); return; }
+      // If the user has no profile (or incomplete), kick off the onboarding wizard
+      if (!data || !data.name) {
+        const { startWizard } = require('../wizard');
+        const { buildOnboardingWizard } = require('../wizards/onboarding');
+        await startWizard(state, message, buildOnboardingWizard());
+        return;
+      }
       const lines = [];
       lines.push('**Your Profile**');
       lines.push(`Name: ${data.name || '(not set)'}`);

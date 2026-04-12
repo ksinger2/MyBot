@@ -1783,7 +1783,9 @@ function startSignalAdapter() {
     if (isGroupMessage && !text.startsWith('!')) {
       // Check per-chat listenToAll toggle — if on, skip the mention check
       // NOTE: use the same prefixed key used for all Signal state (signal:${chatId})
-      if (!state.listenToAll) {
+      // Also skip if this sender has a pending onboarding wizard — they need to reply
+      const hasPendingSenderWizard = state.senderWizards && state.senderWizards[msg.senderId];
+      if (!state.listenToAll && !hasPendingSenderWizard) {
         const mentionList = (msg.mentions && msg.mentions.length > 0)
           ? msg.mentions
           : (msg.raw?.envelope?.dataMessage?.mentions || []);
@@ -1830,9 +1832,10 @@ function startSignalAdapter() {
       }
     }
 
-    // If a wizard is active for this chat, let it consume the message.
-    // The wizard handles its own step progression and onComplete callback.
-    if (state.wizard) {
+    // If a wizard is active for this sender or chat, let it consume the message.
+    // Per-sender wizards (from !onboard) only activate for that specific phone number.
+    const hasSenderWizard = state.senderWizards && state.senderWizards[msg.senderId];
+    if (state.wizard || hasSenderWizard) {
       const fakeMessage = createSignalMessageProxy(msg, chatId, state);
       // Allow !cancel to escape the wizard
       if (text.toLowerCase() === '!cancel') {
@@ -1845,6 +1848,7 @@ function startSignalAdapter() {
       } catch (err) {
         console.error(`[signal] wizard error: ${err.message}`);
         state.wizard = null;
+        if (state.senderWizards) delete state.senderWizards[msg.senderId];
         await signalAdapter.sendMessage(msg.chatId, `Wizard error: ${err.message.substring(0, 200)}. Cancelled.`);
         return;
       }
@@ -2120,6 +2124,8 @@ function createSignalMessageProxy(msg, chatId, state) {
     client, // for commands that need client.channels
     _signalSenderId: msg.senderId, // used by wizards/onComplete to key profile saves
     _signalChatId: msg.chatId,
+    _signalMentions: msg.mentions || [], // for !onboard target resolution
+    _signalBotPhone: signalAdapter?.phoneNumber || null,
   };
 }
 
