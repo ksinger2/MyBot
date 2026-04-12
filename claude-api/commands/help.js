@@ -2,8 +2,33 @@ module.exports = {
   name: '!help',
   aliases: [],
   adminOnly: false,
-  description: 'Show help text with all commands',
+  description: 'Show help text',
   async run(message, arg, state, ctx) {
+    // Signal users get a clean, minimal help. Discord (owner) gets the full list.
+    const isSignal = !!message._signalSenderId;
+
+    if (isSignal) {
+      const helpText =
+        `**Hey! Here's what I can do:**\n\n` +
+        `Just talk to me naturally — ask me anything, send links, ask for recommendations, plan events, etc.\n\n` +
+        `**Useful commands:**\n` +
+        `\`!stop\` — Stop my current response\n` +
+        `\`!clear\` — Start a fresh conversation\n` +
+        `\`!profile\` — See what I know about you\n` +
+        `\`!remember <fact>\` — Tell me something to remember\n` +
+        `\`!forget <keyword>\` — Remove something I learned\n` +
+        `\`!deleteme\` — Delete all your data\n` +
+        `\`!personality <name>\` — Switch my vibe\n` +
+        `\`!personalities\` — See available vibes\n` +
+        `\`!unlock <pin>\` — Unlock code editing (admin)\n\n` +
+        `**Pro tip:** You don't need commands for most things. Just ask!\n` +
+        `"draw me a sunset" • "summarize this TikTok" • "when can we all hang out?" • "remind me tomorrow at 3pm" • "find me earbuds under $50"`;
+      const reply = ctx._dreply || ((m, t) => m.reply(t));
+      await reply(message, helpText);
+      return;
+    }
+
+    // Discord — full developer command list
     const helpText =
       `**Claude Code Bot — Commands:**\n\n` +
       `**Control:**\n` +
@@ -12,32 +37,26 @@ module.exports = {
       `\`!kill\` — Hard kill + destroy session\n` +
       `\`!killall\` — Kill everything across all channels\n` +
       `\`!restart\` — Restart bot container\n` +
-      `\`!refresh\` — Nuclear reset: kill all, clear state, restart\n` +
+      `\`!refresh\` — Nuclear reset\n` +
       `\`!status\` — Show session info\n` +
       `\`!processes\` — Show active Claude processes\n` +
-      `\`!btw\` — Peek at progress while working\n` +
-      `\`!cancel\` — Cancel an active wizard\n\n` +
+      `\`!btw\` — Peek at progress while working\n\n` +
       `**Workspace:**\n` +
-      `\`!cd [path]\` — Show or change project directory\n` +
+      `\`!cd [path]\` — Show or change project\n` +
       `\`!ls [path]\` — List files\n` +
-      `\`!startproject\` — Create a new project with template\n` +
-      `\`!audit [focus]\` — Full project audit (design, qa, security, analytics, performance)\n\n` +
+      `\`!startproject\` — Create project from template\n\n` +
       `**Identity:**\n` +
-      `\`!name [name]\` — Show or set bot name\n` +
-      `\`!identity [Name is desc]\` — Show or set identity\n` +
       `\`!personality <name>\` — Switch personality\n` +
       `\`!personalities\` — List available\n\n` +
-      `**Tasks:** \`!tasks\` · \`!done\` · \`!done all\`\n` +
-      `**Schedule:** \`!schedule\` · \`!schedules\` · \`!unschedule <#>\` · \`!autoschedule <freq> | <task>\`\n` +
-      `**Queue:** \`!queue <task>\` · \`!queued\` · \`!dequeue <#>\`\n` +
-      `**Monitors:** \`!monitor ci <repo>\` · \`!monitor health <url>\` · \`!monitors\` · \`!monitor remove/pause/resume/check <#>\`\n` +
-      `**Briefing:** \`!briefing\` · \`!weekly\`\n` +
-      `**Preview:** \`!preview <port>\` — smart preview (asks device) · \`!preview <port> local\` — localhost link · \`!preview <port> phone\` — tunnel + magic link · \`!preview stop\`\n` +
-      `**Services:** \`!services\` — list PM2 background services · \`!service stop|logs <name>\`\n` +
-      `**Config:** \`!config show\` · \`!config turns|continues|timeout <N>\` — per-channel limits\n` +
-      `**Other:** \`!email <request>\` · \`!imagine <desc>\` · \`!ainews\`\n\n` +
-      `Just type what you want built. Claude runs autonomously — reads, writes, commits, pushes. Use \`!stop\` to interrupt, \`!clear\` to start over.\n\n` +
-      `Current: **${state.identity.name}** | ${state.personality} | \`${state.cwd}\` | ${state.busy ? '🔄 WORKING' : (state.sessionId ? '💤 idle' : '⚫ no session')}`;
+      `**Autonomy:** \`!loop <task>\` · \`!heartbeat <min>\` · \`!orders\`\n` +
+      `**Schedule:** \`!schedule\` · \`!schedules\` · \`!unschedule <#>\` · \`!autoschedule\`\n` +
+      `**Monitors:** \`!monitor ci|health\` · \`!monitors\`\n` +
+      `**Services:** \`!services\` · \`!service stop|logs <name>\`\n` +
+      `**Config:** \`!config show|turns|continues|timeout <N>\`\n` +
+      `**Security:** \`!unlock <pin>\` · \`!permit\` · \`!revoke\` · \`!perms\`\n` +
+      `**Profile:** \`!profile\` · \`!remember\` · \`!forget\` · \`!deleteme\`\n\n` +
+      `Just type what you want built. Use \`!stop\` to interrupt.\n\n` +
+      `Current: **${state.identity?.name || 'Bot'}** | ${state.personality || 'default'} | \`${state.cwd}\` | ${state.busy ? '🔄 WORKING' : (state.sessionId ? '💤 idle' : '⚫ no session')}`;
     await ctx.sendLongMessage(message, helpText, state.cwd);
   }
 };
