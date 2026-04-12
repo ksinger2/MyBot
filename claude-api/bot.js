@@ -1688,6 +1688,10 @@ client.on('interactionCreate', async (interaction) => {
 // --- Signal adapter integration ---
 
 let signalAdapter = null;
+// Cache group member lookups to avoid an HTTP round-trip on every message.
+// Keyed by group chatId, value: { members: [...], name, fetchedAt }.
+const _groupInfoCache = new Map();
+const _GROUP_CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes
 
 function startSignalAdapter() {
   const phoneNumber = process.env.SIGNAL_PHONE_NUMBER;
@@ -1855,13 +1859,15 @@ function startSignalAdapter() {
       if (handled) return;
     }
 
-    // If busy, queue the message
+    // If busy, queue the message — silently in group chats, brief ack in DMs
     if (state.busy) {
       const fakeMessage = createSignalMessageProxy(msg, chatId, state);
       state.queue.push({ message: fakeMessage, content: text });
       saveChannelState(chatId, state, { critical: true });
-      const pos = state.queue.length;
-      await signalAdapter.sendMessage(msg.chatId, `Queued (#${pos}) — I'll get to that next.`);
+      if (!isGroupMessage) {
+        const pos = state.queue.length;
+        await signalAdapter.sendMessage(msg.chatId, `Queued (#${pos}) — I'll get to that next.`);
+      }
       return;
     }
 
@@ -1894,9 +1900,19 @@ function startSignalAdapter() {
       // (isGroupMessage already declared above in the access control block)
       if (isGroupMessage) {
         try {
-          const groupInfo = await signalAdapter._fetch(`/v1/groups/${encodeURIComponent(signalAdapter.phoneNumber)}/${encodeURIComponent(signalAdapter._toPublicGroupId(msg.chatId))}`);
-          if (groupInfo.ok) {
-            const grp = await groupInfo.json();
+          // Use cache to avoid an HTTP round-trip on every message
+          let grp = null;
+          const cached = _groupInfoCache.get(msg.chatId);
+          if (cached && (Date.now() - cached.fetchedAt < _GROUP_CACHE_TTL_MS)) {
+            grp = cached;
+          } else {
+            const groupInfo = await signalAdapter._fetch(`/v1/groups/${encodeURIComponent(signalAdapter.phoneNumber)}/${encodeURIComponent(signalAdapter._toPublicGroupId(msg.chatId))}`);
+            if (groupInfo.ok) {
+              grp = await groupInfo.json();
+              _groupInfoCache.set(msg.chatId, { ...grp, fetchedAt: Date.now() });
+            }
+          }
+          if (grp) {
             const memberIds = (grp.members || []).filter(m => m.startsWith('+') && m !== msg.senderId && m !== signalAdapter.phoneNumber);
             const memberContexts = [];
             for (const mid of memberIds) {
