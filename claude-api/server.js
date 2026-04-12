@@ -24,6 +24,12 @@ function escapeHtml(str) {
 const _setupCsrfTokens = new Map();
 const SETUP_CSRF_TTL_MS = 30 * 60 * 1000; // 30 minutes
 
+// ── F2: ephemeral access tokens for /setup/:userId ──────────────────────────
+// Map<token, { userId, expiresAt }> — single-use, 30min TTL. The bot requests
+// a token via POST /internal/setup-token and DMs the user a URL with ?t=<token>.
+const _setupAccessTokens = new Map();
+const SETUP_ACCESS_TTL_MS = 30 * 60 * 1000; // 30 minutes
+
 // ── M2 + L7: periodic cleanup intervals ──────────────────────────────────────
 // Module-level guard so `require.cache` re-entry (hot reload, test harness)
 // doesn't register duplicate intervals.
@@ -58,7 +64,7 @@ if (!global.__mybotServerIntervals) {
     }
   }, 60 * 60 * 1000).unref();
 
-  // L7: sweep expired CSRF tokens every hour.
+  // L7 + F2: sweep expired CSRF tokens and setup access tokens every hour.
   setInterval(() => {
     try {
       const now = Date.now();
@@ -69,11 +75,18 @@ if (!global.__mybotServerIntervals) {
           expired++;
         }
       }
+      // F2: also sweep expired setup access tokens
+      for (const [tok, entry] of _setupAccessTokens.entries()) {
+        if (!entry || entry.expiresAt <= now) {
+          _setupAccessTokens.delete(tok);
+          expired++;
+        }
+      }
       if (expired > 0) {
-        console.log(`[setup-csrf] expired ${expired} stale token(s)`);
+        console.log(`[setup-tokens] expired ${expired} stale token(s)`);
       }
     } catch (err) {
-      console.error('[setup-csrf] sweep failed:', err.message);
+      console.error('[setup-tokens] sweep failed:', err.message);
     }
   }, 60 * 60 * 1000).unref();
 }
@@ -91,21 +104,30 @@ if (!INTERNAL_API_TOKEN) {
   console.error('[security] WARNING: INTERNAL_API_TOKEN not set — all authenticated routes will be unreachable');
 }
 
-// Constant-time string compare. Pads to equal length before calling
-// timingSafeEqual so a length mismatch doesn't leak via an early throw.
+// Constant-time string compare (F12: simplified — length-equal inputs go
+// straight to timingSafeEqual; length mismatch returns false immediately,
+// which is fine because the length itself is not secret for random tokens).
 function safeTokenEqual(a, b) {
   if (typeof a !== 'string' || typeof b !== 'string') return false;
   if (a.length === 0 || b.length === 0) return false;
-  const len = Math.max(a.length, b.length);
-  const ab = Buffer.alloc(len, 0);
-  const bb = Buffer.alloc(len, 0);
-  ab.write(a);
-  bb.write(b);
-  // Final length check guards against the pathological case where both
-  // strings differ only in trailing NULs after padding.
-  const sameLen = a.length === b.length;
-  const eq = crypto.timingSafeEqual(ab, bb);
-  return sameLen && eq;
+  if (a.length !== b.length) return false;
+  return crypto.timingSafeEqual(Buffer.from(a), Buffer.from(b));
+}
+
+// F14: hard-cap helper for in-memory maps. Evicts oldest entries (FIFO via
+// insertion order) when the map exceeds maxSize. Rate-limited warning log.
+function _capMap(map, maxSize, label) {
+  if (map.size <= maxSize) return;
+  const excess = map.size - maxSize;
+  const iter = map.keys();
+  for (let i = 0; i < excess; i++) {
+    map.delete(iter.next().value);
+  }
+  const now = Date.now();
+  if (!_capMap._lastWarn || now - _capMap._lastWarn > 60000) {
+    _capMap._lastWarn = now;
+    console.warn(`[security] ${label} map overflow — evicted ${excess} oldest entries (cap: ${maxSize})`);
+  }
 }
 
 function requireInternalToken(req, res, next) {
@@ -522,6 +544,20 @@ app.get('/auth/spotify/callback', async (req, res) => {
 // connect Google Calendar — all from their phone browser.
 app.get('/setup/:userId', (req, res) => {
   const userId = decodeURIComponent(req.params.userId);
+
+  // F2: verify ephemeral access token — without a valid ?t= param, reject.
+  const setupToken = typeof req.query.t === 'string' ? req.query.t : '';
+  const accessEntry = _setupAccessTokens.get(setupToken);
+  if (
+    !accessEntry ||
+    accessEntry.expiresAt <= Date.now() ||
+    !safeTokenEqual(accessEntry.userId, userId)
+  ) {
+    return res.status(403).send('Invalid or expired setup link — ask the bot for a new one.');
+  }
+  // Single-use: delete so the same token can't be reused
+  _setupAccessTokens.delete(setupToken);
+
   const googleConfigured = !!(process.env.GOOGLE_CLIENT_ID && process.env.GOOGLE_CLIENT_SECRET);
 
   // Load existing profile to pre-fill the form
@@ -535,13 +571,26 @@ app.get('/setup/:userId', (req, res) => {
     token: csrfToken,
     expiresAt: Date.now() + SETUP_CSRF_TTL_MS,
   });
+  _capMap(_setupCsrfTokens, 10000, '_setupCsrfTokens');
 
   const calConnected = profile.gcal_connected
     ? `<p style="color:#4caf50;font-weight:bold;">✓ Google Calendar connected (${escapeHtml(profile.gcal_email)})</p>`
     : '';
 
+  // F3: generate a separate ephemeral token for the Google Calendar OAuth link
+  // so clicking "Connect Google Calendar" from the setup page is also gated.
+  let gcalToken = '';
+  if (googleConfigured) {
+    gcalToken = crypto.randomBytes(24).toString('hex');
+    _setupAccessTokens.set(gcalToken, {
+      userId,
+      expiresAt: Date.now() + SETUP_ACCESS_TTL_MS,
+    });
+    _capMap(_setupAccessTokens, 10000, '_setupAccessTokens');
+  }
+
   const googleBtn = googleConfigured
-    ? `<a href="/auth/google/calendar/${encodeURIComponent(userId)}" style="display:inline-block;background:#4285f4;color:#fff;padding:12px 24px;border-radius:6px;text-decoration:none;font-size:16px;">Connect Google Calendar</a>`
+    ? `<a href="/auth/google/calendar/${encodeURIComponent(userId)}?t=${encodeURIComponent(gcalToken)}" style="display:inline-block;background:#4285f4;color:#fff;padding:12px 24px;border-radius:6px;text-decoration:none;font-size:16px;">Connect Google Calendar</a>`
     : `<p style="color:#999;">Google Calendar not configured on this server.</p>`;
 
   res.send(`<!DOCTYPE html>
@@ -566,8 +615,9 @@ app.get('/setup/:userId', (req, res) => {
   <p class="sub">Phone: ${escapeHtml(userId)}</p>
 
   <div class="section">
-    <form method="POST" action="/setup/${encodeURIComponent(userId)}">
+    <form method="POST" action="/setup/${encodeURIComponent(userId)}?t=${encodeURIComponent(setupToken)}">
       <input type="hidden" name="_csrf" value="${escapeHtml(csrfToken)}">
+      <input type="hidden" name="_t" value="${escapeHtml(setupToken)}">
       <label for="name">Your Name</label>
       <input type="text" id="name" name="name" value="${escapeHtml(profile.name || '')}" placeholder="e.g. Mike" required>
 
@@ -599,6 +649,16 @@ app.get('/setup/:userId', (req, res) => {
 
 app.post('/setup/:userId', express.urlencoded({ extended: false }), (req, res) => {
   const userId = decodeURIComponent(req.params.userId);
+
+  // F2: verify that the POST came from a form rendered by the gated GET.
+  // The access token was already consumed by GET (single-use), so we just
+  // check that ?t= is present and non-empty — the CSRF token is the real
+  // POST protection.
+  const setupToken = typeof req.query.t === 'string' ? req.query.t : '';
+  if (!setupToken) {
+    return res.status(403).send('Invalid or expired setup link — ask the bot for a new one.');
+  }
+
   const { name, location, timezone } = req.body;
 
   // L7: verify same-origin CSRF token. Each GET issues a fresh token scoped
@@ -606,11 +666,12 @@ app.post('/setup/:userId', express.urlencoded({ extended: false }), (req, res) =
   // we delete it on success (single-use) so a replay can't resubmit.
   const submitted = req.body && req.body._csrf;
   const entry = _setupCsrfTokens.get(userId);
+  // F13: use safeTokenEqual instead of === for constant-time comparison
   const csrfOk =
     entry &&
     typeof submitted === 'string' &&
     submitted.length > 0 &&
-    entry.token === submitted &&
+    safeTokenEqual(entry.token, submitted) &&
     entry.expiresAt > Date.now();
   if (!csrfOk) {
     if (entry) _setupCsrfTokens.delete(userId); // scrub stale/expired entries
@@ -637,13 +698,28 @@ app.post('/setup/:userId', express.urlencoded({ extended: false }), (req, res) =
   <h1>✓ Profile Saved!</h1>
   <p>Name: <strong>${escapeHtml((name||'').trim())}</strong><br>Location: <strong>${escapeHtml((location||'').trim())}</strong><br>Timezone: <strong>${escapeHtml(timezone||'')}</strong></p>
   <p style="margin-top:32px;color:#666;">You can close this tab. Come back to connect Google Calendar if you haven't already.</p>
-  <a href="/setup/${encodeURIComponent(userId)}" style="display:inline-block;margin-top:16px;color:#4285f4;">Back to setup</a>
+  <p style="margin-top:16px;color:#999;font-size:14px;">To edit your profile again, ask the bot for a new setup link.</p>
 </body></html>`);
 });
 
 // Google Calendar OAuth — phone-number-aware (works for Signal users)
+// F3: gated behind the same ephemeral token as /setup/:userId (F2). The
+// !connect bot command must request a setup token first via /internal/setup-token.
 app.get('/auth/google/calendar/:userId', async (req, res) => {
   const userId = decodeURIComponent(req.params.userId);
+
+  // F3: verify ephemeral access token
+  const setupToken = typeof req.query.t === 'string' ? req.query.t : '';
+  const accessEntry = _setupAccessTokens.get(setupToken);
+  if (
+    !accessEntry ||
+    accessEntry.expiresAt <= Date.now() ||
+    !safeTokenEqual(accessEntry.userId, userId)
+  ) {
+    return res.status(403).send('Invalid or expired setup link — ask the bot for a new one.');
+  }
+  _setupAccessTokens.delete(setupToken); // single-use
+
   if (!process.env.GOOGLE_CLIENT_ID) {
     return res.status(400).send('Google OAuth not configured on this server.');
   }
@@ -685,6 +761,27 @@ app.get('/active-sessions', requireInternalToken, (req, res) => {
   } catch {
     res.json({ active: [], count: 0 });
   }
+});
+
+// ── F2: issue ephemeral setup access tokens ──────────────────────────────────
+// Called by the bot (e.g. !setup, !connect) to generate a single-use URL for
+// a specific userId. Gated by requireInternalToken so only the bot process can
+// request tokens.
+app.post('/internal/setup-token', requireInternalToken, (req, res) => {
+  const { userId } = req.body;
+  if (!userId || typeof userId !== 'string') {
+    return res.status(400).json({ error: 'userId required' });
+  }
+  const token = crypto.randomBytes(24).toString('hex');
+  _setupAccessTokens.set(token, {
+    userId,
+    expiresAt: Date.now() + SETUP_ACCESS_TTL_MS,
+  });
+  _capMap(_setupAccessTokens, 10000, '_setupAccessTokens');
+  res.json({
+    token,
+    url: '/setup/' + encodeURIComponent(userId) + '?t=' + token,
+  });
 });
 
 const PORT = 3400;
