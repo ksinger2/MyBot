@@ -27,7 +27,7 @@ const { extractImageAttachments } = require('./adapters/base');
 
 // F10: Deterministic greeting fast-path — replies without invoking Claude.
 // 100% reliable, $0, ~50ms. The system prompt rule stays as a backstop.
-const GREETING_RE = /^[\s\p{Emoji}]*(h(i|ey|ello|ola)|yo+|sup|what'?s\s*up|good\s*(morning|evening|afternoon|night)|gm|thanks?|thank\s*you|thx|ty|ok(ay)?|cool|nice|got\s*it|bet|lol|lmao|haha)\s*[!?.]*\s*$/iu;
+const GREETING_RE = /^[\s\p{Emoji}]*(h(i|ey|ello|ola)|yo+|sup|what'?s\s*up|good\s*(morning|evening|afternoon|night)|gm|thanks?|thank\s*you|thx|ty|ok(ay)?|cool|nice|got\s*it|bet|lol|lmao|haha)(\s+(girl|babe|there|bestie|queen|boo|hun|love|dude|man|bro|fam))?\s*[!?.♡❤️✨💕💋😘]*\s*$/iu;
 const GREETING_RESPONSES = {
   tiffany_pollard: ["hey boo! 💅", "hiii 😘", "what's good! 💕", "heyyy 💋", "sup girl!", "heyy! ✨"],
   april_ludgate: ["hey", "sup", "hi i guess", "what", "hey."],

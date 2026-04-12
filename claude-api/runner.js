@@ -21,14 +21,26 @@ const path = require('path');
 
 // F5: Output scrubber — redacts secrets that might leak via prompt injection
 // or accidental echoing. Applied to every streamed text block and final result.
+// H1 (security re-review): extended to cover all secret formats in the container env.
+const _INTERNAL_TOKEN_LITERAL = process.env.INTERNAL_API_TOKEN || '';
 function scrubSecrets(text) {
   if (typeof text !== 'string') return text;
-  return text
+  let out = text
     .replace(/X-Internal-Token:\s*[\w-]{10,}/gi, 'X-Internal-Token: [REDACTED]')
     .replace(/Bearer\s+[\w\-.]{20,}/gi, 'Bearer [REDACTED]')
-    .replace(/sk-[A-Za-z0-9_\-]{20,}/g, 'sk-[REDACTED]')
-    .replace(/ghp_[A-Za-z0-9]{20,}/g, 'ghp_[REDACTED]')
-    .replace(/github_pat_[A-Za-z0-9_]{20,}/g, 'github_pat_[REDACTED]');
+    .replace(/sk-[A-Za-z0-9_\-]{20,}/g, 'sk-[REDACTED]')           // OpenAI sk-proj-*, sk-ant-*
+    .replace(/sk_(?:live|test)_[A-Za-z0-9]{20,}/g, 'sk_[REDACTED]') // Stripe
+    .replace(/ghp_[A-Za-z0-9]{20,}/g, 'ghp_[REDACTED]')             // GitHub classic PAT
+    .replace(/github_pat_[A-Za-z0-9_]{20,}/g, 'github_pat_[REDACTED]') // GitHub fine-grained PAT
+    .replace(/r8_[A-Za-z0-9]{20,}/g, 'r8_[REDACTED]')               // Replicate
+    .replace(/AIzaSy[A-Za-z0-9_\-]{30,}/g, 'AIzaSy[REDACTED]')      // Google/Gemini API keys
+    .replace(/GOCSPX-[A-Za-z0-9_\-]{20,}/g, 'GOCSPX-[REDACTED]');   // Google OAuth client secret
+  // Literal match for the actual INTERNAL_API_TOKEN value (catches bare echoes
+  // from `echo $INTERNAL_API_TOKEN` or `/proc/self/environ` dumps)
+  if (_INTERNAL_TOKEN_LITERAL.length >= 16) {
+    out = out.replaceAll(_INTERNAL_TOKEN_LITERAL, '[REDACTED]');
+  }
+  return out;
 }
 const { buildSystemPrompt } = require('./system-prompt');
 const { init: initErrorAlerting, sendErrorAlert } = require('./error-alerting');
