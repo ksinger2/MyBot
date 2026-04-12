@@ -1,4 +1,65 @@
-# MyBot — Session Handoff (2026-04-11, late evening)
+# MyBot — Session Handoff (2026-04-11, night)
+
+## Final pass: 24-finding closure + architectural extraction
+
+Two independent review agents (OpenClaw engineering + security re-review)
+identified 24 distinct findings across the post-security-pass codebase.
+Every single one has been addressed — 20 closed, 2 deferred to follow-up
+(F23 Discord adapter symmetry, F24 commands extraction), 2 N/A (F18
+capabilities text accurate after F6, F19 session-journal audit confirmed
+clean). Tracked in the plan file at
+`/home/karen/.claude/plans/wobbly-gliding-finch.md`.
+
+### Key deliverables this pass
+- **`claude-api/runner.js`** (685 LOC, new) — Runner class extracted from
+  `bot.js:askClaude`, owns the full CLI lifecycle: spawn, stream-json
+  parsing, tool/agent/loop tracking, streaming sends, stall/timeout/close.
+- **`claude-api/system-prompt.js`** (220 LOC, new) — `buildSystemPrompt()`
+  extracted from the monolith. All static rules + dynamic personality/
+  identity/profile composition in one independently testable module.
+- **`bot.js`** went from **4163 → ~3430 lines** (-18%).
+- **INTERNAL_API_TOKEN** removed from system prompt (F1). Now passed as
+  a child env var; curl examples use `$INTERNAL_API_TOKEN` (bash ref).
+  Combined with `scrubSecrets()` (F5) — even if Claude echoes the var,
+  the regex scrubber catches it before it reaches the user.
+- **Streaming sends** now serialized via `_sendQueue` promise chain (F4)
+  and scrubbed (F5). Sub-agent text routed to per-agent buckets (F11).
+- **Greeting fast-path** — `GREETING_RE` regex in bot.js fires before
+  Claude for both Signal and Discord. $0, ~50ms, 100% deterministic (F10).
+- **Signal image attachments** — `extractImageAttachments` on `adapters/base.js`,
+  wired into the Signal post-result path (F8).
+- **WebFetch dropped** from the read-only allowlist (F7).
+- **`GH_TOKEN`** passed to Claude child env (F6).
+- **`/setup/:userId`** and **`/auth/google/calendar/:userId`** gated behind
+  ephemeral signed tokens (F2, F3). State maps hard-capped (F14).
+- **safeTokenEqual** simplified + CSRF timing-safe (F12, F13).
+- **`_redactId()`** applied to blocked-sender log (F15).
+- **`atomic-write.js`** hardened: cleanup on failure, accessSync check,
+  `sweepOrphanTmpFiles()` called at boot (F16).
+- **Boot warnings** for `HOST_HOME` and `SIGNAL_OWNER_NUMBER` fallbacks (F17).
+- **`link-extractor.js`** re-gates resolved Location URLs through
+  `_isUrlSafeForFetch()` (F9).
+
+### Deferred to follow-up session
+- **F23** — Discord adapter symmetry: route all Discord sends through
+  `DiscordAdapter.sendMessage` instead of raw `message.channel.send`.
+  ~204 call sites in bot.js.
+- **F24** — Extract `!command` handlers into `claude-api/commands/*.js`.
+  ~30 commands, ~1500 lines. Largest remaining bot.js reduction.
+
+### Credential rotation (2026-04-11)
+During this session, `.env` was accidentally `Read` into the chat,
+leaking all 7 secrets. All were rotated:
+- `INTERNAL_API_TOKEN` and `TOKEN_ENCRYPTION_KEY` — rotated by the user
+  via a host-shell one-liner (values never entered the conversation)
+- `DISCORD_BOT_TOKEN`, `OPENAI_API_KEY`, `GEMINI_API_KEY`,
+  `CLAUDE_CODE_OAUTH_TOKEN`, `GH_TOKEN` — rotated by the user via
+  provider dashboards
+- A memory entry (`feedback_secrets_handling.md`) was saved with a hard
+  rule: NEVER `Read` `.env` or any secrets file directly. Only enumerate
+  keys without values.
+
+---
 
 ## CRITICAL incident: bind-mount break in /rebuild flow (2026-04-11, fixed)
 
