@@ -766,6 +766,12 @@ app.get('/setup/:userId', (req, res) => {
     ? `<a href="/auth/google/calendar/${encodeURIComponent(userId)}?t=${encodeURIComponent(gcalToken)}" style="display:inline-block;background:#4285f4;color:#fff;padding:12px 24px;border-radius:6px;text-decoration:none;font-size:16px;">Connect Google Calendar</a>`
     : `<p style="color:#999;">Google Calendar not configured on this server.</p>`;
 
+  // Build preferences list HTML
+  const prefs = profile.preferences || [];
+  const prefsHtml = prefs.length > 0
+    ? prefs.map((p, i) => `<div class="pref" id="pref-${i}"><span>${escapeHtml(p.fact)}</span><span class="pref-meta">${escapeHtml(p.source || '')}${p.learnedAt ? ' · ' + new Date(p.learnedAt).toLocaleDateString() : ''}</span><button type="button" class="remove-btn" onclick="removePref(${i},'${escapeHtml(p.fact.replace(/'/g, "\\'"))}')">×</button></div>`).join('')
+    : '<p class="empty">No saved preferences yet. The bot learns these from your conversations.</p>';
+
   res.send(`<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -778,14 +784,23 @@ app.get('/setup/:userId', (req, res) => {
     .sub { color: #666; margin-bottom: 32px; font-size: 14px; }
     label { display: block; font-weight: 600; margin: 16px 0 4px; }
     input, select { width: 100%; padding: 10px; border: 1px solid #ccc; border-radius: 6px; font-size: 16px; box-sizing: border-box; }
-    button { margin-top: 20px; width: 100%; background: #222; color: #fff; border: none; padding: 14px; border-radius: 6px; font-size: 16px; cursor: pointer; }
+    button[type="submit"] { margin-top: 20px; width: 100%; background: #222; color: #fff; border: none; padding: 14px; border-radius: 6px; font-size: 16px; cursor: pointer; }
     .section { background: #fff; border-radius: 10px; padding: 20px; margin-bottom: 20px; box-shadow: 0 1px 3px rgba(0,0,0,.1); }
+    .section-title { font-weight: 600; font-size: 16px; margin-bottom: 12px; }
     .success { color: #4caf50; font-weight: bold; }
+    .pref { display: flex; align-items: center; gap: 8px; padding: 10px 0; border-bottom: 1px solid #eee; }
+    .pref:last-child { border-bottom: none; }
+    .pref span:first-child { flex: 1; font-size: 15px; }
+    .pref-meta { color: #999; font-size: 12px; white-space: nowrap; }
+    .remove-btn { background: none; border: 1px solid #ddd; color: #999; width: 28px; height: 28px; border-radius: 50%; cursor: pointer; font-size: 16px; line-height: 1; padding: 0; flex-shrink: 0; }
+    .remove-btn:hover { background: #fee; color: #c00; border-color: #c00; }
+    .empty { color: #999; font-size: 14px; font-style: italic; }
+    .updated { color: #999; font-size: 12px; margin-top: 8px; }
   </style>
 </head>
 <body>
-  <h1>Set Up Your Profile</h1>
-  <p class="sub">Phone: ${escapeHtml(userId)}</p>
+  <h1>${profile.name ? 'Edit Your Profile' : 'Set Up Your Profile'}</h1>
+  <p class="sub">${escapeHtml(userId)}</p>
 
   <div class="section">
     <form method="POST" action="/setup/${encodeURIComponent(userId)}?t=${encodeURIComponent(setupToken)}">
@@ -808,14 +823,41 @@ app.get('/setup/:userId', (req, res) => {
 
       <button type="submit">Save Profile</button>
     </form>
+    ${profile.updatedAt ? `<p class="updated">Last updated: ${new Date(profile.updatedAt).toLocaleDateString()}</p>` : ''}
   </div>
 
   <div class="section">
-    <strong>Google Calendar (read-only)</strong>
-    <p style="color:#666;font-size:14px;margin:8px 0 16px;">Connect so the bot can check your calendar when you ask.</p>
+    <div class="section-title">What I Know About You</div>
+    <p style="color:#666;font-size:13px;margin:0 0 12px;">Learned from our conversations. Tap × to remove any.</p>
+    <div id="prefs-list">${prefsHtml}</div>
+  </div>
+
+  <div class="section">
+    <div class="section-title">Google Calendar</div>
+    <p style="color:#666;font-size:14px;margin:4px 0 16px;">Connect so the bot can check your calendar and coordinate events with friends.</p>
     ${calConnected}
     ${googleBtn}
   </div>
+
+  <script>
+    async function removePref(idx, fact) {
+      if (!confirm('Remove "' + fact + '"?')) return;
+      try {
+        const res = await fetch('/setup/${encodeURIComponent(userId)}/remove-preference', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ fact: fact, _csrf: '${escapeHtml(csrfToken)}' }),
+        });
+        if (res.ok) {
+          const el = document.getElementById('pref-' + idx);
+          if (el) el.remove();
+          if (!document.querySelector('.pref')) {
+            document.getElementById('prefs-list').innerHTML = '<p class="empty">No saved preferences.</p>';
+          }
+        }
+      } catch {}
+    }
+  </script>
 </body>
 </html>`);
 });
@@ -873,6 +915,28 @@ app.post('/setup/:userId', express.urlencoded({ extended: false }), (req, res) =
   <p style="margin-top:32px;color:#666;">You can close this tab. Come back to connect Google Calendar if you haven't already.</p>
   <p style="margin-top:16px;color:#999;font-size:14px;">To edit your profile again, ask the bot for a new setup link.</p>
 </body></html>`);
+});
+
+// Remove a single preference from a user's profile (called from setup page JS)
+app.post('/setup/:userId/remove-preference', express.json(), (req, res) => {
+  const userId = decodeURIComponent(req.params.userId);
+  const { fact, _csrf } = req.body || {};
+  if (!fact) return res.status(400).json({ error: 'fact required' });
+
+  // Verify CSRF token (same one issued to the setup page)
+  const entry = _setupCsrfTokens.get(userId);
+  if (!entry || !_csrf || !safeTokenEqual(entry.token, _csrf) || entry.expiresAt < Date.now()) {
+    return res.status(403).json({ error: 'invalid csrf' });
+  }
+  // Don't delete CSRF here — allow multiple removes from the same page load
+
+  try {
+    const { removePreference } = require('./user-profiles');
+    const removed = removePreference(userId, fact);
+    res.json({ ok: true, removed });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // Google Calendar OAuth — phone-number-aware (works for Signal users)
