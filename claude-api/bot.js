@@ -547,7 +547,7 @@ function listPersonalities() {
     .map(f => f.replace('.md', ''));
 }
 
-function askClaude(prompt, { sessionId = null, personalityFile = null, identity = null, cwd = DEFAULT_WORKSPACE, maxTurns = null, channelState = null, discordChannel = null, channelProxy = null, discordUserId = null, readOnly = false, profileContext = null, streamReplies = false } = {}) {
+function askClaude(prompt, { sessionId = null, personalityFile = null, identity = null, cwd = DEFAULT_WORKSPACE, maxTurns = null, channelState = null, discordChannel = null, channelProxy = null, discordUserId = null, readOnly = false, groupAllowedTools = undefined, profileContext = null, streamReplies = false } = {}) {
   // Wrap raw Discord channel in ChannelProxy if needed
   if (!channelProxy && discordChannel) {
     channelProxy = ChannelProxy.fromDiscord(discordChannel);
@@ -556,7 +556,7 @@ function askClaude(prompt, { sessionId = null, personalityFile = null, identity 
   const runner = new Runner(prompt, {
     sessionId, personalityFile, identity, cwd, maxTurns,
     channelState, channelProxy, discordUserId, readOnly,
-    profileContext, streamReplies,
+    groupAllowedTools, profileContext, streamReplies,
     // Inject bot.js functions so runner.js doesn't need to import bot.js
     freshProgressFn: freshProgress,
     saveChannelStateFn: saveChannelState,
@@ -1903,24 +1903,41 @@ function startSignalAdapter() {
         }
       }
 
-      // GROUP CHATS = PURE CHATBOT MODE. No tools, no session resume, no
-      // engineering. Claude responds as a conversational assistant only.
-      // Owner status does NOT grant tool access in groups — if the owner
-      // wants to edit code, they use a DM or Discord.
+      // GROUP CHATS = SOCIAL ASSISTANT MODE. Claude can search the web, read
+      // links, create/edit calendar events (via curl), coordinate plans, store
+      // preferences — but CANNOT edit code, write files, navigate the codebase,
+      // or do any engineering work. No session resume (prevents old engineering
+      // sessions from carrying over). Max 5 turns (enough for a useful reply,
+      // not enough for a rabbit hole).
       const isGroupChat = isGroupMessage;
+
+      // Proactive onboarding: if the sender has no profile, inject a hint so
+      // Claude asks them to introduce themselves.
+      let groupOnboardHint = '';
+      if (isGroupChat && msg.senderId && msg.senderId.startsWith('+')) {
+        const senderProfile = getProfile(msg.senderId);
+        if (!senderProfile || !senderProfile.setup_complete) {
+          groupOnboardHint = `\n\n[SYSTEM: This user (${msg.senderName || msg.senderId}) has no profile yet. Naturally ask them to introduce themselves — their name, where they're from, and if they want to connect their Google Calendar. Keep it casual and friendly, not robotic. Store what they share via [LEARNED: ...] tags.]`;
+        }
+      }
+
       const claudeOpts = {
-        sessionId: isGroupChat ? null : state.sessionId, // no session resume in groups
+        sessionId: isGroupChat ? null : state.sessionId,
         personalityFile,
         identity: state.identity,
         cwd: state.cwd,
         channelState: state,
         channelProxy: signalProxy,
         discordUserId: msg.senderId,
-        readOnly: isGroupChat ? true : (!senderIsOwner || !_isChannelElevated(chatId)),
-        profileContext: combinedProfileContext,
+        // Groups use a SOCIAL allowlist: web search, reading, calendar (Bash for
+        // curl), sub-agents — but NOT Edit/Write/Grep/Glob (engineering tools).
+        // readOnly=false so the Runner doesn't apply the restrictive readOnly list.
+        // Instead we pass a custom groupAllowedTools list.
+        readOnly: isGroupChat ? false : (!senderIsOwner || !_isChannelElevated(chatId)),
+        groupAllowedTools: isGroupChat ? 'Read,WebSearch,WebFetch,Bash,Task,TodoWrite' : undefined,
+        profileContext: (combinedProfileContext || '') + groupOnboardHint,
         streamReplies: true,
-        // Group chats get 3 turns max — enough for a reply, not enough for a rabbit hole
-        maxTurns: isGroupChat ? 3 : undefined,
+        maxTurns: isGroupChat ? 5 : undefined,
       };
 
       // Auto-detect social/location links — pre-fetch metadata and build action prompt.

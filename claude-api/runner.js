@@ -179,6 +179,7 @@ class Runner {
     channelProxy = null,
     discordUserId = null,
     readOnly = false,
+    groupAllowedTools = undefined, // custom allowlist for group chats (overrides readOnly)
     profileContext = null,
     streamReplies = false,
     // Injected from bot.js so runner doesn't need to import bot.js:
@@ -271,8 +272,13 @@ class Runner {
         '--mcp-config', '/app/.mcp.json',
       ];
 
-      // Read-only tool allowlist
-      if (readOnly) {
+      // Tool restrictions — group chats get a social allowlist, read-only
+      // sessions get the restrictive allowlist, everyone else gets full access.
+      if (groupAllowedTools) {
+        // Group chat: social assistant mode — web search, links, calendar (Bash
+        // for curl), sub-agents. NO Edit/Write/Grep/Glob (engineering tools).
+        args.push('--allowedTools', groupAllowedTools);
+      } else if (readOnly) {
         args.push(
           '--allowedTools',
           [
