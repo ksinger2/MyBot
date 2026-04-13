@@ -819,6 +819,12 @@ app.get('/setup/:userId', (req, res) => {
     _capMap(_setupAccessTokens, 10000, '_setupAccessTokens');
   }
 
+  // Build rules list HTML
+  const rules = profile.rules || [];
+  const rulesHtml = rules.length > 0
+    ? rules.map((r, i) => `<div class="pref" id="rule-${i}"><span>${escapeHtml(r.rule)}</span><span class="pref-meta">${r.addedAt ? new Date(r.addedAt).toLocaleDateString() : ''}</span><button type="button" class="remove-btn" onclick="removeRule(${i},'${escapeHtml(r.rule.replace(/'/g, "\\'"))}')">×</button></div>`).join('')
+    : '<p class="empty-msg">No rules set. Use <code>!rules add ...</code> or add one below.</p>';
+
   // Build preferences list HTML
   const prefs = profile.preferences || [];
   const prefsHtml = prefs.length > 0
@@ -965,6 +971,16 @@ app.get('/setup/:userId', (req, res) => {
   </div>
 
   <div class="card">
+    <div class="card-title">Rules</div>
+    <p class="card-desc">Strict instructions I always follow for you — these override my defaults.</p>
+    <div id="rules-list">${rulesHtml}</div>
+    <div class="tag-input-row" style="margin-top:12px;">
+      <input type="text" id="rule-input" placeholder="e.g. never use bullet points" maxlength="200">
+      <button class="btn btn-primary" onclick="addRuleFromPage()" style="width:48px;font-size:20px;flex-shrink:0;padding:0;">+</button>
+    </div>
+  </div>
+
+  <div class="card">
     <div class="card-title">Scheduled Jobs</div>
     <p class="card-desc">Recurring tasks that run on a schedule and send results to your DM.</p>
     <div id="jobs-list">${jobsHtml || ''}</div>
@@ -1052,6 +1068,29 @@ async function removePref(idx,fact){
   if(!confirm('Remove "'+fact+'"?'))return;
   const res=await fetch('/setup/'+UID+'/remove-preference',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({fact,_csrf:CSRF})});
   if(res.ok){const el=document.getElementById('pref-'+idx);if(el)el.remove();if(!document.querySelector('.pref'))document.getElementById('prefs-list').innerHTML='<p class="empty-msg">No preferences.</p>';}
+}
+
+async function addRuleFromPage(){
+  const inp=document.getElementById('rule-input');
+  const rule=(inp.value||'').trim();
+  if(!rule)return;
+  const res=await fetch('/setup/'+UID+'/add-rule',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({rule,_csrf:CSRF})});
+  const d=await res.json();
+  if(res.ok&&d.ok){
+    const list=document.getElementById('rules-list');
+    if(list.querySelector('.empty-msg'))list.innerHTML='';
+    const idx=list.children.length;
+    const div=document.createElement('div');div.className='pref';div.id='rule-'+idx;
+    div.innerHTML='<span>'+esc(rule)+'</span><span class="pref-meta">today</span><button type="button" class="remove-btn" onclick="removeRule('+idx+',\\''+esc(rule)+'\\')">×</button>';
+    list.appendChild(div);
+    inp.value='';
+  }else{alert(d.error||'Could not add rule');}
+}
+
+async function removeRule(idx,rule){
+  if(!confirm('Remove this rule?'))return;
+  const res=await fetch('/setup/'+UID+'/remove-rule',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({rule,_csrf:CSRF})});
+  if(res.ok){const el=document.getElementById('rule-'+idx);if(el)el.remove();if(!document.querySelector('#rules-list .pref'))document.getElementById('rules-list').innerHTML='<p class="empty-msg">No rules set.</p>';}
 }
 
 function showJobForm(){document.getElementById('job-form').style.display='block';document.getElementById('add-job-btn').style.display='none';document.getElementById('job-edit-id').value='';document.getElementById('job-name').value='';document.getElementById('job-prompt').value='';document.getElementById('job-freq').value='';document.getElementById('job-name').focus();}
@@ -1173,6 +1212,33 @@ app.post('/setup/:userId/remove-preference', express.json(), (req, res) => {
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
+});
+
+// ── Rules endpoints ──
+
+app.post('/setup/:userId/add-rule', express.json(), (req, res) => {
+  const userId = decodeURIComponent(req.params.userId);
+  const { rule, _csrf } = req.body || {};
+  if (!rule || typeof rule !== 'string') return res.status(400).json({ error: 'rule required' });
+  if (rule.length > 200) return res.status(400).json({ error: 'Rule must be under 200 characters' });
+  if (!_verifyCsrf(userId, _csrf)) return res.status(403).json({ error: 'invalid csrf' });
+  try {
+    const { addRule } = require('./user-profiles');
+    addRule(userId, rule);
+    res.json({ ok: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.post('/setup/:userId/remove-rule', express.json(), (req, res) => {
+  const userId = decodeURIComponent(req.params.userId);
+  const { rule, _csrf } = req.body || {};
+  if (!rule) return res.status(400).json({ error: 'rule required' });
+  if (!_verifyCsrf(userId, _csrf)) return res.status(403).json({ error: 'invalid csrf' });
+  try {
+    const { removeRule } = require('./user-profiles');
+    const removed = removeRule(userId, rule);
+    res.json({ ok: true, removed });
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 // ── Tag endpoints ──
@@ -1384,6 +1450,27 @@ app.get('/active-sessions', requireInternalToken, (req, res) => {
 });
 
 // ── F2: issue ephemeral setup access tokens ──────────────────────────────────
+// ── Background task registry ─────────────────────────────────────────────────
+// Claude Code registers tasks here so !btw can show them even when the bot
+// itself isn't busy. Tasks are { id, description, startedAt }.
+const _backgroundTasks = new Map();
+
+app.post('/internal/background-task', requireInternalToken, (req, res) => {
+  const { id, description } = req.body || {};
+  if (!id || !description) return res.status(400).json({ error: 'id and description required' });
+  _backgroundTasks.set(String(id), { id: String(id), description: String(description).substring(0, 200), startedAt: Date.now() });
+  res.json({ ok: true });
+});
+
+app.delete('/internal/background-task/:id', requireInternalToken, (req, res) => {
+  _backgroundTasks.delete(req.params.id);
+  res.json({ ok: true });
+});
+
+app.get('/internal/background-tasks', requireInternalToken, (req, res) => {
+  res.json({ tasks: [..._backgroundTasks.values()] });
+});
+
 // Called by the bot (e.g. !setup, !connect) to generate a single-use URL for
 // a specific userId. Gated by requireInternalToken so only the bot process can
 // request tokens.

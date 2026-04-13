@@ -63,6 +63,16 @@ function _pickGreetingResponse(personality) {
   return pool[Math.floor(Math.random() * pool.length)];
 }
 
+// Returns true when a message should skip the grouping buffer and fire immediately.
+// Messages that clearly end a thought (punctuation, long) don't need debouncing.
+function shouldGroupImmediately(text) {
+  if (MESSAGE_GROUP_DELAY_MS === 0) return true;
+  const t = (text || '').trim();
+  if (/[?!.…]$/.test(t)) return true;
+  if (t.length > 120) return true;
+  return false;
+}
+
 // F15: PII redaction for log output (duplicated from adapters/signal.js to avoid circular dep)
 function _redactId(id) {
   if (typeof id !== 'string') return id;
@@ -172,6 +182,9 @@ const MAX_LOOP_WALLCLOCK_MS = parseInt(process.env.MAX_LOOP_WALLCLOCK_MS, 10) ||
 // M3: per-channel daily iteration cap — a runaway loop that keeps recovering
 // from errors can't burn through more than this many iterations in a UTC day.
 const MAX_LOOP_ITERATIONS_PER_DAY = parseInt(process.env.MAX_LOOP_ITERATIONS_PER_DAY, 10) || 200;
+// Message grouping debounce — wait this many ms for follow-up messages before
+// dispatching. Set MESSAGE_GROUP_DELAY_MS=0 to disable.
+const MESSAGE_GROUP_DELAY_MS = parseInt(process.env.MESSAGE_GROUP_DELAY_MS, 10) || 2500;
 // M3: in-memory per-channel iteration counter, keyed by UTC date. Resets on
 // day rollover. Map<channelId, { date: 'YYYY-MM-DD', count: number }>.
 const _loopIterationsToday = new Map();
@@ -579,8 +592,9 @@ const client = new Client({
     GatewayIntentBits.GuildMembers,
     GatewayIntentBits.MessageContent,
     GatewayIntentBits.DirectMessages,
+    GatewayIntentBits.GuildMessageReactions,
   ],
-  partials: [Partials.Channel],
+  partials: [Partials.Channel, Partials.Message, Partials.Reaction],
 });
 
 // Detect active participants in a channel by scanning recent messages
@@ -614,6 +628,12 @@ function getChannel(channelId) {
       startedAt: null, // timestamp when Claude started working
       progress: freshProgress(), // structured progress for !btw
       queue: [],      // queued messages while Claude is busy
+      groupingTimer: null,   // debounce timer for message grouping
+      groupingBuffer: [],    // buffered messages waiting to be combined
+      groupingSenderId: null, // sender of the buffered messages
+      _triggeredByTimestamp: null, // Signal timestamp of the message that started the active task
+      _triggeredByMessageId: null, // Discord message ID that started the active task
+      lastBotMessageId: null, // Discord: ID of the last message the bot sent in this channel
     });
   }
   return channels.get(channelId);
@@ -953,6 +973,18 @@ client.on('clientReady', () => {
   discordAdapter = new DiscordAdapter({ client });
   discordAdapter.ready = true;
   module.exports.discordAdapter = discordAdapter;
+
+  // Track the bot's last sent message ID per channel so reaction handlers know
+  // which message a 👍/👎 reaction is responding to.
+  const _origSendMessage = discordAdapter.sendMessage.bind(discordAdapter);
+  discordAdapter.sendMessage = async function(chatId, text, opts = {}) {
+    const result = await _origSendMessage(chatId, text, opts);
+    if (result && result.id) {
+      const state = channels.get(chatId);
+      if (state) state.lastBotMessageId = result.id;
+    }
+    return result;
+  };
 
   // F16: sweep orphaned .tmp files from previous crash before reading stores
   try { sweepOrphanTmpFiles(['/app/data', '/home/node/.claude']); } catch {}
@@ -1502,7 +1534,7 @@ client.on('messageCreate', async (message) => {
   // sent during a loop fall into this path and get queued. processQueue won't
   // run them until the loop's outer finally clears state.busy.
   if (state.busy) {
-    state.queue.push({ message, content: message.content });
+    state.queue.push({ message, content: message.content, _messageId: message.id });
     saveChannelState(message.channel.id, state, { critical: true }); // persist queue immediately
     const pos = state.queue.length;
     const ctx = state.loopActive ? ' (loop in progress — use `!stop` to interrupt)' : '';
@@ -1518,6 +1550,41 @@ client.on('messageCreate', async (message) => {
     return;
   }
 
+  // Message grouping debounce — buffer rapid follow-up messages from the same user
+  if (MESSAGE_GROUP_DELAY_MS > 0 && !shouldGroupImmediately(message.content)) {
+    const userId = message.author?.id || message._signalSenderId;
+    // Different user flushing: immediately fire previous buffer
+    if (state.groupingTimer && state.groupingSenderId && state.groupingSenderId !== userId) {
+      clearTimeout(state.groupingTimer);
+      state.groupingTimer = null;
+      const prev = state.groupingBuffer.splice(0);
+      state.groupingSenderId = null;
+      if (prev.length > 0) {
+        const combined = prev.map(e => e.content).join('\n');
+        setImmediate(() => _dispatchDiscordMessage(prev[prev.length - 1].message, combined, state));
+      }
+    }
+    if (!state.groupingBuffer) state.groupingBuffer = [];
+    state.groupingBuffer.push({ content: message.content, message });
+    state.groupingSenderId = userId;
+    if (state.groupingTimer) clearTimeout(state.groupingTimer);
+    state.groupingTimer = setTimeout(() => {
+      const buf = state.groupingBuffer.splice(0);
+      state.groupingTimer = null;
+      state.groupingSenderId = null;
+      if (buf.length === 0) return;
+      const combined = buf.map(e => e.content).join('\n');
+      _dispatchDiscordMessage(buf[buf.length - 1].message, combined, state);
+    }, MESSAGE_GROUP_DELAY_MS);
+    return;
+  }
+  // Immediate path (ends with punctuation or long message)
+  _dispatchDiscordMessage(message, message.content, state);
+});
+
+async function _dispatchDiscordMessage(message, messageText, state) {
+  state.busy = true;
+  state._triggeredByMessageId = message.id || null;
   const personalityFile = getPersonalityFile(state.personality);
 
   // Keep typing indicator alive — F23: route through adapter
@@ -1535,7 +1602,7 @@ client.on('messageCreate', async (message) => {
   try {
     // Track active task so we can resume after crash/restart
     state.activeTask = {
-      prompt: message.content.substring(0, 500),
+      prompt: messageText.substring(0, 500),
       channelId: message.channel.id,
       startedAt: new Date().toISOString(),
       resumeAttempts: 0,
@@ -1544,11 +1611,41 @@ client.on('messageCreate', async (message) => {
 
     let result;
     // Auto-detect social/location links — pre-fetch metadata and build action prompt
-    const detectedLinks = detectLinks(message.content);
-    let messagePrompt = message.content;
+    const detectedLinks = detectLinks(messageText);
+    let messagePrompt = messageText;
     if (detectedLinks.length > 0) {
       const enriched = await enrichLinks(detectedLinks);
-      messagePrompt = buildSmartPrompt(enriched) + message.content;
+      messagePrompt = buildSmartPrompt(enriched) + messageText;
+    }
+    // TikTok transcript injection — fetch captions and prepend as context
+    try {
+      const { extractTikTokUrls, getTikTokTranscriptWithFallback } = require('./tiktok-transcript');
+      const tiktokUrls = extractTikTokUrls(messageText);
+      for (const turl of tiktokUrls) {
+        const result = await getTikTokTranscript(turl);
+        if (result && result.transcript) {
+          messagePrompt += `\n\n<video-transcript url="${turl}">\n${result.transcript}\n</video-transcript>`;
+        }
+      }
+    } catch (err) {
+      console.error('[tiktok] Discord transcript error:', err.message);
+    }
+    // Instagram Reels transcript injection
+    try {
+      const { extractInstagramReelUrls, getInstagramTranscript } = require('./instagram-transcript');
+      const igUrls = extractInstagramReelUrls(messageText);
+      for (const igUrl of igUrls) {
+        const igResult = await getInstagramTranscript(igUrl);
+        if (igResult) {
+          let block = `<video-transcript url="${igUrl}">`;
+          if (igResult.transcript) block += `\n${igResult.transcript}`;
+          else if (igResult.description) block += `\n[No audio transcript. Creator caption: ${igResult.description}]`;
+          block += `\n</video-transcript>`;
+          messagePrompt += `\n\n${block}`;
+        }
+      }
+    } catch (err) {
+      console.error('[instagram] Discord transcript error:', err.message);
     }
 
     const streamingProxy = ChannelProxy.fromDiscordStreaming(message.channel);
@@ -1575,7 +1672,7 @@ client.on('messageCreate', async (message) => {
         state.sessionId = null;
         await _dsend(message.channel, '*Session error — retrying fresh (1/2)...*').catch(() => {});
         try {
-          result = await askClaude(message.content, {
+          result = await askClaude(messageText, {
             personalityFile,
             identity: state.identity,
             cwd: state.cwd,
@@ -1587,7 +1684,7 @@ client.on('messageCreate', async (message) => {
           console.log('Fresh call also failed, retrying after delay:', freshErr.message);
           await _dsend(message.channel, '*Still failing — retrying one more time (2/2)...*').catch(() => {});
           await new Promise(r => setTimeout(r, 3000));
-          result = await askClaude(message.content, {
+          result = await askClaude(messageText, {
             personalityFile,
             identity: state.identity,
             cwd: state.cwd,
@@ -1601,7 +1698,7 @@ client.on('messageCreate', async (message) => {
         await _dsend(message.channel, '*Hit an error — retrying in 3s...*').catch(() => {});
         await new Promise(r => setTimeout(r, 3000));
         try {
-          result = await askClaude(message.content, {
+          result = await askClaude(messageText, {
             personalityFile,
             identity: state.identity,
             cwd: state.cwd,
@@ -1633,7 +1730,7 @@ client.on('messageCreate', async (message) => {
       // Save journal entry so next session (even after restart) knows what happened
       appendEntry(message.channel.id, {
         cwd: state.cwd,
-        promptSummary: message.content,
+        promptSummary: messageText,
         resultSummary: result.text,
         turnCount: result.numTurns || 0,
       });
@@ -1731,7 +1828,7 @@ client.on('messageCreate', async (message) => {
     if (state.sessionId) errorParts.push('\n*Session preserved — send another message to retry, or `!refresh` to reset everything.*');
     else errorParts.push('\n*Try again, or `!refresh` to reset everything.*');
     await _dreply(message, errorParts.join(' · ')).catch(() => {});
-    sendErrorAlert(err, { source: 'message handler', channel: message.channel.id, detail: message.content.substring(0, 100) });
+    sendErrorAlert(err, { source: 'message handler', channel: message.channel.id, detail: messageText.substring(0, 100) });
   } finally {
     clearInterval(typingInterval);
     state.busy = false;
@@ -1743,7 +1840,7 @@ client.on('messageCreate', async (message) => {
     // Drain queued messages
     await processQueue(state);
   }
-});
+}
 
 // Handle Discord button/select menu interactions (for plan components, voting, etc.)
 client.on('interactionCreate', async (interaction) => {
@@ -1751,6 +1848,94 @@ client.on('interactionCreate', async (interaction) => {
     await handleComponentInteraction(interaction);
   } catch (err) {
     console.error('Interaction error:', err.message);
+  }
+});
+
+// Handle Discord "delete for everyone" — cancel queued/running task if it came from the deleted message
+client.on('messageDelete', (message) => {
+  try {
+    const channelId = message.channel?.id;
+    if (!channelId) return;
+    const state = getChannel(channelId);
+    const msgId = message.id;
+    // 1. Cancel grouping timer if this message is still buffered
+    if (state.groupingTimer && state.groupingBuffer?.length > 0) {
+      const inBuffer = state.groupingBuffer.some(e => e.message?.id === msgId);
+      if (inBuffer) {
+        state.groupingBuffer = state.groupingBuffer.filter(e => e.message?.id !== msgId);
+        if (state.groupingBuffer.length === 0) {
+          clearTimeout(state.groupingTimer);
+          state.groupingTimer = null;
+          state.groupingSenderId = null;
+          console.log(`[discord] Deleted message ${msgId} was in grouping buffer — cancelled`);
+          return;
+        }
+      }
+    }
+    // 2. Remove from queue
+    const qBefore = state.queue.length;
+    state.queue = state.queue.filter(q => q._messageId !== msgId);
+    if (state.queue.length < qBefore) {
+      console.log(`[discord] Deleted message ${msgId} removed from queue`);
+      saveChannelState(channelId, state, { critical: true });
+    }
+    // 3. Stop active task if triggered by this message
+    if (state.busy && state._triggeredByMessageId === msgId && state.process) {
+      console.log(`[discord] Deleted message ${msgId} was the active task — stopping`);
+      try { state.process.kill('SIGTERM'); } catch {}
+      state.busy = false;
+      state._triggeredByMessageId = null;
+    }
+  } catch (err) {
+    console.error('[discord] messageDelete error:', err.message);
+  }
+});
+
+// Handle Discord emoji reactions — treat 👍/👎 on the bot's last message as yes/no
+client.on('messageReactionAdd', async (reaction, user) => {
+  try {
+    if (user.bot) return;
+    if (!isAllowed(user.id)) return;
+
+    // Fetch partial reaction/message if needed (older messages arrive as partials)
+    if (reaction.partial) {
+      try { await reaction.fetch(); } catch { return; }
+    }
+    if (reaction.message.partial) {
+      try { await reaction.message.fetch(); } catch { return; }
+    }
+
+    const channelId = reaction.message.channel?.id;
+    if (!channelId) return;
+    const state = getChannel(channelId);
+
+    // Only act on reactions to the bot's last sent message in this channel
+    if (!state.lastBotMessageId || reaction.message.id !== state.lastBotMessageId) return;
+
+    const emoji = reaction.emoji.name;
+    let answer = null;
+    if (emoji === '👍') answer = 'yes';
+    else if (emoji === '👎') answer = 'no';
+    if (!answer) return;
+
+    if (state.busy) {
+      console.log(`[discord] Reaction ${emoji} from ${user.tag} ignored — channel busy`);
+      return;
+    }
+
+    console.log(`[discord] Reaction ${emoji} from ${user.tag} in ${channelId} → dispatching "${answer}"`);
+    // Synthesize a minimal message-like object for _dispatchDiscordMessage
+    const syntheticMessage = {
+      id: reaction.message.id,
+      channel: reaction.message.channel,
+      author: user,
+      content: answer,
+      mentions: { has: () => false },
+      attachments: { size: 0 },
+    };
+    _dispatchDiscordMessage(syntheticMessage, answer, state);
+  } catch (err) {
+    console.error('[discord] messageReactionAdd error:', err.message);
   }
 });
 
@@ -1777,6 +1962,18 @@ function startSignalAdapter() {
   // The destructured `signalAdapter` in `module.exports = {..., signalAdapter}`
   // below captures `null` at module load time.
   module.exports.signalAdapter = signalAdapter;
+
+  // Track the bot's last sent message timestamp per channel so reaction handlers
+  // know which message a 👍/👎 reaction is targeting.
+  const _origSignalSend = signalAdapter.sendMessage.bind(signalAdapter);
+  signalAdapter.sendMessage = async function(chatId, text, opts) {
+    const result = await _origSignalSend(chatId, text, opts);
+    if (result && result.id) {
+      const state = channels.get(`signal:${chatId}`) || channels.get(chatId);
+      if (state) state._lastBotTimestamp = Number(result.id) || null;
+    }
+    return result;
+  };
 
   // Access control for Signal — comma-separated phone numbers.
   // SECURITY (H1): fail-closed. Empty = deny all (except the owner, who is
@@ -2002,7 +2199,7 @@ function startSignalAdapter() {
     // If busy, queue the message — silently in group chats, brief ack in DMs
     if (state.busy) {
       const fakeMessage = createSignalMessageProxy(msg, chatId, state);
-      state.queue.push({ message: fakeMessage, content: text });
+      state.queue.push({ message: fakeMessage, content: text, _timestamp: msg.timestamp });
       saveChannelState(chatId, state, { critical: true });
       if (!isGroupMessage) {
         const pos = state.queue.length;
@@ -2011,26 +2208,180 @@ function startSignalAdapter() {
       return;
     }
 
-    // Normal message — run Claude
-    const personalityFile = getPersonalityFile(state.personality);
-    // Real Signal typing indicator (replaces the old "..." literal-message hack).
-    // Signal typing dots auto-expire after a few seconds, so refresh on an interval
-    // for the duration of Claude's run.
-    await signalAdapter.sendTyping(msg.chatId).catch(() => {});
-    const signalTypingInterval = setInterval(() => {
-      signalAdapter.sendTyping(msg.chatId).catch(() => {});
-    }, 8000);
+    // Message grouping debounce — buffer rapid follow-up messages from the same user
+    if (MESSAGE_GROUP_DELAY_MS > 0 && !shouldGroupImmediately(text)) {
+      const userId = msg.senderId;
+      // Different user flushing: immediately fire previous buffer
+      if (state.groupingTimer && state.groupingSenderId && state.groupingSenderId !== userId) {
+        clearTimeout(state.groupingTimer);
+        state.groupingTimer = null;
+        const prev = state.groupingBuffer.splice(0);
+        state.groupingSenderId = null;
+        if (prev.length > 0) {
+          const combined = prev.map(e => e.content).join('\n');
+          setImmediate(() => {
+            state._triggeredByTimestamp = prev[prev.length - 1].msg?.timestamp;
+            _dispatchSignalMessage(prev[prev.length - 1].msg, prev[prev.length - 1].chatId, combined, state);
+          });
+        }
+      }
+      if (!state.groupingBuffer) state.groupingBuffer = [];
+      state.groupingBuffer.push({ content: text, msg, chatId });
+      state.groupingSenderId = userId;
+      if (state.groupingTimer) clearTimeout(state.groupingTimer);
+      state.groupingTimer = setTimeout(() => {
+        const buf = state.groupingBuffer.splice(0);
+        state.groupingTimer = null;
+        state.groupingSenderId = null;
+        if (buf.length === 0) return;
+        const combined = buf.map(e => e.content).join('\n');
+        state._triggeredByTimestamp = buf[buf.length - 1].msg?.timestamp;
+        _dispatchSignalMessage(buf[buf.length - 1].msg, buf[buf.length - 1].chatId, combined, state);
+      }, MESSAGE_GROUP_DELAY_MS);
+      return;
+    }
+    // Immediate path (ends with punctuation or long message)
+    state._triggeredByTimestamp = msg.timestamp;
+    _dispatchSignalMessage(msg, chatId, text, state);
+  });
 
-    try {
-      state._isGroupChat = isGroupMessage; // used by commands (e.g. !btw) to suppress in groups
-      state.activeTask = {
-        prompt: text.substring(0, 500),
-        channelId: chatId,
-        startedAt: new Date().toISOString(),
-        resumeAttempts: 0,
-      };
-      state.busy = true;
-      saveChannelState(chatId, state, { critical: true });
+  // Handle Signal emoji reactions — treat 👍/👎 as yes/no answers
+  signalAdapter.on('reaction', ({ chatId, senderId, emoji, targetTimestamp, isRemove }) => {
+    if (isRemove) return; // ignore reaction removals
+
+    let answer = null;
+    if (emoji === '👍') answer = 'yes';
+    else if (emoji === '👎') answer = 'no';
+    if (!answer) return;
+
+    const signalChatId = `signal:${chatId}`;
+    const state = getChannel(signalChatId);
+
+    // Access control — same rules as regular messages
+    const isGroupMessage = chatId !== senderId;
+    const senderAllowed = isSignalOwner(senderId) || isGroupMessage || allowedNumbers.has(senderId);
+    if (!senderAllowed) {
+      console.log(`[signal] Reaction from non-allowlisted sender ${senderId} — ignored`);
+      return;
+    }
+
+    if (state.busy) {
+      console.log(`[signal] Reaction ${emoji} from ${senderId} ignored — channel busy`);
+      return;
+    }
+
+    // Only act if the reaction targets the bot's last sent message
+    if (state._lastBotTimestamp && targetTimestamp !== state._lastBotTimestamp) return;
+
+    console.log(`[signal] Reaction ${emoji} from ${senderId} in ${chatId} → dispatching "${answer}"`);
+    const syntheticMsg = {
+      chatId,
+      senderId,
+      senderName: senderId,
+      text: answer,
+      attachments: [],
+      mentions: [],
+      timestamp: Date.now(),
+      raw: null,
+    };
+    state._triggeredByTimestamp = syntheticMsg.timestamp;
+    _dispatchSignalMessage(syntheticMsg, chatId, answer, state);
+  });
+
+  // Handle "delete for everyone" in Signal — cancel queued/running task if triggered by this message
+  signalAdapter.on('messageDelete', ({ chatId, deletedTimestamp }) => {
+    const state = getChannel(`signal:${chatId}`);
+    // 1. Cancel grouping timer if the deleted message is buffered
+    if (state.groupingTimer && state.groupingBuffer?.length > 0) {
+      const inBuffer = state.groupingBuffer.some(e => e.msg?.timestamp === deletedTimestamp);
+      if (inBuffer) {
+        state.groupingBuffer = state.groupingBuffer.filter(e => e.msg?.timestamp !== deletedTimestamp);
+        if (state.groupingBuffer.length === 0) {
+          clearTimeout(state.groupingTimer);
+          state.groupingTimer = null;
+          state.groupingSenderId = null;
+          console.log(`[signal] Deleted message ${deletedTimestamp} was in grouping buffer — cancelled`);
+          return;
+        }
+      }
+    }
+    // 2. Remove from queue
+    const queueLenBefore = state.queue.length;
+    state.queue = state.queue.filter(q => q._timestamp !== deletedTimestamp);
+    if (state.queue.length < queueLenBefore) {
+      console.log(`[signal] Deleted message ${deletedTimestamp} removed from queue`);
+      saveChannelState(`signal:${chatId}`, state, { critical: true });
+    }
+    // 3. Stop active task if it was triggered by this message
+    if (state.busy && state._triggeredByTimestamp === deletedTimestamp && state.process) {
+      console.log(`[signal] Deleted message ${deletedTimestamp} was the active task — stopping`);
+      try { state.process.kill('SIGTERM'); } catch {}
+      state.busy = false;
+      state._triggeredByTimestamp = null;
+    }
+  });
+
+  // Start group-notes reminder loop — sends DM nudges for unresolved action items
+  startReminderLoop(async (userId, msg) => {
+    if (userId.startsWith('+') && signalAdapter && signalAdapter.ready) {
+      await signalAdapter.sendLongMessage(userId, msg);
+    }
+  });
+
+  // Restore pending safe-flight messages from previous boot
+  restoreFlightJobs(async (groupId, msg, opts) => {
+    if (signalAdapter && signalAdapter.ready) {
+      await signalAdapter.sendMessage(groupId, msg, opts || {});
+    }
+  });
+
+  signalAdapter.start().then(() => {
+    // Notify the owner via Signal if this was an unexpected restart (crash).
+    // Clean shutdowns (!restart) and rollbacks are excluded — only genuine
+    // crashes or container kills trigger this. Lets the user know from their
+    // phone that the bot went down and came back.
+    const cleanFile = path.join('/home/node/.claude', '.clean-shutdown');
+    const rolledBackFile = '/tmp/.rolled-back';
+    const wasClean = fs.existsSync(cleanFile);
+    const wasRolledBack = fs.existsSync(rolledBackFile);
+    if (!wasClean && !wasRolledBack) {
+      const { SIGNAL_OWNER } = require('./project-permissions');
+      if (SIGNAL_OWNER) {
+        signalAdapter.sendMessage(SIGNAL_OWNER,
+          '*Bot restarted unexpectedly (possible crash). I\u2019m back online now.*'
+        ).catch(() => {});
+        console.log('[signal] Sent crash notification to owner');
+      }
+    }
+  }).catch(err => {
+    console.error(`[signal] Failed to start: ${err.message}`);
+  });
+}
+
+async function _dispatchSignalMessage(msg, chatId, text, state) {
+  const { buildProfileContext, getProfile } = require('./user-profiles');
+  const { isSignalOwner } = require('./project-permissions');
+  const isGroupMessage = msg.chatId !== msg.senderId;
+  const senderIsOwner = isSignalOwner(msg.senderId);
+  const personalityFile = getPersonalityFile(state.personality);
+  // Real Signal typing indicator (replaces the old "..." literal-message hack).
+  // Signal typing dots auto-expire after a few seconds, so refresh on an interval
+  // for the duration of Claude's run.
+  await signalAdapter.sendTyping(msg.chatId).catch(() => {});
+  const signalTypingInterval = setInterval(() => {
+    signalAdapter.sendTyping(msg.chatId).catch(() => {});
+  }, 8000);
+
+  try {
+    state._isGroupChat = isGroupMessage; // used by commands (e.g. !btw) to suppress in groups
+    state.activeTask = {
+      prompt: text.substring(0, 500),
+      channelId: chatId,
+      startedAt: new Date().toISOString(),
+      resumeAttempts: 0,
+    };
+    state.busy = true;
+    saveChannelState(chatId, state, { critical: true });
 
       const signalProxy = ChannelProxy.fromSignal(signalAdapter, msg.chatId);
 
@@ -2054,7 +2405,20 @@ function startSignalAdapter() {
             }
           }
           if (grp) {
-            const memberIds = (grp.members || []).filter(m => m.startsWith('+') && m !== msg.senderId && m !== signalAdapter.phoneNumber);
+            const rawMembers = grp.members || [];
+            // If any member is an unresolved UUID, refresh contacts now so newly
+            // onboarded users (who ran !setup after bot start) get included.
+            const hasUnresolvedUuids = rawMembers.some(m =>
+              !m.startsWith('+') && signalAdapter._resolveRecipient && signalAdapter._resolveRecipient(m) === m
+            );
+            if (hasUnresolvedUuids) {
+              await signalAdapter._loadContacts().catch(() => {});
+            }
+            const memberIds = rawMembers.map(m => {
+              if (m.startsWith('+')) return m;
+              // Try to resolve UUID→phone using the adapter's lookup table
+              return signalAdapter._resolveRecipient ? signalAdapter._resolveRecipient(m) : null;
+            }).filter(m => m && m.startsWith('+') && m !== msg.senderId && m !== signalAdapter.phoneNumber);
             const memberContexts = [];
             for (const mid of memberIds) {
               const ctx = buildProfileContext(mid, { isGroupChat: true });
@@ -2062,11 +2426,17 @@ function startSignalAdapter() {
             }
             if (memberContexts.length > 0) {
               const groupHeader = `GROUP CONTEXT — This message is from a Signal group with ${grp.members?.length || '?'} members. Sender is ${msg.senderId}. Other known members:`;
+              const memberPhoneMap = memberIds.map(mid => {
+                const prof = getProfile ? getProfile(mid) : null;
+                const name = prof?.name || mid;
+                return `${name}: ${mid}`;
+              }).join(', ');
               combinedProfileContext = [
                 combinedProfileContext || '',
                 groupHeader,
                 ...memberContexts,
                 'When the user says "us" or "we", coordinate across all known members. Use their Google Calendars (where connected) to find times that work for everyone.',
+                `[INTERNAL — for event/reminder scheduling only, do NOT say these aloud]: Member phone numbers: ${memberPhoneMap}`,
                 '\nGROUP PRIVACY RULES (CRITICAL — never violate these):\n- NEVER share event titles, descriptions, or attendee lists from anyone\'s calendar in group chat. Calendar availability in groups: ONLY say "[Name] is busy on [day] from [time] to [time]" or "[Name] is free on [day]"\n- NEVER share phone numbers, email addresses, or profile details of one member with another in group chat\n- NEVER run !profile or share profile data in group chat — tell the user to DM you instead\n- Full calendar details and personal info are ONLY for private 1:1 DMs with that specific user\n- NEVER discuss, reveal, or confirm the existence of OTHER group chats, DM conversations, or channels. You have NO knowledge of what groups any user is in, what they discuss in other chats, who else they talk to, or what other group chats are named. If asked, say "I can only help with this conversation."\n- NEVER reveal conversation history or topics from other sessions, groups, or DMs — even if you have context from the session journal. Each group chat is isolated.\n- If someone asks "what groups is [person] in?" or "what did [person] say in [other chat]?" — refuse. Say you don\'t have access to that information.',
               ].filter(Boolean).join('\n\n');
             }
@@ -2177,6 +2547,36 @@ function startSignalAdapter() {
       if (detectedLinks.length > 0) {
         const enriched = await enrichLinks(detectedLinks);
         signalPrompt = buildSmartPrompt(enriched) + text;
+      }
+      // TikTok transcript injection — fetch captions and append as context
+      try {
+        const { extractTikTokUrls, getTikTokTranscriptWithFallback } = require('./tiktok-transcript');
+        const tiktokUrls = extractTikTokUrls(text);
+        for (const turl of tiktokUrls) {
+          const ttResult = await getTikTokTranscriptWithFallback(turl);
+          if (ttResult && ttResult.transcript) {
+            signalPrompt += `\n\n<video-transcript url="${turl}">\n${ttResult.transcript}\n</video-transcript>`;
+          }
+        }
+      } catch (err) {
+        console.error('[tiktok] Signal transcript error:', err.message);
+      }
+      // Instagram Reels transcript injection
+      try {
+        const { extractInstagramReelUrls, getInstagramTranscript } = require('./instagram-transcript');
+        const igUrls = extractInstagramReelUrls(text);
+        for (const igUrl of igUrls) {
+          const igResult = await getInstagramTranscript(igUrl);
+          if (igResult) {
+            let block = `<video-transcript url="${igUrl}">`;
+            if (igResult.transcript) block += `\n${igResult.transcript}`;
+            else if (igResult.description) block += `\n[No audio transcript. Creator caption: ${igResult.description}]`;
+            block += `\n</video-transcript>`;
+            signalPrompt += `\n\n${block}`;
+          }
+        }
+      } catch (err) {
+        console.error('[instagram] Signal transcript error:', err.message);
       }
 
       const result = await runClaudeWithContinuation(signalPrompt, claudeOpts, signalProxy);
@@ -2341,43 +2741,6 @@ function startSignalAdapter() {
         saveChannelState(chatId, state, { critical: true });
       }
     }
-  });
-
-  // Start group-notes reminder loop — sends DM nudges for unresolved action items
-  startReminderLoop(async (userId, msg) => {
-    if (userId.startsWith('+') && signalAdapter && signalAdapter.ready) {
-      await signalAdapter.sendLongMessage(userId, msg);
-    }
-  });
-
-  // Restore pending safe-flight messages from previous boot
-  restoreFlightJobs(async (groupId, msg, opts) => {
-    if (signalAdapter && signalAdapter.ready) {
-      await signalAdapter.sendMessage(groupId, msg, opts || {});
-    }
-  });
-
-  signalAdapter.start().then(() => {
-    // Notify the owner via Signal if this was an unexpected restart (crash).
-    // Clean shutdowns (!restart) and rollbacks are excluded — only genuine
-    // crashes or container kills trigger this. Lets the user know from their
-    // phone that the bot went down and came back.
-    const cleanFile = path.join('/home/node/.claude', '.clean-shutdown');
-    const rolledBackFile = '/tmp/.rolled-back';
-    const wasClean = fs.existsSync(cleanFile);
-    const wasRolledBack = fs.existsSync(rolledBackFile);
-    if (!wasClean && !wasRolledBack) {
-      const { SIGNAL_OWNER } = require('./project-permissions');
-      if (SIGNAL_OWNER) {
-        signalAdapter.sendMessage(SIGNAL_OWNER,
-          '*Bot restarted unexpectedly (possible crash). I\u2019m back online now.*'
-        ).catch(() => {});
-        console.log('[signal] Sent crash notification to owner');
-      }
-    }
-  }).catch(err => {
-    console.error(`[signal] Failed to start: ${err.message}`);
-  });
 }
 
 /**

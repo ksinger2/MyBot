@@ -39,21 +39,26 @@ module.exports = {
         const mentionProfile = getProfile(mentionPhone);
         if (mentionProfile) {
           const mentionName = mentionProfile.name || m.name || mentionPhone;
-          // Flip perspective in one pass: swap sender ("I") ↔ mentioned user
-          // "@Merrisa and I like bowling" → "@Karen and I like bowling"
-          const escapedMention = (m.name || mentionName).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+          console.log(`[remember-flip] fact="${fact}" mentionName="${mentionName}" senderName="${senderName}" m.uuid="${m.uuid}" m.name="${m.name}"`);
           let flippedFact = fact;
-          // Step 1: Replace "@MentionName and I" → "PLACEHOLDER and I" to avoid double-replace
-          // Step 2: Replace remaining @MentionName → "@SenderName"
-          // Step 3: Replace PLACEHOLDER → "I" (keeps the mentioned user's perspective)
-          //
-          // Simpler approach: just swap the two names directly.
-          // "@Merrisa and I" → "@Karen and I" (from Merrisa's POV, Karen is the other person)
+
+          // Step 0: replace any raw @uuid in the text with @mentionName so the
+          // flip regexes below can match by name regardless of resolution failures.
+          if (m.uuid) {
+            const escapedUuid = m.uuid.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+            flippedFact = flippedFact.replace(new RegExp(`@${escapedUuid}`, 'gi'), `@${mentionName}`);
+          }
+
+          // Flip perspective: replace @MentionName → @SenderName so from the
+          // mentioned user's POV, Karen becomes the referenced person.
+          const escapedMention = mentionName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+          // Handle "X and I" / "I and X" compound patterns first
           flippedFact = flippedFact.replace(new RegExp(`@?${escapedMention}\\s+and\\s+I\\b`, 'gi'), `@${senderName} and I`);
           flippedFact = flippedFact.replace(new RegExp(`\\bI\\s+and\\s+@?${escapedMention}\\b`, 'gi'), `I and @${senderName}`);
-          // Catch any remaining standalone @MentionName references
-          flippedFact = flippedFact.replace(new RegExp(`@${escapedMention}\\b`, 'gi'), `@${senderName}`);
+          // Catch any remaining @MentionName or bare MentionName references
+          flippedFact = flippedFact.replace(new RegExp(`@${escapedMention}(?=\\s|$|[^a-zA-Z0-9_])`, 'gi'), `@${senderName}`);
 
+          console.log(`[remember-flip] flippedFact="${flippedFact}"`);
           addPreference(mentionPhone, flippedFact, 'explicit');
           storedOn.push(mentionName);
         }

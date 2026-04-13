@@ -14,6 +14,12 @@ module.exports = {
     state.loopActive = false;
     state.sessionId = null;
     state.queue = [];
+    if (state.groupingTimer) {
+      clearTimeout(state.groupingTimer);
+      state.groupingTimer = null;
+      state.groupingBuffer = [];
+      state.groupingSenderId = null;
+    }
     state.activeTask = null;
     ctx.saveChannelState(message.channel.id, state, { critical: true });
     await message.reply('Process killed and session destroyed. Full reset — starting from scratch.');

@@ -15,6 +15,12 @@ module.exports = {
       state.progress = ctx.freshProgress();
       const dropped = state.queue.length;
       state.queue = [];
+      if (state.groupingTimer) {
+        clearTimeout(state.groupingTimer);
+        state.groupingTimer = null;
+        state.groupingBuffer = [];
+        state.groupingSenderId = null;
+      }
       const extra = dropped ? ` (${dropped} queued message${dropped > 1 ? 's' : ''} cleared)` : '';
       await message.reply(`Stopped${wasLooping ? ' loop' : ''}. Session preserved — send another message to continue.${extra}`);
     } else if (state.busy || state.loopActive) {
@@ -24,6 +30,12 @@ module.exports = {
       state.progress = ctx.freshProgress();
       const dropped = state.queue.length;
       state.queue = [];
+      if (state.groupingTimer) {
+        clearTimeout(state.groupingTimer);
+        state.groupingTimer = null;
+        state.groupingBuffer = [];
+        state.groupingSenderId = null;
+      }
       ctx.saveChannelState(message.channel.id, state, { critical: true });
       const extra = dropped ? ` (${dropped} queued message${dropped > 1 ? 's' : ''} cleared)` : '';
       await message.reply(`Cleared stuck state${wasLooping ? ' (loop ended)' : ''}.${extra} You're good to go.`);

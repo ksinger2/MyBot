@@ -184,6 +184,33 @@ function removePreference(phone, keyword) {
   return removed;
 }
 
+/** Add a rule (explicit behavioral instruction). Caps at 20, no duplicates. */
+function addRule(phone, rule) {
+  let profile = getProfile(phone);
+  if (!profile) {
+    setProfile(phone, {});
+    profile = getProfile(phone) || {};
+  }
+  if (!profile.rules) profile.rules = [];
+  if (profile.rules.length >= 20) profile.rules.shift();
+  const text = rule.substring(0, 200).trim();
+  if (!text) return false;
+  profile.rules.push({ rule: text, addedAt: new Date().toISOString() });
+  setProfile(phone, profile);
+  return true;
+}
+
+/** Remove rules whose text contains the keyword (case-insensitive). Returns count removed. */
+function removeRule(phone, keyword) {
+  const profile = getProfile(phone);
+  if (!profile || !profile.rules) return 0;
+  const before = profile.rules.length;
+  profile.rules = profile.rules.filter(r => !r.rule.toLowerCase().includes(keyword.toLowerCase()));
+  const removed = before - profile.rules.length;
+  if (removed > 0) setProfile(phone, profile);
+  return removed;
+}
+
 /** Clear all preferences but keep the rest of the profile. */
 function clearPreferences(phone) {
   const profile = getProfile(phone);
@@ -322,6 +349,10 @@ function buildProfileContext(phoneNumber, { isGroupChat = false } = {}) {
   if (profile.location) {
     lines.push(`When this user asks about weather or local info, always use their location: ${_s(profile.location, 100)}.`);
   }
+  if (profile.rules && profile.rules.length > 0) {
+    lines.push(`\nSTRICT USER RULES — follow these exactly, they override defaults:`);
+    for (const r of profile.rules) lines.push(`- ${_s(r.rule)}`);
+  }
 
   return lines.join('\n');
 }
@@ -336,6 +367,8 @@ module.exports = {
   addPreference,
   removePreference,
   clearPreferences,
+  addRule,
+  removeRule,
   addTag,
   removeTag,
   deleteUser,

@@ -60,12 +60,15 @@ module.exports = {
 
   news: {
     enabled: true,
+    // Priority sources: wired.com, theverge.com, reuters.com — Claude will use site: search operators for these
     topics: [
       { query: 'Iran war conflict latest', timeframe: '12 hours', depth: 'detailed' },
       { query: 'tech acquisitions mergers', timeframe: '2 days', depth: 'detailed' },
       { query: 'Anthropic Claude AI announcements', timeframe: '3 days', depth: 'detailed' },
       { query: 'OpenAI Google DeepMind AI news', timeframe: '2 days', depth: 'brief' },
       { query: 'major world events breaking news', timeframe: '12 hours', depth: 'brief' },
+      { query: 'site:wired.com OR site:theverge.com tech AI news', timeframe: '2 days', depth: 'brief' },
+      { query: 'site:reuters.com breaking news world', timeframe: '12 hours', depth: 'brief' },
     ],
   },
 

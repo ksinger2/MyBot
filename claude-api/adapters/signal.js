@@ -169,6 +169,16 @@ class SignalAdapter extends MessagePlatform {
       if (typeof this._cleanupTimer.unref === 'function') this._cleanupTimer.unref();
     }
 
+    // Refresh UUID→phone contact mappings every 5 minutes so newly onboarded
+    // users (who ran !setup after the bot started) get their UUIDs resolved
+    // for group context injection without needing a bot restart.
+    if (!this._contactRefreshTimer) {
+      this._contactRefreshTimer = setInterval(() => {
+        this._loadContacts().catch(() => {});
+      }, 5 * 60 * 1000);
+      if (typeof this._contactRefreshTimer.unref === 'function') this._contactRefreshTimer.unref();
+    }
+
     // Start inbound message ingestion. In webhook mode the signal-api container
     // POSTs every incoming envelope to /signal/webhook in claude-api, so polling
     // is unnecessary (and would fail anyway — /v1/receive returns "Not implemented"
@@ -400,6 +410,34 @@ class SignalAdapter extends MessagePlatform {
       });
     } catch {
       // Best-effort — read receipts are not critical
+    }
+  }
+
+  /**
+   * React to a message in Signal.
+   * @param {string} recipient - Phone number or group ID of the conversation
+   * @param {string} emoji - Emoji to react with (e.g. '👍')
+   * @param {string} targetAuthor - Phone number of the message author being reacted to
+   * @param {number} targetTimestamp - Timestamp of the message being reacted to
+   * @param {boolean} [remove] - If true, remove the reaction instead of adding it
+   */
+  async sendReaction(recipient, emoji, targetAuthor, targetTimestamp, remove = false) {
+    if (!recipient || !emoji || !targetAuthor || !targetTimestamp || !this.ready) return;
+    const resolved = this._resolveRecipient(recipient.replace(/^signal:/, ''));
+    try {
+      await this._fetch(`/v1/reactions/${encodeURIComponent(this.phoneNumber)}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          recipient: resolved,
+          reaction: emoji,
+          target_author: targetAuthor,
+          timestamp: targetTimestamp,
+          remove,
+        }),
+      });
+    } catch (err) {
+      console.warn(`[signal] sendReaction failed: ${err.message}`);
     }
   }
 
@@ -765,6 +803,35 @@ class SignalAdapter extends MessagePlatform {
     if (!dataMessage) return; // Skip receipts, typing indicators, etc.
 
     const text = dataMessage.message;
+    // Handle "delete for everyone" — cancel any queued/running task that originated from this message
+    if (dataMessage.remoteDelete) {
+      const deletedTs = dataMessage.remoteDelete.timestamp;
+      const senderPhone2 = envelope.sourceNumber || this._resolveRecipient(envelope.sourceUuid || envelope.source);
+      const groupId2 = dataMessage.groupInfo?.groupId;
+      const chatId2 = groupId2 || senderPhone2 || (envelope.sourceUuid || envelope.source);
+      console.log(`[signal] Remote delete for timestamp ${deletedTs} in chat ${chatId2}`);
+      this.emit('messageDelete', { chatId: chatId2, deletedTimestamp: deletedTs });
+      return;
+    }
+
+    // Handle emoji reactions (👍/👎 etc.) — these have no text/attachments
+    if (dataMessage.reaction) {
+      const r = dataMessage.reaction;
+      const senderPhone2 = envelope.sourceNumber || this._resolveRecipient(senderUuid);
+      const senderId2 = senderPhone2 || senderUuid;
+      const groupId2 = dataMessage.groupInfo?.groupId;
+      const chatId2 = groupId2 || senderPhone2 || senderUuid;
+      console.log(`[signal] Reaction ${r.emoji} from ${_redactId(senderId2)} on ts=${r.targetSentTimestamp} remove=${r.isRemove}`);
+      this.emit('reaction', {
+        chatId: chatId2,
+        senderId: senderId2,
+        emoji: r.emoji,
+        targetTimestamp: r.targetSentTimestamp,
+        isRemove: !!r.isRemove,
+      });
+      return;
+    }
+
     if (!text && !dataMessage.attachments?.length) return; // Skip empty messages
 
     // Resolve UUID→phone so replies go to the same chat thread

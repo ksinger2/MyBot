@@ -38,7 +38,7 @@ function saveSeen(seen) {
 const AI_NEWS_CONFIG = {
   enabled: true,
   // Every 3 hours
-  schedule: '0 8,11,14,17 * * *',
+  schedule: '0 8,11,14,17,20 * * *',
   timezone: 'America/Los_Angeles',
   channelId: '1481550166501626039', // same channel as morning briefing
 };
@@ -201,7 +201,7 @@ function startAINewsScheduler(client) {
     () => sendAINews(client)
   );
 
-  console.log(`[ai-news] Scheduler started: every 3 hours (${AI_NEWS_CONFIG.timezone})`);
+  console.log(`[ai-news] Scheduler started: 8am–8pm every 3 hours (${AI_NEWS_CONFIG.timezone})`);
 }
 
 module.exports = { startAINewsScheduler, sendAINews, AI_NEWS_CONFIG };

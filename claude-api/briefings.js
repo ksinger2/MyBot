@@ -136,7 +136,8 @@ function buildPrompt(stockData, weatherData, jobsData, cfg, tasks = null) {
 - NO fluff, NO filler, NO long intros
 - Every news item MUST have a link to an article
 - Every job listing MUST have a link to the posting
-- USE WEB SEARCH to find real, current information with real URLs`);
+- USE WEB SEARCH to find real, current information with real URLs
+- DO NOT add a "Sources:", "References:", or any link list at the bottom — links go inline with each item only`);
 
   // Stock data (pre-fetched, just format it)
   if (stockData && stockData.length > 0) {
@@ -208,6 +209,7 @@ function buildPrompt(stockData, weatherData, jobsData, cfg, tasks = null) {
     for (const topic of cfg.news.topics) {
       instructions += `- "${topic.query}" (last ${topic.timeframe})${topic.depth === 'detailed' ? ' — give me specifics: who, what, when, consequences' : ' — 1-2 bullet points'}\n`;
     }
+    instructions += `\nPriority sources: prefer articles from wired.com, theverge.com, and reuters.com. Use site: search operators to find them (e.g. "site:wired.com AI news", "site:theverge.com tech acquisition"). Use the article URL from search results directly — do NOT attempt to fetch or scrape these pages (they block bots).\n`;
     instructions += `\nFormat each news item as:\n**Headline** — 1-2 sentence summary of EXACTLY what happened. [Read more](url)\n\nIMPORTANT: All article links MUST be hyperlinked text using [text](url) markdown format. Do NOT paste bare URLs. Do NOT use Discord embed-style links — wrap URLs in < > angle brackets to suppress embeds if needed. Keep it compact.\n\n`;
   }
 

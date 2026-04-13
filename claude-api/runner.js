@@ -352,6 +352,7 @@ class Runner {
       let currentToolInput = '';
       let lastEventWasAssistant = false;
       let streamedAny = false;
+      let hitRateLimit = false;
 
       // --- stdout handler: stream-json event parsing ---
       child.stdout.on('data', (d) => {
@@ -367,6 +368,11 @@ class Runner {
             const event = JSON.parse(line);
 
             console.log(`[event] type=${event.type}${event.subtype ? ` subtype=${event.subtype}` : ''}${event.message?.role ? ` role=${event.message.role}` : ''}${event.parent_tool_use_id ? ` parent=${event.parent_tool_use_id}` : ''}`);
+
+            if (event.type === 'rate_limit_event') {
+              hitRateLimit = true;
+              console.warn(`[rate-limit] Hit Anthropic rate limit — will notify user on close`);
+            }
 
             const parentId = event.parent_tool_use_id || null;
             const agentObj = parentId && channelState ? channelState.progress.activeAgents.get(parentId) : null;
@@ -703,6 +709,15 @@ class Runner {
         }
 
         if (code !== 0) {
+          // Rate limit: CLI was cut off by Anthropic — notify user clearly.
+          if (hitRateLimit) {
+            console.warn(`[rate-limit] Process exited after rate limit event — notifying user`);
+            if (channelProxy) {
+              channelProxy.send('⏳ Hit Anthropic rate limit mid-task. Wait a minute and try again.').catch(() => {});
+            }
+            return resolve({ text: '', sessionId: resultSessionId, cost: resultCost, numTurns: resultNumTurns, stopped: true, rateLimited: true });
+          }
+
           // error_max_turns: CLI exits 1 with empty text — treat as graceful turn limit,
           // not a crash. This lets runClaudeWithContinuation auto-continue as normal.
           if (resultSubtype === 'error_max_turns') {

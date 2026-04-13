@@ -9,6 +9,32 @@ module.exports = {
       return; // silently ignore in groups
     }
     if (!state.busy && !state.process) {
+      // Check for background tasks registered by Claude Code
+      try {
+        const http = require('http');
+        const tasks = await new Promise((resolve) => {
+          const req = http.request({
+            hostname: 'localhost', port: 3400, path: '/internal/background-tasks',
+            headers: { 'X-Internal-Token': process.env.INTERNAL_API_TOKEN || '' },
+          }, res => {
+            let d = ''; res.on('data', c => d += c);
+            res.on('end', () => { try { resolve(JSON.parse(d).tasks || []); } catch { resolve([]); } });
+          });
+          req.on('error', () => resolve([]));
+          req.end();
+        });
+        if (tasks.length > 0) {
+          const lines = [`🔄 **Bot idle — ${tasks.length} background task(s) running:**`];
+          for (const t of tasks) {
+            const elapsed = Math.round((Date.now() - t.startedAt) / 1000);
+            const mins = Math.floor(elapsed / 60), secs = elapsed % 60;
+            const runtime = mins > 0 ? `${mins}m ${secs}s` : `${secs}s`;
+            lines.push(`  ⏳ "${t.description}" (${runtime})`);
+          }
+          await message.reply(lines.join('\n'));
+          return;
+        }
+      } catch {}
       await message.reply('Nothing running right now.');
       return;
     }
@@ -55,6 +81,32 @@ module.exports = {
       }
       lines.push('```');
     }
+
+    // Append background tasks from the internal registry (even while bot is busy)
+    try {
+      const http = require('http');
+      const bgTasks = await new Promise((resolve) => {
+        const req = http.request({
+          hostname: 'localhost', port: 3400, path: '/internal/background-tasks',
+          headers: { 'X-Internal-Token': process.env.INTERNAL_API_TOKEN || '' },
+        }, res => {
+          let d = ''; res.on('data', c => d += c);
+          res.on('end', () => { try { resolve(JSON.parse(d).tasks || []); } catch { resolve([]); } });
+        });
+        req.on('error', () => resolve([]));
+        req.end();
+      });
+      if (bgTasks.length > 0) {
+        lines.push('');
+        lines.push(`🔄 **Background tasks (${bgTasks.length} running):**`);
+        for (const t of bgTasks) {
+          const elapsed = Math.round((Date.now() - t.startedAt) / 1000);
+          const mins = Math.floor(elapsed / 60), secs = elapsed % 60;
+          const runtime = mins > 0 ? `${mins}m ${secs}s` : `${secs}s`;
+          lines.push(`  ⏳ "${t.description}" (${runtime})`);
+        }
+      }
+    } catch {}
 
     await ctx.sendLongMessage(message, lines.join('\n'), state.cwd);
   }
