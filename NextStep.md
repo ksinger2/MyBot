@@ -80,6 +80,8 @@ Add `https://mybot.backtoirl.com/auth/spotify/callback` in Spotify Dashboard.
 - Rebuild announcement removed
 - Pending events persisted to disk
 - BOT_PUBLIC_URL fix across setup/auth files
+- Crash notification only on real crashes (rebuild writes clean-shutdown
+  marker so intentional restarts don't trigger false alerts)
 
 ### Remaining improvements
 - **Sidecar rebuilder** (designed, not built): Move Docker socket to
