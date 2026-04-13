@@ -663,13 +663,20 @@ async function runClaudeWithContinuation(prompt, opts, channelProxy) {
   let anyStreamed = !!result.streamed;
   const maxContinues = opts.channelState?.config?.maxContinues || MAX_AUTO_CONTINUES;
 
-  while (result.hitTurnLimit && continueCount < maxContinues && !result.stopped) {
+  // Don't auto-continue in group chats (short tasks, noisy for non-technical users)
+  const isGroupContext = opts.channelState?._isGroupChat;
+
+  while (result.hitTurnLimit && continueCount < maxContinues && !result.stopped && !isGroupContext) {
     continueCount++;
-    await channelProxy.send(
-      `*Turn limit reached (${continueCount}/${maxContinues}) — auto-continuing...*`
-    ).catch(() => {});
+    // Only show debug messages to the owner in DM contexts (not groups, not other users)
+    const isOwnerDm = channelProxy.platform === 'discord' || (opts.channelState && !opts.channelState._isGroupChat);
+    if (isOwnerDm) {
+      await channelProxy.send(
+        `*Turn limit reached (${continueCount}/${maxContinues}) — auto-continuing...*`
+      ).catch(() => {});
+    }
     result = await askClaude(
-      'You hit the turn limit. Continue where you left off. If the task is complete, just summarize what you did.',
+      'You hit the turn limit. Continue where you left off. If the task is complete, say DONE and do not add anything else.',
       { ...opts, sessionId: result.sessionId }
     );
     totalCost += result.cost || 0;
