@@ -1,8 +1,43 @@
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 
 const JOURNAL_FILE = path.join('/home/node/.claude', 'session-journal.json');
 const MAX_ENTRIES = 5;
+const ENTRY_TTL_MS = 72 * 60 * 60 * 1000; // 72 hours
+
+// ── Encryption (same pattern as user-profiles.js, domain-separated) ──
+
+const RAW_KEY = process.env.TOKEN_ENCRYPTION_KEY || '';
+
+function _key() {
+  if (!RAW_KEY) return null;
+  return crypto.hkdfSync('sha256', Buffer.from(RAW_KEY, 'utf8'), Buffer.alloc(0), 'mybot-session-journal', 32);
+}
+
+function _encrypt(plaintext) {
+  const key = _key();
+  if (!key) return plaintext;
+  const iv = crypto.randomBytes(12);
+  const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
+  const enc = Buffer.concat([cipher.update(plaintext, 'utf8'), cipher.final()]);
+  const tag = cipher.getAuthTag();
+  return JSON.stringify({ v: 1, iv: iv.toString('hex'), tag: tag.toString('hex'), ct: enc.toString('hex') });
+}
+
+function _decrypt(value) {
+  if (typeof value !== 'string') return value;
+  let env;
+  try { env = JSON.parse(value); } catch { return value; }
+  if (!env || env.v !== 1 || !env.iv || !env.tag || !env.ct) return value;
+  const key = _key();
+  if (!key) return null;
+  try {
+    const decipher = crypto.createDecipheriv('aes-256-gcm', key, Buffer.from(env.iv, 'hex'));
+    decipher.setAuthTag(Buffer.from(env.tag, 'hex'));
+    return Buffer.concat([decipher.update(Buffer.from(env.ct, 'hex')), decipher.final()]).toString('utf8');
+  } catch { return null; }
+}
 
 function _timeAgo(isoString) {
   const ms = Date.now() - new Date(isoString).getTime();
@@ -16,25 +51,43 @@ function _timeAgo(isoString) {
 function readJournal() {
   try {
     if (!fs.existsSync(JOURNAL_FILE)) return {};
-    return JSON.parse(fs.readFileSync(JOURNAL_FILE, 'utf8'));
+    const raw = JSON.parse(fs.readFileSync(JOURNAL_FILE, 'utf8'));
+    // Decrypt entries
+    const result = {};
+    for (const [channelId, entries] of Object.entries(raw)) {
+      if (!Array.isArray(entries)) continue;
+      result[channelId] = entries.map(e => {
+        if (typeof e === 'string') {
+          // Encrypted entry
+          const plain = _decrypt(e);
+          if (!plain) return null;
+          try { return JSON.parse(plain); } catch { return null; }
+        }
+        return e; // legacy plaintext object
+      }).filter(Boolean);
+    }
+    return result;
   } catch { return {}; }
 }
 
 function writeJournal(data) {
+  // Encrypt each entry before writing
+  const encrypted = {};
+  for (const [channelId, entries] of Object.entries(data)) {
+    encrypted[channelId] = entries.map(e => _encrypt(JSON.stringify(e)));
+  }
   const tmpFile = JOURNAL_FILE + '.tmp';
   for (let attempt = 0; attempt < 3; attempt++) {
     try {
-      fs.writeFileSync(tmpFile, JSON.stringify(data, null, 2));
+      fs.writeFileSync(tmpFile, JSON.stringify(encrypted, null, 2));
       fs.renameSync(tmpFile, JOURNAL_FILE);
       return;
     } catch (err) {
       console.error(`Session journal write attempt ${attempt + 1}/3 failed:`, err.message);
       if (attempt < 2) {
-        // Brief synchronous delay before retry
         const start = Date.now();
         while (Date.now() - start < [100, 500][attempt]) {}
       } else {
-        // Final failure — try to alert
         try {
           const { sendErrorAlert } = require('./error-alerting');
           sendErrorAlert(err, { source: 'session-journal', detail: 'Journal write failed 3x' });
@@ -46,21 +99,24 @@ function writeJournal(data) {
 
 /**
  * Append a completed session entry for a channel.
- * Keeps only the last MAX_ENTRIES entries.
+ * Entries are encrypted at rest and auto-expire after 72 hours.
  */
-function appendEntry(channelId, { cwd, resultSummary, turnCount }) {
+function appendEntry(channelId, { cwd, promptSummary, resultSummary, turnCount }) {
   const journal = readJournal();
   if (!journal[channelId]) journal[channelId] = [];
 
-  // Security: only store metadata, never user prompts or response content.
-  // Conversation content was previously stored as promptSummary/resultSummary
-  // which leaked sensitive data (phone numbers, secrets, private conversations)
-  // to the plaintext journal file on disk.
+  // Expire old entries
+  const now = Date.now();
+  journal[channelId] = journal[channelId].filter(e =>
+    e.timestamp && (now - new Date(e.timestamp).getTime()) < ENTRY_TTL_MS
+  );
+
   journal[channelId].unshift({
     timestamp: new Date().toISOString(),
     cwd,
+    promptSummary: (promptSummary || '').substring(0, 200),
+    resultSummary: (resultSummary || '').substring(0, 400),
     turnCount: turnCount || 0,
-    resultLength: (resultSummary || '').length,
   });
 
   // Keep only last MAX_ENTRIES
@@ -81,12 +137,13 @@ function getJournalContext(channelId) {
     const label = i === 0 ? 'Last session' : `${i + 1} sessions ago`;
     const ago = _timeAgo(e.timestamp);
     const parts = [`**${label}** (${ago}, \`${e.cwd}\`)`];
-    if (e.turnCount) parts.push(`${e.turnCount} turns`);
-    if (e.resultLength) parts.push(`~${e.resultLength} chars`);
+    if (e.promptSummary) parts.push(`Asked: ${e.promptSummary}`);
+    if (e.resultSummary) parts.push(`Result: ${e.resultSummary}`);
+    if (e.turnCount) parts.push(`(${e.turnCount} turns)`);
     return parts.join(' — ');
   });
 
-  return `[Session history — metadata only, no content]\n${lines.join('\n')}`;
+  return `[Session history — what happened in recent sessions]\n${lines.join('\n')}`;
 }
 
 module.exports = { appendEntry, getJournalContext };
