@@ -75,6 +75,8 @@ services:
       # GH_TOKEN from the environment. Set this in .env to a personal access
       # token with minimum scopes the bot needs (repo, workflow — NOT admin).
       - GH_TOKEN=${GH_TOKEN:-}
+      # Concert ticket scraper plugin (optional — only used when concert-scraper profile is active)
+      - TICKETMASTER_API_KEY=${TICKETMASTER_API_KEY:-}
     # SSH key and gh config mounts were removed 2026-04-11 after a security
     # review found prompt-injection could exfiltrate them via Claude's Read
     # tool + --dangerously-skip-permissions. `gh` CLI now authenticates via
@@ -134,6 +136,25 @@ services:
     # claude-api is up may be lost; signal-api typically retries on failure.
     profiles:
       - signal  # Only starts when: docker compose --profile signal up -d
+
+  # Concert ticket scraper — Playwright-based Python service that scrapes
+  # StubHub, VividSeats, TickPick, SeatGeek, and optionally Ticketmaster.
+  # Only started when explicitly enabled:
+  #   docker compose --profile concerts up -d
+  concert-scraper:
+    build: ./concert-scraper
+    container_name: mybot-concert-scraper
+    restart: unless-stopped
+    ports:
+      - "5001:5000"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    profiles:
+      - concerts  # Only starts when: docker compose --profile concerts up -d
 
 volumes:
   signal-data:

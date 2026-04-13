@@ -205,20 +205,35 @@ app.post('/ask', requireInternalToken, (req, res) => {
 
 // Internal image generation endpoint — called by Claude CLI via curl
 app.post('/imagine', requireInternalToken, async (req, res) => {
-  const { prompt } = req.body;
+  const { prompt, inputImagePath } = req.body;
   if (!prompt) return res.status(400).json({ error: 'prompt required' });
   if (!process.env.OPENAI_API_KEY) return res.status(500).json({ error: 'No OPENAI_API_KEY configured' });
 
   try {
     const OpenAI = require('openai');
+    const { toFile } = require('openai');
     const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
-    const response = await openai.images.generate({
-      model: 'gpt-image-1',
-      prompt,
-      n: 1,
-      size: '1024x1024',
-      quality: 'low',
-    });
+    let response;
+    if (inputImagePath && fs.existsSync(inputImagePath)) {
+      // Image-to-image: edit the provided reference image
+      response = await openai.images.edit({
+        model: 'gpt-image-1',
+        image: await toFile(fs.createReadStream(inputImagePath), path.basename(inputImagePath), { type: 'image/png' }),
+        prompt,
+        n: 1,
+        size: '1024x1024',
+        quality: 'low',
+      });
+    } else {
+      // Text-to-image: generate from prompt only
+      response = await openai.images.generate({
+        model: 'gpt-image-1',
+        prompt,
+        n: 1,
+        size: '1024x1024',
+        quality: 'low',
+      });
+    }
     const base64 = response.data[0].b64_json;
     const buffer = Buffer.from(base64, 'base64');
     const imgPath = `/tmp/imagine_${Date.now()}.png`;
@@ -1491,6 +1506,39 @@ app.post('/internal/setup-token', requireInternalToken, (req, res) => {
     token,
     url: '/setup/' + encodeURIComponent(userId) + '?t=' + token,
   });
+});
+
+// ── Concert ticket prices endpoint (plugin: concert-tracker) ─────────────────
+// Called by Claude via curl when the user asks about concert ticket prices.
+// Delegates to the concert-tracker plugin which calls the concert-scraper
+// sidecar in parallel for all 5 sources. Safe to leave in even when the
+// concert-scraper profile is not active — returns a helpful message instead.
+app.post('/concerts/prices', requireInternalToken, async (req, res) => {
+  const { artist, venue, date, city } = req.body || {};
+  if (!artist) {
+    return res.status(400).json({ error: 'artist is required' });
+  }
+
+  try {
+    const plugin = require('./plugins/concert-tracker');
+    const available = await plugin.isAvailable();
+    if (!available) {
+      return res.json({
+        text: 'Concert scraper is not currently running. Start it with:\n  docker compose --profile concerts up -d\n\nThen retry your question.',
+      });
+    }
+
+    const text = await plugin.getPrices(
+      artist,
+      venue || '',
+      date || '',
+      city || '',
+    );
+    res.json({ text });
+  } catch (err) {
+    console.error('[concerts/prices] error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
 });
 
 const PORT = 3400;

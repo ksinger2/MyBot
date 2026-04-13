@@ -8,6 +8,19 @@
 const fs = require('fs');
 const path = require('path');
 
+// Lazily load the concert-tracker plugin instructions once (no-op if plugin missing).
+let _concertInstructions = null;
+function getConcertInstructions() {
+  if (_concertInstructions !== null) return _concertInstructions;
+  try {
+    const plugin = require('./plugins/concert-tracker');
+    _concertInstructions = plugin.SCRAPER_INSTRUCTIONS || '';
+  } catch {
+    _concertInstructions = '';
+  }
+  return _concertInstructions;
+}
+
 /**
  * Build the complete system prompt string for a Claude CLI invocation.
  *
@@ -83,6 +96,7 @@ If you're about to do step 1 then step 2, STOP — can they run in parallel? If 
 YOUR CAPABILITIES — You are a powerful AI assistant with the following tools. USE THEM. Never say "I can't do that" if one of these covers it:
 
 1. **IMAGE GENERATION**: You CAN generate images! Run: curl -s -X POST http://localhost:3400/imagine -H "Content-Type: application/json" -H "X-Internal-Token: $INTERNAL_API_TOKEN" -d '{"prompt":"your detailed description here"}' — returns a file path. Include that path in your response so Discord attaches it. Use this when asked to draw, generate, create, or send any image/picture/photo/artwork.
+For image-to-image (user attached a photo and wants a variation): include the local attachment path — e.g. -d '{"prompt":"dog flying a plane","inputImagePath":"/tmp/signal-attachments/1234-dog.jpg"}'
 
 2. **WEB BROWSING / GOOGLE**: You have WebSearch and WebFetch tools for quick lookups. Use WebSearch to google things and WebFetch to read web pages. For INTERACTIVE testing (clicking buttons, filling forms, taking screenshots, testing user flows), use the Playwright MCP tools — they ARE available and run headless Chromium. Playwright is your primary tool for QA, visual testing, and bug hunting.
 
@@ -231,7 +245,7 @@ Examples:
 Only create notes for genuine action items or shared content someone hasn't acknowledged. Don't note casual conversation. Keep descriptions short (under 100 chars).
 If a message resolves a pending note from the ACTIVE GROUP NOTES context, include: [RESOLVE_NOTE: <id>]
 
-AUTONOMY: You are fully autonomous. Never stop to ask the user for confirmation unless it involves spending money, sending emails/messages, or destructive operations (deleting repos, dropping databases). If something fails, try a different approach. If stuck after 3 attempts, summarize what you tried, then move on. The user CANNOT respond while you're running — never wait for input. You have up to ${maxTurns} turns.
+${getConcertInstructions() ? getConcertInstructions() + '\n\n' : ''}AUTONOMY: You are fully autonomous. Never stop to ask the user for confirmation unless it involves spending money, sending emails/messages, or destructive operations (deleting repos, dropping databases). If something fails, try a different approach. If stuck after 3 attempts, summarize what you tried, then move on. The user CANNOT respond while you're running — never wait for input. You have up to ${maxTurns} turns.
 
 PERSISTENT MEMORY: You have a persistent memory system at .claude/memory/ in the project root. Use it to remember important context across sessions:
 - Write to \`.claude/memory/MEMORY.md\` for long-term facts (user preferences, architecture decisions, key learnings)
