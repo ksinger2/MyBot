@@ -1,55 +1,75 @@
 # MyBot — Session Handoff (2026-04-12)
 
-## Spotify, security, encrypted journal, setup session persistence
+## Privacy, Spotify, security, encrypted journal, setup persistence
+
+### Group chat privacy (new — critical)
+Comprehensive privacy rules for group chats to prevent data leakage:
+
+**Calendar privacy:**
+- Group chats only show "X is busy on Saturday from 2-4pm" — never
+  event titles, descriptions, or attendees
+- Full calendar details only visible in private 1:1 DMs with that user
+- `buildProfileContext()` accepts `isGroupChat` flag, injects PRIVACY
+  rules into Claude's system prompt for group contexts
+
+**Cross-group isolation:**
+- Claude refuses to reveal/confirm existence of other group chats or DMs
+- Won't discuss what groups someone is in, who they talk to, or what's
+  said in other conversations
+- Session journal context from other chats never leaked
+- Each group treated as fully isolated
+
+**Commands blocked in groups:**
+- `!profile` → "DM me to view your profile"
+- `!schedules` → "DM me to view yours"
+- `!setup` → sends link via DM instead of posting publicly (was exposing
+  phone numbers in group chat URLs)
+
+**Files:** `bot.js`, `user-profiles.js`, `commands/profile.js`,
+`commands/schedules.js`, `commands/setup.js`
+
+### Signal mention fixes
+- U+FFFC placeholder now replaced with `@name` from mention metadata
+  (was stripped entirely, so "@Merrisa" became blank)
+- `!onboard @person` resolves UUID-only mentions via contact cache
+- Wizard sender matching resolves UUID→phone for reply detection
+- Greeting uses mention name ("Hey Merrisa") not raw UUID
+
+**Files:** `bot.js`, `adapters/signal.js`, `commands/onboard.js`
 
 ### Spotify integration
 - Green "Connect Spotify" button on setup page (ephemeral token gated)
-- On connect: fetches top 20 artists, auto-imports as tags (category "Artist")
-- `buildProfileContext()` includes artist list + instructs Claude to find
-  concerts/events in user's area
+- On connect: fetches top 20 artists, auto-imports as tags ("Artist")
+- `buildProfileContext()` includes artist list + concert discovery
 - "Concert Alerts" job template on setup page
-- Redirect URI defaults to `BOT_PUBLIC_URL/auth/spotify/callback`
+- Fixed Express route ordering (`/auth/spotify/callback` before `/:userId`)
 
 **Setup:** Set `SPOTIFY_CLIENT_ID` and `SPOTIFY_CLIENT_SECRET` in `.env`.
-Add redirect URI in Spotify Developer Dashboard.
+Add `https://mybot.backtoirl.com/auth/spotify/callback` in Spotify Dashboard.
 
 ### Encrypted session journal
-Session journal now stores prompt/result summaries encrypted at rest
-(AES-256-GCM, domain `mybot-session-journal`) instead of stripped.
-- Cross-session context maintained — Claude sees what happened in
-  previous sessions even when API sessions expire between messages
+- Prompt/result summaries encrypted at rest (AES-256-GCM, domain
+  `mybot-session-journal`) — cross-session context maintained
 - Auto-expires entries after 72 hours
-- Backward-compatible with legacy plaintext entries (re-encrypts on write)
-- Raw file on disk is cipher text, not readable conversation content
+- Backward-compatible with legacy plaintext entries
 
 ### Setup page session persistence
-- Setup access token no longer consumed on page load — valid for full
-  30-minute TTL across all operations (save profile, connect OAuth, etc.)
-- OAuth callbacks (Google Calendar, Spotify) store return URL server-side
-  and redirect back to setup page after 1.5s
-- Profile save also auto-redirects back to setup
-- Fixed Express route ordering: `/auth/spotify/callback` defined before
-  `/auth/spotify/:userId` so "callback" isn't matched as userId param
+- Setup token valid for full 30-minute TTL (not consumed on page load)
+- OAuth callbacks redirect back to setup via server-side return URL
+- Profile save auto-redirects back
 
-### Security hardening (from 3-agent audit)
-- **Complete data deletion**: `deleteUser()` removes profile + OAuth
-  tokens + schedules + cancels cron jobs
-- **Job limits**: Max 10 DM jobs/user, min 5-minute cron interval
-- **Input validation**: Tag 100 chars, category 50, job name 100, prompt
-  2000, frequency 100
-- **Data persistence**: `/app/data` mounted as named Docker volume
-- **Log redaction**: Group names, phone numbers, Discord guild names
-  redacted via `_redactPhone()`, `_redactId()`
-- **Fail-closed encryption**: `TOKEN_ENCRYPTION_KEY` required at startup
-- **Prompt injection prevention**: `buildProfileContext()` sanitizes
-  user strings — strips `[ ] { } < >`, caps lengths
+### Security hardening
+- `deleteUser()` removes profile + tokens + schedules + cancels cron
+- Max 10 DM jobs/user, min 5-minute cron interval
+- Input validation on all setup endpoints
+- `/app/data` mounted as named Docker volume
+- Log redaction: group names, phone numbers, guild names
+- `TOKEN_ENCRYPTION_KEY` required at startup (fail-closed)
+- Prompt injection prevention in `buildProfileContext()`
 
 ### Setup page features
 - Professional dark gradient header, purple accent, card-based layout
-- Tags with suggestion chips (Sports Team, Diet, Cuisine, Hobby, Music)
-- Scheduled DM jobs with CRUD, toggle, quick templates (Morning Briefing,
-  AI Pulse, Weekly Meal Plan, Concert Alerts)
-- Preferences display with remove buttons
+- Tags with suggestion chips, Scheduled DM jobs with CRUD/toggle
 - Google Calendar + Spotify connect buttons
 - `parseFrequency` extracted to shared module
 
