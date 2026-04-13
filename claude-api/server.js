@@ -36,6 +36,9 @@ const SETUP_CSRF_TTL_MS = 30 * 60 * 1000; // 30 minutes
 // Map<token, { userId, expiresAt }> — single-use, 30min TTL. The bot requests
 // a token via POST /internal/setup-token and DMs the user a URL with ?t=<token>.
 const _setupAccessTokens = new Map();
+// Store setup return URLs so OAuth callbacks can redirect back to the setup page.
+// Keyed by userId, set before OAuth redirect, consumed on callback.
+const _oauthReturnUrls = new Map();
 const SETUP_ACCESS_TTL_MS = 30 * 60 * 1000; // 30 minutes
 
 // ── M2 + L7: periodic cleanup intervals ──────────────────────────────────────
@@ -714,7 +717,12 @@ app.get('/auth/spotify/callback', async (req, res) => {
   try {
     const spotifyAuth = require('./spotify-auth');
     const result = await spotifyAuth.handleCallback(code, state);
-    res.send(`<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Spotify Connected</title><style>body{font-family:-apple-system,sans-serif;max-width:480px;margin:60px auto;padding:0 20px;text-align:center;}</style></head><body><h1 style="color:#1DB954;">Spotify Connected!</h1><p>${escapeHtml(result.displayName)} is now linked.</p><p style="color:#666;font-size:14px;">Your top artists have been imported. Returning to setup...</p><script>setTimeout(()=>history.go(-2),1500)</script></body></html>`);
+    const returnUrl = _oauthReturnUrls.get(result.userId);
+    if (returnUrl) _oauthReturnUrls.delete(result.userId);
+    const redirectScript = returnUrl
+      ? `<script>setTimeout(()=>window.location.href='${returnUrl}',1500)</script>`
+      : '';
+    res.send(`<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Spotify Connected</title><style>body{font-family:-apple-system,sans-serif;max-width:480px;margin:60px auto;padding:0 20px;text-align:center;}</style></head><body><h1 style="color:#1DB954;">Spotify Connected!</h1><p>${escapeHtml(result.displayName)} is now linked.</p><p style="color:#666;font-size:14px;">Your top artists have been imported.${returnUrl ? ' Returning to setup...' : ''}</p>${redirectScript}</body></html>`);
   } catch (err) {
     console.error('Spotify OAuth callback error:', err.message);
     res.status(500).send(`<h2>Spotify authorization failed</h2><p>${escapeHtml(err.message)}</p>`);
@@ -729,11 +737,13 @@ app.get('/auth/spotify/:userId', async (req, res) => {
   if (!accessEntry || accessEntry.expiresAt <= Date.now() || !safeTokenEqual(accessEntry.userId, userId)) {
     return res.status(403).send('Invalid or expired setup link — ask the bot for a new one.');
   }
-  _setupAccessTokens.delete(setupToken);
+  // Don't delete token — user needs it to return to setup page after OAuth
   if (!process.env.SPOTIFY_CLIENT_ID) {
     return res.status(400).send('Spotify OAuth not configured on this server.');
   }
   try {
+    // Save return URL so callback can redirect back to setup
+    _oauthReturnUrls.set(userId, `/setup/${encodeURIComponent(userId)}?t=${encodeURIComponent(setupToken)}`);
     const spotifyAuth = require('./spotify-auth');
     const authUrl = spotifyAuth.getAuthUrl(userId);
     res.redirect(authUrl);
@@ -1322,12 +1332,13 @@ app.get('/auth/google/calendar/:userId', async (req, res) => {
   ) {
     return res.status(403).send('Invalid or expired setup link — ask the bot for a new one.');
   }
-  _setupAccessTokens.delete(setupToken); // single-use
+  // Don't delete token — user needs it to return to setup page after OAuth
 
   if (!process.env.GOOGLE_CLIENT_ID) {
     return res.status(400).send('Google OAuth not configured on this server.');
   }
   try {
+    _oauthReturnUrls.set(userId, `/setup/${encodeURIComponent(userId)}?t=${encodeURIComponent(setupToken)}`);
     const googleAuth = require('./google-auth');
     const authUrl = googleAuth.getAuthUrl(userId);
     res.redirect(authUrl);
@@ -1342,8 +1353,13 @@ app.get('/auth/google/callback', async (req, res) => {
   if (!code || !state) return res.status(400).send('Missing code or state parameter.');
   try {
     const googleAuth = require('./google-auth');
-    const { email, displayName } = await googleAuth.handleCallback(code, state);
-    res.send(`<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Calendar Connected</title><style>body{font-family:-apple-system,sans-serif;max-width:480px;margin:60px auto;padding:0 20px;text-align:center;}</style></head><body><h1 style="color:#4285f4;">Calendar Connected!</h1><p>${escapeHtml(displayName)} (${escapeHtml(email)}) is now linked.</p><p style="color:#666;font-size:14px;">Returning to setup...</p><script>setTimeout(()=>history.go(-2),1500)</script></body></html>`);
+    const result = await googleAuth.handleCallback(code, state);
+    const returnUrl = _oauthReturnUrls.get(result.userId);
+    if (returnUrl) _oauthReturnUrls.delete(result.userId);
+    const redirectScript = returnUrl
+      ? `<script>setTimeout(()=>window.location.href='${returnUrl}',1500)</script>`
+      : '';
+    res.send(`<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Calendar Connected</title><style>body{font-family:-apple-system,sans-serif;max-width:480px;margin:60px auto;padding:0 20px;text-align:center;}</style></head><body><h1 style="color:#4285f4;">Calendar Connected!</h1><p>${escapeHtml(result.displayName)} (${escapeHtml(result.email)}) is now linked.</p><p style="color:#666;font-size:14px;">${returnUrl ? 'Returning to setup...' : 'You can close this tab.'}</p>${redirectScript}</body></html>`);
   } catch (err) {
     console.error('OAuth callback error:', err.message);
     res.status(500).send(`<h2>Authorization failed</h2><p>${escapeHtml(err.message)}</p>`);

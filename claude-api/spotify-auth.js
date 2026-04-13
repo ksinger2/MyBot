@@ -162,7 +162,7 @@ async function handleCallback(code, state) {
     console.warn(`[spotify] Could not auto-tag artists: ${err.message}`);
   }
 
-  return { displayName, email, spotifyUserId, isPremium };
+  return { userId: discordUserId, displayName, email, spotifyUserId, isPremium };
 }
 
 /**

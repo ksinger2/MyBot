@@ -140,7 +140,7 @@ async function handleCallback(code, state) {
     userProfiles.markCalendarConnected(discordUserId, email);
   } catch {}
 
-  return { email, displayName };
+  return { userId: discordUserId, email, displayName };
 }
 
 /**
