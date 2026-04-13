@@ -1,4 +1,77 @@
-# MyBot — Session Handoff (2026-04-12)
+# MyBot — Session Handoff (2026-04-13)
+
+## Group features, flight tracker, mention fixes, no-output fix
+
+### Signal group maxTurns increased (3 → 8)
+- Group chats had `maxTurns: 3` which was too low — Claude would exhaust
+  turns on ToolSearch/tool fetching before producing a response
+- Increased to 8, enough for tool fetches + a useful reply
+
+**Files:** `bot.js` (line ~2107)
+
+### *(No output)* messages eliminated
+- Bot was sending `*(No output)*` to users when Claude produced no text
+  (common with low turn limits or tool-only runs)
+- Now: if text is empty + hit turn limit → sends "I ran out of turns"
+- If text is empty + no turn limit → silently skips (no placeholder)
+- Fixed in all three code paths: Discord `sendLongMessage()`, Signal
+  non-streamed path, and Discord adapter `sendLongMessage()`
+
+**Files:** `bot.js` (lines ~709, ~1658, ~2152), `adapters/discord.js` (line ~124)
+
+### Flight sharer (new feature)
+- When a user shares a flight image (boarding pass, confirmation, itinerary)
+  in a group chat, Claude reads the image and extracts flight details
+- Automatically creates a travel block calendar event for ALL group members
+  so they know the person is traveling
+- Schedules a "have a safe flight @name" message 2h before departure
+- Active flights injected into group context so users can ask "is Karen's
+  flight on time?" and Claude will WebSearch the flight number
+- Flights persisted to `/app/data/flights.json`, safe-flight jobs survive
+  restarts via `restoreFlightJobs()` on boot
+- 30-day auto-prune, deduplication by flight number + traveler + departure
+
+**Files:** `flight-tracker.js` (new), `bot.js`, `system-prompt.js`
+
+### Group notes & DM reminders (new feature)
+- Claude detects action items in group chats (questions, shared content,
+  tasks assigned) and tags them with `[NOTE: @TargetName description]`
+- Notes stored in `/app/data/group-notes.json` (encrypted at rest, AES-256-GCM)
+- Active notes injected into group prompt context so Claude can resolve them
+  with `[RESOLVE_NOTE: <id>]`
+- Reminder loop checks every hour, sends DM nudges to users with pending
+  notes (max 3 reminders, 4h apart, 7-day expiry)
+- Tags stripped from user-visible output (same pattern as `[LEARNED:]`)
+- System prompt updated with GROUP NOTES instructions
+
+**Files:** `group-notes.js` (new), `bot.js`, `system-prompt.js`
+
+### Signal mention resolution (major fix)
+- Contacts without phone numbers (UUID-only, like Merrisa) now resolve
+  correctly — added `_uuidToName` cache from signal-cli `profile.given_name`
+- Three-layer resolution: signal-cli profile name → UUID→phone→user-profile → fallback
+- Raw @UUID patterns in text (e.g. `@59237aa4-...`) auto-replaced with names
+- Outgoing messages auto-resolve `@Name` to proper Signal mentions (U+FFFC +
+  mentions array) so recipients see names as saved in their contacts
+- `phoneToUuid()` reverse lookup and `resolveUuidToName()` added to adapter
+
+**Files:** `adapters/signal.js`, `bot.js`
+
+### `!remember` multi-user + perspective flip
+- `!remember @Merrisa and I like bowling` now stores on BOTH profiles
+- Karen sees: `@Merrisa and I like bowling`
+- Merrisa sees: `@Karen and I like bowling` (perspective-flipped)
+- Confirmation shows resolved names, not UUIDs
+
+**Files:** `commands/remember.js`
+
+### *(No output)* messages eliminated
+- Bot no longer sends `*(No output)*` placeholder to users
+- If text is empty + hit turn limit → "I ran out of turns" message
+- If text is empty + no turn limit → silently skip
+- Fixed in Discord `sendLongMessage()`, Signal path, and Discord adapter
+
+**Files:** `bot.js`, `adapters/discord.js`
 
 ## Privacy, Spotify, security, encrypted journal, setup persistence
 

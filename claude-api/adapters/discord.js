@@ -122,7 +122,7 @@ class DiscordAdapter extends MessagePlatform {
    */
   async sendLongMessage(chatId, text, opts = {}) {
     if (!text || text.length === 0) {
-      return this.sendMessage(chatId, '*(No output)*', opts);
+      return; // Silently skip — caller handles turn-limit messaging
     }
 
     const limit = this.getCharLimit();

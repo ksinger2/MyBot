@@ -26,6 +26,8 @@ const { sweepOrphanTmpFiles, atomicWriteJsonSync } = require('./atomic-write');
 const { extractImageAttachments } = require('./adapters/base');
 const { DiscordAdapter } = require('./adapters/discord');
 const { loadCommands } = require('./commands');
+const { addNote, extractNotes, stripNoteTags, getGroupNotes, startReminderLoop } = require('./group-notes');
+const { registerFlight, restoreFlightJobs, extractFlightTag, stripFlightTags } = require('./flight-tracker');
 
 // F23: Module-level DiscordAdapter instance — all Discord sends route through this
 let discordAdapter = null;
@@ -707,7 +709,8 @@ async function runClaudeWithContinuation(prompt, opts, channelProxy) {
 
 async function sendLongMessage(message, text, cwd = DEFAULT_WORKSPACE) {
   if (!text || text.length === 0) {
-    await _dreply(message, '*(No output)*');
+    // Silently skip — don't send a confusing placeholder to the user.
+    // The caller handles turn-limit messaging separately.
     return;
   }
 
@@ -1654,9 +1657,12 @@ client.on('messageCreate', async (message) => {
             }).catch(() => {});
           }
         }
-      } else {
+      } else if (result.text) {
         await sendLongMessage(message, result.text, state.cwd);
+      } else if (result.hitTurnLimit) {
+        await _dreply(message, 'I ran out of turns before I could respond — try again or simplify your request.');
       }
+      // If no text and no turn limit, silently skip — don't send a placeholder
 
       // Step 3: Completion summary for non-trivial tasks
       const elapsed = state.startedAt ? Math.round((Date.now() - state.startedAt) / 1000) : 0;
@@ -1816,14 +1822,52 @@ function startSignalAdapter() {
     const mentions = msg.mentions || [];
     if (mentions.length > 0) {
       // Replace each U+FFFC with the mention name (iterate in reverse to preserve positions)
-      const sortedMentions = [...mentions].filter(m => m.name || m.number).sort((a, b) => (b.start || 0) - (a.start || 0));
+      // Include ALL mentions, even those without name/number — we'll resolve them
+      const sortedMentions = [...mentions].sort((a, b) => (b.start || 0) - (a.start || 0));
       for (const m of sortedMentions) {
-        const name = m.name || m.number || 'someone';
+        let name = m.name || null;
+        // If no name, try resolving UUID → phone → profile name
+        if (!name && m.number && m.number.startsWith('+')) {
+          const p = getProfile(m.number);
+          if (p && p.name) name = p.name;
+          else name = m.number;
+        }
+        if (!name && m.uuid) {
+          // Try signal-cli profile name cache (works even without phone number)
+          name = signalAdapter?.resolveUuidToName?.(m.uuid) || null;
+          // Also try UUID→phone→profile
+          if (!name) {
+            const resolved = signalAdapter?._resolveRecipient?.(m.uuid);
+            if (resolved && resolved.startsWith('+')) {
+              m.number = resolved;
+              const p = getProfile(resolved);
+              name = p?.name || resolved;
+            }
+          }
+        }
+        if (!name) name = 'someone';
+        m.name = name; // persist the resolved name on the mention object
         text = text.substring(0, m.start || 0) + '@' + name + text.substring((m.start || 0) + (m.length || 1));
       }
     }
     // Strip any remaining U+FFFC that wasn't matched to a mention
     text = text.replace(/\uFFFC/g, '').trim();
+    // Also replace raw @UUID patterns that some Signal clients embed directly in text
+    text = text.replace(/@([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/gi, (match, uuid) => {
+      // Try signal-cli profile name cache first (works for contacts without phone numbers)
+      const cachedName = signalAdapter?.resolveUuidToName?.(uuid);
+      if (cachedName) return '@' + cachedName;
+      // Try UUID→phone→profile
+      const resolved = signalAdapter?._resolveRecipient?.(uuid);
+      if (resolved && resolved.startsWith('+')) {
+        const p = getProfile(resolved);
+        return '@' + (p?.name || resolved);
+      }
+      // Try matching against mentions array
+      const m = mentions.find(m => m.uuid === uuid);
+      if (m?.name) return '@' + m.name;
+      return match;
+    });
     const downloadedFiles = (msg.attachments || []).filter(a => a.localPath);
     if (downloadedFiles.length > 0) {
       const fileList = downloadedFiles
@@ -2036,8 +2080,8 @@ function startSignalAdapter() {
       // links, create/edit calendar events (via curl), coordinate plans, store
       // preferences — but CANNOT edit code, write files, navigate the codebase,
       // or do any engineering work. No session resume (prevents old engineering
-      // sessions from carrying over). Max 5 turns (enough for a useful reply,
-      // not enough for a rabbit hole).
+      // sessions from carrying over). Max 8 turns (enough for tool fetches +
+      // a useful reply, not enough for a rabbit hole).
       const isGroupChat = isGroupMessage;
 
       // Proactive onboarding: if the sender has no profile, inject a hint so
@@ -2063,6 +2107,49 @@ function startSignalAdapter() {
         } catch {}
       }
 
+      // Inject active group notes so Claude knows what's pending
+      let groupNotesContext = '';
+      if (isGroupChat) {
+        try {
+          const activeNotes = getGroupNotes(msg.chatId);
+          if (activeNotes.length > 0) {
+            const noteLines = activeNotes.map(n => {
+              const from = n.fromName || 'Someone';
+              const target = n.targetName ? `@${n.targetName}` : 'everyone';
+              const age = Math.round((Date.now() - n.createdAt) / (60 * 60 * 1000));
+              const ageStr = age < 1 ? 'just now' : age < 24 ? `${age}h ago` : `${Math.round(age / 24)}d ago`;
+              return `- [${n.type}] ${from} → ${target}: "${n.summary}" (${ageStr}, id=${n.id})`;
+            });
+            groupNotesContext = `\n\n[ACTIVE GROUP NOTES — these are pending action items in this group chat. If the current message resolves one, include [RESOLVE_NOTE: <id>] in your response.]\n${noteLines.join('\n')}`;
+          }
+        } catch (e) {
+          console.warn(`[group-notes] failed to build context: ${e.message}`);
+        }
+      }
+
+      // Inject active flights context so Claude can check flight status
+      let activeFlightsContext = '';
+      if (isGroupChat) {
+        try {
+          const flightsData = require('./flight-tracker');
+          // Load flights for this group that haven't departed yet
+          const allFlights = JSON.parse(fs.readFileSync('/app/data/flights.json', 'utf8') || '[]');
+          const upcoming = allFlights.filter(f =>
+            f.groupId === msg.chatId &&
+            new Date(f.departureTime).getTime() > Date.now() - 24 * 60 * 60 * 1000 // include flights from last 24h
+          );
+          if (upcoming.length > 0) {
+            const lines = upcoming.map(f => {
+              const dep = new Date(f.departureTime);
+              const hoursUntil = Math.round((dep.getTime() - Date.now()) / (60 * 60 * 1000));
+              const timeStr = hoursUntil > 0 ? `in ${hoursUntil}h` : `${Math.abs(hoursUntil)}h ago`;
+              return `- ${f.travelerName || f.traveler}: ${f.airline || ''} ${f.flightNumber || 'unknown'} ${f.departureAirport}→${f.arrivalAirport} departing ${timeStr}`;
+            });
+            activeFlightsContext = `\n\n[ACTIVE FLIGHTS in this group — use these for flight status checks via WebSearch]\n${lines.join('\n')}`;
+          }
+        } catch {}
+      }
+
       const claudeOpts = {
         sessionId: isGroupChat ? null : state.sessionId,
         personalityFile,
@@ -2077,9 +2164,9 @@ function startSignalAdapter() {
         // Instead we pass a custom groupAllowedTools list.
         readOnly: isGroupChat ? false : (!senderIsOwner || !_isChannelElevated(chatId)),
         groupAllowedTools: isGroupChat ? 'Read,WebSearch,WebFetch,Bash,Task,TodoWrite' : undefined,
-        profileContext: (combinedProfileContext || '') + groupOnboardHint + pendingEventContext + (isGroupChat ? `\n\nCHAT_ID: ${msg.chatId}\nSENDER_ID: ${msg.senderId}` : ''),
+        profileContext: (combinedProfileContext || '') + groupOnboardHint + pendingEventContext + groupNotesContext + activeFlightsContext + (isGroupChat ? `\n\nCHAT_ID: ${msg.chatId}\nSENDER_ID: ${msg.senderId}` : ''),
         streamReplies: true,
-        maxTurns: isGroupChat ? 3 : (senderIsOwner ? (parseInt(process.env.SIGNAL_OWNER_MAX_TURNS, 10) || 200) : undefined),
+        maxTurns: isGroupChat ? 8 : (senderIsOwner ? (parseInt(process.env.SIGNAL_OWNER_MAX_TURNS, 10) || 200) : undefined),
       };
 
       // Auto-detect social/location links — pre-fetch metadata and build action prompt.
@@ -2117,6 +2204,69 @@ function startSignalAdapter() {
         }
       }
 
+      // Group notes extraction — detect [NOTE:...] tags and store action items
+      if (isGroupChat) {
+        try {
+          // Build group members list for name→phone resolution
+          const cached = _groupInfoCache.get(msg.chatId);
+          const memberList = [];
+          if (cached && cached.members) {
+            for (const mid of cached.members) {
+              if (mid.startsWith('+')) {
+                const p = getProfile(mid);
+                if (p && p.name) memberList.push({ id: mid, name: p.name });
+              }
+            }
+          }
+          const detectedNotes = extractNotes(result.text, {
+            groupId: msg.chatId,
+            from: msg.senderId,
+            fromName: msg.senderName || (getProfile(msg.senderId) || {}).name || null,
+            groupMembers: memberList,
+          });
+          for (const n of detectedNotes) {
+            addNote(n);
+          }
+          // Resolve notes that Claude marked as done
+          const resolveRe = /\[RESOLVE_NOTE:\s*([a-f0-9]+)\]/gi;
+          let resolveMatch;
+          while ((resolveMatch = resolveRe.exec(result.text)) !== null) {
+            const { resolveNote } = require('./group-notes');
+            resolveNote(resolveMatch[1]);
+          }
+          // Strip note/resolve tags from user-visible output
+          result.text = stripNoteTags(result.text).replace(/\[RESOLVE_NOTE:\s*[a-f0-9]+\]/gi, '').trim();
+        } catch (e) {
+          console.warn(`[group-notes] extraction failed: ${e.message}`);
+        }
+      }
+
+      // Flight detection — extract [FLIGHT:...] tags and set up calendar + safe-flight msg
+      if (isGroupChat) {
+        try {
+          const detectedFlights = extractFlightTag(result.text);
+          for (const fi of detectedFlights) {
+            // Resolve group members for calendar events
+            const cached = _groupInfoCache.get(msg.chatId);
+            const members = cached?.members?.filter(m => m.startsWith('+') && m !== signalAdapter.phoneNumber) || [];
+            await registerFlight({
+              ...fi,
+              groupId: msg.chatId,
+              traveler: fi.traveler || msg.senderId,
+              travelerName: fi.travelerName || msg.senderName || (getProfile(msg.senderId) || {}).name || null,
+              groupMembers: members,
+            }, async (groupId, text, opts) => {
+              if (signalAdapter && signalAdapter.ready) {
+                await signalAdapter.sendMessage(groupId, text, opts || {});
+              }
+            });
+          }
+          result.text = stripFlightTags(result.text);
+        } catch (e) {
+          console.warn(`[flight-tracker] extraction failed: ${e.message}`);
+        }
+      }
+
       // If the group onboard hint was injected this turn, mark the sender
       // as onboarded so the hint doesn't fire again on every message.
       // The user either shared their info (stored via [LEARNED:] above)
@@ -2149,9 +2299,12 @@ function startSignalAdapter() {
         // piece. Skip the final send to avoid duplicating it. If nothing was
         // streamed (e.g., the run produced only tool output, or streaming was
         // bypassed for some reason), fall back to sending the full text.
-        if (!result.streamed) {
-          await signalAdapter.sendLongMessage(msg.chatId, result.text || '*(No output)*');
+        if (!result.streamed && result.text) {
+          await signalAdapter.sendLongMessage(msg.chatId, result.text);
+        } else if (!result.streamed && !result.text && result.hitTurnLimit) {
+          await signalAdapter.sendMessage(msg.chatId, 'I ran out of turns before I could respond — try again or simplify your request.');
         }
+        // If no text and no turn limit, silently skip — don't send a placeholder
         // F8: extract image attachments from result text regardless of streaming
         // state, and send each as a separate Signal message with the file attached.
         const imagePaths = extractImageAttachments(result.text || '');
@@ -2187,6 +2340,20 @@ function startSignalAdapter() {
         // processQueue clears in-memory state; re-persist so disk matches.
         saveChannelState(chatId, state, { critical: true });
       }
+    }
+  });
+
+  // Start group-notes reminder loop — sends DM nudges for unresolved action items
+  startReminderLoop(async (userId, msg) => {
+    if (userId.startsWith('+') && signalAdapter && signalAdapter.ready) {
+      await signalAdapter.sendLongMessage(userId, msg);
+    }
+  });
+
+  // Restore pending safe-flight messages from previous boot
+  restoreFlightJobs(async (groupId, msg, opts) => {
+    if (signalAdapter && signalAdapter.ready) {
+      await signalAdapter.sendMessage(groupId, msg, opts || {});
     }
   });
 

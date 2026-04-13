@@ -97,6 +97,7 @@ class SignalAdapter extends MessagePlatform {
     // Track known conversations for chat metadata
     this._chats = new Map(); // chatId → { name, lastSeen }
     this._uuidToPhone = new Map(); // UUID → phone number cache
+    this._uuidToName = new Map();  // UUID → display name (from signal-cli profile)
     this._groups = new Map(); // internal_id → { publicId, name, isMember }
     this._joinedGroups = new Set(); // internal_ids we've already attempted to join
     this._selfUuid = null; // bot's own ACI/PNI — populated by _loadSelfInfo() so
@@ -205,16 +206,109 @@ class SignalAdapter extends MessagePlatform {
    * @param {Buffer[]} [opts.attachments] - File buffers
    * @param {string[]} [opts.attachmentNames] - Filenames
    */
+  /**
+   * Reverse-lookup: phone number → UUID. Needed for outgoing @mentions.
+   * Returns null if no mapping is known.
+   */
+  phoneToUuid(phone) {
+    if (!phone || !phone.startsWith('+')) return null;
+    for (const [uuid, p] of this._uuidToPhone.entries()) {
+      if (p === phone) return uuid;
+    }
+    return null;
+  }
+
+  /**
+   * Process @-mention patterns in outgoing text. Resolves `@Name` patterns
+   * to proper Signal mentions using the U+FFFC placeholder + mentions array.
+   *
+   * Two modes:
+   *   1. Explicit: caller passes opts.mentions = [{phone, name, uuid}]
+   *   2. Auto-detect: scans text for @Name patterns and matches against
+   *      known user profiles (requires user-profiles.js)
+   *
+   * @param {string} text - Message text potentially containing @mentions
+   * @param {Object} opts - Options
+   * @param {Array}  opts.mentions - Pre-built mentions array [{phone, name, uuid}]
+   * @returns {{ text: string, mentions: Array }} Processed text + mentions array
+   */
+  _buildOutgoingMentions(text, opts = {}) {
+    if (!text) return { text, mentions: [] };
+
+    // Build a name→{phone, uuid} lookup from explicit mentions + known profiles
+    const nameMap = new Map(); // lowercase name → { phone, uuid }
+
+    // Explicit mentions take priority
+    if (opts.mentions && opts.mentions.length > 0) {
+      for (const m of opts.mentions) {
+        if (m.name) {
+          const uuid = m.uuid || this.phoneToUuid(m.phone);
+          if (uuid) nameMap.set(m.name.toLowerCase(), { phone: m.phone, uuid });
+        }
+      }
+    }
+
+    // Auto-detect: load known profiles and build name→uuid map
+    try {
+      const { getAllProfiles } = require('../user-profiles');
+      const profiles = getAllProfiles();
+      for (const [phone, profile] of Object.entries(profiles)) {
+        if (profile.name && !nameMap.has(profile.name.toLowerCase())) {
+          const uuid = this.phoneToUuid(phone);
+          if (uuid) nameMap.set(profile.name.toLowerCase(), { phone, uuid });
+        }
+      }
+    } catch {}
+
+    if (nameMap.size === 0) return { text, mentions: [] };
+
+    // Find all @Name occurrences in text and replace with U+FFFC
+    const mentions = [];
+    let processed = text;
+    // Sort by name length descending so "Karen Smith" matches before "Karen"
+    const names = [...nameMap.keys()].sort((a, b) => b.length - a.length);
+
+    for (const name of names) {
+      const { uuid } = nameMap.get(name);
+      // Case-insensitive search for @Name (word boundary after @)
+      const re = new RegExp(`@(${name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')})(?=[^a-zA-Z]|$)`, 'gi');
+      let match;
+      // Collect all match positions first (re-scan after each replacement shifts offsets)
+      const positions = [];
+      while ((match = re.exec(processed)) !== null) {
+        positions.push({ start: match.index, fullMatch: match[0], name: match[1] });
+      }
+      // Replace in reverse order to preserve positions
+      for (let i = positions.length - 1; i >= 0; i--) {
+        const pos = positions[i];
+        processed = processed.substring(0, pos.start) + '\uFFFC' + processed.substring(pos.start + pos.fullMatch.length);
+        mentions.push({ start: pos.start, length: 1, uuid });
+      }
+    }
+
+    // Re-sort mentions by start position (signal-cli expects this)
+    mentions.sort((a, b) => a.start - b.start);
+
+    return { text: processed, mentions };
+  }
+
   async sendMessage(chatId, text, opts = {}) {
     // Strip any prefix (e.g. "signal:") and resolve UUID→phone
     const raw = chatId.replace(/^signal:/, '');
     const recipient = this._resolveRecipient(raw);
 
+    // Process @mentions in outgoing text
+    const mentionResult = this._buildOutgoingMentions(text, opts);
+
     const payload = {
-      message: text,
+      message: mentionResult.text,
       number: this.phoneNumber,
       text_mode: 'normal',
     };
+
+    if (mentionResult.mentions.length > 0) {
+      payload.mentions = mentionResult.mentions;
+    }
 
     // bbernhard/signal-cli-rest-api /v2/send takes EVERYTHING via `recipients`.
     // Phone numbers / UUIDs go in raw; group IDs must be wrapped as
@@ -226,7 +320,7 @@ class SignalAdapter extends MessagePlatform {
     }
     payload.recipients = [sendRecipient];
 
-    console.log(`[signal] Sending to ${_redactId(recipient)}: ${text.substring(0, 50)}...`);
+    console.log(`[signal] Sending to ${_redactId(recipient)}: ${(text || '').substring(0, 50)}...`);
 
     // Handle attachments
     if (opts.attachments && opts.attachments.length > 0) {
@@ -595,8 +689,13 @@ class SignalAdapter extends MessagePlatform {
           if (c.uuid && c.number) {
             this._uuidToPhone.set(c.uuid, c.number);
           }
+          // Cache profile display names for UUID→name resolution (even without phone)
+          if (c.uuid) {
+            const displayName = c.profile?.given_name || c.name || c.profile_name || null;
+            if (displayName) this._uuidToName.set(c.uuid, displayName);
+          }
         }
-        console.log(`[signal] Loaded ${this._uuidToPhone.size} UUID→phone mappings`);
+        console.log(`[signal] Loaded ${this._uuidToPhone.size} UUID→phone, ${this._uuidToName.size} UUID→name mappings`);
       }
     } catch (err) {
       console.warn(`[signal] Could not load contacts: ${err.message}`);
@@ -610,6 +709,27 @@ class SignalAdapter extends MessagePlatform {
     if (!uuidOrPhone) return uuidOrPhone;
     if (uuidOrPhone.startsWith('+')) return uuidOrPhone; // already a phone number
     return this._uuidToPhone.get(uuidOrPhone) || uuidOrPhone;
+  }
+
+  /**
+   * Resolve a UUID to a display name. Checks: signal-cli profile name cache,
+   * then user-profiles (bot-side), then falls back to null.
+   */
+  resolveUuidToName(uuid) {
+    if (!uuid) return null;
+    // Check signal-cli profile name cache
+    const cached = this._uuidToName.get(uuid);
+    if (cached) return cached;
+    // Try UUID→phone→profile
+    const phone = this._uuidToPhone.get(uuid);
+    if (phone) {
+      try {
+        const { getProfile } = require('../user-profiles');
+        const p = getProfile(phone);
+        if (p?.name) return p.name;
+      } catch {}
+    }
+    return null;
   }
 
   async _acceptMessageRequest(uuid) {
@@ -711,11 +831,23 @@ class SignalAdapter extends MessagePlatform {
       start: m.start,
       length: m.length,
     }));
-    // Resolve UUID-only mentions to phone numbers via the contact cache
+    // Resolve UUID-only mentions to phone numbers via the contact cache,
+    // then look up profile names so @mentions render as real names in text
     for (const m of mentions) {
       if (!m.number && m.uuid) {
         const resolved = this._resolveRecipient(m.uuid);
         if (resolved && resolved.startsWith('+')) m.number = resolved;
+      }
+      // If we still have no name, try signal-cli profile cache then user-profiles
+      if (!m.name && m.uuid) {
+        m.name = this.resolveUuidToName(m.uuid) || null;
+      }
+      if (!m.name && m.number && m.number.startsWith('+')) {
+        try {
+          const { getProfile } = require('../user-profiles');
+          const profile = getProfile(m.number);
+          if (profile && profile.name) m.name = profile.name;
+        } catch {}
       }
     }
 
