@@ -82,6 +82,8 @@ Add `https://mybot.backtoirl.com/auth/spotify/callback` in Spotify Dashboard.
 - BOT_PUBLIC_URL fix across setup/auth files
 - Crash notification only on real crashes (rebuild writes clean-shutdown
   marker so intentional restarts don't trigger false alerts)
+- Group chats: no auto-continue, no "Turn limit reached" messages, no
+  debug/status output — regular users only see the bot's actual response
 
 ### Remaining improvements
 - **Sidecar rebuilder** (designed, not built): Move Docker socket to
