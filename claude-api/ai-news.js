@@ -104,11 +104,11 @@ ${sourcesHint}
 FORMAT RULES (CRITICAL — follow exactly):
 - Output ONLY a header and bullet points. NO intro, NO outro, NO commentary.
 - Header: **🤖 AI Pulse** (then the current time in Pacific Time, e.g. "**🤖 AI Pulse** — 3:00 PM PT")
-- Each bullet: one sentence, max ~15 words, ONE hyperlinked word, and a time-ago tag at the end
-- Hyperlink format: [word](url) — pick the most descriptive word (company name, product, or key action)
-- Time-ago format: parenthetical at end of bullet showing when published
-- Example: • Meta [releases](https://example.com) Llama 4 Scout — beats GPT-4o on reasoning (1h ago)
-- Example: • OpenAI [acquires](https://example.com) Rockset for $800M to boost enterprise search (3h ago)
+- Each bullet: hyperlink ONLY the first word (company or source name), rest of sentence is plain text, time-ago tag at end
+- Format: • [CompanyName](url) does thing — brief detail (Xh ago)
+- The URL is hidden — only the company/source name is clickable. DO NOT show the raw URL anywhere.
+- Example: • [Meta](https://example.com) releases Llama 4 Scout — beats GPT-4o on reasoning (1h ago)
+- Example: • [OpenAI](https://example.com) acquires Rockset for $800M to boost enterprise search (3h ago)
 - ONLY include NEW stories not in the seen list below
 - If there are zero new stories, output ONLY: "**🤖 AI Pulse** — Nothing new since last check."
 - NO deep links, NO long URLs visible, NO essay, NO explanation

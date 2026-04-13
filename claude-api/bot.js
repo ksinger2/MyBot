@@ -1070,6 +1070,14 @@ client.on('clientReady', () => {
   const aiNews = require('./ai-news');
   aiNews.startAINewsScheduler(client);
 
+  // Seed media pulse job for Signal owner (first boot only — editable via setup page)
+  const { seedMediaPulse } = require('./media-pulse-seed');
+  const mediaPulseSeed = seedMediaPulse();
+  if (mediaPulseSeed) {
+    // Newly created — register it immediately so it doesn't wait for next restart
+    try { const { registerJob } = require('./scheduler'); registerJob(mediaPulseSeed, client); } catch {}
+  }
+
   // Start user-created schedules
   startAllSchedules(client);
 
@@ -1435,6 +1443,31 @@ client.on('messageCreate', async (message) => {
   if (isGuild && !isMentioned && !message.content.startsWith('!')) {
     const guildState = getChannel(message.channel.id);
     if (!guildState.listenToAll) return;
+
+    // listenToAll is on — but still skip human-to-human exchanges:
+    // 1. Message @mentions other users but NOT the bot → skip only if it's
+    //    an imperative directed AT them. Mentions in the context of a request
+    //    to the bot ("@Alice wants to join the event") should still reach Claude.
+    const mentionsOthers = message.mentions.users.size > 0 && !message.mentions.has(client.user);
+    if (mentionsOthers) {
+      const contentWithoutMentions = message.content.replace(/<@!?\d+>/g, '').trim().toLowerCase();
+      const isAddressingOther =
+        /^(say|go|come|check|look|tell|do|get|send|show|ask|reply|answer|respond|introduce|hi|hey|hello|wave|lol|haha|omg|nice|wow|ok|okay|sure|thanks|thank)\b/.test(contentWithoutMentions) ||
+        /^(can u|can you|could u|could you|would u|would you|do u|do you|are you|will you|wanna|want to|you should|u should)\b/.test(contentWithoutMentions) ||
+        /^(please |plz |pls )\b/.test(contentWithoutMentions) ||
+        contentWithoutMentions.length === 0;
+      const thirdPersonVerb = /\b(wants?|is|has|would like|needs?|going|trying|asked|said|told|mentioned)\b/.test(contentWithoutMentions);
+      if (isAddressingOther && !thirdPersonVerb) return;
+      // 3rd-person mention — fall through to Claude
+    }
+
+    // 2. Short conversational message with no question/task/bot-name → skip
+    const botName = (guildState.identity?.name || '').toLowerCase();
+    const contentLower = message.content.toLowerCase();
+    const hasQuestion = contentLower.includes('?');
+    const hasTask = /\b(can you|could you|please|remind|schedule|search|find|look up|what|who|when|where|how|tell me|do you|help)\b/i.test(contentLower);
+    const namesMeByName = botName && contentLower.includes(botName);
+    if (!hasQuestion && !hasTask && !namesMeByName) return;
   }
 
   // Strip the @mention prefix from message content so Claude doesn't see it
@@ -2105,21 +2138,74 @@ function startSignalAdapter() {
       // NOTE: use the same prefixed key used for all Signal state (signal:${chatId})
       // Also skip if this sender has a pending onboarding wizard — they need to reply
       const hasPendingSenderWizard = state.senderWizards && state.senderWizards[msg.senderId];
+      const mentionList = (msg.mentions && msg.mentions.length > 0)
+        ? msg.mentions
+        : (msg.raw?.envelope?.dataMessage?.mentions || []);
+      const botPhone = signalAdapter.phoneNumber;
+      const botUuid = signalAdapter._selfUuid || null;
+      const botMentioned = mentionList.some(m =>
+        (m.number && m.number === botPhone) ||
+        (m.uuid && botUuid && m.uuid === botUuid)
+      );
+
       if (!state.listenToAll && !hasPendingSenderWizard) {
-        const mentionList = (msg.mentions && msg.mentions.length > 0)
-          ? msg.mentions
-          : (msg.raw?.envelope?.dataMessage?.mentions || []);
-        const botPhone = signalAdapter.phoneNumber;
-        const botUuid = signalAdapter._selfUuid || null;
-        const botMentioned = mentionList.some(m =>
-          (m.number && m.number === botPhone) ||
-          (m.uuid && botUuid && m.uuid === botUuid)
-        );
         if (!botMentioned) {
           console.log(`[signal] Group message — bot not mentioned, ignoring (${mentionList.length} other mention(s))`);
           return;
         }
       }
+
+      // Even in listenToAll mode: if the message is ADDRESSING another person
+      // directly (imperative verb directed at them), skip. But if it mentions
+      // someone in the context of a request to the bot ("@Merrisa wants to join"),
+      // don't skip — fall through so Claude can handle it.
+      if (state.listenToAll && !botMentioned && mentionList.length > 0) {
+        // Strip U+FFFC placeholders AND any literal @Name text Signal may include
+        const textWithoutMentions = text
+          .replace(/\uFFFC/g, '')
+          .replace(/@\w[\w\s]*/g, '')  // strip @Name patterns
+          .trim().toLowerCase();
+        // Skip if ADDRESSING the mentioned person (2nd-person directed-at):
+        //   imperatives, 2nd-person requests, trailing "pls/please" with no task content
+        // Keep if talking ABOUT the mentioned person to the bot (3rd-person):
+        //   "wants to join", "is coming", "would like to", "needs to be added"
+        const isAddressingOther =
+          /^(say|go|come|check|look|tell|do|get|send|show|ask|reply|answer|respond|introduce|hi|hey|hello|wave|lol|haha|omg|nice|wow|ok|okay|sure|thanks|thank)\b/.test(textWithoutMentions) ||
+          /^(can u|can you|could u|could you|would u|would you|do u|do you|are you|will you|wanna|want to|you should|u should)\b/.test(textWithoutMentions) ||
+          /^(please |plz |pls )\b/.test(textWithoutMentions) ||
+          textWithoutMentions.length === 0; // message was ONLY the @mention
+        // Also skip if the stripped text ends with "pls"/"please" and has no 3rd-person verb
+        const thirdPersonVerb = /\b(wants?|is|has|would like|needs?|going|trying|asked|said|told|mentioned)\b/.test(textWithoutMentions);
+        if (isAddressingOther && !thirdPersonVerb) {
+          console.log(`[signal] Group listenToAll — message addressing another person, ignoring`);
+          return;
+        }
+        // 3rd-person mention (talking ABOUT someone to the bot) — fall through to Claude
+      }
+
+      // Even in listenToAll mode: if the message is clearly a short conversational
+      // exchange not addressed to the bot (no question, no task, no bot name), skip.
+      // Heuristic: no "?", no "!", no bot name/alias in text, under 60 chars, mentions no one.
+      if (state.listenToAll && !botMentioned && mentionList.length === 0) {
+        const botName = (state.identity?.name || '').toLowerCase();
+        const textLower = text.toLowerCase().replace(/\uFFFC/g, '').trim();
+        const hasQuestion = textLower.includes('?');
+        const hasTask = /\b(can you|could you|please|remind|schedule|search|find|look up|what|who|when|where|how|tell me|do you|help)\b/i.test(textLower);
+        const namesMeByName = botName && textLower.includes(botName);
+        if (!hasQuestion && !hasTask && !namesMeByName) {
+          console.log(`[signal] Group listenToAll — short conversational message, not directed at bot, ignoring`);
+          return;
+        }
+      }
+    }
+
+    // Store UUID→profile link so group context builder can resolve this user by
+    // UUID even when the adapter's in-memory/disk UUID→phone cache has no entry.
+    // This fires on every message from a known phone number that also carries a UUID.
+    const incomingUuid = msg.raw?.envelope?.sourceUuid;
+    if (incomingUuid && msg.senderId && msg.senderId.startsWith('+')) {
+      const { saveSignalUuid } = require('./user-profiles');
+      if (saveSignalUuid) saveSignalUuid(msg.senderId, incomingUuid);
     }
 
     // F10: Deterministic greeting fast-path — $0, ~50ms, 100% reliable.
@@ -2341,17 +2427,50 @@ function startSignalAdapter() {
     // crashes or container kills trigger this. Lets the user know from their
     // phone that the bot went down and came back.
     const cleanFile = path.join('/home/node/.claude', '.clean-shutdown');
+    const rebuildMarker = path.join('/home/node/.claude', '.rebuild-marker');
     const rolledBackFile = '/tmp/.rolled-back';
     const wasClean = fs.existsSync(cleanFile);
+    const wasRebuild = fs.existsSync(rebuildMarker);
     const wasRolledBack = fs.existsSync(rolledBackFile);
-    if (!wasClean && !wasRolledBack) {
-      const { SIGNAL_OWNER } = require('./project-permissions');
-      if (SIGNAL_OWNER) {
-        signalAdapter.sendMessage(SIGNAL_OWNER,
-          '*Bot restarted unexpectedly (possible crash). I\u2019m back online now.*'
-        ).catch(() => {});
-        console.log('[signal] Sent crash notification to owner');
+    // Clean up rebuild marker so it only fires once
+    if (wasRebuild) {
+      try { fs.unlinkSync(rebuildMarker); } catch {}
+    }
+    const { SIGNAL_OWNER } = require('./project-permissions');
+    if (wasRebuild && SIGNAL_OWNER) {
+      signalAdapter.sendMessage(SIGNAL_OWNER,
+        'Rebuild complete — I\u2019m back!'
+      ).catch(() => {});
+      console.log('[signal] Sent rebuild-complete notification to owner');
+    } else if (!wasClean && !wasRolledBack && SIGNAL_OWNER) {
+      signalAdapter.sendMessage(SIGNAL_OWNER,
+        '*Bot restarted unexpectedly (possible crash). I\u2019m back online now.*'
+      ).catch(() => {});
+      console.log('[signal] Sent crash notification to owner');
+    }
+
+    // If Discord is disabled, run the platform-agnostic startup tasks here
+    // (schedulers, queue runner, monitors). When Discord IS enabled these run
+    // in the clientReady handler instead so they have access to the Discord client.
+    const enabledPlatforms = (process.env.ENABLED_PLATFORMS || 'signal').split(',').map(s => s.trim());
+    if (!enabledPlatforms.includes('discord')) {
+      // Seed media pulse job for Signal owner (first boot only — editable via setup page)
+      const { seedMediaPulse } = require('./media-pulse-seed');
+      const mediaPulseSeed = seedMediaPulse();
+      if (mediaPulseSeed) {
+        try { const { registerJob } = require('./scheduler'); registerJob(mediaPulseSeed, null); } catch {}
       }
+
+      // Start user-created schedules (Signal dm-task jobs)
+      startAllSchedules(null);
+
+      // Start background task queue runner
+      const { startQueueRunner } = require('./queue-runner');
+      startQueueRunner(null);
+
+      // Start event monitors (CI, health checks)
+      const { startMonitorRunner } = require('./monitor-runner');
+      startMonitorRunner(null);
     }
   }).catch(err => {
     console.error(`[signal] Failed to start: ${err.message}`);
@@ -2416,9 +2535,23 @@ async function _dispatchSignalMessage(msg, chatId, text, state) {
             }
             const memberIds = rawMembers.map(m => {
               if (m.startsWith('+')) return m;
-              // Try to resolve UUID→phone using the adapter's lookup table
-              return signalAdapter._resolveRecipient ? signalAdapter._resolveRecipient(m) : null;
-            }).filter(m => m && m.startsWith('+') && m !== msg.senderId && m !== signalAdapter.phoneNumber);
+              // Try UUID→phone via adapter cache
+              const resolved = signalAdapter._resolveRecipient ? signalAdapter._resolveRecipient(m) : m;
+              if (resolved && resolved.startsWith('+')) return resolved;
+              // Fallback: find profile keyed by UUID (Signal UUID-only mode)
+              try {
+                const { findProfileBySignalUuid } = require('./user-profiles');
+                const found = findProfileBySignalUuid ? findProfileBySignalUuid(m) : null;
+                if (found) return found; // may be a phone OR a UUID key
+              } catch {}
+              return null;
+            }).filter(m => {
+              if (!m) return false;
+              // Exclude self and the current sender — allow both phone and UUID-keyed profiles
+              const senderResolved = msg.senderId;
+              const botPhone = signalAdapter.phoneNumber;
+              return m !== senderResolved && m !== botPhone && m !== signalAdapter._selfUuid;
+            });
             const memberContexts = [];
             for (const mid of memberIds) {
               const ctx = buildProfileContext(mid, { isGroupChat: true });
@@ -2771,8 +2904,13 @@ function createSignalMessageProxy(msg, chatId, state) {
 }
 
 function start() {
+  const enabledPlatforms = (process.env.ENABLED_PLATFORMS || 'signal').split(',').map(s => s.trim());
+  const discordEnabled = enabledPlatforms.includes('discord');
+
   const token = process.env.DISCORD_BOT_TOKEN;
-  if (!token) {
+  if (!discordEnabled) {
+    console.log('Discord disabled (not in ENABLED_PLATFORMS) — skipping Discord login');
+  } else if (!token) {
     console.warn('DISCORD_BOT_TOKEN not set — Discord bot disabled');
   } else {
     client.login(token);

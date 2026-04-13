@@ -527,8 +527,10 @@ app.post('/rebuild', requireInternalToken, async (req, res) => {
 
   // 3. Mark as clean shutdown so the crash notification doesn't fire on restart.
   // Without this, every rebuild triggers "Bot restarted unexpectedly" to the owner.
+  // Also write a separate rebuild marker so the bot can DM the owner on startup.
   try {
     fs.writeFileSync(path.join('/home/node/.claude', '.clean-shutdown'), Date.now().toString());
+    fs.writeFileSync(path.join('/home/node/.claude', '.rebuild-marker'), Date.now().toString());
   } catch {}
 
   // L4: validate HOST_PROJECT_PATH before we commit to spawning anything.

@@ -1,6 +1,38 @@
 # MyBot — Next Steps
 
-## What Was Done (2026-04-13)
+## What Was Done (2026-04-13, session 2)
+
+### Discord disabled — Signal only
+- `ENABLED_PLATFORMS` default changed from `discord` to `signal` in docker-compose.yml
+- `start()` in bot.js now gates `client.login()` on `ENABLED_PLATFORMS` including 'discord' — Discord token in .env no longer auto-connects Discord
+- All platform-agnostic startup tasks (schedulers, media pulse seed, queue runner, monitor runner) moved to Signal `start().then(...)` — previously wired to Discord `clientReady` which never fired in Signal-only mode
+
+### Rebuild complete notification
+- `/rebuild` endpoint now writes `.rebuild-marker` file in addition to `.clean-shutdown`
+- On Signal adapter startup: if `.rebuild-marker` exists, sends "Rebuild complete — I'm back!" DM to owner and deletes the marker (one-shot)
+- Crash notification logic unchanged (fires only when neither clean nor rolled-back)
+
+### Media Pulse (Signal DM scheduled job)
+- `media-pulse-seed.js` seeds a `dm-task` job for SIGNAL_OWNER on first boot
+- Cron: `0 8,13,18 * * *` (8am, 1pm, 6pm PT) — no overnight messages
+- Covers: Disney, Netflix, Amazon, YouTube, TikTok, Epic Games, Chinese media, acquisitions, startups
+- Sources: Variety, Hollywood Reporter, Deadline, Forbes, Bloomberg, Verge, TechCrunch, Reuters, Wired, Axios, The Wrap
+- Format: `• [CompanyName](url) does thing — detail (Xh ago)`
+- Visible and editable from Signal setup page under Scheduled Jobs
+- Was broken because seed ran inside Discord `clientReady` — fixed by moving to Signal startup path
+
+### Signal UUID persistence across rebuilds
+- `_uuidToPhone` map in SignalAdapter now persisted to `/app/data/signal-uuid-phone.json`
+- Written on every UUID learned and after `_loadContacts()` runs
+- On startup: loaded from disk so Merrisa's UUID survives container rebuilds
+
+### listenToAll intent filter
+- In groups with `listenToAll` enabled, bot now ignores messages clearly addressed to another person
+- 2nd-person pattern check: `say|go|come|...` and `can u|could you|do you|...` prefixes
+- 3rd-person verb rescue: `wants|is|has|would like|needs` overrides the filter (e.g. "@Merrisa wants to join the event" still triggers bot)
+- Strips both `\uFFFC` (Signal attachment) and literal `@Name` text before checking
+
+## What Was Done (2026-04-13, session 1)
 
 ### Message grouping debounce
 - Consecutive messages from the same user within 2.5s are combined before dispatching to Claude
@@ -66,15 +98,16 @@
 - No more "🔄 Rebuilding myself" broadcast to all Signal channels before rebuild
 
 ## Known Issues / To Do
-- Emoji reaction test (👍/👎 on bot message) not yet confirmed working end-to-end — Karen couldn't test in-session
+- Emoji reaction test (👍/👎 on bot message) not yet confirmed working end-to-end
 - Debug logging in `remember.js` should be removed once perspective-flip bug confirmed fixed
 - Group members can still only self-onboard by DMing the bot directly (not from group chat)
 - Cloudflare Tunnel runs as a host process — consider docker-compose sidecar for resilience
+- Verify Media Pulse appears in setup page after Discord-disabled rebuild
+- Confirm Merrisa's UUID now loads correctly in group context after UUID persistence fix
 
 ## Priorities
-1. Test 👍/👎 reaction handling end-to-end
-2. Confirm group UUID resolution works for Merrisa (next group message should pick her up)
-3. Remove debug logs from `remember.js` once flip bug confirmed fixed
-4. Test Google Calendar OAuth end-to-end via `mybot.backtoirl.com`
-</content>
-</invoke>
+1. Confirm Media Pulse shows in setup page and fires on schedule
+2. Test 👍/👎 reaction handling end-to-end on Signal
+3. Confirm group UUID resolution works for Merrisa
+4. Remove debug logs from `remember.js` once flip bug confirmed fixed
+5. Test Google Calendar OAuth end-to-end via `mybot.backtoirl.com`

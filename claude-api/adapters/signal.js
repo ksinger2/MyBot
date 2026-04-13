@@ -1,3 +1,28 @@
+const fs = require('fs');
+const path = require('path');
+
+// Persist UUID→phone mappings across restarts so group members are recognized
+// even after a bot rebuild wipes the in-memory cache.
+const UUID_CACHE_FILE = '/app/data/signal-uuid-phone.json';
+
+function _loadPersistedUuidCache() {
+  try {
+    if (fs.existsSync(UUID_CACHE_FILE)) {
+      const raw = JSON.parse(fs.readFileSync(UUID_CACHE_FILE, 'utf8'));
+      return new Map(Object.entries(raw));
+    }
+  } catch {}
+  return new Map();
+}
+
+function _persistUuidCache(map) {
+  try {
+    const obj = Object.fromEntries(map);
+    fs.mkdirSync(path.dirname(UUID_CACHE_FILE), { recursive: true });
+    fs.writeFileSync(UUID_CACHE_FILE, JSON.stringify(obj), 'utf8');
+  } catch {}
+}
+
 /**
  * SignalAdapter — Messaging adapter for Signal via signal-cli-rest-api sidecar.
  *
@@ -21,8 +46,6 @@
  */
 
 const { MessagePlatform, NormalizedMessage } = require('./base');
-const fs = require('fs');
-const path = require('path');
 
 /**
  * Redact a phone number for log output. Shows first 2 chars (usually "+1")
@@ -96,7 +119,7 @@ class SignalAdapter extends MessagePlatform {
 
     // Track known conversations for chat metadata
     this._chats = new Map(); // chatId → { name, lastSeen }
-    this._uuidToPhone = new Map(); // UUID → phone number cache
+    this._uuidToPhone = _loadPersistedUuidCache(); // UUID → phone, persisted across restarts
     this._uuidToName = new Map();  // UUID → display name (from signal-cli profile)
     this._groups = new Map(); // internal_id → { publicId, name, isMember }
     this._joinedGroups = new Set(); // internal_ids we've already attempted to join
@@ -733,6 +756,7 @@ class SignalAdapter extends MessagePlatform {
             if (displayName) this._uuidToName.set(c.uuid, displayName);
           }
         }
+        _persistUuidCache(this._uuidToPhone);
         console.log(`[signal] Loaded ${this._uuidToPhone.size} UUID→phone, ${this._uuidToName.size} UUID→name mappings`);
       }
     } catch (err) {
@@ -850,10 +874,22 @@ class SignalAdapter extends MessagePlatform {
         this._loadGroups().catch(() => {});
       }
     }
-    // Cache any new UUID→phone mapping we discover
+    // Cache any new UUID→phone mapping we discover — persist to disk so it
+    // survives bot restarts (in-memory map alone gets wiped on every rebuild).
     if (senderUuid && envelope.sourceNumber && !this._uuidToPhone.has(senderUuid)) {
       this._uuidToPhone.set(senderUuid, envelope.sourceNumber);
+      _persistUuidCache(this._uuidToPhone);
       console.log(`[signal] Learned UUID→phone: ${_redactUuid(senderUuid)} → ${_redactPhone(envelope.sourceNumber)}`);
+    }
+    // Even when envelope.sourceNumber is absent (newer Signal clients omit it),
+    // if senderId resolved to a phone number from the UUID cache, store the
+    // reverse mapping so future group lookups can find this user by UUID.
+    if (senderUuid && senderId && senderId !== senderUuid && senderId.startsWith('+')) {
+      if (!this._uuidToPhone.has(senderUuid)) {
+        this._uuidToPhone.set(senderUuid, senderId);
+        _persistUuidCache(this._uuidToPhone);
+        console.log(`[signal] Stored UUID→phone from resolved sender: ${_redactUuid(senderUuid)} → ${_redactPhone(senderId)}`);
+      }
     }
     console.log(`[signal] Incoming from ${_redactId(senderId)} (phone: ${_redactPhone(senderPhone)}, uuid: ${_redactUuid(senderUuid)}, chat: ${_redactId(chatId)}): ${(dataMessage.message || '').substring(0, 50)}${dataMessage.attachments?.length ? ` [${dataMessage.attachments.length} attachment(s)]` : ''}`);
     const timestamp = dataMessage.timestamp || envelope.timestamp || Date.now();

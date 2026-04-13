@@ -357,6 +357,40 @@ function buildProfileContext(phoneNumber, { isGroupChat = false } = {}) {
   return lines.join('\n');
 }
 
+// ── Signal UUID helpers ──
+
+/**
+ * Store a Signal UUID against a user's profile so the group context builder
+ * can resolve UUID→phone even when the adapter's in-memory/disk cache misses.
+ * Called whenever a message arrives from a known phone number with a UUID.
+ * No-ops gracefully if the profile doesn't exist yet.
+ */
+function saveSignalUuid(phoneNumber, uuid) {
+  if (!phoneNumber || !uuid) return;
+  const existing = getProfile(phoneNumber);
+  // Only write if the uuid is new or different — avoids unnecessary disk I/O
+  if (existing && existing.signalUuid === uuid) return;
+  setProfile(phoneNumber, { signalUuid: uuid });
+}
+
+/**
+ * Scan all profiles for one whose `signalUuid` matches the given UUID.
+ * Returns the phone number (profile key) or null if not found.
+ * Used as a last-resort fallback when the adapter cache has no UUID→phone entry.
+ */
+function findProfileBySignalUuid(uuid) {
+  if (!uuid) return null;
+  const store = readStore();
+  for (const [key, entry] of Object.entries(store)) {
+    // Profile explicitly stored their UUID
+    const profile = _decodeEntry(entry);
+    if (profile && profile.signalUuid === uuid) return key;
+    // Profile is keyed by UUID directly (when Signal never sent a phone number)
+    if (key === uuid) return key;
+  }
+  return null;
+}
+
 module.exports = {
   getProfile,
   setProfile,
@@ -373,4 +407,6 @@ module.exports = {
   removeTag,
   deleteUser,
   getUserData,
+  saveSignalUuid,
+  findProfileBySignalUuid,
 };
