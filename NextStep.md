@@ -1,117 +1,63 @@
 # MyBot — Session Handoff (2026-04-12)
 
-## Discord streaming, Signal read receipts, crash notification, cleanup
+## Setup page redesign, tags, scheduled DM jobs, security hardening
 
-### Discord streaming (new)
-Responses now stream live to Discord using message editing instead of
-waiting for Claude to finish and sending the full response at once.
+### Setup page — professional redesign
+Complete visual overhaul of `/setup/:userId` page:
+- Dark gradient header (#1a1a2e → #2d2b55), purple accent (#6c63ff)
+- Card-based layout with 14px border-radius, subtle shadows
+- 48px touch targets, mobile-first (480px max-width)
+- Smooth transitions on focus/hover, toggle switches for jobs
 
-- Uses `ChannelProxy.fromDiscordStreaming()` — edits a single message
-  as text arrives (debounced every 2s to respect Discord rate limits)
-- Shows a trailing `█` cursor while generating, removed on completion
-- When text exceeds 1800 chars, finalizes current message and starts new
-- Image attachments sent separately after streaming completes
-- `streamReplies: true` passed to runner, same flag Signal already uses
+### Tags system (new)
+User-curated identity labels stored in `profile.tags[]`:
+- Suggestion chips: Sports Team, Diet, Cuisine, Hobby, Music, Custom
+- Click chip → input appears with category label → Enter/+ to add
+- Tags displayed as styled pills with × remove
+- Stored as `{ label, category, addedAt }`, cap 30/user, deduped
+- Included in Claude's system prompt via `buildProfileContext()`
 
-**Files changed:**
-- `claude-api/bot.js` — new `fromDiscordStreaming()` static method on
-  `ChannelProxy`; Discord message handler now uses streaming proxy with
-  `streamReplies: true`; `sendLongMessage()` guarded by `!result.streamed`
+**Files:** `user-profiles.js` (addTag/removeTag), `server.js` (endpoints + UI)
 
-### Signal read receipts (new)
-Bot now sends a read receipt (blue double-check) when it receives a
-Signal DM, so the sender knows their message was received.
+### Scheduled DM jobs (new)
+Per-user recurring tasks that run through Claude and send results to DM:
+- Create/edit/delete/toggle from the setup page
+- Quick templates: Morning Briefing, AI Pulse, Weekly Meal Plan
+- `type: 'dm-task'` in scheduler.js — detects Signal (phone) vs Discord
+- Signal: `signalAdapter.sendLongMessage(phone, result.text)`
+- Discord: `client.users.fetch(id)` → `createDM()` → send chunked text
+- `parseFrequency` extracted to `parse-frequency.js` (shared module)
 
-- `sendReadReceipt(senderId, timestamp)` method on `SignalAdapter`
-- Calls `POST /v1/receipts/{number}` on signal-cli-rest-api
-- Fire-and-forget, best-effort — doesn't block message handling
-- Only for DMs (not groups — Signal doesn't support group read receipts)
+**Files:** `scheduler.js`, `schedules-storage.js`, `parse-frequency.js`, `server.js`
 
-**Files changed:**
-- `claude-api/adapters/signal.js` — new `sendReadReceipt()` method
-- `claude-api/bot.js` — calls `sendReadReceipt()` on message receive
+### Security hardening
+From security audit:
+- **Complete data deletion**: `deleteUser()` now removes profile + OAuth
+  tokens + all schedules + cancels active cron jobs (was profile-only)
+- **Job limits**: Max 10 DM jobs per user, minimum 5-minute cron interval
+  (rejects `*/1`-`*/4` and `* * * * *`)
+- **Input validation**: Tag label 100 chars, category 50, job name 100,
+  job prompt 2000, frequency 100 — all validated server-side before storage
+- **Data persistence**: `/app/data` mounted as named Docker volume
+  (`bot-data`) so profiles, tokens, events survive container rebuilds
 
-### Crash notification via Signal (new)
-On unexpected restart (crash, container kill), the bot sends the owner
-a Signal DM: "Bot restarted unexpectedly (possible crash). I'm back
-online now." Clean `!restart` and rollback restarts don't trigger it.
+**Files:** `user-profiles.js`, `schedules-storage.js`, `scheduler.js`,
+`parse-frequency.js`, `server.js`, `docker-compose.yml`
 
-**Files changed:**
-- `claude-api/bot.js` — after `signalAdapter.start()`, checks clean
-  shutdown file; sends notification to `SIGNAL_OWNER` if unclean
-
-### Rebuild announcement removed
-The broadcast of "I'm back" messages to ALL channels after a rebuild
-was removed — it was annoying users in channels that weren't even
-talking to the bot.
-
-- `wantsRestartNotification` flag no longer set during `/rebuild`
-- Auto-resume still notifies channels with actual interrupted work
-  (activeTask or pendingQueue) — that's crash recovery, not spam
-- System prompt no longer tells Claude to announce rebuilds
-
-**Files changed:**
-- `claude-api/server.js` — removed `wantsRestartNotification` marking
-- `claude-api/bot.js` — removed `wantsRestartNotification` from filter
-- `claude-api/system-prompt.js` — removed rebuild announcement instruction
-
-### Pending events persisted to disk
-Group pending events (`_pendingGroupEvents` Map) now save to
-`/app/data/pending-events.json` on every mutation and load on startup.
-Expired events (>24h) are still swept hourly.
-
-**Files changed:**
-- `claude-api/server.js` — `_savePendingEvents()` helper, load on
-  startup, save after `/event`, `/event/join`, and sweep
-
-### BOT_PUBLIC_URL fix
-Three files were using `PUBLIC_URL` or falling back to `localhost:3400`
-instead of the `BOT_PUBLIC_URL` env var defined in docker-compose.yml.
-
-**Files changed:**
-- `claude-api/commands/setup.js`
-- `claude-api/google-auth.js`
-- `claude-api/wizards/onboarding.js`
-
-### Google OAuth — published but unverified
-OAuth consent screen published (was "Testing" which blocked non-test
-users). Users will see a "Google hasn't verified this app" warning —
-click Advanced → Go to app (unsafe). One-time per user. Full
-verification skipped (requires multi-week review, not worth it for
-personal use).
+### Previous session changes (also 2026-04-12)
+- Discord streaming (edit-based, `fromDiscordStreaming()`)
+- Signal read receipts (blue double-check on DM receive)
+- Crash notification via Signal DM to owner
+- Rebuild announcement removed (only interrupted-work channels notified)
+- Pending events persisted to `/app/data/pending-events.json`
+- BOT_PUBLIC_URL fix in setup.js, google-auth.js, onboarding.js
+- Google OAuth consent screen published (unverified, users click through)
 
 ### Remaining improvements (not blockers)
 - WhatsApp adapter not started
 - Signal group joins still failing ("Cannot find service ID for self")
   — needs re-linking bot as a linked device of a primary phone
 - SIGNAL_OWNER_NUMBER not set in .env (using hardcoded fallback)
-
----
-
-## Previous: `!listen` toggle + better video link fallback
-
-### `!listen` command
-Per-channel toggle that controls whether the bot responds to every message
-in a group chat or only to @mentions and !commands.
-
-- `!listen` — flip-flop toggle
-- `!listen on` — respond to all group messages
-- `!listen off` — mentions-only (default)
-- Aliases: `!listenall`, `!listening`
-- Works on both Signal and Discord
-- Persisted across restarts via `channel-persistence.js`
-
-### Better video link fallback (TikTok/Instagram/YouTube)
-When yt-dlp fails (IP-blocked, geo-restricted, etc.), the bot now has a
-multi-tier fallback instead of just saying "couldn't pull the video":
-
-1. **OG tags** — TikTok links now fetch both oEmbed AND OG meta tags in
-   parallel. OG tags often contain the full video caption/description that
-   oEmbed omits.
-2. **Browser screenshot** — prompt now instructs Claude to use Playwright
-   `browser_navigate` + `browser_screenshot` to view the actual page and
-   describe the visual content.
-3. **WebSearch** — last resort, with stronger instructions to identify the
-   specific content (exact recipe, exact topic) rather than vague guesses.
-4. **Anti-vagueness rule** — "vague guesses like 'likely a recipe based on
-   their content style' are NOT acceptable" added to response rules.
+- Discord streaming could use edit-batching optimization for very long responses
+- Job execution not yet tested end-to-end with a real scheduled fire
+  (cron registration verified, DM routing code tested manually)
