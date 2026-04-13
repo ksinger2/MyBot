@@ -20,6 +20,7 @@ services:
       # Access control — comma-separated IDs/numbers (empty = DENY ALL after the
       # 2026-04-11 fail-closed flip). SIGNAL_OWNER_NUMBER always bypasses the
       # Signal allowlist so the owner can never lock themselves out.
+      - SIGNAL_OWNER_NUMBER=${SIGNAL_OWNER_NUMBER:-}
       - ALLOWED_USER_IDS=${ALLOWED_USER_IDS:-}
       - ADMIN_USER_IDS=${ADMIN_USER_IDS:-}
       # API keys available to Claude Code when building projects
@@ -139,8 +140,7 @@ services:
 
   # Concert ticket scraper — Playwright-based Python service that scrapes
   # StubHub, VividSeats, TickPick, SeatGeek, and optionally Ticketmaster.
-  # Only started when explicitly enabled:
-  #   docker compose --profile concerts up -d
+  # Starts automatically with the rest of MyBot.
   concert-scraper:
     build: ./concert-scraper
     container_name: mybot-concert-scraper
@@ -153,8 +153,6 @@ services:
       timeout: 10s
       retries: 3
       start_period: 60s
-    profiles:
-      - concerts  # Only starts when: docker compose --profile concerts up -d
 
 volumes:
   signal-data:

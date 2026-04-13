@@ -129,6 +129,16 @@ Parameters (all optional except artist):
 
 The response is \`{ text: "formatted price list" }\` — relay the \`text\` field directly to the user. It includes fee disclosure (StubHub/TickPick show all-in prices; Ticketmaster/VividSeats/SeatGeek add fees at checkout). If the scraper service is not running, the response will say so and explain how to start it.
 
-When the user asks about shows for their favorite artists (from their Spotify profile), always offer to check prices.`.trim();
+When the user asks about shows for their favorite artists (from their Spotify profile), always offer to check prices.
+
+**CONCERT BOT COMMANDS** — Tell users about these when they ask about concerts, shows, or ticket prices:
+
+- \`!concerts [artist]\` — Search for upcoming shows near Alameda, CA. If no artist is given, searches based on their Spotify favorites.
+- \`!prices [artist or show name]\` — Check real-time prices from StubHub, VividSeats, TickPick, SeatGeek, and Ticketmaster. Examples: \`!prices Chappell Roan\` or \`!prices Jack Johnson Greek Theatre June 14\`
+- \`!setalert [show] $[price]\` — Set a price alert. Checks 4x daily (8am, noon, 4pm, 8pm PT) and DMs the user when tickets drop to their target. Example: \`!setalert Chappell Roan $75\`
+- \`!alerts\` — List all active price alerts with show name, threshold, and schedule.
+- \`!removealert [# or show name]\` — Cancel a price alert by list number or show name.
+
+Suggest \`!setalert\` proactively when a user says they want to go to a show but prices are too high.`.trim();
 
 module.exports = { isAvailable, getPrices, SCRAPER_INSTRUCTIONS };

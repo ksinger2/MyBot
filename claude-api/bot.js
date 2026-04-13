@@ -2185,12 +2185,12 @@ function startSignalAdapter() {
 
       // Even in listenToAll mode: if the message is clearly a short conversational
       // exchange not addressed to the bot (no question, no task, no bot name), skip.
-      // Heuristic: no "?", no "!", no bot name/alias in text, under 60 chars, mentions no one.
-      if (state.listenToAll && !botMentioned && mentionList.length === 0) {
+      // Owner always bypasses this filter — they set up listenToAll and should always get responses.
+      if (state.listenToAll && !botMentioned && mentionList.length === 0 && !senderIsOwner) {
         const botName = (state.identity?.name || '').toLowerCase();
         const textLower = text.toLowerCase().replace(/\uFFFC/g, '').trim();
         const hasQuestion = textLower.includes('?');
-        const hasTask = /\b(can you|could you|please|remind|schedule|search|find|look up|what|who|when|where|how|tell me|do you|help)\b/i.test(textLower);
+        const hasTask = /\b(can you|could you|please|remind|schedule|search|find|look up|what|who|when|where|how|tell me|do you|help|show|get|check|track|set|add|list|commands|u have|u know)\b/i.test(textLower);
         const namesMeByName = botName && textLower.includes(botName);
         if (!hasQuestion && !hasTask && !namesMeByName) {
           console.log(`[signal] Group listenToAll — short conversational message, not directed at bot, ignoring`);
@@ -2335,9 +2335,11 @@ function startSignalAdapter() {
   signalAdapter.on('reaction', ({ chatId, senderId, emoji, targetTimestamp, isRemove }) => {
     if (isRemove) return; // ignore reaction removals
 
+    // Strip skin-tone modifiers (U+1F3FB–1F3FF) so 👍🏼 matches 👍
+    const baseEmoji = emoji.replace(/[\u{1F3FB}-\u{1F3FF}]/gu, '').trim();
     let answer = null;
-    if (emoji === '👍') answer = 'yes';
-    else if (emoji === '👎') answer = 'no';
+    if (baseEmoji === '👍') answer = 'yes';
+    else if (baseEmoji === '👎') answer = 'no';
     if (!answer) return;
 
     const signalChatId = `signal:${chatId}`;
@@ -2438,9 +2440,13 @@ function startSignalAdapter() {
     }
     const { SIGNAL_OWNER } = require('./project-permissions');
     if (wasRebuild && SIGNAL_OWNER) {
-      signalAdapter.sendMessage(SIGNAL_OWNER,
-        'Rebuild complete — I\u2019m back!'
-      ).catch(() => {});
+      let rebuildMsg = 'Rebuild complete — I\u2019m back!';
+      try {
+        const { execSync } = require('child_process');
+        const lastCommit = execSync('git log -1 --pretty=format:"%s"', { cwd: '/workspace/MyBot', encoding: 'utf8' }).trim();
+        if (lastCommit) rebuildMsg += `\n\nLast commit: ${lastCommit}`;
+      } catch {}
+      signalAdapter.sendMessage(SIGNAL_OWNER, rebuildMsg).catch(() => {});
       console.log('[signal] Sent rebuild-complete notification to owner');
     } else if (!wasClean && !wasRolledBack && SIGNAL_OWNER) {
       signalAdapter.sendMessage(SIGNAL_OWNER,
