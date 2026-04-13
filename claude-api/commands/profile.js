@@ -14,6 +14,13 @@ module.exports = {
       return;
     }
 
+    // Privacy: refuse to show profile data in group chats
+    const isGroup = message._signalChatId && message._signalChatId !== message._signalSenderId;
+    if (isGroup) {
+      await message.reply('Profile info is private — DM me to view or edit your profile.');
+      return;
+    }
+
     const { isSignalOwner: _iso3 } = require('../project-permissions');
     const parts = arg.trim().split(/\s+/);
 

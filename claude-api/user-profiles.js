@@ -276,7 +276,7 @@ function removeTag(phone, label) {
  * Build a system-prompt snippet describing this user to Claude.
  * Injected into every Signal request so Claude knows who it's talking to.
  */
-function buildProfileContext(phoneNumber) {
+function buildProfileContext(phoneNumber, { isGroupChat = false } = {}) {
   const profile = getProfile(phoneNumber);
   if (!profile) return null;
 
@@ -293,8 +293,12 @@ function buildProfileContext(phoneNumber) {
   if (profile.location) lines.push(`- Location: ${_s(profile.location, 100)}`);
   if (profile.timezone) lines.push(`- Timezone: ${_s(profile.timezone, 50)}`);
   if (profile.gcal_email && profile.gcal_connected) {
-    lines.push(`- Google Calendar: ${profile.gcal_email} (read-only access granted)`);
-    lines.push(`When this user asks about calendar events, use their Google Calendar (${profile.gcal_email}).`);
+    lines.push(`- Google Calendar: connected`);
+    if (isGroupChat) {
+      lines.push(`PRIVACY: In group chats, NEVER reveal event titles or details from this user's calendar. Only say "${_s(profile.name, 50) || 'they'} is busy on [day] from [time] to [time]" — no event names, no descriptions, no attendees. Full calendar details are ONLY for private DMs with this user.`);
+    } else {
+      lines.push(`When this user asks about calendar events, use their Google Calendar (${profile.gcal_email}).`);
+    }
   } else {
     lines.push(`- Google Calendar: not connected`);
   }

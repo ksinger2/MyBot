@@ -42,6 +42,23 @@ module.exports = {
       setupUrl = `${baseUrl}/setup/${encodeURIComponent(targetPhone)}`;
     }
 
-    await message.reply(`Setup link for ${targetPhone}:\n${setupUrl}\n\nTap it on your phone to set your name, location, and connect Google Calendar.`);
+    // Privacy: in group chats, don't show phone number or link publicly.
+    // Send the link via DM instead.
+    const isGroup = message._signalChatId && message._signalChatId !== message._signalSenderId;
+    if (isGroup) {
+      try {
+        const { signalAdapter } = require('../bot');
+        if (signalAdapter && signalAdapter.ready) {
+          await signalAdapter.sendMessage(targetPhone, `Here's your setup link:\n${setupUrl}\n\nTap it to set your name, location, connect calendar & Spotify.`);
+          await message.reply('Sent you a DM with your setup link.');
+        } else {
+          await message.reply('DM me directly for your setup link.');
+        }
+      } catch {
+        await message.reply('DM me directly for your setup link.');
+      }
+    } else {
+      await message.reply(`Here's your setup link:\n${setupUrl}\n\nTap it to set your name, location, connect calendar & Spotify.`);
+    }
   }
 };

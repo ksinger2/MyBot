@@ -1986,7 +1986,7 @@ function startSignalAdapter() {
       // Build profile context. For 1:1 messages, just the sender. For group
       // messages, also list all OTHER known members of the group so the bot
       // can answer things like "plan for us" using everyone's calendars.
-      let combinedProfileContext = buildProfileContext(msg.senderId);
+      let combinedProfileContext = buildProfileContext(msg.senderId, { isGroupChat: isGroupMessage });
       // (isGroupMessage already declared above in the access control block)
       if (isGroupMessage) {
         try {
@@ -2006,16 +2006,17 @@ function startSignalAdapter() {
             const memberIds = (grp.members || []).filter(m => m.startsWith('+') && m !== msg.senderId && m !== signalAdapter.phoneNumber);
             const memberContexts = [];
             for (const mid of memberIds) {
-              const ctx = buildProfileContext(mid);
+              const ctx = buildProfileContext(mid, { isGroupChat: true });
               if (ctx) memberContexts.push(ctx.replace('USER PROFILE (this message is from', 'OTHER GROUP MEMBER ('));
             }
             if (memberContexts.length > 0) {
-              const groupHeader = `GROUP CONTEXT — This message is from a Signal group "${grp.name || msg.chatId}" with ${grp.members?.length || '?'} members. Sender is ${msg.senderId}. Other known members:`;
+              const groupHeader = `GROUP CONTEXT — This message is from a Signal group with ${grp.members?.length || '?'} members. Sender is ${msg.senderId}. Other known members:`;
               combinedProfileContext = [
                 combinedProfileContext || '',
                 groupHeader,
                 ...memberContexts,
                 'When the user says "us" or "we", coordinate across all known members. Use their Google Calendars (where connected) to find times that work for everyone.',
+                '\nGROUP PRIVACY RULES (CRITICAL — never violate these):\n- NEVER share event titles, descriptions, or attendee lists from anyone\'s calendar in group chat\n- Calendar availability in groups: ONLY say "[Name] is busy on [day] from [time] to [time]" or "[Name] is free on [day]"\n- NEVER share phone numbers, email addresses, or profile details of one member with another in group chat\n- NEVER run !profile or share profile data in group chat — tell the user to DM you instead\n- Full calendar details and personal info are ONLY for private 1:1 DMs with that specific user',
               ].filter(Boolean).join('\n\n');
             }
           }
