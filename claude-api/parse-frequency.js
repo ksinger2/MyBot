@@ -79,4 +79,22 @@ function parseFrequency(input) {
   return null;
 }
 
-module.exports = { parseFrequency };
+/**
+ * Validate that a cron rule doesn't fire more often than every 5 minutes.
+ * Returns true if the interval is safe, false if too frequent.
+ */
+function validateMinInterval(cronRule) {
+  const parts = cronRule.trim().split(/\s+/);
+  if (parts.length !== 5) return false;
+  const [minute, hour] = parts;
+  // Reject every-minute patterns
+  if (minute === '*' && hour === '*') return false;
+  // Reject */1 through */4 in minutes field
+  const minuteStep = minute.match(/^\*\/(\d+)$/);
+  if (minuteStep && parseInt(minuteStep[1], 10) < 5) return false;
+  // Reject explicit per-minute patterns like "1,2,3,4,5" with >12 entries (fires 12+ times/hour)
+  if (minute.includes(',') && minute.split(',').length > 12) return false;
+  return true;
+}
+
+module.exports = { parseFrequency, validateMinInterval };

@@ -177,4 +177,12 @@ function cancelJob(scheduleId) {
   }
 }
 
-module.exports = { startAllSchedules, registerJob, cancelJob };
+function cancelUserJobs(userId) {
+  const { getUserSchedules } = require('./schedules-storage');
+  const userScheds = getUserSchedules(userId);
+  for (const s of userScheds) {
+    cancelJob(s.id);
+  }
+}
+
+module.exports = { startAllSchedules, registerJob, cancelJob, cancelUserJobs };

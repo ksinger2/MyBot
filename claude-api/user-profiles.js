@@ -193,12 +193,21 @@ function clearPreferences(phone) {
   return true;
 }
 
-/** Completely remove a user's profile entry. Returns false if user didn't exist. */
+/** Completely remove a user's profile and all associated data (tokens, schedules). */
 function deleteUser(phone) {
   const store = readStore();
   if (!(phone in store)) return false;
   delete store[phone];
   writeStore(store);
+  // Clean up OAuth tokens
+  try { require('./user-tokens').removeToken(phone); } catch {}
+  // Clean up scheduled jobs and cancel active cron jobs
+  try {
+    const { removeAllUserSchedules } = require('./schedules-storage');
+    removeAllUserSchedules(phone);
+    const { cancelUserJobs } = require('./scheduler');
+    cancelUserJobs(phone);
+  } catch {}
   return true;
 }
 

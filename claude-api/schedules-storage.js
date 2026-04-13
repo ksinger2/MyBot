@@ -86,4 +86,13 @@ function toggleSchedule(id, userId) {
   return sched;
 }
 
-module.exports = { loadSchedules, addSchedule, removeSchedule, getUserSchedules, formatScheduleList, updateSchedule, toggleSchedule };
+function removeAllUserSchedules(userId) {
+  const store = readStore();
+  const before = store.schedules.length;
+  store.schedules = store.schedules.filter(s => s.userId !== userId);
+  const removed = before - store.schedules.length;
+  if (removed > 0) writeStore(store);
+  return removed;
+}
+
+module.exports = { loadSchedules, addSchedule, removeSchedule, getUserSchedules, formatScheduleList, updateSchedule, toggleSchedule, removeAllUserSchedules };

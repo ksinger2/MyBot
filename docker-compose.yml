@@ -95,6 +95,7 @@ services:
       - ${HOST_HOME:-/home/karen}/.gitconfig:/home/node/.gitconfig:ro
       - /mnt/c/Users/karen/Desktop/Github Projects:/workspace
       - /var/run/docker.sock:/var/run/docker.sock
+      - bot-data:/app/data
     healthcheck:
       test: ["CMD", "node", "-e", "require('http').get('http://localhost:3400/health', r => { process.exit(r.statusCode === 200 ? 0 : 1) })"]
       interval: 30s
@@ -136,6 +137,7 @@ services:
 
 volumes:
   signal-data:
+  bot-data:
 
 networks:
   default:

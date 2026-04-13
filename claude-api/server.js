@@ -1124,7 +1124,9 @@ function _verifyCsrf(userId, csrf) {
 app.post('/setup/:userId/add-tag', express.json(), (req, res) => {
   const userId = decodeURIComponent(req.params.userId);
   const { label, category, _csrf } = req.body || {};
-  if (!label) return res.status(400).json({ error: 'label required' });
+  if (!label || typeof label !== 'string') return res.status(400).json({ error: 'label required' });
+  if (label.length > 100) return res.status(400).json({ error: 'Tag must be under 100 characters' });
+  if (category && category.length > 50) return res.status(400).json({ error: 'Category must be under 50 characters' });
   if (!_verifyCsrf(userId, _csrf)) return res.status(403).json({ error: 'invalid csrf' });
   try {
     const { addTag } = require('./user-profiles');
@@ -1154,14 +1156,24 @@ app.post('/setup/:userId/jobs', express.json(), (req, res) => {
   if (!name || !prompt || !frequency) return res.status(400).json({ error: 'name, prompt, and frequency required' });
   if (!_verifyCsrf(userId, _csrf)) return res.status(403).json({ error: 'invalid csrf' });
 
-  const { parseFrequency } = require('./parse-frequency');
+  // Input length validation
+  if (name.length > 100) return res.status(400).json({ error: 'Job name must be under 100 characters' });
+  if (prompt.length > 2000) return res.status(400).json({ error: 'Job prompt must be under 2000 characters' });
+  if (frequency.length > 100) return res.status(400).json({ error: 'Frequency must be under 100 characters' });
+
+  // Job count limit (max 10 per user)
+  const { getUserSchedules, addSchedule } = require('./schedules-storage');
+  const existingJobs = getUserSchedules(userId).filter(s => s.type === 'dm-task');
+  if (existingJobs.length >= 10) return res.status(400).json({ error: 'Maximum 10 scheduled jobs per user' });
+
+  const { parseFrequency, validateMinInterval } = require('./parse-frequency');
   const parsed = parseFrequency(frequency);
   if (!parsed) return res.status(400).json({ error: 'Could not parse schedule. Try: "daily at 9am", "weekdays at 8:30am", "every 3 hours"' });
+  if (!validateMinInterval(parsed.cron)) return res.status(400).json({ error: 'Schedule must be at least every 5 minutes' });
 
   let tz = 'America/Los_Angeles';
   try { const p = require('./user-profiles').getProfile(userId); if (p?.timezone) tz = p.timezone; } catch {}
 
-  const { addSchedule } = require('./schedules-storage');
   const sched = addSchedule({ userId, channelId: null, message: prompt, cronRule: parsed.cron, description: name, type: 'dm-task', cwd: null, timezone: tz });
 
   // Activate immediately
@@ -1180,13 +1192,17 @@ app.put('/setup/:userId/jobs/:jobId', express.json(), (req, res) => {
   const { name, prompt, frequency, _csrf } = req.body || {};
   if (!_verifyCsrf(userId, _csrf)) return res.status(403).json({ error: 'invalid csrf' });
 
+  if (name && name.length > 100) return res.status(400).json({ error: 'Job name must be under 100 characters' });
+  if (prompt && prompt.length > 2000) return res.status(400).json({ error: 'Job prompt must be under 2000 characters' });
+
   const fields = {};
   if (name) fields.description = name;
   if (prompt) fields.message = prompt;
   if (frequency) {
-    const { parseFrequency } = require('./parse-frequency');
+    const { parseFrequency, validateMinInterval } = require('./parse-frequency');
     const parsed = parseFrequency(frequency);
     if (!parsed) return res.status(400).json({ error: 'Could not parse schedule.' });
+    if (!validateMinInterval(parsed.cron)) return res.status(400).json({ error: 'Schedule must be at least every 5 minutes' });
     fields.cronRule = parsed.cron;
   }
 
