@@ -174,10 +174,10 @@ class SignalAdapter extends MessagePlatform {
     // in MODE=json-rpc).
     this._stopping = false;
     if (this.useWebhook) {
-      console.log(`[signal] Webhook mode — not polling. Inbound arrives at /signal/webhook for ${this.phoneNumber} (${this._uuidToPhone.size} contacts mapped)`);
+      console.log(`[signal] Webhook mode — not polling. Inbound arrives at /signal/webhook for ${_redactPhone(this.phoneNumber)} (${this._uuidToPhone.size} contacts mapped)`);
     } else {
       this._poll();
-      console.log(`[signal] Adapter started — polling every ${this.pollInterval}ms for ${this.phoneNumber} (${this._uuidToPhone.size} contacts mapped)`);
+      console.log(`[signal] Adapter started — polling every ${this.pollInterval}ms for ${_redactPhone(this.phoneNumber)} (${this._uuidToPhone.size} contacts mapped)`);
     }
     this.ready = true;
     this.emit('ready');
@@ -446,7 +446,7 @@ class SignalAdapter extends MessagePlatform {
       });
       if (!resp.ok) {
         const errText = await resp.text().catch(() => '');
-        console.warn(`[signal] Failed to join group "${name}" (${publicId}): HTTP ${resp.status} ${errText.substring(0, 200)}`);
+        console.warn(`[signal] Failed to join group (${_redactId(internalId)}): HTTP ${resp.status}`);
         return;
       }
       // Verify actual membership (bbernhard returns 204 even on silent errors)
@@ -455,16 +455,16 @@ class SignalAdapter extends MessagePlatform {
         const grp = await verifyResp.json();
         const actuallyMember = (grp.members || []).includes(this.phoneNumber);
         if (actuallyMember) {
-          console.log(`[signal] Joined group "${name}" — confirmed member`);
+          console.log(`[signal] Joined group ${_redactId(internalId)} — confirmed member`);
           if (internalId && this._groups.has(internalId)) {
             this._groups.get(internalId).isMember = true;
           }
         } else {
-          console.warn(`[signal] Join call returned 204 for "${name}" but bot is still pending invite — likely the "Cannot find service ID for self" signal-cli limitation. Group will be unreachable until the account is re-linked as a linked device.`);
+          console.warn(`[signal] Join call returned 204 for group ${_redactId(internalId)} but bot is still pending invite — likely the "Cannot find service ID for self" signal-cli limitation.`);
         }
       }
     } catch (err) {
-      console.warn(`[signal] Error joining group "${name}": ${err.message}`);
+      console.warn(`[signal] Error joining group ${_redactId(internalId)}: ${err.message}`);
     }
   }
 

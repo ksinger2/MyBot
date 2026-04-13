@@ -280,10 +280,18 @@ function buildProfileContext(phoneNumber) {
   const profile = getProfile(phoneNumber);
   if (!profile) return null;
 
+  // Sanitize user-controlled strings to prevent prompt injection.
+  // Strips characters commonly used in injection attempts: [ ] { } < >
+  // and limits length to prevent context stuffing.
+  const _s = (str, maxLen = 200) => {
+    if (!str || typeof str !== 'string') return '';
+    return str.replace(/[\[\]{}<>]/g, '').substring(0, maxLen).trim();
+  };
+
   const lines = [`USER PROFILE (this message is from ${phoneNumber}):`];
-  if (profile.name)     lines.push(`- Name: ${profile.name}`);
-  if (profile.location) lines.push(`- Location: ${profile.location}`);
-  if (profile.timezone) lines.push(`- Timezone: ${profile.timezone}`);
+  if (profile.name)     lines.push(`- Name: ${_s(profile.name, 50)}`);
+  if (profile.location) lines.push(`- Location: ${_s(profile.location, 100)}`);
+  if (profile.timezone) lines.push(`- Timezone: ${_s(profile.timezone, 50)}`);
   if (profile.gcal_email && profile.gcal_connected) {
     lines.push(`- Google Calendar: ${profile.gcal_email} (read-only access granted)`);
     lines.push(`When this user asks about calendar events, use their Google Calendar (${profile.gcal_email}).`);
@@ -291,7 +299,7 @@ function buildProfileContext(phoneNumber) {
     lines.push(`- Google Calendar: not connected`);
   }
   if (profile.spotify_connected) {
-    const artists = (profile.tags || []).filter(t => t.category === 'Artist').map(t => t.label);
+    const artists = (profile.tags || []).filter(t => t.category === 'Artist').map(t => _s(t.label, 100));
     if (artists.length > 0) {
       lines.push(`- Spotify: connected — favorite artists: ${artists.join(', ')}`);
       lines.push(`When this user asks about concerts, events, or tickets, prioritize their favorite artists. Proactively mention upcoming shows in their area.`);
@@ -300,15 +308,15 @@ function buildProfileContext(phoneNumber) {
     }
   }
   if (profile.tags && profile.tags.length > 0) {
-    const tagStr = profile.tags.map(t => t.category !== 'Custom' ? `${t.label} (${t.category})` : t.label).join(', ');
+    const tagStr = profile.tags.map(t => t.category !== 'Custom' ? `${_s(t.label)} (${_s(t.category, 50)})` : _s(t.label)).join(', ');
     lines.push(`- Tags: ${tagStr}`);
   }
   if (profile.preferences && profile.preferences.length > 0) {
-    const facts = profile.preferences.map(p => p.fact).join(', ');
+    const facts = profile.preferences.map(p => _s(p.fact)).join(', ');
     lines.push(`- Preferences: ${facts}`);
   }
   if (profile.location) {
-    lines.push(`When this user asks about weather or local info, always use their location: ${profile.location}.`);
+    lines.push(`When this user asks about weather or local info, always use their location: ${_s(profile.location, 100)}.`);
   }
 
   return lines.join('\n');

@@ -4,6 +4,14 @@ const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
 
+// Security: fail-closed if TOKEN_ENCRYPTION_KEY is not set. User profiles,
+// OAuth tokens, and Spotify tokens are encrypted at rest with this key.
+// Without it, all personal data would be stored in plaintext.
+if (!process.env.TOKEN_ENCRYPTION_KEY) {
+  console.error('[FATAL] TOKEN_ENCRYPTION_KEY not set in environment. Refusing to start — user data would be unencrypted. Set a random 32+ char value in .env.');
+  process.exit(1);
+}
+
 const app = express();
 // L5: cap default JSON body size at 1mb. The per-route /signal/webhook override
 // (5mb) still applies because it's mounted locally on that route.
@@ -969,7 +977,7 @@ app.get('/setup/:userId', (req, res) => {
         <span class="chip" onclick="prefillJob('Morning Briefing','Give me a morning briefing: top news, weather for my area, and anything on my calendar today.','daily at 8am')">Morning Briefing</span>
         <span class="chip" onclick="prefillJob('AI Pulse','What are the latest AI news and developments from the last few hours? Give me a concise bullet-point summary.','daily at 10am')">AI Pulse</span>
         <span class="chip" onclick="prefillJob('Weekly Meal Plan','Suggest a weekly meal plan based on my dietary preferences and favorite cuisines. Include a grocery list.','monday at 9am')">Weekly Meal Plan</span>
-        <span class="chip" onclick="prefillJob('Concert Alerts','Search for upcoming concerts and events for my favorite Spotify artists in my area. Include ticket prices, dates, and venue info. Only show events in the next 2 months.','weekly at friday 10am')">Concert Alerts</span>
+        <span class="chip" onclick="prefillJob('Concert Alerts','Search for upcoming concerts and events for my favorite Spotify artists in my area. Include ticket prices, dates, and venue info. Only show events in the next 2 months.','friday at 10am')">Concert Alerts</span>
       </div>
     </div>
   </div>

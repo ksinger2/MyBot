@@ -953,7 +953,7 @@ client.on('clientReady', () => {
 
   console.log(`Discord bot logged in as ${client.user.tag}`);
   console.log(`Bot is in ${client.guilds.cache.size} server(s)`);
-  client.guilds.cache.forEach(g => console.log(` - ${g.name} (${g.id})`));
+  client.guilds.cache.forEach(g => console.log(` - guild ${g.id}`));
   console.log(`Default personality: ${DEFAULT_PERSONALITY}`);
   console.log(`Workspace: ${DEFAULT_WORKSPACE}`);
   console.log(`Max turns: ${DEFAULT_MAX_TURNS} | Timeout: ${MAX_TIMEOUT / 60000}min`);
