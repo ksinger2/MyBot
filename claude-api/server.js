@@ -525,11 +525,11 @@ app.post('/rebuild', requireInternalToken, async (req, res) => {
     console.error('[rebuild] flushPendingWrites failed:', err.message);
   }
 
-  // 3. (Removed) Rebuild-triggered restart notifications were annoying users in
-  //    channels that weren't actively talking to the bot. Auto-resume still
-  //    notifies channels that had an activeTask or pendingQueue (crash recovery).
-
-  // Pre-rebuild Signal notifications removed — too noisy for users.
+  // 3. Mark as clean shutdown so the crash notification doesn't fire on restart.
+  // Without this, every rebuild triggers "Bot restarted unexpectedly" to the owner.
+  try {
+    fs.writeFileSync(path.join('/home/node/.claude', '.clean-shutdown'), Date.now().toString());
+  } catch {}
 
   // L4: validate HOST_PROJECT_PATH before we commit to spawning anything.
   // Even though flipping this env var requires container access, validating
