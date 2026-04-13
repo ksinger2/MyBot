@@ -4,6 +4,15 @@ const path = require('path');
 const JOURNAL_FILE = path.join('/home/node/.claude', 'session-journal.json');
 const MAX_ENTRIES = 5;
 
+function _timeAgo(isoString) {
+  const ms = Date.now() - new Date(isoString).getTime();
+  const mins = Math.floor(ms / 60000);
+  if (mins < 60) return `${mins}m ago`;
+  const hours = Math.floor(mins / 60);
+  if (hours < 24) return `${hours}h ago`;
+  return `${Math.floor(hours / 24)}d ago`;
+}
+
 function readJournal() {
   try {
     if (!fs.existsSync(JOURNAL_FILE)) return {};
@@ -39,16 +48,19 @@ function writeJournal(data) {
  * Append a completed session entry for a channel.
  * Keeps only the last MAX_ENTRIES entries.
  */
-function appendEntry(channelId, { cwd, promptSummary, resultSummary, turnCount }) {
+function appendEntry(channelId, { cwd, resultSummary, turnCount }) {
   const journal = readJournal();
   if (!journal[channelId]) journal[channelId] = [];
 
+  // Security: only store metadata, never user prompts or response content.
+  // Conversation content was previously stored as promptSummary/resultSummary
+  // which leaked sensitive data (phone numbers, secrets, private conversations)
+  // to the plaintext journal file on disk.
   journal[channelId].unshift({
     timestamp: new Date().toISOString(),
     cwd,
-    promptSummary: (promptSummary || '').substring(0, 200),
-    resultSummary: (resultSummary || '').substring(0, 400),
     turnCount: turnCount || 0,
+    resultLength: (resultSummary || '').length,
   });
 
   // Keep only last MAX_ENTRIES
@@ -67,15 +79,14 @@ function getJournalContext(channelId) {
 
   const lines = entries.map((e, i) => {
     const label = i === 0 ? 'Last session' : `${i + 1} sessions ago`;
-    const date = new Date(e.timestamp).toLocaleString();
-    const parts = [`**${label}** (${date}, \`${e.cwd}\`)`];
-    if (e.promptSummary) parts.push(`Asked: ${e.promptSummary}`);
-    if (e.resultSummary) parts.push(`Result: ${e.resultSummary}`);
-    if (e.turnCount) parts.push(`(${e.turnCount} turns)`);
+    const ago = _timeAgo(e.timestamp);
+    const parts = [`**${label}** (${ago}, \`${e.cwd}\`)`];
+    if (e.turnCount) parts.push(`${e.turnCount} turns`);
+    if (e.resultLength) parts.push(`~${e.resultLength} chars`);
     return parts.join(' — ');
   });
 
-  return `[Session history — what happened in recent sessions]\n${lines.join('\n')}`;
+  return `[Session history — metadata only, no content]\n${lines.join('\n')}`;
 }
 
 module.exports = { appendEntry, getJournalContext };
