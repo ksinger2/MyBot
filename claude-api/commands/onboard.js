@@ -23,15 +23,19 @@ module.exports = {
 
     // ── Resolve target phone ──────────────────────────────────────────────────
     // Prefer a Signal @mention (message._signalMentions from the proxy).
-    // Fall back to a raw +phone arg.
+    // Fall back to a raw +phone arg. Mentions may have phone, UUID, or both —
+    // accept any non-bot mention and use whatever identifier is available.
     const mentions = (message._signalMentions || []).filter(
-      m => m.number && m.number !== message._signalBotPhone
+      m => (m.number || m.uuid) && m.number !== message._signalBotPhone && m.uuid !== message._signalBotPhone
     );
 
     let targetPhone = null;
+    let targetName = null;
 
     if (mentions.length > 0) {
-      targetPhone = mentions[0].number;
+      const m = mentions[0];
+      targetPhone = (m.number && m.number.startsWith('+')) ? m.number : m.uuid;
+      targetName = m.name || null;
     } else {
       const argTrimmed = (arg || '').trim();
       if (argTrimmed.startsWith('+')) targetPhone = argTrimmed;
@@ -55,8 +59,9 @@ module.exports = {
     const { buildOnboardingWizard } = require('../wizards/onboarding');
 
     // Announce to the group so the target person knows to respond
+    const displayName = targetName || (targetPhone.startsWith('+') ? targetPhone : 'there');
     await message.reply(
-      `Hey ${targetPhone} 👋 — I'm going to ask you a couple quick questions to get you set up. Go ahead and answer whenever you're ready!`
+      `Hey ${displayName} — I'm going to ask you a couple quick questions to get you set up. Go ahead and answer whenever you're ready!`
     );
 
     await startSenderWizard(state, message, buildOnboardingWizard(targetPhone), targetPhone);
