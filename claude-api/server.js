@@ -205,27 +205,44 @@ app.post('/ask', requireInternalToken, (req, res) => {
 
 // Internal image generation endpoint — called by Claude CLI via curl
 app.post('/imagine', requireInternalToken, async (req, res) => {
-  const { prompt, inputImagePath } = req.body;
+  const { prompt } = req.body;
   if (!prompt) return res.status(400).json({ error: 'prompt required' });
   if (!process.env.OPENAI_API_KEY) return res.status(500).json({ error: 'No OPENAI_API_KEY configured' });
+
+  // Auto-inject inputImagePath from the shared session context if Claude didn't
+  // pass one. This is the deterministic path — Claude never needs to include
+  // inputImagePath in its curl call; the server always knows the right context.
+  const imageContext = require('./image-context');
+  const resolvedInputImage = (req.body.inputImagePath && fs.existsSync(req.body.inputImagePath))
+    ? req.body.inputImagePath
+    : imageContext.consume(); // consume clears it so it doesn't leak
+
+  if (resolvedInputImage) {
+    console.log(`[imagine] using input image: ${resolvedInputImage}${req.body.inputImagePath ? ' (from request)' : ' (from session context — Claude omitted it)'}`);
+  }
 
   try {
     const OpenAI = require('openai');
     const { toFile } = require('openai');
     const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
     let response;
-    if (inputImagePath && fs.existsSync(inputImagePath)) {
-      // Image-to-image: edit the provided reference image
+    if (resolvedInputImage && fs.existsSync(resolvedInputImage)) {
+      // Detect MIME type from extension
+      const ext = path.extname(resolvedInputImage).toLowerCase();
+      const mimeType = ext === '.jpg' || ext === '.jpeg' ? 'image/jpeg'
+        : ext === '.webp' ? 'image/webp'
+        : 'image/png'; // OpenAI accepts PNG, JPEG, WEBP only — no GIF
+      // Image-to-image: edit using the reference photo
       response = await openai.images.edit({
         model: 'gpt-image-1',
-        image: await toFile(fs.createReadStream(inputImagePath), path.basename(inputImagePath), { type: 'image/png' }),
+        image: await toFile(fs.createReadStream(resolvedInputImage), path.basename(resolvedInputImage), { type: mimeType }),
         prompt,
         n: 1,
         size: '1024x1024',
         quality: 'low',
       });
     } else {
-      // Text-to-image: generate from prompt only
+      // Text-to-image: no input image, generate from prompt only
       response = await openai.images.generate({
         model: 'gpt-image-1',
         prompt,
@@ -546,6 +563,46 @@ app.post('/rebuild', requireInternalToken, async (req, res) => {
   try {
     fs.writeFileSync(path.join('/home/node/.claude', '.clean-shutdown'), Date.now().toString());
     fs.writeFileSync(path.join('/home/node/.claude', '.rebuild-marker'), Date.now().toString());
+    // Snapshot pending work so the rebuild DM can report "up next".
+    // Pull from: (1) explicit background tasks, (2) active channel tasks, (3) queued messages
+    try {
+      const pendingItems = [];
+      // Registered background tasks
+      const bgTasks = [...(_backgroundTasks || new Map()).values()];
+      bgTasks.forEach(t => t.description && pendingItems.push(t.description));
+      // Active channel tasks + queued messages — check both in-memory and persisted disk state
+      const seenPrompts = new Set();
+      const captureChannelState = (state) => {
+        if (state.activeTask?.prompt) {
+          const p = state.activeTask.prompt.substring(0, 120);
+          if (!seenPrompts.has(p)) { seenPrompts.add(p); pendingItems.push('In progress: ' + p); }
+        }
+        if (state.queue && state.queue.length > 0) {
+          state.queue.forEach(q => {
+            if (q.content) {
+              const p = q.content.substring(0, 120);
+              if (!seenPrompts.has(p)) { seenPrompts.add(p); pendingItems.push('Queued: ' + p); }
+            }
+          });
+        }
+      };
+      // In-memory channels (fastest, most up-to-date)
+      try {
+        const { channels } = require('./bot');
+        if (channels) for (const [, state] of channels) captureChannelState(state);
+      } catch {}
+      // Persisted disk state (catches tasks that were active before last restart)
+      try {
+        const stateFile = path.join('/home/node/.claude', 'channel-state.json');
+        if (fs.existsSync(stateFile)) {
+          const diskStates = JSON.parse(fs.readFileSync(stateFile, 'utf8'));
+          for (const state of Object.values(diskStates)) captureChannelState(state);
+        }
+      } catch {}
+      if (pendingItems.length > 0) {
+        fs.writeFileSync(path.join('/home/node/.claude', '.pending-work'), pendingItems.join('\n'));
+      }
+    } catch {}
   } catch {}
 
   // L4: validate HOST_PROJECT_PATH before we commit to spawning anything.
@@ -858,7 +915,7 @@ app.get('/setup/:userId', (req, res) => {
   const jobsHtml = userJobs.map(j => `<div class="job-card" id="job-${j.id}">
     <div class="job-header"><span class="job-name">${escapeHtml(j.description)}</span>
     <label class="toggle"><input type="checkbox" ${j.active ? 'checked' : ''} onchange="toggleJob(${j.id})"><span class="toggle-track"><span class="toggle-thumb"></span></span></label></div>
-    <p class="job-prompt">${escapeHtml((j.message || '').substring(0, 120))}${j.message && j.message.length > 120 ? '...' : ''}</p>
+    <p class="job-prompt">${escapeHtml((j.message || '').substring(0, 300))}${j.message && j.message.length > 300 ? '...' : ''}</p>
     <p class="job-schedule">${escapeHtml(j.description)} \u00b7 <code>${escapeHtml(j.cronRule)}</code></p>
     <div class="job-actions"><button onclick="editJob(${j.id})">Edit</button><button class="btn-danger" onclick="deleteJob(${j.id})">Delete</button></div>
   </div>`).join('');

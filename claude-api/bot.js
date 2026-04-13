@@ -401,12 +401,29 @@ class ChannelProxy {
 
   /** Create a ChannelProxy for a Signal conversation */
   static fromSignal(adapter, recipientChatId) {
-    return new ChannelProxy({
-      sendFn: (text) => adapter.sendMessage(recipientChatId, text),
-      typingFn: () => Promise.resolve(), // Signal doesn't have typing indicators for bots
+    // Collect image paths stripped from streamed text so we can attach them
+    // after the session ends — they can't be sent inline during streaming.
+    const _strippedImagePaths = [];
+
+    const proxy = new ChannelProxy({
+      sendFn: (text) => {
+        // Strip any image file paths before sending — they attach separately.
+        const cleaned = (text || '').replace(/\/tmp\/[^\s"'`\n]+\.(?:png|jpg|jpeg|webp)/gi, (match) => {
+          const p = match.trim();
+          if (p && !_strippedImagePaths.includes(p)) _strippedImagePaths.push(p);
+          return '';
+        }).trim();
+        if (!cleaned) return Promise.resolve();
+        return adapter.sendMessage(recipientChatId, cleaned);
+      },
+      typingFn: () => Promise.resolve(),
       platform: 'signal',
       chatId: recipientChatId,
     });
+
+    // Expose collected paths so the signal handler can send them as attachments
+    proxy.strippedImagePaths = _strippedImagePaths;
+    return proxy;
   }
 }
 
@@ -1997,13 +2014,22 @@ function startSignalAdapter() {
   module.exports.signalAdapter = signalAdapter;
 
   // Track the bot's last sent message timestamp per channel so reaction handlers
-  // know which message a 👍/👎 reaction is targeting.
+  // Track the last N bot message timestamps per channel so 👍/👎 reactions
+  // on any recent message (not just the absolute last) get handled correctly.
+  // Cost footers, queue confirmations etc. overwrite _lastBotTimestamp and would
+  // silently drop reactions to the real content message — tracking a set fixes this.
   const _origSignalSend = signalAdapter.sendMessage.bind(signalAdapter);
   signalAdapter.sendMessage = async function(chatId, text, opts) {
     const result = await _origSignalSend(chatId, text, opts);
     if (result && result.id) {
       const state = channels.get(`signal:${chatId}`) || channels.get(chatId);
-      if (state) state._lastBotTimestamp = Number(result.id) || null;
+      if (state) {
+        state._lastBotTimestamp = Number(result.id) || null;
+        // Keep a rolling window of last 10 bot message timestamps
+        if (!state._recentBotTimestamps) state._recentBotTimestamps = [];
+        state._recentBotTimestamps.push(Number(result.id));
+        if (state._recentBotTimestamps.length > 10) state._recentBotTimestamps.shift();
+      }
     }
     return result;
   };
@@ -2105,6 +2131,14 @@ function startSignalAdapter() {
         .join('\n');
       const fileBlock = `[The user attached ${downloadedFiles.length} file(s). Read or analyze them with the Read/Bash tools as needed:]\n${fileList}`;
       text = text ? `${text}\n\n${fileBlock}` : fileBlock;
+
+      // Deterministic image context: register the first image attachment so
+      // the /imagine endpoint auto-injects it regardless of what Claude passes.
+      const imageFiles = downloadedFiles.filter(a => a.type && a.type.startsWith('image/'));
+      if (imageFiles.length > 0) {
+        const imageContext = require('./image-context');
+        imageContext.set(imageFiles[0].localPath);
+      }
     }
     if (!text) return; // truly empty (no text, no attachments)
 
@@ -2358,8 +2392,11 @@ function startSignalAdapter() {
       return;
     }
 
-    // Only act if the reaction targets the bot's last sent message
-    if (state._lastBotTimestamp && targetTimestamp !== state._lastBotTimestamp) return;
+    // Only act if the reaction targets one of the bot's recent messages.
+    // Using a rolling window of last 10 timestamps so cost footers / queue
+    // confirmations don't overwrite the real content message timestamp.
+    const recentTs = state._recentBotTimestamps || (state._lastBotTimestamp ? [state._lastBotTimestamp] : []);
+    if (recentTs.length > 0 && !recentTs.includes(targetTimestamp)) return;
 
     console.log(`[signal] Reaction ${emoji} from ${senderId} in ${chatId} → dispatching "${answer}"`);
     const syntheticMsg = {
@@ -2440,11 +2477,20 @@ function startSignalAdapter() {
     }
     const { SIGNAL_OWNER } = require('./project-permissions');
     if (wasRebuild && SIGNAL_OWNER) {
-      let rebuildMsg = 'Rebuild complete — I\u2019m back!';
+      let rebuildMsg = 'Rebuild complete \u2014 I\u2019m back!';
       try {
         const { execSync } = require('child_process');
         const lastCommit = execSync('git log -1 --pretty=format:"%s"', { cwd: '/workspace/MyBot', encoding: 'utf8' }).trim();
-        if (lastCommit) rebuildMsg += `\n\nLast commit: ${lastCommit}`;
+        if (lastCommit) rebuildMsg += `\n\nJust shipped: ${lastCommit}`;
+      } catch {}
+      // Include pending work if any was noted before rebuild
+      try {
+        const pendingFile = path.join('/home/node/.claude', '.pending-work');
+        if (fs.existsSync(pendingFile)) {
+          const pending = fs.readFileSync(pendingFile, 'utf8').trim();
+          if (pending) rebuildMsg += `\n\nUp next: ${pending}`;
+          fs.unlinkSync(pendingFile);
+        }
       } catch {}
       signalAdapter.sendMessage(SIGNAL_OWNER, rebuildMsg).catch(() => {});
       console.log('[signal] Sent rebuild-complete notification to owner');
@@ -2838,16 +2884,25 @@ async function _dispatchSignalMessage(msg, chatId, text, state) {
         // piece. Skip the final send to avoid duplicating it. If nothing was
         // streamed (e.g., the run produced only tool output, or streaming was
         // bypassed for some reason), fall back to sending the full text.
+        // F8: extract image paths from result.text regardless of streaming mode.
+        // result.text always retains the original paths (the sendFn strips them
+        // from what's sent to Signal but doesn't modify result.text). We can't
+        // use signalProxy.strippedImagePaths because the send queue is async —
+        // it hasn't flushed yet when we reach this point.
+        const imagePaths = extractImageAttachments(result.text || '');
+
         if (!result.streamed && result.text) {
-          await signalAdapter.sendLongMessage(msg.chatId, result.text);
+          // Strip image file paths from the text — they'll be sent as attachments below
+          let textToSend = result.text;
+          for (const imgPath of imagePaths) {
+            textToSend = textToSend.replace(imgPath, '').trim();
+          }
+          if (textToSend) await signalAdapter.sendLongMessage(msg.chatId, textToSend);
         } else if (!result.streamed && !result.text && result.hitTurnLimit) {
           await signalAdapter.sendMessage(msg.chatId, 'I ran out of turns before I could respond — try again or simplify your request.');
         }
         // If no text and no turn limit, silently skip — don't send a placeholder
-        // F8: extract image attachments from result text regardless of streaming
-        // state, and send each as a separate Signal message with the file attached.
-        const imagePaths = extractImageAttachments(result.text || '');
-        if (imagePaths && imagePaths.size > 0) {
+        if (imagePaths && imagePaths.length > 0) {
           for (const imgPath of imagePaths) {
             try {
               const imgBuf = fs.readFileSync(imgPath);
@@ -2872,6 +2927,8 @@ async function _dispatchSignalMessage(msg, chatId, text, state) {
       state.startedAt = null;
       state.progress = freshProgress();
       state.activeTask = null;
+      // Clear any unconsumed image context so it doesn't leak into a later request
+      require('./image-context').clear();
       saveChannelState(chatId, state, { critical: true });
       // Drain queue
       if (state.queue.length > 0) {

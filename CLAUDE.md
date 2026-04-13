@@ -55,3 +55,18 @@ These are the capabilities Claude has when running inside the bot. The system pr
 - Image file paths MUST appear in text response for Discord attachment
 - System prompt is assembled in `askClaude()` from: brevity rules + capabilities + identity + personality file
 - Three-layer timeout: stall (10min), check-in (5min), hard cap (90min)
+
+## Determinism Rule (CRITICAL)
+**Never rely on prompt language alone to guarantee behavior.** Any time a plan depends on Claude reliably including something in a tool call (a parameter, a flag, a value), that is non-deterministic and WILL fail.
+
+When designing a feature, always ask: *"What happens if Claude omits this?"* If the answer is "it breaks," make it deterministic at the infrastructure level instead:
+- Store context server-side (e.g., `image-context.js`) and auto-inject it in the handler
+- Use middleware or wrappers that enforce required values regardless of Claude's output
+- Collect data that gets stripped/consumed during streaming (e.g., `strippedImagePaths`) so it isn't lost
+- Prompt instructions are UI polish only — not a reliability mechanism
+
+Examples of non-deterministic (BAD) vs deterministic (GOOD):
+- ❌ "You MUST pass inputImagePath in the curl call" → Claude sometimes forgets it
+- ✅ `imageContext.set(path)` before session + `imageContext.consume()` in `/imagine` handler
+- ❌ "Include the file path in your response" → path gets stripped during streaming
+- ✅ Collect stripped paths in proxy, send as attachments after session ends

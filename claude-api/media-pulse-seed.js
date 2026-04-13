@@ -52,9 +52,10 @@ FORMAT RULES (follow exactly):
  * Called once on bot startup.
  */
 function seedMediaPulse() {
-  const ownerPhone = process.env.SIGNAL_OWNER;
+  // Support both SIGNAL_OWNER_NUMBER (primary) and SIGNAL_OWNER (legacy alias)
+  const ownerPhone = process.env.SIGNAL_OWNER_NUMBER || process.env.SIGNAL_OWNER;
   if (!ownerPhone) {
-    console.log('[media-pulse] No SIGNAL_OWNER set — skipping seed');
+    console.log('[media-pulse] No SIGNAL_OWNER_NUMBER set — skipping seed');
     return;
   }
 

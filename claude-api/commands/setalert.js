@@ -68,13 +68,14 @@ Otherwise reply with nothing (empty response — do not send any message).`;
     const cronRule = '0 8,12,16,20 * * *';
     const description = `Price Alert: ${showName} (below $${threshold})`;
 
+    const senderId = message._signalSenderId || message.author?.id;
     const sched = ctx.addSchedule({
-      userId: message.author.id,
-      channelId: message.channel.id,
+      userId: senderId,
+      channelId: null,
       message: jobPrompt,
       cronRule,
       description,
-      type: 'task',
+      type: 'dm-task',
       timezone: 'America/Los_Angeles',
     });
 
