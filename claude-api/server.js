@@ -698,14 +698,35 @@ app.post('/signal/webhook', express.json({ limit: '5mb' }), (req, res) => {
   }
 });
 
+// Spotify OAuth — gated initiation (same ephemeral token pattern as Google Calendar)
+app.get('/auth/spotify/:userId', async (req, res) => {
+  const userId = decodeURIComponent(req.params.userId);
+  const setupToken = typeof req.query.t === 'string' ? req.query.t : '';
+  const accessEntry = _setupAccessTokens.get(setupToken);
+  if (!accessEntry || accessEntry.expiresAt <= Date.now() || !safeTokenEqual(accessEntry.userId, userId)) {
+    return res.status(403).send('Invalid or expired setup link — ask the bot for a new one.');
+  }
+  _setupAccessTokens.delete(setupToken);
+  if (!process.env.SPOTIFY_CLIENT_ID) {
+    return res.status(400).send('Spotify OAuth not configured on this server.');
+  }
+  try {
+    const spotifyAuth = require('./spotify-auth');
+    const authUrl = spotifyAuth.getAuthUrl(userId);
+    res.redirect(authUrl);
+  } catch (err) {
+    res.status(500).send(`OAuth error: ${escapeHtml(err.message)}`);
+  }
+});
+
 // Spotify OAuth callback for playlist integration
 app.get('/auth/spotify/callback', async (req, res) => {
   const { code, state } = req.query;
   if (!code || !state) return res.status(400).send('Missing code or state parameter.');
   try {
     const spotifyAuth = require('./spotify-auth');
-    const { displayName, email } = await spotifyAuth.handleCallback(code, state);
-    res.send(`<h2>Spotify Connected!</h2><p>${escapeHtml(displayName)} (${escapeHtml(email || 'no email')}) is now linked. You can close this tab.</p>`);
+    const result = await spotifyAuth.handleCallback(code, state);
+    res.send(`<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Spotify Connected</title><style>body{font-family:-apple-system,sans-serif;max-width:480px;margin:60px auto;padding:0 20px;text-align:center;}</style></head><body><h1 style="color:#1DB954;">Spotify Connected!</h1><p>${escapeHtml(result.displayName)} is now linked.</p><p style="color:#666;font-size:14px;">Your top artists have been auto-imported as tags. You can manage them from the setup page.</p><p style="margin-top:24px;color:#999;font-size:13px;">You can close this tab.</p></body></html>`);
   } catch (err) {
     console.error('Spotify OAuth callback error:', err.message);
     res.status(500).send(`<h2>Spotify authorization failed</h2><p>${escapeHtml(err.message)}</p>`);
@@ -765,6 +786,18 @@ app.get('/setup/:userId', (req, res) => {
   const googleBtn = googleConfigured
     ? `<a href="/auth/google/calendar/${encodeURIComponent(userId)}?t=${encodeURIComponent(gcalToken)}" style="display:inline-block;background:#4285f4;color:#fff;padding:12px 24px;border-radius:6px;text-decoration:none;font-size:16px;">Connect Google Calendar</a>`
     : `<p style="color:#999;">Google Calendar not configured on this server.</p>`;
+
+  // Spotify OAuth token (same ephemeral pattern as Google Calendar)
+  const spotifyConfigured = !!(process.env.SPOTIFY_CLIENT_ID && process.env.SPOTIFY_CLIENT_SECRET);
+  let spotifyToken = '';
+  if (spotifyConfigured) {
+    spotifyToken = crypto.randomBytes(24).toString('hex');
+    _setupAccessTokens.set(spotifyToken, {
+      userId,
+      expiresAt: Date.now() + SETUP_ACCESS_TTL_MS,
+    });
+    _capMap(_setupAccessTokens, 10000, '_setupAccessTokens');
+  }
 
   // Build preferences list HTML
   const prefs = profile.preferences || [];
@@ -936,6 +969,7 @@ app.get('/setup/:userId', (req, res) => {
         <span class="chip" onclick="prefillJob('Morning Briefing','Give me a morning briefing: top news, weather for my area, and anything on my calendar today.','daily at 8am')">Morning Briefing</span>
         <span class="chip" onclick="prefillJob('AI Pulse','What are the latest AI news and developments from the last few hours? Give me a concise bullet-point summary.','daily at 10am')">AI Pulse</span>
         <span class="chip" onclick="prefillJob('Weekly Meal Plan','Suggest a weekly meal plan based on my dietary preferences and favorite cuisines. Include a grocery list.','monday at 9am')">Weekly Meal Plan</span>
+        <span class="chip" onclick="prefillJob('Concert Alerts','Search for upcoming concerts and events for my favorite Spotify artists in my area. Include ticket prices, dates, and venue info. Only show events in the next 2 months.','weekly at friday 10am')">Concert Alerts</span>
       </div>
     </div>
   </div>
@@ -945,6 +979,13 @@ app.get('/setup/:userId', (req, res) => {
     <p class="card-desc">Connect so I can check your calendar and coordinate events with friends.</p>
     ${profile.gcal_connected ? `<div class="gcal-connected"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="20 6 9 17 4 12"/></svg> Connected (${escapeHtml(profile.gcal_email)})</div>` : ''}
     ${googleConfigured ? `<a href="/auth/google/calendar/${encodeURIComponent(userId)}?t=${encodeURIComponent(gcalToken)}" class="gcal-btn"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#4285f4" stroke-width="2"><rect x="3" y="4" width="18" height="18" rx="2" ry="2"/><line x1="16" y1="2" x2="16" y2="6"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="3" y1="10" x2="21" y2="10"/></svg>${profile.gcal_connected ? 'Reconnect' : 'Connect Google Calendar'}</a>` : '<p class="empty-msg">Google Calendar not configured on this server.</p>'}
+  </div>
+
+  <div class="card">
+    <div class="card-title">Spotify</div>
+    <p class="card-desc">Connect to auto-import your favorite artists. I'll use them to find concerts, ticket prices, and let you know when events are coming to your area.</p>
+    ${profile.spotify_connected ? `<div class="gcal-connected"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="20 6 9 17 4 12"/></svg> Connected (${escapeHtml(profile.spotify_email || profile.spotify_user_id || '')})</div>` : ''}
+    ${spotifyConfigured ? `<a href="/auth/spotify/${encodeURIComponent(userId)}?t=${encodeURIComponent(spotifyToken)}" class="gcal-btn" style="border-color:#1DB954;color:#1DB954;"><svg width="18" height="18" viewBox="0 0 24 24" fill="#1DB954"><path d="M12 0C5.4 0 0 5.4 0 12s5.4 12 12 12 12-5.4 12-12S18.66 0 12 0zm5.521 17.34c-.24.359-.66.48-1.021.24-2.82-1.74-6.36-2.101-10.561-1.141-.418.122-.779-.179-.899-.539-.12-.421.18-.78.54-.9 4.56-1.021 8.52-.6 11.64 1.32.42.18.479.659.301 1.02zm1.44-3.3c-.301.42-.841.6-1.262.3-3.239-1.98-8.159-2.58-11.939-1.38-.479.12-1.02-.12-1.14-.6-.12-.48.12-1.021.6-1.141C9.6 9.9 15 10.561 18.72 12.84c.361.181.54.78.241 1.2zm.12-3.36C15.24 8.4 8.82 8.16 5.16 9.301c-.6.179-1.2-.181-1.38-.721-.18-.601.18-1.2.72-1.381 4.26-1.26 11.28-1.02 15.721 1.621.539.3.719 1.02.419 1.56-.299.421-1.02.599-1.559.3z"/></svg>${profile.spotify_connected ? 'Reconnect' : 'Connect Spotify'}</a>` : '<p class="empty-msg">Spotify not configured on this server.</p>'}
   </div>
 
   </div>

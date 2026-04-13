@@ -69,7 +69,7 @@ const SCOPES = [
   'user-library-read',
 ];
 
-const REDIRECT_URI = process.env.SPOTIFY_REDIRECT_URI || 'http://localhost:3400/auth/spotify/callback';
+const REDIRECT_URI = process.env.SPOTIFY_REDIRECT_URI || `${process.env.BOT_PUBLIC_URL || 'http://localhost:3400'}/auth/spotify/callback`;
 
 /**
  * Generate a Spotify OAuth URL for a Discord user to authorize the bot.
@@ -143,6 +143,24 @@ async function handleCallback(code, state) {
     email,
     isPremium,
   });
+
+  // Mark profile as Spotify-connected and auto-import top artists as tags
+  try {
+    const userProfiles = require('./user-profiles');
+    userProfiles.setProfile(discordUserId, { spotify_connected: true, spotify_email: email, spotify_user_id: spotifyUserId });
+    // Fetch top artists and add as tags (best-effort)
+    const topArtists = await spotifyApi(tokens.access_token, 'GET', 'me/top/artists?time_range=medium_term&limit=20');
+    if (topArtists.items && topArtists.items.length > 0) {
+      let imported = 0;
+      for (const artist of topArtists.items) {
+        const tag = userProfiles.addTag(discordUserId, artist.name, 'Artist');
+        if (tag) imported++;
+      }
+      console.log(`[spotify] Auto-imported ${imported} artist tag(s) for user`);
+    }
+  } catch (err) {
+    console.warn(`[spotify] Could not auto-tag artists: ${err.message}`);
+  }
 
   return { displayName, email, spotifyUserId, isPremium };
 }

@@ -290,6 +290,15 @@ function buildProfileContext(phoneNumber) {
   } else {
     lines.push(`- Google Calendar: not connected`);
   }
+  if (profile.spotify_connected) {
+    const artists = (profile.tags || []).filter(t => t.category === 'Artist').map(t => t.label);
+    if (artists.length > 0) {
+      lines.push(`- Spotify: connected — favorite artists: ${artists.join(', ')}`);
+      lines.push(`When this user asks about concerts, events, or tickets, prioritize their favorite artists. Proactively mention upcoming shows in their area.`);
+    } else {
+      lines.push(`- Spotify: connected (no artist data yet)`);
+    }
+  }
   if (profile.tags && profile.tags.length > 0) {
     const tagStr = profile.tags.map(t => t.category !== 'Custom' ? `${t.label} (${t.category})` : t.label).join(', ');
     lines.push(`- Tags: ${tagStr}`);

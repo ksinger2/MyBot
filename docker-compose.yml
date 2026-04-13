@@ -43,7 +43,7 @@ services:
       # Spotify OAuth for collaborative playlists
       - SPOTIFY_CLIENT_ID=${SPOTIFY_CLIENT_ID:-}
       - SPOTIFY_CLIENT_SECRET=${SPOTIFY_CLIENT_SECRET:-}
-      - SPOTIFY_REDIRECT_URI=${SPOTIFY_REDIRECT_URI:-http://localhost:3400/auth/spotify/callback}
+      - SPOTIFY_REDIRECT_URI=${SPOTIFY_REDIRECT_URI:-https://mybot.backtoirl.com/auth/spotify/callback}
       # Session limits (configurable)
       - DEFAULT_MAX_TURNS=${DEFAULT_MAX_TURNS:-50}
       - MAX_AUTO_CONTINUES=${MAX_AUTO_CONTINUES:-3}
