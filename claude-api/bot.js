@@ -1801,10 +1801,22 @@ function startSignalAdapter() {
     // Claude can Read them. The user reported that images sent over Signal
     // were silently dropped — this is the fix: we hand Claude the local
     // path that the adapter just downloaded.
-    // Strip U+FFFC (object replacement character) from ALL Signal text, not
-    // just the greeting check. Signal inserts ￼ as a placeholder for @mentions.
-    // Claude interprets it as a missing image/attachment and goes investigating.
-    let text = (msg.text || '').replace(/\uFFFC/g, '').trim();
+    // Replace U+FFFC (object replacement character) with the actual mention name.
+    // Signal inserts ￼ as a placeholder for @mentions in the text body, with the
+    // real name/UUID in the separate mentions array. Without this, "@Merrisa" becomes
+    // a blank space and Claude sees "Do  and I" instead of "Do @Merrisa and I".
+    let text = msg.text || '';
+    const mentions = msg.mentions || [];
+    if (mentions.length > 0) {
+      // Replace each U+FFFC with the mention name (iterate in reverse to preserve positions)
+      const sortedMentions = [...mentions].filter(m => m.name || m.number).sort((a, b) => (b.start || 0) - (a.start || 0));
+      for (const m of sortedMentions) {
+        const name = m.name || m.number || 'someone';
+        text = text.substring(0, m.start || 0) + '@' + name + text.substring((m.start || 0) + (m.length || 1));
+      }
+    }
+    // Strip any remaining U+FFFC that wasn't matched to a mention
+    text = text.replace(/\uFFFC/g, '').trim();
     const downloadedFiles = (msg.attachments || []).filter(a => a.localPath);
     if (downloadedFiles.length > 0) {
       const fileList = downloadedFiles
