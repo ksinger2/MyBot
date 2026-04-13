@@ -1906,9 +1906,22 @@ function startSignalAdapter() {
 
     // If a wizard is active for this sender or chat, let it consume the message.
     // Per-sender wizards (from !onboard) only activate for that specific phone number.
-    const hasSenderWizard = state.senderWizards && state.senderWizards[msg.senderId];
+    // If senderId is a UUID, also check if the resolved phone number has a wizard
+    // (the wizard was keyed by phone number from !onboard, but the sender may arrive
+    // as a UUID if their phone isn't in the contacts cache yet).
+    let wizardSenderId = msg.senderId;
+    if (state.senderWizards && !state.senderWizards[msg.senderId] && msg.senderId && !msg.senderId.startsWith('+')) {
+      // Try resolving UUID to phone via adapter
+      const resolved = signalAdapter._resolveRecipient(msg.senderId);
+      if (resolved && resolved.startsWith('+') && state.senderWizards[resolved]) {
+        wizardSenderId = resolved;
+      }
+    }
+    const hasSenderWizard = state.senderWizards && state.senderWizards[wizardSenderId];
     if (state.wizard || hasSenderWizard) {
       const fakeMessage = createSignalMessageProxy(msg, chatId, state);
+      // If we resolved a different senderId for the wizard, override the proxy
+      if (wizardSenderId !== msg.senderId) fakeMessage._signalSenderId = wizardSenderId;
       // Allow !cancel to escape the wizard
       if (text.toLowerCase() === '!cancel') {
         await cancelWizard(state, fakeMessage);

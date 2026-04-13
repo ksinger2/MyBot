@@ -705,12 +705,19 @@ class SignalAdapter extends MessagePlatform {
     // shape — sometimes only `uuid` is set, sometimes only `number`, sometimes
     // both. We pass through whatever the envelope had.
     const mentions = (dataMessage.mentions || []).map(m => ({
-      number: m.number || null,
+      number: m.number || (m.uuid ? this._resolveRecipient(m.uuid) : null) || null,
       uuid: m.uuid || null,
       name: m.name || null,
       start: m.start,
       length: m.length,
     }));
+    // Resolve UUID-only mentions to phone numbers via the contact cache
+    for (const m of mentions) {
+      if (!m.number && m.uuid) {
+        const resolved = this._resolveRecipient(m.uuid);
+        if (resolved && resolved.startsWith('+')) m.number = resolved;
+      }
+    }
 
     const normalized = new NormalizedMessage({
       id: String(timestamp),
