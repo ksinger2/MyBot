@@ -1,3 +1,55 @@
+# MyBot — Session Handoff (2026-04-14)
+
+## Spotify artist refresh — new sources + silent-failure fix
+
+### The bug
+Artist import was missing favorites. Two issues:
+1. Every section of the import wrapped API calls in empty `catch {}`, so
+   a single HTTP blip silently dropped an entire category without any log.
+2. Only pulled from 4 sources — top/followed/liked/albums — missed
+   artists that only live in playlists, Daily Mix, or recently-played.
+
+### What changed
+- `spotify-auth.js` — rewrote `importUserArtists()` (old `refreshArtists`
+  is now an alias for back-compat with the `/spotify/refresh-artists`
+  HTTP endpoint in `server.js`). Changes:
+  - Errors per section are now *captured* and returned in `result.errors`
+    instead of being swallowed — partial failures are visible.
+  - Wider pagination caps: liked tracks 500→2000, saved albums 200→1000,
+    followed-artists pages 10→20.
+  - **Two new sources**: `me/player/recently-played` (last 50 plays) and
+    `me/playlists` → `playlists/{id}/tracks` (first 40 playlists, 500
+    tracks each, only requests `fields=items(track(artists(name))),next`
+    to bound payload size).
+  - Per-source counters (`top/followed/liked/albums/recent/playlists`)
+    so we can see which source contributed what.
+  - Logs full summary via `console.log` in addition to returning it.
+- `commands/refreshartists.js` (new) — Signal DM command that runs
+  `importUserArtists(phone)` and replies with counts + source breakdown
+  + any errors. Aliases: `!refreshspotify`, `!repullartists`,
+  `!reimportartists`.
+- Container rebuilt.
+
+### How to use
+```
+!refreshartists
+```
+Replies with something like:
+> Done. 312 artists total (+174 new).
+> Sources: top=142, followed=203, liked=187, albums=64, recent=18, playlists=487 (794 unique).
+
+If a section fails, the error shows up in the reply too, which is how we
+diagnose "favorite artist missing" going forward.
+
+### Why this matters
+The first run only returned 138 artists for Karen, and two artists she
+listens to heavily were missing. Spotify's `me/top/artists` has known
+flakiness with Discover Weekly / Daily Mix / radio autoplay — those
+listens don't always show up in the top-artists endpoint. Adding
+`recently-played` + `playlists` catches them.
+
+---
+
 # MyBot — Session Handoff (2026-04-13)
 
 ## Group features, flight tracker, mention fixes, no-output fix
