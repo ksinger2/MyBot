@@ -58,6 +58,7 @@ COPY wizards/ ./wizards/
 COPY personalities/ ./personalities/
 COPY adapters/ ./adapters/
 COPY skills/ ./skills/
+COPY plugins/ ./plugins/
 COPY project-template/ ./project-template/
 COPY entrypoint.sh /app/entrypoint.sh
 RUN chmod +x /app/entrypoint.sh

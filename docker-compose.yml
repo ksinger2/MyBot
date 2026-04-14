@@ -78,6 +78,8 @@ services:
       - GH_TOKEN=${GH_TOKEN:-}
       # Concert ticket scraper plugin (optional — only used when concert-scraper profile is active)
       - TICKETMASTER_API_KEY=${TICKETMASTER_API_KEY:-}
+      # SerpApi key for Google Flights price tracking (free tier: 250 searches/month)
+      - SERPAPI_KEY=${SERPAPI_KEY:-}
     # SSH key and gh config mounts were removed 2026-04-11 after a security
     # review found prompt-injection could exfiltrate them via Claude's Read
     # tool + --dangerously-skip-permissions. `gh` CLI now authenticates via

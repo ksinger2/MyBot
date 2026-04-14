@@ -47,7 +47,18 @@ module.exports = {
     const isGroup = message._signalChatId && message._signalChatId !== message._signalSenderId;
     if (isGroup) {
       try {
-        const { signalAdapter } = require('../bot');
+        const { signalAdapter, _addKnownGroupMember } = require('../bot');
+        // Auto-allowlist this group member so their DM replies are accepted.
+        // Add both the targetPhone and the raw sender identifiers — signal-cli
+        // may use UUID in DM context even if we have a phone number here.
+        if (_addKnownGroupMember) {
+          _addKnownGroupMember(targetPhone);
+          if (message._signalSenderId) _addKnownGroupMember(message._signalSenderId);
+          // Also store the UUID from the raw envelope if different from senderId
+          const _raw = message._signalRaw?.envelope;
+          if (_raw?.sourceUuid) _addKnownGroupMember(_raw.sourceUuid);
+          if (_raw?.sourceNumber) _addKnownGroupMember(_raw.sourceNumber);
+        }
         if (signalAdapter && signalAdapter.ready) {
           await signalAdapter.sendMessage(targetPhone, `Here's your setup link:\n${setupUrl}\n\nTap it to set your name, location, connect calendar & Spotify.`);
           await message.reply('Sent you a DM with your setup link.');

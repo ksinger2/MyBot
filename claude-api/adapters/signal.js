@@ -330,6 +330,36 @@ class SignalAdapter extends MessagePlatform {
     const raw = chatId.replace(/^signal:/, '');
     const recipient = this._resolveRecipient(raw);
 
+    // DETERMINISTIC SECRET FILTER — last line of defense before anything reaches
+    // the user. Runs on EVERY outgoing message regardless of source.
+    if (text) {
+      // Block any password/credential patterns that somehow made it through
+      text = text.replace(/"password"\s*:\s*"[^"]+"/gi, '"password": "[REDACTED]"');
+      text = text.replace(/password\s*[:=]\s*\S+/gi, 'password=[REDACTED]');
+      text = text.replace(/"email"\s*:\s*"[^"@]+@[^"]+"/gi, '"email": "[REDACTED]"');
+      text = text.replace(/Authorization:\s*Basic\s+[A-Za-z0-9+/=]{10,}/gi, 'Authorization: Basic [REDACTED]');
+      // Block API key patterns
+      text = text.replace(/sk-[A-Za-z0-9_\-]{20,}/g, 'sk-[REDACTED]');
+      text = text.replace(/ghp_[A-Za-z0-9]{20,}/g, 'ghp_[REDACTED]');
+      text = text.replace(/AIzaSy[A-Za-z0-9_\-]{30,}/g, 'AIzaSy[REDACTED]');
+      // Block env var dumps
+      text = text.replace(/(?:_KEY|_TOKEN|_SECRET|_PASSWORD|_PIN)=["']?[^\s"']{8,}/gi, (m) => m.split('=')[0] + '=[REDACTED]');
+    }
+
+    // Clean up markdown for Signal (which doesn't render markdown links).
+    // Convert [title](url) → "title (url)" for short URLs, or just "title" for long ones.
+    // Also add spacing between bullet points for readability.
+    if (text) {
+      // Convert markdown links: [title](url) → title for long URLs, title (url) for short
+      text = text.replace(/\[([^\]]+)\]\((https?:\/\/[^)]+)\)/g, (_, title, url) => {
+        return url.length > 60 ? title : `${title} (${url})`;
+      });
+      // Add blank line after each bullet point for breathing room
+      text = text.replace(/^(- .+)$/gm, '$1\n');
+      // Collapse triple+ newlines back to double
+      text = text.replace(/\n{3,}/g, '\n\n');
+    }
+
     // Process @mentions in outgoing text
     const mentionResult = this._buildOutgoingMentions(text, opts);
 

@@ -24,7 +24,12 @@ module.exports = {
     }
 
     const senderName = profile.name || 'someone';
-    const fact = arg.trim();
+    // Strip any injected attachment metadata that leaked through
+    const fact = arg.replace(/\n?\[The user attached \d+ file\(s\)[\s\S]*$/, '').trim();
+    if (!fact) {
+      await message.reply("I can't read images with !remember — describe what you want me to remember in text, or just send the image with a regular message and I'll parse it.");
+      return;
+    }
 
     // Store on the sender's profile
     addPreference(phone, fact, 'explicit');
@@ -65,9 +70,17 @@ module.exports = {
       }
     }
 
+    // Replace any raw phone numbers or @phone references in the fact with names
+    let displayFact = fact;
+    displayFact = displayFact.replace(/@?\+\d{10,15}/g, (match) => {
+      const ph = match.replace(/^@/, '');
+      const p = getProfile(ph);
+      return p?.name ? `@${p.name}` : match;
+    });
+
     const who = storedOn.length > 1
       ? `Remembered for ${storedOn.join(' & ')}`
       : 'Remembered';
-    await message.reply(`${who}: ${fact}`);
+    await message.reply(`${who}: ${displayFact}`);
   }
 };

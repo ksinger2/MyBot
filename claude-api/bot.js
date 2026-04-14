@@ -408,11 +408,13 @@ class ChannelProxy {
     const proxy = new ChannelProxy({
       sendFn: (text) => {
         // Strip any image file paths before sending — they attach separately.
-        const cleaned = (text || '').replace(/\/tmp\/[^\s"'`\n]+\.(?:png|jpg|jpeg|webp)/gi, (match) => {
+        let cleaned = (text || '').replace(/\/tmp\/[^\s"'`\n]+\.(?:png|jpg|jpeg|webp)/gi, (match) => {
           const p = match.trim();
           if (p && !_strippedImagePaths.includes(p)) _strippedImagePaths.push(p);
           return '';
-        }).trim();
+        });
+        // Strip all system tags before they reach the user (they get processed post-session)
+        cleaned = cleaned.replace(/\[(IMAGINE|LEARNED|NOTE|RESOLVE_NOTE|UPDATE_NOTES|CONCERT_PRICES|FLIGHT_SEARCH|FLIGHT_PRICE|EIGHTSLEEP|FLIGHT):\s*[^\]]*\]/gi, '').trim();
         if (!cleaned) return Promise.resolve();
         return adapter.sendMessage(recipientChatId, cleaned);
       },
@@ -578,6 +580,48 @@ Present a final summary:
 Begin Phase 1 now.`;
 }
 
+// ── Startup markers — read ONCE, consumed immediately ───────────────────────
+// Prevents the race condition where Discord and Signal both read/delete the
+// same marker files independently. Both platforms now reference these pre-
+// computed values instead of calling fs.existsSync() themselves.
+const _startupMarkers = (() => {
+  const cleanFile = path.join('/home/node/.claude', '.clean-shutdown');
+  const rebuildFile = path.join('/home/node/.claude', '.rebuild-marker');
+  const rolledBackFile = '/tmp/.rolled-back';
+  const wasClean = fs.existsSync(cleanFile);
+  const wasRebuild = fs.existsSync(rebuildFile);
+  const wasRolledBack = fs.existsSync(rolledBackFile);
+  // Consume markers immediately so they fire only once regardless of startup order
+  if (wasClean) try { fs.unlinkSync(cleanFile); } catch {}
+  if (wasRebuild) try { fs.unlinkSync(rebuildFile); } catch {}
+  if (wasRolledBack) try { fs.unlinkSync(rolledBackFile); } catch {}
+  return { wasClean, wasRebuild, wasRolledBack };
+})();
+
+// ── Auto-allowlist: track identifiers seen in shared Signal groups ───────────
+// If someone is in a group with the bot, they're trusted enough to DM the bot
+// (e.g., after typing !setup in a group). Persisted to survive rebuilds.
+// Stores BOTH phone numbers AND UUIDs because the same user's senderId can
+// differ between contexts (phone in group, UUID in DM, or vice versa).
+const KNOWN_GROUP_MEMBERS_FILE = path.join('/app/data', 'known-group-members.json');
+const _knownGroupMembers = new Set();
+try {
+  const _kgmRaw = JSON.parse(fs.readFileSync(KNOWN_GROUP_MEMBERS_FILE, 'utf8'));
+  if (Array.isArray(_kgmRaw)) _kgmRaw.forEach(n => _knownGroupMembers.add(n));
+} catch {}
+function _addKnownGroupMember(identifier) {
+  if (!identifier || _knownGroupMembers.has(identifier)) return;
+  _knownGroupMembers.add(identifier);
+  try { atomicWriteJsonSync(KNOWN_GROUP_MEMBERS_FILE, [..._knownGroupMembers]); } catch {}
+}
+// Add both phone AND UUID for a group member so DMs match regardless of format
+function _addKnownGroupMemberFull(msg) {
+  if (msg.senderId) _addKnownGroupMember(msg.senderId);
+  // Also add the raw UUID and phone from the envelope if available
+  if (msg._senderUuid) _addKnownGroupMember(msg._senderUuid);
+  if (msg._senderPhone) _addKnownGroupMember(msg._senderPhone);
+}
+
 // Per-channel state
 const channels = new Map();
 
@@ -597,6 +641,10 @@ async function gracefulShutdown(signal) {
     new Promise(resolve => setTimeout(resolve, 5000)),
   ]);
   flushPendingWrites();
+  // Write clean-shutdown marker so the next boot doesn't send a crash notification.
+  // This covers both !restart (which already wrote it) and docker compose stop/rebuild
+  // (which sends SIGTERM but previously had no marker).
+  try { fs.writeFileSync(path.join('/home/node/.claude', '.clean-shutdown'), Date.now().toString()); } catch {}
   process.exit(0);
 }
 process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
@@ -644,7 +692,7 @@ function getChannel(channelId) {
       wizard: null,   // active wizard state (multi-step interactions)
       startedAt: null, // timestamp when Claude started working
       progress: freshProgress(), // structured progress for !btw
-      queue: [],      // queued messages while Claude is busy
+      queue: (saved?.pendingQueue || []).map(text => ({ content: text, timestamp: Date.now() })),
       groupingTimer: null,   // debounce timer for message grouping
       groupingBuffer: [],    // buffered messages waiting to be combined
       groupingSenderId: null, // sender of the buffered messages
@@ -674,7 +722,7 @@ function listPersonalities() {
     .map(f => f.replace('.md', ''));
 }
 
-function askClaude(prompt, { sessionId = null, personalityFile = null, identity = null, cwd = DEFAULT_WORKSPACE, maxTurns = null, channelState = null, discordChannel = null, channelProxy = null, discordUserId = null, readOnly = false, groupAllowedTools = undefined, profileContext = null, streamReplies = false } = {}) {
+function askClaude(prompt, { sessionId = null, personalityFile = null, identity = null, cwd = DEFAULT_WORKSPACE, maxTurns = null, channelState = null, discordChannel = null, channelProxy = null, discordUserId = null, readOnly = false, groupAllowedTools = undefined, profileContext = null, streamReplies = false, model = 'sonnet' } = {}) {
   // Wrap raw Discord channel in ChannelProxy if needed
   if (!channelProxy && discordChannel) {
     channelProxy = ChannelProxy.fromDiscord(discordChannel);
@@ -683,7 +731,7 @@ function askClaude(prompt, { sessionId = null, personalityFile = null, identity 
   const runner = new Runner(prompt, {
     sessionId, personalityFile, identity, cwd, maxTurns,
     channelState, channelProxy, discordUserId, readOnly,
-    groupAllowedTools, profileContext, streamReplies,
+    groupAllowedTools, profileContext, streamReplies, model,
     // Inject bot.js functions so runner.js doesn't need to import bot.js
     freshProgressFn: freshProgress,
     saveChannelStateFn: saveChannelState,
@@ -1047,23 +1095,14 @@ client.on('clientReady', () => {
   // Initialize error alerting
   initErrorAlerting(client);
 
-  // Check if we recovered from a crash loop via automatic rollback
-  const rolledBackMarker = '/tmp/.rolled-back';
-  let wasRolledBack = false;
-  if (fs.existsSync(rolledBackMarker)) {
-    wasRolledBack = true;
-    try {
-      fs.unlinkSync(rolledBackMarker);
-      sendErrorAlert(new Error('Automatic rollback triggered — bot crash-looped after a rebuild and was restored to the last known good version. The bad code changes are still in /workspace/MyBot/claude-api/ and need to be fixed.'));
-      console.log('[entrypoint] Recovered from crash loop via automatic rollback');
-    } catch {}
-  }
+  // Use pre-computed startup markers (read once at module load to prevent race
+  // condition between Discord and Signal startup handlers).
+  const wasRolledBack = _startupMarkers.wasRolledBack;
+  const wasCleanShutdown = _startupMarkers.wasClean;
 
-  // Check if this was a clean shutdown (!restart) vs a crash
-  const cleanShutdownFile = path.join('/home/node/.claude', '.clean-shutdown');
-  const wasCleanShutdown = fs.existsSync(cleanShutdownFile);
-  if (wasCleanShutdown) {
-    try { fs.unlinkSync(cleanShutdownFile); } catch {}
+  if (wasRolledBack) {
+    sendErrorAlert(new Error('Automatic rollback triggered — bot crash-looped after a rebuild and was restored to the last known good version. The bad code changes are still in /workspace/MyBot/claude-api/ and need to be fixed.'));
+    console.log('[entrypoint] Recovered from crash loop via automatic rollback');
   }
 
   // After crash-loop rollback, clear all active tasks (the task may have caused the crash)
@@ -1786,9 +1825,12 @@ async function _dispatchDiscordMessage(message, messageText, state) {
       });
 
       // If text was streamed live, skip re-sending it. But still send any
-      // image attachments that were referenced in the response text.
+      // image attachments (registry = primary, text extraction = fallback).
       if (result.streamed) {
-        const imagePaths = extractImageAttachments(result.text || '');
+        const _imgReg = require('./image-registry');
+        const _regPaths = _imgReg.getOutputs(message.channel.id);
+        const _txtPaths = extractImageAttachments(result.text || '');
+        const imagePaths = [...new Set([..._regPaths, ..._txtPaths])];
         if (imagePaths.length > 0) {
           const imageBuffers = [];
           const imageNames = [];
@@ -2040,8 +2082,10 @@ function startSignalAdapter() {
   // meant a misconfigured .env exposed the bot to every Signal number on Earth.
   const allowedNumbers = new Set((process.env.SIGNAL_ALLOWED_NUMBERS || '').split(',').filter(Boolean));
   if (allowedNumbers.size === 0) {
-    console.warn('[security] WARNING: SIGNAL_ALLOWED_NUMBERS is empty — only the owner (SIGNAL_OWNER_NUMBER) will be allowed to talk to the bot on Signal. Set SIGNAL_ALLOWED_NUMBERS in .env to permit additional numbers.');
+    console.warn('[security] WARNING: SIGNAL_ALLOWED_NUMBERS is empty — only the owner and known group members will be allowed to DM the bot. Set SIGNAL_ALLOWED_NUMBERS in .env to permit additional numbers.');
   }
+
+  // Known group members loaded at module level — see _addKnownGroupMember()
 
   const { isSignalOwner, hasProjectPermission } = require('./project-permissions');
   const { buildProfileContext, getProfile } = require('./user-profiles');
@@ -2056,7 +2100,17 @@ function startSignalAdapter() {
     // This lets group members interact with the bot without being individually
     // allowlisted, while still blocking random DMs from unknown numbers.
     const isGroupMessage = msg.chatId !== msg.senderId;
-    const senderAllowed = isSignalOwner(msg.senderId) || isGroupMessage || allowedNumbers.has(msg.senderId);
+    // Track group members for auto-allowlist — store ALL known identifiers
+    // (phone, UUID, senderId) so DMs match regardless of which format signal-cli uses
+    if (isGroupMessage) {
+      _addKnownGroupMember(msg.senderId);
+      // Also store the raw UUID and phone from the envelope if available
+      const _rawEnv = msg.raw?.envelope || msg.raw;
+      if (_rawEnv?.sourceUuid) _addKnownGroupMember(_rawEnv.sourceUuid);
+      if (_rawEnv?.sourceNumber) _addKnownGroupMember(_rawEnv.sourceNumber);
+    }
+    const senderAllowed = isSignalOwner(msg.senderId) || isGroupMessage
+      || allowedNumbers.has(msg.senderId) || _knownGroupMembers.has(msg.senderId);
     if (!senderAllowed) {
       console.log(`[signal] blocked DM from non-allowlisted sender ${_redactId(msg.senderId)}`);
       return;
@@ -2132,13 +2186,6 @@ function startSignalAdapter() {
       const fileBlock = `[The user attached ${downloadedFiles.length} file(s). Read or analyze them with the Read/Bash tools as needed:]\n${fileList}`;
       text = text ? `${text}\n\n${fileBlock}` : fileBlock;
 
-      // Deterministic image context: register the first image attachment so
-      // the /imagine endpoint auto-injects it regardless of what Claude passes.
-      const imageFiles = downloadedFiles.filter(a => a.type && a.type.startsWith('image/'));
-      if (imageFiles.length > 0) {
-        const imageContext = require('./image-context');
-        imageContext.set(imageFiles[0].localPath);
-      }
     }
     if (!text) return; // truly empty (no text, no attachments)
 
@@ -2150,6 +2197,17 @@ function startSignalAdapter() {
     // the group's base64 internal ID. We use a per-sender state key for
     // wizards (so onboarding tracks per-person, not per-group).
     const chatId = `signal:${msg.chatId}`;
+
+    // Deterministic image context: register image attachments in the per-chatId
+    // registry so /imagine auto-injects them regardless of what Claude passes.
+    // Must be after chatId is declared.
+    if (downloadedFiles.length > 0) {
+      const imageFiles = downloadedFiles.filter(a => a.type && a.type.startsWith('image/'));
+      if (imageFiles.length > 0) {
+        const imageRegistry = require('./image-registry');
+        imageRegistry.setInput(chatId, imageFiles[0].localPath);
+      }
+    }
     const state = getChannel(chatId);
 
     // Auto-onboard new Signal users: if we don't have a profile for this phone
@@ -2309,7 +2367,8 @@ function startSignalAdapter() {
 
     // Handle commands (same !command syntax).
     // Also handle "@BotName !command" — strip the @mention prefix first.
-    const cmdText = text.replace(/^@\S+\s+/, '').trim();
+    // Strip the injected [The user attached...] block so it doesn't leak into command args.
+    const cmdText = text.replace(/^@\S+\s+/, '').replace(/\n?\[The user attached \d+ file\(s\)[\s\S]*$/, '').trim();
     if (cmdText.startsWith('!')) {
       const fakeMessage = createSignalMessageProxy({ ...msg, text: cmdText }, chatId, state);
       const handled = await handleCommand(fakeMessage);
@@ -2461,40 +2520,115 @@ function startSignalAdapter() {
   });
 
   signalAdapter.start().then(() => {
-    // Notify the owner via Signal if this was an unexpected restart (crash).
-    // Clean shutdowns (!restart) and rollbacks are excluded — only genuine
-    // crashes or container kills trigger this. Lets the user know from their
-    // phone that the bot went down and came back.
-    const cleanFile = path.join('/home/node/.claude', '.clean-shutdown');
-    const rebuildMarker = path.join('/home/node/.claude', '.rebuild-marker');
-    const rolledBackFile = '/tmp/.rolled-back';
-    const wasClean = fs.existsSync(cleanFile);
-    const wasRebuild = fs.existsSync(rebuildMarker);
-    const wasRolledBack = fs.existsSync(rolledBackFile);
-    // Clean up rebuild marker so it only fires once
-    if (wasRebuild) {
-      try { fs.unlinkSync(rebuildMarker); } catch {}
-    }
+    // Wire Signal into error alerting so critical errors go to owner's phone
+    const { initSignal: _initSignalAlerts } = require('./error-alerting');
+    _initSignalAlerts(signalAdapter);
+
+    // Seed known group members from signal-api so existing group members
+    // can DM the bot immediately (not just after their first group message
+    // since this code was deployed).
+    (async () => {
+      try {
+        const phone = signalAdapter.phoneNumber;
+        if (!phone) return;
+        const http = require('http');
+        const resp = await new Promise((resolve, reject) => {
+          const url = `${process.env.SIGNAL_API_URL || 'http://signal-api:8080'}/v1/groups/${encodeURIComponent(phone)}`;
+          http.get(url, r => {
+            let data = '';
+            r.on('data', c => data += c);
+            r.on('end', () => { try { resolve(JSON.parse(data)); } catch { resolve([]); } });
+          }).on('error', reject);
+        });
+        if (!Array.isArray(resp)) return;
+        let seeded = 0;
+        for (const g of resp) {
+          if (!Array.isArray(g.members)) continue;
+          for (const member of g.members) {
+            if (member && member !== phone) {
+              _addKnownGroupMember(member);
+              seeded++;
+            }
+          }
+        }
+        // Also seed from the UUID→phone cache so UUIDs are recognized too
+        if (signalAdapter._uuidToPhone) {
+          for (const [uuid, ph] of signalAdapter._uuidToPhone) {
+            if (_knownGroupMembers.has(ph)) _addKnownGroupMember(uuid);
+          }
+        }
+        if (seeded > 0) {
+          console.log(`[signal] Seeded ${_knownGroupMembers.size} known group member identifier(s) from signal-api`);
+        }
+      } catch (err) {
+        console.warn(`[signal] Could not seed group members: ${err.message}`);
+      }
+    })();
+
+    // Use pre-computed startup markers (read once at module load, no race condition).
     const { SIGNAL_OWNER } = require('./project-permissions');
-    if (wasRebuild && SIGNAL_OWNER) {
+    if (_startupMarkers.wasRebuild && SIGNAL_OWNER) {
       let rebuildMsg = 'Rebuild complete \u2014 I\u2019m back!';
       try {
         const { execSync } = require('child_process');
         const lastCommit = execSync('git log -1 --pretty=format:"%s"', { cwd: '/workspace/MyBot', encoding: 'utf8' }).trim();
         if (lastCommit) rebuildMsg += `\n\nJust shipped: ${lastCommit}`;
       } catch {}
-      // Include pending work if any was noted before rebuild
+
+      // Collect tasks to auto-resume (from .pending-work AND persisted channel state)
+      const resumeLines = [];
       try {
         const pendingFile = path.join('/home/node/.claude', '.pending-work');
         if (fs.existsSync(pendingFile)) {
           const pending = fs.readFileSync(pendingFile, 'utf8').trim();
-          if (pending) rebuildMsg += `\n\nUp next: ${pending}`;
+          if (pending) rebuildMsg += `\n\nUp next:\n${pending}`;
           fs.unlinkSync(pendingFile);
+          // Collect both "Queued:" and "In progress:" lines for auto-resume
+          resumeLines.push(...pending.split('\n').filter(l =>
+            l.startsWith('Queued: ') || l.startsWith('In progress: ')
+          ));
         }
       } catch {}
-      signalAdapter.sendMessage(SIGNAL_OWNER, rebuildMsg).catch(() => {});
+
+      // Resolve owner name dynamically instead of hardcoding
+      let ownerName = 'Owner';
+      try {
+        const { getProfile } = require('./user-profiles');
+        const ownerProfile = getProfile(SIGNAL_OWNER);
+        if (ownerProfile?.name) ownerName = ownerProfile.name;
+      } catch {}
+
+      // Send rebuild notification first, then auto-resume tasks immediately
+      // (no setTimeout — the Signal adapter is ready since we're inside .then())
+      if (resumeLines.length > 0) {
+        rebuildMsg += `\n\n_Auto-resuming ${resumeLines.length} task(s)..._`;
+      }
+      signalAdapter.sendMessage(SIGNAL_OWNER, rebuildMsg).then(() => {
+        // Dispatch auto-resume tasks after the notification is confirmed sent
+        for (const line of resumeLines) {
+          const taskText = line.replace(/^(Queued|In progress):\s*/, '').trim();
+          if (!taskText) continue;
+          const chatId = `signal:${SIGNAL_OWNER}`;
+          const state = getChannel(chatId);
+          if (!state.busy) {
+            const syntheticMsg = {
+              chatId: SIGNAL_OWNER,
+              senderId: SIGNAL_OWNER,
+              senderName: ownerName,
+              text: taskText,
+              attachments: [],
+              mentions: [],
+              timestamp: Date.now(),
+            };
+            _dispatchSignalMessage(syntheticMsg, SIGNAL_OWNER, taskText, state);
+          } else {
+            state.queue.push({ content: taskText, timestamp: Date.now() });
+            saveChannelState(chatId, state);
+          }
+        }
+      }).catch(() => {});
       console.log('[signal] Sent rebuild-complete notification to owner');
-    } else if (!wasClean && !wasRolledBack && SIGNAL_OWNER) {
+    } else if (!_startupMarkers.wasClean && !_startupMarkers.wasRolledBack && SIGNAL_OWNER) {
       signalAdapter.sendMessage(SIGNAL_OWNER,
         '*Bot restarted unexpectedly (possible crash). I\u2019m back online now.*'
       ).catch(() => {});
@@ -2535,6 +2669,16 @@ async function _dispatchSignalMessage(msg, chatId, text, state) {
   const isGroupMessage = msg.chatId !== msg.senderId;
   const senderIsOwner = isSignalOwner(msg.senderId);
   const personalityFile = getPersonalityFile(state.personality);
+
+  // Detect "still broken" feedback and mark the latest repair as failed
+  // so the repair ledger context tells Bianca what didn't work.
+  try {
+    const repairLedger = require('./repair-ledger');
+    if (repairLedger.isFailureFeedback(text)) {
+      repairLedger.markLatestFailed(text.substring(0, 200));
+    }
+  } catch {}
+
   // Real Signal typing indicator (replaces the old "..." literal-message hack).
   // Signal typing dots auto-expire after a few seconds, so refresh on an interval
   // for the duration of Claude's run.
@@ -2604,10 +2748,12 @@ async function _dispatchSignalMessage(msg, chatId, text, state) {
               const botPhone = signalAdapter.phoneNumber;
               return m !== senderResolved && m !== botPhone && m !== signalAdapter._selfUuid;
             });
+            console.log(`[signal] Group ${msg.chatId.substring(0, 8)}...: ${rawMembers.length} raw members → ${memberIds.length} resolved IDs: ${memberIds.map(m => m.startsWith('+') ? m.slice(0,4)+'****' : m.slice(0,8)+'...').join(', ')}`);
             const memberContexts = [];
             for (const mid of memberIds) {
               const ctx = buildProfileContext(mid, { isGroupChat: true });
               if (ctx) memberContexts.push(ctx.replace('USER PROFILE (this message is from', 'OTHER GROUP MEMBER ('));
+              else console.log(`[signal] No profile context for member: ${mid.startsWith('+') ? mid.slice(0,4)+'****' : mid.slice(0,8)+'...'}`);
             }
             if (memberContexts.length > 0) {
               const groupHeader = `GROUP CONTEXT — This message is from a Signal group with ${grp.members?.length || '?'} members. Sender is ${msg.senderId}. Other known members:`;
@@ -2705,6 +2851,16 @@ async function _dispatchSignalMessage(msg, chatId, text, state) {
         } catch {}
       }
 
+      // Inject last-generated image context for refinement ("make the glasses bigger")
+      let imageRefinementContext = '';
+      try {
+        const _imgReg = require('./image-registry');
+        const lastImg = _imgReg.getLastOutput(chatId);
+        if (lastImg) {
+          imageRefinementContext = `\n\n[PREVIOUS IMAGE: You recently generated ${lastImg} for this chat. If the user is asking to refine, edit, or modify that image (e.g. "make it bigger", "change the color", "add a hat"), pass that path as inputImagePath in your /imagine curl call to edit it.]`;
+        }
+      } catch {}
+
       const claudeOpts = {
         sessionId: isGroupChat ? null : state.sessionId,
         personalityFile,
@@ -2717,11 +2873,16 @@ async function _dispatchSignalMessage(msg, chatId, text, state) {
         // curl), sub-agents — but NOT Edit/Write/Grep/Glob (engineering tools).
         // readOnly=false so the Runner doesn't apply the restrictive readOnly list.
         // Instead we pass a custom groupAllowedTools list.
-        readOnly: isGroupChat ? false : (!senderIsOwner || !_isChannelElevated(chatId)),
-        groupAllowedTools: isGroupChat ? 'Read,WebSearch,WebFetch,Bash,Task,TodoWrite' : undefined,
-        profileContext: (combinedProfileContext || '') + groupOnboardHint + pendingEventContext + groupNotesContext + activeFlightsContext + (isGroupChat ? `\n\nCHAT_ID: ${msg.chatId}\nSENDER_ID: ${msg.senderId}` : ''),
+        readOnly: isGroupChat ? false : (!senderIsOwner && !_isChannelElevated(chatId)),
+        // Group chats: social tools only. NO Bash (prevents file deletion/modification
+        // by non-owner group members). NO Edit/Write/Grep/Glob (engineering tools).
+        // Image generation in groups works via user photo attachments + image registry.
+        groupAllowedTools: isGroupChat ? 'Read,WebSearch,WebFetch,Task,TodoWrite' : undefined,
+        profileContext: (combinedProfileContext || '') + groupOnboardHint + pendingEventContext + groupNotesContext + activeFlightsContext + imageRefinementContext + (isGroupChat ? `\n\nCHAT_ID: ${msg.chatId}\nSENDER_ID: ${msg.senderId}` : ''),
         streamReplies: true,
         maxTurns: isGroupChat ? 8 : (senderIsOwner ? (parseInt(process.env.SIGNAL_OWNER_MAX_TURNS, 10) || 200) : undefined),
+        // Owner DMs get Opus, everything else gets Sonnet
+        model: (!isGroupChat && senderIsOwner) ? 'opus' : 'sonnet',
       };
 
       // Auto-detect social/location links — pre-fetch metadata and build action prompt.
@@ -2787,6 +2948,241 @@ async function _dispatchSignalMessage(msg, chatId, text, state) {
         } catch (e) {
           console.warn(`[auto-learn] failed to store preference: ${e.message}`);
         }
+      }
+
+      // [UPDATE_NOTES:] tag extraction — update a specific personal note from chat.
+      // Format: [UPDATE_NOTES: @userId noteTitle="Restaurant List" <content>]
+      // If noteTitle matches an existing note, updates it. Otherwise creates a new one.
+      const updateNotesRe = /\[UPDATE_NOTES:\s*@?(\S+)\s+(?:noteTitle="([^"]+)"\s+)?([\s\S]+?)\]/gi;
+      let notesMatch;
+      while ((notesMatch = updateNotesRe.exec(result.text || '')) !== null) {
+        const targetId = notesMatch[1].trim();
+        const noteTitle = (notesMatch[2] || 'Notes').trim();
+        const newContent = notesMatch[3].trim().substring(0, 10000);
+        try {
+          const { setProfile, getProfile: _gp } = require('./user-profiles');
+          let resolvedId = targetId;
+          if (!_gp(targetId)) {
+            const cached = _groupInfoCache.get(msg.chatId);
+            if (cached?.members) {
+              for (const mid of cached.members) {
+                const p = _gp(mid);
+                if (p?.name?.toLowerCase() === targetId.toLowerCase()) { resolvedId = mid; break; }
+              }
+            }
+          }
+          const profile = _gp(resolvedId);
+          if (profile) {
+            let notes = Array.isArray(profile.notes) ? [...profile.notes]
+              : (profile.notes ? [{ id: 'migrated', title: 'Notes', content: profile.notes, updatedAt: new Date().toISOString() }] : []);
+            // Find existing note by title (case-insensitive)
+            const existing = notes.find(n => n.title.toLowerCase() === noteTitle.toLowerCase());
+            if (existing) {
+              existing.content = newContent;
+              existing.updatedAt = new Date().toISOString();
+            } else {
+              notes.push({ id: 'n' + Date.now(), title: noteTitle.substring(0, 100), content: newContent, updatedAt: new Date().toISOString() });
+            }
+            setProfile(resolvedId, { notes });
+            console.log(`[update-notes] ${existing ? 'Updated' : 'Created'} note "${noteTitle}" for ${resolvedId.substring(0, 8)}... (${newContent.length} chars)`);
+          }
+        } catch (e) { console.warn(`[update-notes] failed: ${e.message}`); }
+      }
+      if (updateNotesRe.test(result.text || '')) {
+        result.text = (result.text || '').replace(updateNotesRe, '').trim();
+      }
+
+      // [IMAGINE:] tag extraction — server-side image generation without Bash.
+      // Works in group chats where Bash is blocked. Claude outputs [IMAGINE: prompt]
+      // and bot.js calls /imagine internally.
+      const imagineRe = /\[IMAGINE:\s*(.+?)\]/gi;
+      const imagineMatches = [...(result.text || '').matchAll(imagineRe)];
+      if (imagineMatches.length > 0) {
+        const http = require('http');
+        const imageRegistry = require('./image-registry');
+        for (const match of imagineMatches) {
+          const raw = match[1].trim();
+          // Check for INPUT: suffix for image-to-image refinement
+          const inputMatch = raw.match(/^(.+?)\s+INPUT:(\S+)$/i);
+          const imaginePrompt = inputMatch ? inputMatch[1].trim() : raw;
+          const inputPath = inputMatch ? inputMatch[2] : (imageRegistry.getLastOutput(chatId) || null);
+          try {
+            const body = JSON.stringify({
+              prompt: imaginePrompt,
+              ...(inputPath ? { inputImagePath: inputPath } : {}),
+            });
+            const imgResult = await new Promise((resolve, reject) => {
+              const req = http.request({
+                hostname: 'localhost', port: 3400, path: '/imagine',
+                method: 'POST',
+                headers: {
+                  'Content-Type': 'application/json',
+                  'X-Internal-Token': process.env.INTERNAL_API_TOKEN || '',
+                  'X-Session-Key': chatId,
+                  'Content-Length': Buffer.byteLength(body),
+                },
+                timeout: 120000,
+              }, (res) => {
+                let data = '';
+                res.on('data', c => data += c);
+                res.on('end', () => {
+                  try { resolve(JSON.parse(data)); } catch { reject(new Error('bad response')); }
+                });
+              });
+              req.on('error', reject);
+              req.on('timeout', () => { req.destroy(); reject(new Error('timeout')); });
+              req.write(body);
+              req.end();
+            });
+            if (imgResult.path) {
+              console.log(`[imagine-tag] Generated: ${imgResult.path}`);
+            }
+          } catch (e) {
+            console.warn(`[imagine-tag] Failed: ${e.message}`);
+          }
+        }
+        // Strip tags from text before sending to user
+        result.text = (result.text || '').replace(imagineRe, '').trim();
+      }
+
+      // [CONCERT_PRICES:] tag extraction — get ticket prices without Bash.
+      // Format: [CONCERT_PRICES: artist="Name" venue="Venue" date="YYYY-MM-DD" city="City"]
+      const concertRe = /\[CONCERT_PRICES:\s*(.+?)\]/gi;
+      const concertMatches = [...(result.text || '').matchAll(concertRe)];
+      if (concertMatches.length > 0) {
+        const http = require('http');
+        for (const match of concertMatches) {
+          const raw = match[1].trim();
+          // Parse key="value" pairs
+          const params = {};
+          raw.replace(/(\w+)="([^"]+)"/g, (_, k, v) => { params[k] = v; });
+          // Also handle bare artist name (no key=value)
+          if (!params.artist && !raw.includes('=')) params.artist = raw;
+          try {
+            const body = JSON.stringify(params);
+            const priceResult = await new Promise((resolve, reject) => {
+              const req = http.request({
+                hostname: 'localhost', port: 3400, path: '/concerts/prices',
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', 'X-Internal-Token': process.env.INTERNAL_API_TOKEN || '', 'Content-Length': Buffer.byteLength(body) },
+                timeout: 30000,
+              }, (res) => {
+                let data = '';
+                res.on('data', c => data += c);
+                res.on('end', () => { try { resolve(JSON.parse(data)); } catch { resolve({ text: data }); } });
+              });
+              req.on('error', reject);
+              req.on('timeout', () => { req.destroy(); reject(new Error('timeout')); });
+              req.write(body); req.end();
+            });
+            if (priceResult.text) {
+              // Send as follow-up (can't append to streamed text)
+              await signalAdapter.sendMessage(msg.chatId, priceResult.text);
+              console.log(`[concert-prices] Got prices for: ${params.artist || 'unknown'}`);
+            }
+          } catch (e) { console.warn(`[concert-prices] Failed: ${e.message}`); }
+        }
+        // Strip the tags (but keep the appended price results)
+        result.text = (result.text || '').replace(concertRe, '').trim();
+      }
+
+      // [FLIGHT_SEARCH:] tag extraction — search Google Flights and record snapshot.
+      const flightSearchRe = /\[FLIGHT_SEARCH:\s*(.+?)\]/gi;
+      const flightMatches = [...(result.text || '').matchAll(flightSearchRe)];
+      if (flightMatches.length > 0) {
+        try {
+          const flightPrices = require('./plugins/flight-prices');
+          for (const match of flightMatches) {
+            const raw = match[1].trim();
+            const params = {};
+            raw.replace(/(\w+)=(\S+)/g, (_, k, v) => { params[k] = v; });
+            if (params.origin && params.destination && params.date) {
+              const flightText = await flightPrices.checkFlightPrices(
+                params.origin, params.destination, params.date,
+                { airline: params.airline || null, returnDate: params.returnDate || null }
+              );
+              if (flightText) {
+                await signalAdapter.sendMessage(msg.chatId, flightText);
+                console.log(`[flight-search] Results for ${params.origin}→${params.destination}`);
+              }
+            }
+          }
+        } catch (e) { console.warn(`[flight-search] tag error: ${e.message}`); }
+        result.text = (result.text || '').replace(flightSearchRe, '').trim();
+      }
+      // Also handle legacy [FLIGHT_PRICE:] tags for backward compat
+      const flightPriceRe = /\[FLIGHT_PRICE:\s*(.+?)\]/gi;
+      if (flightPriceRe.test(result.text || '')) {
+        result.text = (result.text || '').replace(flightPriceRe, '').trim();
+      }
+
+      // [EIGHTSLEEP:] tag extraction — control Eight Sleep bed without Bash.
+      // Format: [EIGHTSLEEP: action side params]
+      const eightSleepRe = /\[EIGHTSLEEP:\s*(.+?)\]/gi;
+      const eightSleepMatches = [...(result.text || '').matchAll(eightSleepRe)];
+      if (eightSleepMatches.length > 0) {
+        try {
+          const eightSleep = require('./eight-sleep');
+          for (const match of eightSleepMatches) {
+            const parts = match[1].trim().split(/\s+/);
+            const action = (parts[0] || '').toLowerCase();
+            let side = (parts[1] || 'my').toLowerCase();
+            const userId = msg.senderId;
+            // Resolve "my" to the user's stored side
+            if (side === 'my' || side === 'mine') {
+              const _p = require('./user-profiles').getProfile(msg.senderId);
+              side = _p?.eightsleep_side || 'left';
+            }
+            let statusMsg = '';
+            try {
+              if (action === 'status') {
+                const s = await eightSleep.getStatus(userId, side);
+                if (s?.error) statusMsg = `Eight Sleep error: ${s.error}`;
+                else if (s) {
+                  // Auto-save side mapping based on owner names
+                  const _up = require('./user-profiles');
+                  const senderProfile = _up.getProfile(msg.senderId);
+                  if (senderProfile && !senderProfile.eightsleep_side && s.leftOwner && s.rightOwner) {
+                    const senderName = senderProfile.name?.toLowerCase();
+                    if (senderName && s.leftOwner.toLowerCase().includes(senderName)) {
+                      _up.setProfile(msg.senderId, { eightsleep_side: 'left' });
+                      console.log(`[eight-sleep] Auto-detected: ${senderProfile.name} sleeps on the left`);
+                    } else if (senderName && s.rightOwner.toLowerCase().includes(senderName)) {
+                      _up.setProfile(msg.senderId, { eightsleep_side: 'right' });
+                      console.log(`[eight-sleep] Auto-detected: ${senderProfile.name} sleeps on the right`);
+                    }
+                  }
+                  const owner = side === 'left' ? s.leftOwner : s.rightOwner;
+                  const ownerStr = owner ? ` (${owner})` : '';
+                  const levelStr = s.level != null ? `, level ${s.level > 0 ? '+' : ''}${s.level}` : '';
+                  const targetStr = s.targetLevel != null && s.targetLevel !== s.level ? ` → target ${s.targetLevel > 0 ? '+' : ''}${s.targetLevel}` : '';
+                  const durationStr = s.durationRemaining ? ` (${s.durationRemaining}min remaining)` : '';
+                  statusMsg = `🛏️ ${side} side${ownerStr}: ${s.on ? 'ON' : 'OFF'}${levelStr}${targetStr}${durationStr}`;
+                }
+                else statusMsg = 'Could not read Eight Sleep status — check your credentials in !setup.';
+              } else if (action === 'set') {
+                const level = parseInt(parts[2], 10) || 0;
+                await eightSleep.setTemp(userId, side, level);
+                statusMsg = `🛏️ Set ${side} side to level ${level}`;
+              } else if (action === 'on') {
+                await eightSleep.turnOn(userId, side);
+                statusMsg = `🛏️ Turned ${side} side ON`;
+              } else if (action === 'off') {
+                await eightSleep.turnOff(userId, side);
+                statusMsg = `🛏️ Turned ${side} side OFF`;
+              }
+              if (statusMsg) {
+                console.log(`[eight-sleep] ${statusMsg}`);
+                // Send as follow-up message (can't append to result.text — streaming already sent it)
+                await signalAdapter.sendMessage(msg.chatId, statusMsg);
+              }
+            } catch (e) {
+              console.warn(`[eight-sleep] ${action} failed: ${e.message}`);
+              await signalAdapter.sendMessage(msg.chatId, `Eight Sleep error: ${e.message?.substring(0, 200)}`);
+            }
+          }
+        } catch (e) { console.warn(`[eight-sleep] module error: ${e.message}`); }
+        result.text = (result.text || '').replace(eightSleepRe, '').trim();
       }
 
       // Group notes extraction — detect [NOTE:...] tags and store action items
@@ -2884,12 +3280,15 @@ async function _dispatchSignalMessage(msg, chatId, text, state) {
         // piece. Skip the final send to avoid duplicating it. If nothing was
         // streamed (e.g., the run produced only tool output, or streaming was
         // bypassed for some reason), fall back to sending the full text.
-        // F8: extract image paths from result.text regardless of streaming mode.
-        // result.text always retains the original paths (the sendFn strips them
-        // from what's sent to Signal but doesn't modify result.text). We can't
-        // use signalProxy.strippedImagePaths because the send queue is async —
-        // it hasn't flushed yet when we reach this point.
-        const imagePaths = extractImageAttachments(result.text || '');
+        //
+        // Image delivery: use the server-side image registry as PRIMARY source
+        // (deterministic — /imagine registers outputs regardless of Claude's text).
+        // Union with extractImageAttachments as fallback for non-/imagine images
+        // (e.g., images Claude downloads via other tools).
+        const imageRegistry = require('./image-registry');
+        const registryPaths = imageRegistry.getOutputs(chatId);
+        const textPaths = extractImageAttachments(result.text || '');
+        const imagePaths = [...new Set([...registryPaths, ...textPaths])];
 
         if (!result.streamed && result.text) {
           // Strip image file paths from the text — they'll be sent as attachments below
@@ -2927,8 +3326,8 @@ async function _dispatchSignalMessage(msg, chatId, text, state) {
       state.startedAt = null;
       state.progress = freshProgress();
       state.activeTask = null;
-      // Clear any unconsumed image context so it doesn't leak into a later request
-      require('./image-context').clear();
+      // Clean up image registry for this session so it doesn't leak into a later request
+      require('./image-registry').end(chatId);
       saveChannelState(chatId, state, { critical: true });
       // Drain queue
       if (state.queue.length > 0) {
@@ -2963,6 +3362,7 @@ function createSignalMessageProxy(msg, chatId, state) {
     _signalChatId: msg.chatId,
     _signalMentions: msg.mentions || [], // for !onboard target resolution
     _signalBotPhone: signalAdapter?.phoneNumber || null,
+    _signalRaw: msg.raw || null, // for UUID/phone extraction in commands
   };
 }
 
@@ -2983,4 +3383,4 @@ function start() {
   startSignalAdapter();
 }
 
-module.exports = { start, askClaude, runClaudeWithContinuation, client, getChannelState, getPersonalityFile, sendLongMessage, freshProgress, channels, signalAdapter, discordAdapter, _tryUnlock, _isChannelElevated };
+module.exports = { start, askClaude, runClaudeWithContinuation, client, getChannelState, getPersonalityFile, sendLongMessage, freshProgress, channels, signalAdapter, discordAdapter, _tryUnlock, _isChannelElevated, _addKnownGroupMember };

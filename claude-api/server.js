@@ -209,52 +209,68 @@ app.post('/imagine', requireInternalToken, async (req, res) => {
   if (!prompt) return res.status(400).json({ error: 'prompt required' });
   if (!process.env.OPENAI_API_KEY) return res.status(500).json({ error: 'No OPENAI_API_KEY configured' });
 
-  // Auto-inject inputImagePath from the shared session context if Claude didn't
-  // pass one. This is the deterministic path — Claude never needs to include
-  // inputImagePath in its curl call; the server always knows the right context.
-  const imageContext = require('./image-context');
+  // Resolve chatId for the image registry. Priority:
+  // 1. X-Session-Key header (set via $IMAGE_SESSION_KEY env var in curl)
+  // 2. sessionKey in request body (if Claude passes it)
+  // 3. Fallback: find the only active session in the registry
+  const imageRegistry = require('./image-registry');
+  const chatId = req.headers['x-session-key']
+    || req.body.sessionKey
+    || imageRegistry.findActiveChatId();
+
+  // Resolve input image: explicit request body > registry > none
   const resolvedInputImage = (req.body.inputImagePath && fs.existsSync(req.body.inputImagePath))
     ? req.body.inputImagePath
-    : imageContext.consume(); // consume clears it so it doesn't leak
+    : (chatId ? imageRegistry.consumeInput(chatId) : null);
 
   if (resolvedInputImage) {
-    console.log(`[imagine] using input image: ${resolvedInputImage}${req.body.inputImagePath ? ' (from request)' : ' (from session context — Claude omitted it)'}`);
+    console.log(`[imagine] using input image: ${resolvedInputImage}${req.body.inputImagePath ? ' (from request)' : ' (from registry — Claude omitted it)'}`);
   }
 
   try {
     const OpenAI = require('openai');
-    const { toFile } = require('openai');
     const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
-    let response;
+    let base64;
     if (resolvedInputImage && fs.existsSync(resolvedInputImage)) {
-      // Detect MIME type from extension
+      // Image-to-image: use gpt-image-1.5 which has higher fidelity to input
+      // images than gpt-image-1. The edit prompt is augmented to emphasize
+      // preserving the subject's visual identity from the reference photo.
+      const { toFile } = require('openai');
       const ext = path.extname(resolvedInputImage).toLowerCase();
       const mimeType = ext === '.jpg' || ext === '.jpeg' ? 'image/jpeg'
         : ext === '.webp' ? 'image/webp'
-        : 'image/png'; // OpenAI accepts PNG, JPEG, WEBP only — no GIF
-      // Image-to-image: edit using the reference photo
-      response = await openai.images.edit({
-        model: 'gpt-image-1',
+        : 'image/png';
+      const imgSize = fs.statSync(resolvedInputImage).size;
+      console.log(`[imagine] Image-to-image with gpt-image-1.5 (${(imgSize / 1024).toFixed(0)}KB ${mimeType})`);
+      const editPrompt = `IMPORTANT: The attached photo is a visual reference. The generated image MUST preserve the exact same subject — same breed, same color, same physical features, same appearance. Do not change the subject's look. ${prompt}`;
+      const response = await openai.images.edit({
+        model: 'gpt-image-1.5',
         image: await toFile(fs.createReadStream(resolvedInputImage), path.basename(resolvedInputImage), { type: mimeType }),
-        prompt,
+        prompt: editPrompt,
         n: 1,
         size: '1024x1024',
-        quality: 'low',
+        quality: 'high',
       });
+      base64 = response.data[0].b64_json;
     } else {
       // Text-to-image: no input image, generate from prompt only
-      response = await openai.images.generate({
-        model: 'gpt-image-1',
+      const response = await openai.images.generate({
+        model: 'gpt-image-1.5',
         prompt,
         n: 1,
         size: '1024x1024',
-        quality: 'low',
+        quality: 'high',
       });
+      base64 = response.data[0].b64_json;
     }
-    const base64 = response.data[0].b64_json;
     const buffer = Buffer.from(base64, 'base64');
     const imgPath = `/tmp/imagine_${Date.now()}.png`;
     fs.writeFileSync(imgPath, buffer);
+
+    // Register the output image so bot.js can send it as an attachment
+    // deterministically — no prompt compliance required
+    if (chatId) imageRegistry.addOutput(chatId, imgPath);
+
     res.json({ path: imgPath, prompt });
   } catch (err) {
     console.error('Image generation error:', err.message);
@@ -503,6 +519,114 @@ app.post('/event/join', requireInternalToken, async (req, res) => {
 
 app.get('/health', (req, res) => res.json({ status: 'ok' }));
 
+// ── Debug image upload — drag & drop screenshots for sharing with Claude Code ─
+const DEBUG_UPLOAD_DIR = '/tmp/debug-uploads';
+fs.mkdirSync(DEBUG_UPLOAD_DIR, { recursive: true });
+
+app.get('/debug', (req, res) => {
+  res.setHeader('Content-Type', 'text/html');
+  res.send(`<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Debug Upload</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:-apple-system,system-ui,sans-serif;background:#0f0f0f;color:#e0e0e0;min-height:100vh;display:flex;flex-direction:column;align-items:center;padding:24px}
+h1{font-size:1.4rem;margin-bottom:8px;color:#fff}
+.sub{color:#888;font-size:.85rem;margin-bottom:24px}
+#drop{width:100%;max-width:600px;border:2px dashed #444;border-radius:12px;padding:48px 24px;text-align:center;cursor:pointer;transition:all .2s}
+#drop.over{border-color:#a78bfa;background:rgba(167,139,250,.08)}
+#drop p{color:#999;font-size:.95rem}
+#files{width:100%;max-width:600px;margin-top:20px;display:flex;flex-direction:column;gap:10px}
+.file-entry{background:#1a1a1a;border-radius:8px;padding:12px;display:flex;align-items:center;gap:12px}
+.file-entry img{width:60px;height:60px;object-fit:cover;border-radius:6px;background:#222}
+.file-entry .info{flex:1}
+.file-entry .path{font-family:monospace;font-size:.8rem;color:#a78bfa;word-break:break-all}
+.file-entry .time{font-size:.75rem;color:#666}
+input[type=file]{display:none}
+</style></head><body>
+<h1>Debug Upload</h1>
+<p class="sub">Drag & drop images here. Files save to /tmp/debug-uploads/ for Claude Code to read.</p>
+<div id="drop" onclick="document.getElementById('picker').click()">
+<p>Drop images here or click to browse</p>
+</div>
+<input type="file" id="picker" accept="image/*" multiple>
+<div id="files"></div>
+<script>
+const drop=document.getElementById('drop'),picker=document.getElementById('picker'),filesDiv=document.getElementById('files');
+['dragenter','dragover'].forEach(e=>drop.addEventListener(e,ev=>{ev.preventDefault();drop.classList.add('over')}));
+['dragleave','drop'].forEach(e=>drop.addEventListener(e,ev=>{ev.preventDefault();drop.classList.remove('over')}));
+drop.addEventListener('drop',e=>{if(e.dataTransfer.files.length)upload(e.dataTransfer.files)});
+picker.addEventListener('change',e=>{if(e.target.files.length)upload(e.target.files)});
+async function upload(files){
+  for(const f of files){
+    const form=new FormData();form.append('file',f);
+    const r=await fetch('/debug/upload',{method:'POST',body:form});
+    const j=await r.json();
+    if(j.path){
+      const d=document.createElement('div');d.className='file-entry';
+      d.innerHTML='<img src="/debug/file/'+encodeURIComponent(j.filename)+'"><div class="info"><div class="path">'+j.path+'</div><div class="time">'+new Date().toLocaleTimeString()+'</div></div>';
+      filesDiv.prepend(d);
+    }
+  }
+}
+// Load existing files on page load
+fetch('/debug/files').then(r=>r.json()).then(files=>{
+  files.forEach(f=>{
+    const d=document.createElement('div');d.className='file-entry';
+    d.innerHTML='<img src="/debug/file/'+encodeURIComponent(f.name)+'"><div class="info"><div class="path">'+f.path+'</div><div class="time">'+new Date(f.mtime).toLocaleTimeString()+'</div></div>';
+    filesDiv.appendChild(d);
+  });
+});
+</script></body></html>`);
+});
+
+app.post('/debug/upload', (req, res) => {
+  // Parse multipart form data manually (no multer dependency)
+  const chunks = [];
+  req.on('data', c => chunks.push(c));
+  req.on('end', () => {
+    const buf = Buffer.concat(chunks);
+    const contentType = req.headers['content-type'] || '';
+    const boundaryMatch = contentType.match(/boundary=(.+)/);
+    if (!boundaryMatch) return res.status(400).json({ error: 'no boundary' });
+    const boundary = boundaryMatch[1];
+    const parts = buf.toString('binary').split('--' + boundary);
+    for (const part of parts) {
+      const headerEnd = part.indexOf('\r\n\r\n');
+      if (headerEnd < 0) continue;
+      const headers = part.substring(0, headerEnd);
+      const fnMatch = headers.match(/filename="([^"]+)"/);
+      if (!fnMatch) continue;
+      const filename = `${Date.now()}_${fnMatch[1].replace(/[^a-zA-Z0-9._-]/g, '_')}`;
+      const body = part.substring(headerEnd + 4, part.length - 2); // strip trailing \r\n
+      const filePath = path.join(DEBUG_UPLOAD_DIR, filename);
+      fs.writeFileSync(filePath, body, 'binary');
+      console.log(`[debug] Uploaded: ${filePath} (${Buffer.byteLength(body, 'binary')} bytes)`);
+      return res.json({ path: filePath, filename });
+    }
+    res.status(400).json({ error: 'no file found in upload' });
+  });
+});
+
+app.get('/debug/files', (req, res) => {
+  try {
+    const files = fs.readdirSync(DEBUG_UPLOAD_DIR)
+      .filter(f => /\.(png|jpg|jpeg|gif|webp)$/i.test(f))
+      .map(f => {
+        const stat = fs.statSync(path.join(DEBUG_UPLOAD_DIR, f));
+        return { name: f, path: path.join(DEBUG_UPLOAD_DIR, f), size: stat.size, mtime: stat.mtime };
+      })
+      .sort((a, b) => b.mtime - a.mtime)
+      .slice(0, 20);
+    res.json(files);
+  } catch { res.json([]); }
+});
+
+app.get('/debug/file/:filename', (req, res) => {
+  const filePath = path.join(DEBUG_UPLOAD_DIR, req.params.filename.replace(/\.\./g, ''));
+  if (!fs.existsSync(filePath)) return res.status(404).send('not found');
+  res.sendFile(filePath);
+});
+
 // ── Self-rebuild endpoint ────────────────────────────────────────────────────
 // Single sanctioned path for the bot to rebuild itself. Claude is told via the
 // system prompt to call this instead of running docker commands directly.
@@ -547,6 +671,21 @@ app.post('/rebuild', requireInternalToken, async (req, res) => {
       error: 'Syntax errors found — refusing to rebuild',
       details: syntaxErrors,
     });
+  }
+
+  // 1b. Record the repair attempt in the ledger (if reason provided)
+  if (req.body.reason) {
+    try {
+      const repairLedger = require('./repair-ledger');
+      repairLedger.addAttempt({
+        issue: req.body.reason,
+        approach: req.body.approach || 'rebuild triggered',
+        filesChanged: req.body.filesChanged || [],
+        commitHash: req.body.commitHash || null,
+      });
+    } catch (e) {
+      console.warn(`[rebuild] repair ledger write failed: ${e.message}`);
+    }
   }
 
   // 2. Flush all pending channel state writes
@@ -803,6 +942,23 @@ app.get('/auth/spotify/callback', async (req, res) => {
   }
 });
 
+// Spotify artist refresh — re-import artists from Spotify without full re-auth
+app.post('/spotify/refresh-artists', async (req, res) => {
+  if (req.headers['x-internal-token'] !== process.env.INTERNAL_API_TOKEN) {
+    return res.status(403).json({ ok: false, error: 'Forbidden' });
+  }
+  const { userId } = req.body || {};
+  if (!userId) return res.status(400).json({ ok: false, error: 'Missing userId' });
+  try {
+    const spotifyAuth = require('./spotify-auth');
+    const result = await spotifyAuth.refreshArtists(userId);
+    res.json({ ok: true, ...result });
+  } catch (err) {
+    console.error('[spotify/refresh-artists] error:', err.message);
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
 // Spotify OAuth — gated initiation (same ephemeral token pattern as Google Calendar)
 app.get('/auth/spotify/:userId', async (req, res) => {
   const userId = decodeURIComponent(req.params.userId);
@@ -1012,6 +1168,11 @@ app.get('/setup/:userId', (req, res) => {
         ${['America/New_York','America/Chicago','America/Denver','America/Los_Angeles','America/Phoenix','America/Anchorage','Pacific/Honolulu','Europe/London','Europe/Paris','Europe/Berlin','Asia/Tokyo','Asia/Seoul','Australia/Sydney'
         ].map(tz => `<option value="${escapeHtml(tz)}"${profile.timezone === tz ? ' selected' : ''}>${escapeHtml(tz.replace(/_/g,' '))}</option>`).join('')}
       </select>
+      <label for="pronouns">Pronouns</label>
+      <select id="pronouns" name="pronouns">
+        ${[['','Prefer not to say'],['she/her','she/her'],['he/him','he/him'],['they/them','they/them'],['he/they','he/they'],['she/they','she/they'],['any','any pronouns']
+        ].map(([val,label]) => `<option value="${escapeHtml(val)}"${profile.pronouns === val ? ' selected' : ''}>${escapeHtml(label)}</option>`).join('')}
+      </select>
       <button type="submit" class="btn btn-primary" style="margin-top:18px;">Save Profile</button>
     </form>
     ${profile.updatedAt ? `<p style="color:#999;font-size:12px;margin-top:8px;text-align:center;">Last updated ${new Date(profile.updatedAt).toLocaleDateString()}</p>` : ''}
@@ -1036,6 +1197,67 @@ app.get('/setup/:userId', (req, res) => {
       </div>
     </div>
     <div class="tag-pills" id="tags-list">${tagsHtml || '<p class="empty-msg">No tags yet.</p>'}</div>
+  </div>
+
+  <div class="card">
+    <div class="card-title">Personal Notes</div>
+    <p class="card-desc">Markdown notes — restaurant lists, preferences, anything. Each note is like a mini document I'll reference in conversations.</p>
+    <div id="notes-list">${(() => {
+      const notes = Array.isArray(profile.notes) ? profile.notes : (profile.notes ? [{ id: 'migrated', title: 'Notes', content: profile.notes, updatedAt: new Date().toISOString() }] : []);
+      if (notes.length === 0) return '<p class="empty-msg">No notes yet.</p>';
+      return notes.map(n => `
+        <div class="note-card" id="note-${escapeHtml(n.id)}" style="background:#1a1a1a;border:1px solid #333;border-radius:8px;padding:12px;margin-bottom:10px;">
+          <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
+            <input type="text" class="note-title" value="${escapeHtml(n.title || '')}" placeholder="Note title" style="background:transparent;border:none;color:#fff;font-weight:bold;font-size:15px;flex:1;padding:4px 0;">
+            <button onclick="deleteNote('${escapeHtml(n.id)}')" style="background:none;border:none;color:#666;cursor:pointer;font-size:18px;padding:0 4px;" title="Delete">\u00d7</button>
+          </div>
+          <textarea class="note-content" style="width:100%;min-height:120px;background:#111;color:#e0e0e0;border:1px solid #222;border-radius:6px;padding:10px;font-family:'SF Mono',monospace;font-size:13px;resize:vertical;white-space:pre-wrap;">${escapeHtml(n.content || '')}</textarea>
+          <div style="display:flex;justify-content:space-between;align-items:center;margin-top:6px;">
+            <span style="color:#555;font-size:11px;">${n.updatedAt ? new Date(n.updatedAt).toLocaleDateString() : ''}</span>
+            <button class="btn btn-primary" style="font-size:13px;padding:6px 14px;" onclick="saveNote('${escapeHtml(n.id)}')">Save</button>
+          </div>
+        </div>`).join('');
+    })()}</div>
+    <button class="btn btn-add" onclick="addNewNote()">+ Add Note</button>
+    <script>
+    function addNewNote(){
+      const id='n'+Date.now();
+      const html=\`<div class="note-card" id="note-\${id}" style="background:#1a1a1a;border:1px solid #333;border-radius:8px;padding:12px;margin-bottom:10px;">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
+          <input type="text" class="note-title" value="" placeholder="Note title (e.g. Restaurant List)" style="background:transparent;border:none;color:#fff;font-weight:bold;font-size:15px;flex:1;padding:4px 0;">
+          <button onclick="deleteNote('\${id}')" style="background:none;border:none;color:#666;cursor:pointer;font-size:18px;padding:0 4px;" title="Delete">\u00d7</button>
+        </div>
+        <textarea class="note-content" style="width:100%;min-height:120px;background:#111;color:#e0e0e0;border:1px solid #222;border-radius:6px;padding:10px;font-family:'SF Mono',monospace;font-size:13px;resize:vertical;white-space:pre-wrap;" placeholder="Write your note in markdown..."></textarea>
+        <div style="display:flex;justify-content:flex-end;margin-top:6px;">
+          <button class="btn btn-primary" style="font-size:13px;padding:6px 14px;" onclick="saveNote('\${id}')">Save</button>
+        </div>
+      </div>\`;
+      const emptyMsg=document.querySelector('#notes-list .empty-msg');
+      if(emptyMsg)emptyMsg.remove();
+      document.getElementById('notes-list').insertAdjacentHTML('beforeend',html);
+      document.querySelector('#note-'+id+' .note-title').focus();
+    }
+    function saveNote(id){
+      const card=document.getElementById('note-'+id);
+      if(!card)return;
+      const title=card.querySelector('.note-title').value.trim()||'Untitled';
+      const content=card.querySelector('.note-content').value;
+      fetch('/setup/${encodeURIComponent(userId)}/notes/'+encodeURIComponent(id)+'?t=${encodeURIComponent(setupToken)}',{
+        method:'PUT',headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({title,content})
+      }).then(r=>r.json()).then(j=>{
+        if(j.ok){const btn=card.querySelector('.btn-primary');btn.textContent='Saved!';setTimeout(()=>btn.textContent='Save',2000);}
+      });
+    }
+    function deleteNote(id){
+      if(!confirm('Delete this note?'))return;
+      fetch('/setup/${encodeURIComponent(userId)}/notes/'+encodeURIComponent(id)+'?t=${encodeURIComponent(setupToken)}',{
+        method:'DELETE'
+      }).then(r=>r.json()).then(j=>{
+        if(j.ok){const card=document.getElementById('note-'+id);if(card)card.remove();}
+      });
+    }
+    </script>
   </div>
 
   <div class="card">
@@ -1079,7 +1301,7 @@ app.get('/setup/:userId', (req, res) => {
         <span class="chip" onclick="prefillJob('Morning Briefing','Give me a morning briefing: top news, weather for my area, and anything on my calendar today.','daily at 8am')">Morning Briefing</span>
         <span class="chip" onclick="prefillJob('AI Pulse','What are the latest AI news and developments from the last few hours? Give me a concise bullet-point summary.','daily at 10am')">AI Pulse</span>
         <span class="chip" onclick="prefillJob('Weekly Meal Plan','Suggest a weekly meal plan based on my dietary preferences and favorite cuisines. Include a grocery list.','monday at 9am')">Weekly Meal Plan</span>
-        <span class="chip" onclick="prefillJob('Concert Alerts','Search for upcoming concerts and events for my favorite Spotify artists in my area. Include ticket prices, dates, and venue info. Only show events in the next 2 months.','friday at 10am')">Concert Alerts</span>
+        <span class="chip" onclick="prefillJob('Concert Price Tracker','Check for upcoming concerts by my favorite Spotify artists within 50 miles of my location. For each show, get current ticket prices from multiple sources (StubHub, SeatGeek, VividSeats). Compare prices and highlight any deals under $100. Only show events in the next 3 months. If prices dropped since last check, flag them.','every 6 hours')">Concert Price Tracker</span>
       </div>
     </div>
   </div>
@@ -1096,6 +1318,35 @@ app.get('/setup/:userId', (req, res) => {
     <p class="card-desc">Connect to auto-import your favorite artists. I'll use them to find concerts, ticket prices, and let you know when events are coming to your area.</p>
     ${profile.spotify_connected ? `<div class="gcal-connected"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="20 6 9 17 4 12"/></svg> Connected (${escapeHtml(profile.spotify_email || profile.spotify_user_id || '')})</div>` : ''}
     ${spotifyConfigured ? `<a href="/auth/spotify/${encodeURIComponent(userId)}?t=${encodeURIComponent(spotifyToken)}" class="gcal-btn" style="border-color:#1DB954;color:#1DB954;"><svg width="18" height="18" viewBox="0 0 24 24" fill="#1DB954"><path d="M12 0C5.4 0 0 5.4 0 12s5.4 12 12 12 12-5.4 12-12S18.66 0 12 0zm5.521 17.34c-.24.359-.66.48-1.021.24-2.82-1.74-6.36-2.101-10.561-1.141-.418.122-.779-.179-.899-.539-.12-.421.18-.78.54-.9 4.56-1.021 8.52-.6 11.64 1.32.42.18.479.659.301 1.02zm1.44-3.3c-.301.42-.841.6-1.262.3-3.239-1.98-8.159-2.58-11.939-1.38-.479.12-1.02-.12-1.14-.6-.12-.48.12-1.021.6-1.141C9.6 9.9 15 10.561 18.72 12.84c.361.181.54.78.241 1.2zm.12-3.36C15.24 8.4 8.82 8.16 5.16 9.301c-.6.179-1.2-.181-1.38-.721-.18-.601.18-1.2.72-1.381 4.26-1.26 11.28-1.02 15.721 1.621.539.3.719 1.02.419 1.56-.299.421-1.02.599-1.559.3z"/></svg>${profile.spotify_connected ? 'Reconnect' : 'Connect Spotify'}</a>` : '<p class="empty-msg">Spotify not configured on this server.</p>'}
+  </div>
+
+  <div class="card">
+    <div class="card-title">Eight Sleep</div>
+    <p class="card-desc">Connect your Eight Sleep smart mattress so I can control temperature, turn it on/off, and check status.</p>
+    ${(() => { try { return require('./eight-sleep').hasCredentials(userId) ? '<div class="gcal-connected"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="20 6 9 17 4 12"/></svg> Connected</div>' : ''; } catch { return ''; } })()}
+    <div id="eightsleep-form">
+      <label for="eightsleep-email">Eight Sleep Email</label>
+      <input type="email" id="eightsleep-email" placeholder="your@email.com">
+      <label for="eightsleep-pass">Password</label>
+      <input type="password" id="eightsleep-pass" placeholder="Your Eight Sleep password">
+      <p class="input-hint">Credentials are encrypted and stored securely. Only you can access your bed.</p>
+      <button class="btn btn-primary" style="margin-top:10px;" onclick="connectEightSleep()">Connect Eight Sleep</button>
+    </div>
+    <script>
+    function connectEightSleep(){
+      const email=document.getElementById('eightsleep-email').value;
+      const pass=document.getElementById('eightsleep-pass').value;
+      if(!email||!pass){alert('Enter email and password');return;}
+      fetch('/setup/${encodeURIComponent(userId)}/eightsleep?t=${encodeURIComponent(setupToken)}',{
+        method:'POST',headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({email,password:pass})
+      }).then(r=>r.json()).then(j=>{
+        if(j.ok){
+          document.getElementById('eightsleep-form').innerHTML='<div class="gcal-connected"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="20 6 9 17 4 12"/></svg> Connected!</div>';
+        } else { alert(j.error||'Connection failed'); }
+      });
+    }
+    </script>
   </div>
 
   </div>
@@ -1214,16 +1465,16 @@ function esc(s){const d=document.createElement('div');d.textContent=s;return d.i
 app.post('/setup/:userId', express.urlencoded({ extended: false }), (req, res) => {
   const userId = decodeURIComponent(req.params.userId);
 
-  // F2: verify that the POST came from a form rendered by the gated GET.
-  // The access token was already consumed by GET (single-use), so we just
-  // check that ?t= is present and non-empty — the CSRF token is the real
-  // POST protection.
+  // F2: verify the setup access token is valid AND scoped to this userId.
+  // The CSRF token below is the primary POST protection, but we also verify
+  // the setup token to prevent URL manipulation attacks.
   const setupToken = typeof req.query.t === 'string' ? req.query.t : '';
-  if (!setupToken) {
+  const _postAccessEntry = _setupAccessTokens.get(setupToken);
+  if (!_postAccessEntry || _postAccessEntry.expiresAt <= Date.now() || !safeTokenEqual(_postAccessEntry.userId, userId)) {
     return res.status(403).send('Invalid or expired setup link — ask the bot for a new one.');
   }
 
-  const { name, location, timezone } = req.body;
+  const { name, location, timezone, pronouns } = req.body;
 
   // L7: verify same-origin CSRF token. Each GET issues a fresh token scoped
   // to the userId with a 30min TTL; POST must present the matching token and
@@ -1248,6 +1499,7 @@ app.post('/setup/:userId', express.urlencoded({ extended: false }), (req, res) =
       name: (name || '').trim(),
       location: (location || '').trim(),
       timezone: timezone || 'America/New_York',
+      pronouns: (pronouns || '').trim() || null,
       setup_complete: true,
     });
   } catch (err) {
@@ -1346,6 +1598,79 @@ app.post('/setup/:userId/remove-tag', express.json(), (req, res) => {
     const { removeTag } = require('./user-profiles');
     const removed = removeTag(userId, label);
     res.json({ ok: true, removed });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// ── Notes CRUD endpoints (personal markdown notes) ──
+function _verifySetupAccess(req, res) {
+  const userId = decodeURIComponent(req.params.userId);
+  const token = typeof req.query.t === 'string' ? req.query.t : '';
+  const accessEntry = _setupAccessTokens.get(token);
+  if (!accessEntry || accessEntry.expiresAt <= Date.now() || !safeTokenEqual(accessEntry.userId, userId)) {
+    res.status(403).json({ error: 'invalid or expired token' });
+    return null;
+  }
+  return userId;
+}
+
+// Save/update a single note
+app.put('/setup/:userId/notes/:noteId', express.json(), (req, res) => {
+  const userId = _verifySetupAccess(req, res);
+  if (!userId) return;
+  const noteId = req.params.noteId;
+  const { title, content } = req.body || {};
+  if (typeof content !== 'string') return res.status(400).json({ error: 'content required' });
+  try {
+    const { getProfile, setProfile } = require('./user-profiles');
+    const profile = getProfile(userId) || {};
+    let notes = Array.isArray(profile.notes) ? profile.notes
+      : (profile.notes ? [{ id: 'migrated', title: 'Notes', content: profile.notes, updatedAt: new Date().toISOString() }] : []);
+    const existing = notes.find(n => n.id === noteId);
+    if (existing) {
+      existing.title = (title || '').substring(0, 100);
+      existing.content = content.substring(0, 10000);
+      existing.updatedAt = new Date().toISOString();
+    } else {
+      if (notes.length >= 20) return res.status(400).json({ error: 'max 20 notes' });
+      notes.push({ id: noteId, title: (title || '').substring(0, 100), content: content.substring(0, 10000), updatedAt: new Date().toISOString() });
+    }
+    setProfile(userId, { notes });
+    res.json({ ok: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// Delete a note
+app.delete('/setup/:userId/notes/:noteId', (req, res) => {
+  const userId = _verifySetupAccess(req, res);
+  if (!userId) return;
+  const noteId = req.params.noteId;
+  try {
+    const { getProfile, setProfile } = require('./user-profiles');
+    const profile = getProfile(userId) || {};
+    let notes = Array.isArray(profile.notes) ? profile.notes : [];
+    notes = notes.filter(n => n.id !== noteId);
+    setProfile(userId, { notes });
+    res.json({ ok: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// ── Eight Sleep endpoint ──
+app.post('/setup/:userId/eightsleep', express.json(), (req, res) => {
+  const userId = decodeURIComponent(req.params.userId);
+  const token = typeof req.query.t === 'string' ? req.query.t : '';
+  const accessEntry = _setupAccessTokens.get(token);
+  if (!accessEntry || accessEntry.expiresAt <= Date.now() || !safeTokenEqual(accessEntry.userId, userId)) {
+    return res.status(403).json({ error: 'invalid or expired token' });
+  }
+  const { email, password } = req.body || {};
+  if (!email || !password) return res.status(400).json({ error: 'email and password required' });
+  try {
+    const eightSleep = require('./eight-sleep');
+    eightSleep.saveCredentials(userId, email, password);
+    // Update profile to show connection status
+    const { setProfile } = require('./user-profiles');
+    setProfile(userId, { eightsleep_connected: true });
+    res.json({ ok: true });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
@@ -1611,7 +1936,25 @@ app.listen(PORT, () => {
       console.error('[safe-rebuild] Snapshot error:', err.message);
     }
   }, 30000);
+
+  // After 45s, run smoke tests to verify critical subsystems
+  setTimeout(() => {
+    const { runAndReport } = require('./smoke-test');
+    runAndReport().catch(err => {
+      console.error('[smoke-test] Startup smoke test failed:', err.message);
+    });
+  }, 45000);
 });
+
+// Write clean-shutdown marker on SIGTERM/SIGINT so the next boot doesn't
+// send a false crash notification. The entrypoint.sh trap may not fire
+// reliably (bash traps don't run during foreground waits on some Docker
+// setups), so we also handle it at the Node level.
+for (const sig of ['SIGTERM', 'SIGINT']) {
+  process.on(sig, () => {
+    try { fs.writeFileSync(path.join('/home/node/.claude', '.clean-shutdown'), Date.now().toString()); } catch {}
+  });
+}
 
 // Start Discord bot
 const bot = require('./bot');

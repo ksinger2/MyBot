@@ -114,6 +114,12 @@ function getProfile(phoneNumber) {
 function setProfile(phoneNumber, fields) {
   const store = readStore();
   const existing = _decodeEntry(store[phoneNumber]) || {};
+  // Protect notes from accidental wipe — never overwrite existing notes with empty
+  if (Array.isArray(existing.notes) && existing.notes.length > 0) {
+    if (Array.isArray(fields.notes) && fields.notes.length === 0) {
+      delete fields.notes; // don't overwrite non-empty notes with empty array
+    }
+  }
   const merged = {
     ...existing,
     ...fields,
@@ -279,7 +285,7 @@ function addTag(phone, label, category = 'Custom') {
   if (!normalizedLabel) return null;
   // Dedup by label (case-insensitive)
   if (profile.tags.some(t => t.label.toLowerCase() === normalizedLabel.toLowerCase())) return null;
-  if (profile.tags.length >= 30) return null;
+  if (profile.tags.length >= 500) return null;
   const tag = { label: normalizedLabel, category: category.trim().substring(0, 50), addedAt: new Date().toISOString() };
   profile.tags.push(tag);
   setProfile(phone, profile);
@@ -317,6 +323,7 @@ function buildProfileContext(phoneNumber, { isGroupChat = false } = {}) {
 
   const lines = [`USER PROFILE (this message is from ${phoneNumber}):`];
   if (profile.name)     lines.push(`- Name: ${_s(profile.name, 50)}`);
+  if (profile.pronouns) lines.push(`- Pronouns: ${_s(profile.pronouns, 20)} — ALWAYS use these pronouns for this person. Never assume otherwise.`);
   if (profile.location) lines.push(`- Location: ${_s(profile.location, 100)}`);
   if (profile.timezone) lines.push(`- Timezone: ${_s(profile.timezone, 50)}`);
   if (profile.gcal_email && profile.gcal_connected) {
@@ -352,6 +359,24 @@ function buildProfileContext(phoneNumber, { isGroupChat = false } = {}) {
   if (profile.rules && profile.rules.length > 0) {
     lines.push(`\nSTRICT USER RULES — follow these exactly, they override defaults:`);
     for (const r of profile.rules) lines.push(`- ${_s(r.rule)}`);
+  }
+  if (profile.eightsleep_connected) {
+    const side = profile.eightsleep_side || 'unknown';
+    lines.push(`- Eight Sleep: connected — this user sleeps on the **${side}** side. When they say "my bed" or "my side", use [EIGHTSLEEP: action ${side}]. Do NOT ask which side — you already know.`);
+  }
+  // Inject personal notes (supports both legacy string and new array format)
+  const notesArr = Array.isArray(profile.notes) ? profile.notes
+    : (profile.notes && profile.notes.trim() ? [{ id: 'legacy', title: 'Notes', content: profile.notes }] : []);
+  if (notesArr.length > 0) {
+    lines.push(`\n[USER NOTES — personal reference data for this user:]`);
+    let totalChars = 0;
+    for (const n of notesArr) {
+      if (totalChars > 5000) { lines.push('(additional notes truncated)'); break; }
+      const title = _s(n.title, 100) || 'Untitled';
+      const content = (n.content || '').substring(0, 2000);
+      lines.push(`\n### ${title} (note id: ${n.id})\n${content}`);
+      totalChars += content.length;
+    }
   }
 
   return lines.join('\n');

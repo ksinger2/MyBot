@@ -41,14 +41,20 @@ pm2 ping >/dev/null 2>&1 || true
 # Trap signals to dump PM2 state before exit
 cleanup() {
   echo "[ENTRYPOINT] Shutting down — dumping PM2 state..."
+  # Write clean-shutdown marker so next boot doesn't send a false crash notification
+  echo "$(date +%s)" > /home/node/.claude/.clean-shutdown
+  # Relay signal to node so bot.js gracefulShutdown() can persist state
+  [ -n "$NODE_PID" ] && kill -TERM "$NODE_PID" 2>/dev/null && wait "$NODE_PID" 2>/dev/null
   pm2 dump 2>/dev/null
   pm2 kill 2>/dev/null
   exit 0
 }
 trap cleanup SIGTERM SIGINT
 
-# Run the app
-node server.js
+# Run the app in background so bash can process SIGTERM via trap
+node server.js &
+NODE_PID=$!
+wait $NODE_PID
 EXIT_CODE=$?
 
 # On crash, record timestamp and dump PM2 state

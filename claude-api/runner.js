@@ -26,17 +26,28 @@ const _INTERNAL_TOKEN_LITERAL = process.env.INTERNAL_API_TOKEN || '';
 function scrubSecrets(text) {
   if (typeof text !== 'string') return text;
   let out = text
+    // ── API key patterns ──
     .replace(/X-Internal-Token:\s*[\w-]{10,}/gi, 'X-Internal-Token: [REDACTED]')
     .replace(/Bearer\s+[\w\-.]{20,}/gi, 'Bearer [REDACTED]')
-    .replace(/sk-[A-Za-z0-9_\-]{20,}/g, 'sk-[REDACTED]')           // OpenAI sk-proj-*, sk-ant-*
+    .replace(/sk-[A-Za-z0-9_\-]{20,}/g, 'sk-[REDACTED]')           // OpenAI
     .replace(/sk_(?:live|test)_[A-Za-z0-9]{20,}/g, 'sk_[REDACTED]') // Stripe
     .replace(/ghp_[A-Za-z0-9]{20,}/g, 'ghp_[REDACTED]')             // GitHub classic PAT
-    .replace(/github_pat_[A-Za-z0-9_]{20,}/g, 'github_pat_[REDACTED]') // GitHub fine-grained PAT
+    .replace(/github_pat_[A-Za-z0-9_]{20,}/g, 'github_pat_[REDACTED]') // GitHub fine-grained
     .replace(/r8_[A-Za-z0-9]{20,}/g, 'r8_[REDACTED]')               // Replicate
-    .replace(/AIzaSy[A-Za-z0-9_\-]{30,}/g, 'AIzaSy[REDACTED]')      // Google/Gemini API keys
-    .replace(/GOCSPX-[A-Za-z0-9_\-]{20,}/g, 'GOCSPX-[REDACTED]');   // Google OAuth client secret
-  // Literal match for the actual INTERNAL_API_TOKEN value (catches bare echoes
-  // from `echo $INTERNAL_API_TOKEN` or `/proc/self/environ` dumps)
+    .replace(/AIzaSy[A-Za-z0-9_\-]{30,}/g, 'AIzaSy[REDACTED]')      // Google/Gemini
+    .replace(/GOCSPX-[A-Za-z0-9_\-]{20,}/g, 'GOCSPX-[REDACTED]')   // Google OAuth secret
+    // ── Password/credential patterns ──
+    .replace(/"password"\s*:\s*"[^"]+"/gi, '"password": "[REDACTED]"')
+    .replace(/"pass(?:word)?"\s*[:=]\s*"[^"]+"/gi, '"password": "[REDACTED]"')
+    .replace(/"email"\s*:\s*"[^"@]+@[^"]+"/gi, '"email": "[REDACTED]"')
+    .replace(/password\s*[:=]\s*\S+/gi, 'password=[REDACTED]')
+    .replace(/Authorization:\s*Basic\s+[A-Za-z0-9+/=]{10,}/gi, 'Authorization: Basic [REDACTED]')
+    // ── Environment variable dumps ──
+    .replace(/(?:INTERNAL_API_TOKEN|TOKEN_ENCRYPTION_KEY|BOT_UNLOCK_PIN|OPENAI_API_KEY|GEMINI_API_KEY|GH_TOKEN|SERPAPI_KEY|SPOTIFY_CLIENT_SECRET|GOOGLE_CLIENT_SECRET|ELEVENLABS_API_KEY|REPLICATE_API_TOKEN|STRIPE_SECRET_KEY|VIDEO_GEN_API_KEY|DISCORD_BOT_TOKEN|SIGNAL_OWNER_NUMBER|TICKETMASTER_API_KEY)=\S+/g,
+      (m) => m.split('=')[0] + '=[REDACTED]')
+    // ── Catch any remaining token-like strings from env dumps ──
+    .replace(/(?:_KEY|_TOKEN|_SECRET|_PASSWORD)=["']?[^\s"']{8,}/gi, (m) => m.split('=')[0] + '=[REDACTED]');
+  // Literal match for the actual INTERNAL_API_TOKEN value
   if (_INTERNAL_TOKEN_LITERAL.length >= 16) {
     out = out.replaceAll(_INTERNAL_TOKEN_LITERAL, '[REDACTED]');
   }
@@ -182,6 +193,7 @@ class Runner {
     groupAllowedTools = undefined, // custom allowlist for group chats (overrides readOnly)
     profileContext = null,
     streamReplies = false,
+    model = 'sonnet', // 'sonnet' or 'opus'
     // Injected from bot.js so runner doesn't need to import bot.js:
     freshProgressFn = null,
     saveChannelStateFn = null,
@@ -195,6 +207,7 @@ class Runner {
     this.maxTurns = maxTurns || (channelState?.config?.maxTurns) || DEFAULT_MAX_TURNS;
     this.channelState = channelState;
     this.channelProxy = channelProxy;
+    this.model = model;
     this.discordUserId = discordUserId;
     this.readOnly = readOnly;
     this.groupAllowedTools = groupAllowedTools;
@@ -257,6 +270,19 @@ class Runner {
         }
         const memoryContext = loadMemory(cwd);
         if (memoryContext) contextParts.push(memoryContext);
+        // Inject repair ledger + pre-flight checklist when Bianca is working on herself
+        if (cwd === '/workspace/MyBot' || cwd?.startsWith('/workspace/MyBot/')) {
+          try {
+            const { buildRepairContext } = require('./repair-ledger');
+            const repairCtx = buildRepairContext();
+            if (repairCtx) contextParts.push(repairCtx);
+          } catch {}
+          try {
+            const { buildPreflightBlock } = require('./preflight');
+            const preflight = buildPreflightBlock(cwd, prompt);
+            if (preflight) contextParts.push(preflight);
+          } catch {}
+        }
         if (contextParts.length > 0) {
           effectivePrompt = contextParts.join('\n\n') + `\n\n[Current request]:\n${prompt}`;
         }
@@ -267,7 +293,7 @@ class Runner {
         '-p', effectivePrompt,
         '--output-format', 'stream-json',
         '--verbose',
-        '--model', 'sonnet',
+        '--model', this.model,
         '--max-turns', String(maxTurns),
         '--dangerously-skip-permissions',
         '--mcp-config', '/app/.mcp.json',
@@ -321,6 +347,10 @@ class Runner {
           // F1: passed as env var so Claude's Bash tool can expand $INTERNAL_API_TOKEN
           // in curl examples without the literal value leaking into the system prompt.
           INTERNAL_API_TOKEN: process.env.INTERNAL_API_TOKEN || '',
+          // Image registry session key — used by /imagine to associate generated
+          // images with the correct chatId. Deterministic: set by infrastructure,
+          // not by Claude's prompt compliance.
+          IMAGE_SESSION_KEY: channelState?._channelId || '',
           // F6: owner is trusted; gh capability is documented. Risk: prompt-injection
           // could exfiltrate via Bash — mitigated by scrubSecrets (F5).
           GH_TOKEN: process.env.GH_TOKEN || '',

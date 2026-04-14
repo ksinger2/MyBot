@@ -9,6 +9,7 @@
 
 const { searchPrices } = require('./scraper-client');
 const { formatPriceResults } = require('./prices');
+const { recordSnapshot, getTrend } = require('./concert-price-history');
 
 const SCRAPER_URL = process.env.CONCERT_SCRAPER_URL || 'http://concert-scraper:5000';
 const TICKETMASTER_API_KEY = process.env.TICKETMASTER_API_KEY || '';
@@ -106,7 +107,14 @@ async function getPrices(artist, venue, date, city) {
     pricesBySource[SCRAPE_SITES[i]] = scrapeResults[i];
   }
 
-  return formatPriceResults(pricesBySource, { artist, venue, date, city });
+  // Record snapshot for historical tracking
+  try { recordSnapshot({ artist, venue, date, city }, pricesBySource); } catch {}
+
+  // Get trend from previous snapshots
+  let trend = null;
+  try { trend = getTrend(artist, venue, date); } catch {}
+
+  return formatPriceResults(pricesBySource, { artist, venue, date, city }, trend);
 }
 
 // ── System prompt instructions ────────────────────────────────────────────────
@@ -130,6 +138,8 @@ Parameters (all optional except artist):
 The response is \`{ text: "formatted price list" }\` — relay the \`text\` field directly to the user. It includes fee disclosure (StubHub/TickPick show all-in prices; Ticketmaster/VividSeats/SeatGeek add fees at checkout). If the scraper service is not running, the response will say so and explain how to start it.
 
 When the user asks about shows for their favorite artists (from their Spotify profile), always offer to check prices.
+
+**Group chats (no Bash):** Use this tag instead of curl: [CONCERT_PRICES: artist="Chappell Roan" venue="Chase Center" date="2026-05-15" city="San Francisco"]. The system will call the scraper and append the results to your response. You can also use just the artist name: [CONCERT_PRICES: Chappell Roan].
 
 **CONCERT BOT COMMANDS** — Tell users about these when they ask about concerts, shows, or ticket prices:
 
