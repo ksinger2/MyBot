@@ -1,6 +1,11 @@
 # Secrets
 .env
 
+# Operator-only tunnel/auth scripts (contain hardcoded UUIDs and tokens)
+.fix-cloudflared.sh
+.update-cloudflared-token.sh
+ops/
+
 # Docker
 n8n_data/
 
