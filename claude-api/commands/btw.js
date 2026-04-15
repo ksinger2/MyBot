@@ -15,7 +15,7 @@ module.exports = {
         const tasks = await new Promise((resolve) => {
           const req = http.request({
             hostname: 'localhost', port: 3400, path: '/internal/background-tasks',
-            headers: { 'X-Internal-Token': process.env.INTERNAL_API_TOKEN || '' },
+            headers: { 'X-Internal-Token': require('../internal-token').getInternalToken() },
           }, res => {
             let d = ''; res.on('data', c => d += c);
             res.on('end', () => { try { resolve(JSON.parse(d).tasks || []); } catch { resolve([]); } });
@@ -88,7 +88,7 @@ module.exports = {
       const bgTasks = await new Promise((resolve) => {
         const req = http.request({
           hostname: 'localhost', port: 3400, path: '/internal/background-tasks',
-          headers: { 'X-Internal-Token': process.env.INTERNAL_API_TOKEN || '' },
+          headers: { 'X-Internal-Token': require('../internal-token').getInternalToken() },
         }, res => {
           let d = ''; res.on('data', c => d += c);
           res.on('end', () => { try { resolve(JSON.parse(d).tasks || []); } catch { resolve([]); } });

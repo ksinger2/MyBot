@@ -10,6 +10,8 @@ const fs = require('fs');
 const path = require('path');
 const http = require('http');
 const { atomicWriteJsonSync } = require('./atomic-write');
+// H2 (auth hardening): closure-backed token, not process.env
+const { getInternalToken } = require('./internal-token');
 
 const RESULTS_FILE = path.join('/app/data', 'smoke-test-results.json');
 const MAX_RESULTS = 20;
@@ -24,7 +26,7 @@ function _httpPost(urlPath, body = {}, timeoutMs = 15000) {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        'X-Internal-Token': process.env.INTERNAL_API_TOKEN || '',
+        'X-Internal-Token': getInternalToken(),
         'Content-Length': Buffer.byteLength(data),
       },
       timeout: timeoutMs || 15000,

@@ -120,14 +120,12 @@ async function getPrices(artist, venue, date, city) {
 // ── System prompt instructions ────────────────────────────────────────────────
 
 const SCRAPER_INSTRUCTIONS = `
-10. **CONCERT TICKET PRICES**: When the user asks about concert tickets, cheapest tickets for a show, ticket prices, or whether it's worth going to a concert, you can get real scraped prices from 5 ticket sites (StubHub, VividSeats, TickPick, SeatGeek, Ticketmaster) by calling:
+10. **CONCERT TICKET PRICES**: When the user asks about concert tickets, cheapest tickets for a show, ticket prices, or whether it's worth going to a concert, you can get real scraped prices from 5 ticket sites (StubHub, VividSeats, TickPick, SeatGeek, Ticketmaster) by emitting this tag:
 
-\`\`\`
-curl -s -X POST http://localhost:3400/concerts/prices \\
-  -H "Content-Type: application/json" \\
-  -H "X-Internal-Token: $INTERNAL_API_TOKEN" \\
-  -d '{"artist":"Chappell Roan","venue":"Chase Center","date":"2026-05-15","city":"San Francisco"}'
-\`\`\`
+\`[CONCERT_PRICES: artist="Chappell Roan" venue="Chase Center" date="2026-05-15" city="San Francisco"]\`
+
+Or just the artist:
+\`[CONCERT_PRICES: Chappell Roan]\`
 
 Parameters (all optional except artist):
 - \`artist\` — artist/band name (required)
@@ -135,11 +133,9 @@ Parameters (all optional except artist):
 - \`date\`   — show date as YYYY-MM-DD (omit if unknown)
 - \`city\`   — city name (omit if unknown)
 
-The response is \`{ text: "formatted price list" }\` — relay the \`text\` field directly to the user. It includes fee disclosure (StubHub/TickPick show all-in prices; Ticketmaster/VividSeats/SeatGeek add fees at checkout). If the scraper service is not running, the response will say so and explain how to start it.
+There is NO curl alternative — the system calls the scraper and appends the formatted price list (with fee disclosure: StubHub/TickPick show all-in prices; Ticketmaster/VividSeats/SeatGeek add fees at checkout) to your response. You do not have credentials for /concerts/prices.
 
 When the user asks about shows for their favorite artists (from their Spotify profile), always offer to check prices.
-
-**Group chats (no Bash):** Use this tag instead of curl: [CONCERT_PRICES: artist="Chappell Roan" venue="Chase Center" date="2026-05-15" city="San Francisco"]. The system will call the scraper and append the results to your response. You can also use just the artist name: [CONCERT_PRICES: Chappell Roan].
 
 **CONCERT BOT COMMANDS** — Tell users about these when they ask about concerts, shows, or ticket prices:
 

@@ -31,9 +31,13 @@ function buildConcertTrackerWizard() {
       const artists = Array.isArray(data._artistList) ? data._artistList : [];
       if (artists.length === 0) return;
       try {
-        const { setProfile } = require('../user-profiles');
+        const { setProfile, getProfile: _verifyGetProfile } = require('../user-profiles');
         setProfile(phone, { concert_tracker_artists: artists });
-        console.log(`[concert-tracker] early-exit save: ${artists.length} artists for ${phone.slice(0, 4)}****`);
+        // Deterministic paper trail — read back the value that landed on
+        // disk so a silent setProfile regression shows up as a mismatch.
+        const _verify = _verifyGetProfile(phone);
+        const _savedCount = Array.isArray(_verify?.concert_tracker_artists) ? _verify.concert_tracker_artists.length : 0;
+        console.log(`[concert-tracker] early-exit save: ${_savedCount}/${artists.length} artists persisted for ${phone.slice(0, 4)}****`);
       } catch (err) {
         console.warn(`[concert-tracker] early-exit save failed: ${err.message}`);
       }
@@ -245,8 +249,14 @@ function buildConcertTrackerWizard() {
         // scheduler reads `concert_tracker_artists` at fire time, so any
         // edits via `!track add/remove` propagate without re-running the
         // wizard.
-        const { setProfile } = require('../user-profiles');
+        const { setProfile, getProfile: _verifyGetProfile } = require('../user-profiles');
         setProfile(phone, { concert_tracker_artists: artists });
+        // Deterministic paper trail — read back and log what actually
+        // landed on disk. If setProfile silently no-ops in a future
+        // regression, the count won't match and the log will tell us.
+        const _verify = _verifyGetProfile(phone);
+        const _savedCount = Array.isArray(_verify?.concert_tracker_artists) ? _verify.concert_tracker_artists.length : 0;
+        console.log(`[concert-tracker] onComplete save: ${_savedCount}/${artists.length} artists persisted for ${phone.slice(0, 4)}****`);
 
         // Convert the user's free-text frequency into a real cron rule.
         const parsedFreq = parseFrequency(freq) || parseFrequency('every 6 hours');

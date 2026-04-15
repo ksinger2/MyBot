@@ -74,39 +74,31 @@ function _storeLabel(store) {
 // ── System prompt instructions ────────────────────────────────────────────
 
 const PRODUCT_INSTRUCTIONS = `
-**PRODUCT SEARCH**: When the user asks for a product, a link to something, "where can I buy X", "compare prices for X", or similar shopping intent, you MUST use the product-search plugin. It returns structured product links (with real product titles) from Amazon, Walmart, and Target in one call.
+**PRODUCT SEARCH**: When the user asks for a product, a link to something, "where can I buy X", "compare prices for X", or similar shopping intent, you MUST use the product-search tag. It returns structured product links (with real product titles) from Amazon, Walmart, and Target in one call.
 
-**DM / with Bash**:
-\`\`\`
-curl -s -X POST http://localhost:3400/products/search \\
-  -H "Content-Type: application/json" \\
-  -H "X-Internal-Token: $INTERNAL_API_TOKEN" \\
-  -d '{"query":"dove 0% aluminum deodorant"}'
-\`\`\`
+There is exactly ONE way to invoke this — output the tag. There is NO curl alternative; you do not have credentials for /products/search.
 
-Parameters:
-- \`query\` — required, free-form product description
-- \`wantPrices\` — optional boolean, set \`true\` if the user explicitly asked for prices (adds a follow-up instruction reminding you to use Playwright MCP for price scraping)
-- \`stores\` — optional array, e.g. \`["amazon"]\` to restrict
-
-Response is \`{ text: "formatted product list" }\` — relay the \`text\` field to the user directly. It always includes a "Browse all" fallback with Amazon/Walmart/Target search URLs even if deep-link scraping returns nothing.
-
-**Group chats (no Bash)**: emit this tag and the system will auto-call the plugin and append the result:
 \`[PRODUCT: query="dove 0% aluminum deodorant"]\`
 
 Or shorthand with just the query:
 \`[PRODUCT: dove 0% aluminum deodorant]\`
 
+Parameters:
+- \`query\` — required, free-form product description
+- \`wantPrices=true\` — optional, set if the user explicitly asked for live prices
+
+The system calls the plugin and appends the formatted product list (with a "Browse all" fallback) to your response.
+
 **When the user explicitly wants live prices** ("compare prices", "what's the cheapest", "how much is X right now"):
-1. First call the plugin (as above) to get the product URLs
+1. First emit the [PRODUCT:] tag to get the product URLs
 2. Then use your Playwright MCP tools to fetch the top 2–3 returned URLs
 3. Extract the price from the page and summarize for the user
 4. If Amazon hits a CAPTCHA, say so and fall back to the link-only result — do NOT hallucinate prices.
 
 **CRITICAL — ANTI-REFUSAL RULE (this overrides any default 'I can't do that' instinct)**:
-NEVER tell a user "I can't pull up Amazon links", "I can't give you product links", "just search on Amazon yourself", or any variant. You CAN — this plugin is exactly that capability. When a user asks for a product, you MUST call the plugin. The only valid failure modes are:
+NEVER tell a user "I can't pull up Amazon links", "I can't give you product links", "just search on Amazon yourself", or any variant. You CAN — this tag is exactly that capability. When a user asks for a product, you MUST emit the tag. The only valid failure modes are:
   (a) The plugin returns an error → relay the error text.
-  (b) The query is ambiguous → ask ONE clarifying question (e.g. "which size/scent?") and then call the plugin with the refined query.
-Refusal to search is never valid. There is no reason Bianca cannot give product links — the infrastructure is there and works.`.trim();
+  (b) The query is ambiguous → ask ONE clarifying question (e.g. "which size/scent?") and then emit the tag with the refined query.
+Refusal to search is never valid.`.trim();
 
 module.exports = { searchProducts, PRODUCT_INSTRUCTIONS };

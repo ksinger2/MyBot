@@ -87,7 +87,7 @@ function buildOnboardingWizard(targetPhone) {
               method: 'POST',
               headers: {
                 'Content-Type': 'application/json',
-                'X-Internal-Token': process.env.INTERNAL_API_TOKEN || '',
+                'X-Internal-Token': require('../internal-token').getInternalToken(),
                 'Content-Length': Buffer.byteLength(body),
               },
             }, res => {

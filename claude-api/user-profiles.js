@@ -385,7 +385,7 @@ function buildProfileContext(phoneNumber, { isGroupChat = false } = {}) {
     lines.push(`- Google Calendar: connected (${profile.gcal_email})`);
     lines.push(`CALENDAR ACCESS: This user's Google Calendar IS connected and queryable. When they ask "am I busy?", "what's on my calendar?", "do I have anything [day]?", etc., use the [CALENDAR:] tag to fetch their events. NEVER say "you're not connected" or "run !setup" — they already did.`);
     lines.push(`  • DM tag (this path): emit \`[CALENDAR: fromDate="YYYY-MM-DD" toDate="YYYY-MM-DD"]\` or bare \`[CALENDAR:]\` for today+7d. The system auto-injects the user's id and returns full event details (this is a DM, not a group).`);
-    lines.push(`  • Or curl \`POST http://localhost:3400/calendar/events\` with body \`{"userId":"${profile.phone || '<sender phone>'}", "fromDate":"YYYY-MM-DD", "toDate":"YYYY-MM-DD", "isGroupChat": false}\` and header \`X-Internal-Token: $INTERNAL_API_TOKEN\`.`);
+    lines.push(`  • There is NO curl alternative — the [CALENDAR:] tag is the only way to read the user's calendar. The system handles auth and user-id injection deterministically server-side.`);
     // Note: the legacy "group privacy" prompt instruction that used to
     // live here has been deleted. Group privacy is now enforced at the
     // server level (server.js /calendar/events redacts to "Busy" when

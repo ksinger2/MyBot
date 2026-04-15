@@ -22,7 +22,11 @@ const path = require('path');
 // F5: Output scrubber — redacts secrets that might leak via prompt injection
 // or accidental echoing. Applied to every streamed text block and final result.
 // H1 (security re-review): extended to cover all secret formats in the container env.
-const _INTERNAL_TOKEN_LITERAL = process.env.INTERNAL_API_TOKEN || '';
+// H2 (auth hardening): the literal comes from the closure-backed internal-token
+// module, NEVER from process.env — by this point process.env.INTERNAL_API_TOKEN
+// has already been scrubbed so Claude's Bash tool can't read it back.
+const { getInternalToken } = require('./internal-token');
+const _INTERNAL_TOKEN_LITERAL = getInternalToken();
 function scrubSecrets(text) {
   if (typeof text !== 'string') return text;
   let out = text
@@ -343,7 +347,16 @@ class Runner {
         args.push('--append-system-prompt', systemPromptText);
       }
 
-      // Spawn the Claude CLI child process
+      // Spawn the Claude CLI child process.
+      //
+      // H2 — AUTH HARDENING: INTERNAL_API_TOKEN is intentionally NOT passed
+      // to the child. Claude does not need it — every former curl path is
+      // now a server-side tag handler ([CALENDAR:], [WEATHER:], [IMAGINE:],
+      // [REMIND:], [EVENT:], [EVENT_JOIN:], [PRODUCT:], [CONCERT_PRICES:],
+      // [REBUILD], etc.) that runs in-process using the closure-stored token.
+      // Even if Claude tries `echo $INTERNAL_API_TOKEN` via Bash, it gets ''.
+      //
+      // Do NOT re-add INTERNAL_API_TOKEN here. It is a security regression.
       const child = spawn('claude', args, {
         cwd,
         env: {
@@ -354,9 +367,6 @@ class Runner {
           PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH: process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH || '',
           LANG: process.env.LANG || 'en_US.UTF-8',
           TERM: process.env.TERM || 'xterm-256color',
-          // F1: passed as env var so Claude's Bash tool can expand $INTERNAL_API_TOKEN
-          // in curl examples without the literal value leaking into the system prompt.
-          INTERNAL_API_TOKEN: process.env.INTERNAL_API_TOKEN || '',
           // Image registry session key — used by /imagine to associate generated
           // images with the correct chatId. Deterministic: set by infrastructure,
           // not by Claude's prompt compliance.

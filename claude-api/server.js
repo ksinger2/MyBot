@@ -4,6 +4,13 @@ const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
 
+// H2 (auth hardening): capture INTERNAL_API_TOKEN into a closure and delete
+// it from process.env BEFORE any other require() runs. This prevents any
+// downstream code (runner spawns, plugin child_process calls, etc.) from
+// leaking the token to subprocesses via inherited env. Loaded first so every
+// subsequent module sees the scrubbed process.env.
+const { getInternalToken } = require('./internal-token');
+
 // Security: fail-closed if TOKEN_ENCRYPTION_KEY is not set. User profiles,
 // OAuth tokens, and Spotify tokens are encrypted at rest with this key.
 // Without it, all personal data would be stored in plaintext.
@@ -108,11 +115,18 @@ if (!global.__mybotServerIntervals) {
 // ?token= query string for /signal/webhook, where bbernhard's JSON-RPC
 // forwarder cannot inject custom headers).
 //
-// The secret comes from INTERNAL_API_TOKEN in the environment. If it is unset
-// we REFUSE every authenticated request with 503 — we never fail open.
-const INTERNAL_API_TOKEN = process.env.INTERNAL_API_TOKEN || '';
+// The secret is loaded via internal-token.js (closure-backed). It is NOT
+// read from process.env here — process.env.INTERNAL_API_TOKEN has already
+// been deleted by the internal-token module to prevent child-process leakage.
+// If unset, every authenticated route 503s — we never fail open.
+const INTERNAL_API_TOKEN = getInternalToken();
 if (!INTERNAL_API_TOKEN) {
   console.error('[security] WARNING: INTERNAL_API_TOKEN not set — all authenticated routes will be unreachable');
+} else {
+  // H2 startup probe: confirm process.env has been scrubbed. If this logs
+  // "LEAKED" something re-populated the var after internal-token.js ran.
+  const envState = process.env.INTERNAL_API_TOKEN ? 'LEAKED' : 'scrubbed';
+  console.log(`[security] INTERNAL_API_TOKEN loaded via closure; process.env state: ${envState}`);
 }
 
 // Constant-time string compare (F12: simplified — length-equal inputs go
@@ -964,7 +978,8 @@ app.get('/auth/spotify/callback', async (req, res) => {
 
 // Spotify artist refresh — re-import artists from Spotify without full re-auth
 app.post('/spotify/refresh-artists', async (req, res) => {
-  if (req.headers['x-internal-token'] !== process.env.INTERNAL_API_TOKEN) {
+  // H2: use closure-backed INTERNAL_API_TOKEN (process.env copy is deleted).
+  if (!INTERNAL_API_TOKEN || !safeTokenEqual(req.headers['x-internal-token'] || '', INTERNAL_API_TOKEN)) {
     return res.status(403).json({ ok: false, error: 'Forbidden' });
   }
   const { userId } = req.body || {};

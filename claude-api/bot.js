@@ -1,3 +1,13 @@
+// H2 (auth hardening): MUST be required first, before runner.js or anything
+// that may spawn child processes. Captures INTERNAL_API_TOKEN into a closure
+// and deletes it from process.env so Claude subprocesses can never read it.
+const { getInternalToken } = require('./internal-token');
+const INTERNAL_API_TOKEN = getInternalToken();
+if (INTERNAL_API_TOKEN) {
+  const envState = process.env.INTERNAL_API_TOKEN ? 'LEAKED' : 'scrubbed';
+  console.log(`[security] bot.js: INTERNAL_API_TOKEN loaded via closure; process.env state: ${envState}`);
+}
+
 const { Client, GatewayIntentBits, Partials, AttachmentBuilder } = require('discord.js');
 const { spawn, execSync, execFileSync } = require('child_process');
 const fs = require('fs');
@@ -1536,10 +1546,20 @@ client.on('messageCreate', async (message) => {
 
   const state = getChannel(message.channel.id);
 
-  // Handle commands — also cancel any active wizard when a command is issued
+  // Handle commands — also cancel any active wizard when a command is issued.
+  // CRITICAL: must go through cancelWizard() so the wizard's onCancel hook
+  // runs (e.g. concert-tracker saves the curated artist list on early exit).
+  // The previous code set `state.wizard = null` directly, which silently
+  // dropped any partial-save data — that's the exact bug the Signal-side
+  // silent-cancel path already fixes via `await cancelWizard(...,{silent:true})`.
   if (message.content.startsWith('!')) {
     if (state.wizard && message.content.trim().toLowerCase() !== '!cancel') {
-      state.wizard = null; // silently cancel wizard on any command
+      try {
+        await cancelWizard(state, message, { silent: true });
+      } catch (err) {
+        console.warn(`[discord] silent wizard cancel failed: ${err.message}`);
+        state.wizard = null;
+      }
     }
     try {
       const handled = await handleCommand(message);
@@ -2910,7 +2930,7 @@ async function _dispatchSignalMessage(msg, chatId, text, state) {
         const _imgReg = require('./image-registry');
         const lastImg = _imgReg.getLastOutput(chatId);
         if (lastImg) {
-          imageRefinementContext = `\n\n[PREVIOUS IMAGE: You recently generated ${lastImg} for this chat. If the user is asking to refine, edit, or modify that image (e.g. "make it bigger", "change the color", "add a hat"), pass that path as inputImagePath in your /imagine curl call to edit it.]`;
+          imageRefinementContext = `\n\n[PREVIOUS IMAGE: You recently generated ${lastImg} for this chat. If the user is asking to refine, edit, or modify that image (e.g. "make it bigger", "change the color", "add a hat"), append \`INPUT:${lastImg}\` to your [IMAGINE:] tag to use it as the source.]`;
         }
       } catch {}
 
@@ -3108,7 +3128,7 @@ async function _dispatchSignalMessage(msg, chatId, text, state) {
                 method: 'POST',
                 headers: {
                   'Content-Type': 'application/json',
-                  'X-Internal-Token': process.env.INTERNAL_API_TOKEN || '',
+                  'X-Internal-Token': INTERNAL_API_TOKEN,
                   'X-Session-Key': chatId,
                   'Content-Length': Buffer.byteLength(body),
                 },
@@ -3155,7 +3175,7 @@ async function _dispatchSignalMessage(msg, chatId, text, state) {
               const req = http.request({
                 hostname: 'localhost', port: 3400, path: '/concerts/prices',
                 method: 'POST',
-                headers: { 'Content-Type': 'application/json', 'X-Internal-Token': process.env.INTERNAL_API_TOKEN || '', 'Content-Length': Buffer.byteLength(body) },
+                headers: { 'Content-Type': 'application/json', 'X-Internal-Token': INTERNAL_API_TOKEN, 'Content-Length': Buffer.byteLength(body) },
                 timeout: 30000,
               }, (res) => {
                 let data = '';
@@ -3217,7 +3237,7 @@ async function _dispatchSignalMessage(msg, chatId, text, state) {
                 const req = http.request({
                   hostname: 'localhost', port: 3400, path: '/calendar/events',
                   method: 'POST',
-                  headers: { 'Content-Type': 'application/json', 'X-Internal-Token': process.env.INTERNAL_API_TOKEN || '', 'Content-Length': Buffer.byteLength(body) },
+                  headers: { 'Content-Type': 'application/json', 'X-Internal-Token': INTERNAL_API_TOKEN, 'Content-Length': Buffer.byteLength(body) },
                   timeout: 15000,
                 }, (res) => {
                   let data = '';
@@ -3297,6 +3317,206 @@ async function _dispatchSignalMessage(msg, chatId, text, state) {
           }
         } catch (e) { console.warn(`[weather-tag] plugin error: ${e.message}`); }
         result.text = (result.text || '').replace(weatherRe, '').trim();
+      }
+
+      // [REMIND:] tag extraction — create a Google Calendar reminder.
+      //
+      // SECURITY / DETERMINISM (H2): the user_id / discord_user_id fields are
+      // NOT taken from Claude's output — they are clobbered with msg.senderId
+      // after the parse loop. Same parse-then-clobber pattern used by [CALENDAR:].
+      const remindRe = /\[REMIND:\s*(.+?)\]/gi;
+      const remindMatches = [...(result.text || '').matchAll(remindRe)];
+      if (remindMatches.length > 0 && msg?.senderId) {
+        try {
+          const http = require('http');
+          for (const match of remindMatches) {
+            const raw = (match[1] || '').trim();
+            const params = {};
+            raw.replace(/(\w+)="([^"]+)"/g, (_, k, v) => { params[k] = v; });
+            // Bare numeric duration_minutes=15 (no quotes)
+            raw.replace(/(\w+)=(\d+)/g, (_, k, v) => { params[k] = v; });
+            // Clobber identity fields — Claude does not get to choose who the reminder is for.
+            params.discord_user_id = msg.senderId;
+            params.user_id = msg.senderId;
+            if (!params.title || !params.datetime) continue;
+            try {
+              const body = JSON.stringify({
+                title: params.title,
+                datetime: params.datetime,
+                duration_minutes: parseInt(params.duration_minutes, 10) || 15,
+                discord_user_id: msg.senderId,
+                user_id: msg.senderId,
+              });
+              const remResult = await new Promise((resolve, reject) => {
+                const req = http.request({
+                  hostname: 'localhost', port: 3400, path: '/remind',
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json', 'X-Internal-Token': INTERNAL_API_TOKEN, 'Content-Length': Buffer.byteLength(body) },
+                  timeout: 15000,
+                }, (res) => {
+                  let data = '';
+                  res.on('data', c => data += c);
+                  res.on('end', () => { try { resolve(JSON.parse(data)); } catch { resolve({ text: data }); } });
+                });
+                req.on('error', reject);
+                req.on('timeout', () => { req.destroy(); reject(new Error('timeout')); });
+                req.write(body); req.end();
+              });
+              if (remResult?.error) {
+                await signalAdapter.sendMessage(msg.chatId, `Reminder failed: ${remResult.error}`);
+              }
+              console.log(`[remind-tag] ${msg.senderId.slice(0,4)}**** "${params.title.slice(0,40)}" at ${params.datetime}`);
+            } catch (e) { console.warn(`[remind-tag] failed: ${e.message}`); }
+          }
+        } catch (e) { console.warn(`[remind-tag] handler error: ${e.message}`); }
+        result.text = (result.text || '').replace(remindRe, '').trim();
+      }
+
+      // [EVENT:] tag extraction — create a shared group calendar event.
+      //
+      // SECURITY / DETERMINISM (H2): chat_id is clobbered with msg.chatId; the
+      // creator (msg.senderId) is always included in user_ids. user_ids that
+      // Claude emits are ALSO filtered against the known group member cache to
+      // prevent Claude from inviting arbitrary phone numbers.
+      const eventRe = /\[EVENT:\s*(.+?)\]/gi;
+      const eventMatches = [...(result.text || '').matchAll(eventRe)];
+      if (eventMatches.length > 0 && msg?.senderId && msg?.chatId) {
+        try {
+          const http = require('http');
+          // Resolve allowed user_ids for this group (members + sender)
+          const cached = _groupInfoCache.get(msg.chatId);
+          const allowedMembers = new Set();
+          allowedMembers.add(msg.senderId);
+          if (cached?.members) {
+            for (const m of cached.members) {
+              if (typeof m === 'string' && m.startsWith('+')) allowedMembers.add(m);
+            }
+          }
+          for (const match of eventMatches) {
+            const raw = (match[1] || '').trim();
+            const params = {};
+            raw.replace(/(\w+)="([^"]+)"/g, (_, k, v) => { params[k] = v; });
+            raw.replace(/(\w+)=(\d+)/g, (_, k, v) => { params[k] = v; });
+            if (!params.title || !params.datetime) continue;
+            // Parse user_ids list and filter to known group members.
+            // user_ids can be comma-separated phone numbers in the params.
+            let claimed = [];
+            if (params.user_ids) {
+              claimed = params.user_ids.split(/[,;\s]+/).map(s => s.trim()).filter(Boolean);
+            }
+            // Always include the sender. Filter every other id against the
+            // group member cache so Claude can't add strangers.
+            const uids = new Set();
+            uids.add(msg.senderId);
+            for (const id of claimed) {
+              if (allowedMembers.has(id)) uids.add(id);
+            }
+            try {
+              const body = JSON.stringify({
+                title: params.title,
+                datetime: params.datetime,
+                duration_minutes: parseInt(params.duration_minutes, 10) || 120,
+                location: params.location || '',
+                description: params.description || '',
+                user_ids: Array.from(uids),
+                chat_id: msg.chatId,  // CLOBBER: never trust Claude
+              });
+              const evResult = await new Promise((resolve, reject) => {
+                const req = http.request({
+                  hostname: 'localhost', port: 3400, path: '/event',
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json', 'X-Internal-Token': INTERNAL_API_TOKEN, 'Content-Length': Buffer.byteLength(body) },
+                  timeout: 20000,
+                }, (res) => {
+                  let data = '';
+                  res.on('data', c => data += c);
+                  res.on('end', () => { try { resolve(JSON.parse(data)); } catch { resolve({ text: data }); } });
+                });
+                req.on('error', reject);
+                req.on('timeout', () => { req.destroy(); reject(new Error('timeout')); });
+                req.write(body); req.end();
+              });
+              console.log(`[event-tag] ${msg.senderId.slice(0,4)}**** "${params.title.slice(0,40)}" → ${uids.size} attendees, created=${evResult?.created?.length || 0} failed=${evResult?.failed?.length || 0}`);
+            } catch (e) { console.warn(`[event-tag] failed: ${e.message}`); }
+          }
+        } catch (e) { console.warn(`[event-tag] handler error: ${e.message}`); }
+        result.text = (result.text || '').replace(eventRe, '').trim();
+      }
+
+      // [EVENT_JOIN:] tag extraction — add a user to an existing group event.
+      //
+      // SECURITY / DETERMINISM (H2): chat_id is clobbered with msg.chatId;
+      // user_id is clobbered with msg.senderId (you can only opt yourself in).
+      const eventJoinRe = /\[EVENT_JOIN:\s*(.+?)\]/gi;
+      const eventJoinMatches = [...(result.text || '').matchAll(eventJoinRe)];
+      if (eventJoinMatches.length > 0 && msg?.senderId && msg?.chatId) {
+        try {
+          const http = require('http');
+          // Only one join action makes sense per turn — but loop in case Claude emits multiple
+          for (const _ of eventJoinMatches) {
+            try {
+              const body = JSON.stringify({
+                chat_id: msg.chatId,    // CLOBBER
+                user_id: msg.senderId,  // CLOBBER — you can only join yourself
+              });
+              await new Promise((resolve, reject) => {
+                const req = http.request({
+                  hostname: 'localhost', port: 3400, path: '/event/join',
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json', 'X-Internal-Token': INTERNAL_API_TOKEN, 'Content-Length': Buffer.byteLength(body) },
+                  timeout: 15000,
+                }, (res) => {
+                  let data = '';
+                  res.on('data', c => data += c);
+                  res.on('end', () => { try { resolve(JSON.parse(data)); } catch { resolve({ text: data }); } });
+                });
+                req.on('error', reject);
+                req.on('timeout', () => { req.destroy(); reject(new Error('timeout')); });
+                req.write(body); req.end();
+              });
+              console.log(`[event-join-tag] ${msg.senderId.slice(0,4)}**** joined event in ${msg.chatId.slice(0,8)}…`);
+              break; // one join per turn is enough
+            } catch (e) { console.warn(`[event-join-tag] failed: ${e.message}`); }
+          }
+        } catch (e) { console.warn(`[event-join-tag] handler error: ${e.message}`); }
+        result.text = (result.text || '').replace(eventJoinRe, '').trim();
+      }
+
+      // [REBUILD] tag extraction — Claude self-rebuild signal.
+      //
+      // SECURITY / DETERMINISM (H2): only the bot owner can trigger a rebuild.
+      // This is enforced by checking msg.senderId against the configured owner.
+      // Claude in a group chat or non-owner DM cannot trigger the rebuild even
+      // if it emits the tag.
+      const rebuildRe = /\[REBUILD\]/gi;
+      if (rebuildRe.test(result.text || '') && msg?.senderId) {
+        try {
+          const { isSignalOwner } = require('./project-permissions');
+          if (isSignalOwner(msg.senderId) && !isGroupChat) {
+            const http = require('http');
+            try {
+              await new Promise((resolve, reject) => {
+                const req = http.request({
+                  hostname: 'localhost', port: 3400, path: '/rebuild',
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json', 'X-Internal-Token': INTERNAL_API_TOKEN, 'Content-Length': 0 },
+                  timeout: 30000,
+                }, (res) => {
+                  let data = '';
+                  res.on('data', c => data += c);
+                  res.on('end', () => { try { resolve(JSON.parse(data)); } catch { resolve({ text: data }); } });
+                });
+                req.on('error', reject);
+                req.on('timeout', () => { req.destroy(); reject(new Error('timeout')); });
+                req.end();
+              });
+              console.log(`[rebuild-tag] triggered by ${msg.senderId.slice(0,4)}****`);
+            } catch (e) { console.warn(`[rebuild-tag] failed: ${e.message}`); }
+          } else {
+            console.warn(`[rebuild-tag] denied — sender ${msg.senderId.slice(0,4)}**** is not owner or in group chat`);
+          }
+        } catch (e) { console.warn(`[rebuild-tag] handler error: ${e.message}`); }
+        result.text = (result.text || '').replace(rebuildRe, '').trim();
       }
 
       // [FLIGHT_SEARCH:] tag extraction — search Google Flights and record snapshot.

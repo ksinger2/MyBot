@@ -9,7 +9,8 @@
  *   !prices Jack Johnson Greek Theatre June 14
  */
 
-const INTERNAL_TOKEN = process.env.INTERNAL_API_TOKEN || '';
+// H2 (auth hardening): closure-backed token, not process.env
+const INTERNAL_TOKEN = require('../internal-token').getInternalToken();
 
 module.exports = {
   name: '!prices',

@@ -10,7 +10,7 @@
  *
  * Exports:
  *   getForecast(location, fromDate?, toDate?) — formatted plain-text forecast
- *   WEATHER_INSTRUCTIONS — system-prompt block (curl + [WEATHER:] tag)
+ *   WEATHER_INSTRUCTIONS — system-prompt block (tag-only, no curl)
  */
 
 const GEOCODE_BASE = 'https://geocoding-api.open-meteo.com/v1/search';
@@ -237,29 +237,22 @@ function _addDays(yyyymmdd, n) {
 // ── System prompt instructions ────────────────────────────────────────────────
 
 const WEATHER_INSTRUCTIONS = `
-**WEATHER**: When the user asks about weather, temperature, forecast, "should I go to X outside", "will it rain", etc., use the weather plugin instead of WebSearch/WebFetch. WebSearch returns stale monthly averages from content farms; the plugin hits Open-Meteo (official, no API key, 16-day forecast) and returns real structured data.
+**WEATHER**: When the user asks about weather, temperature, forecast, "should I go to X outside", "will it rain", etc., use the weather tag instead of WebSearch/WebFetch. WebSearch returns stale monthly averages from content farms; the plugin hits Open-Meteo (official, no API key, 16-day forecast) and returns real structured data.
 
-**DM / with Bash**: call
-\`\`\`
-curl -s -X POST http://localhost:3400/weather \\
-  -H "Content-Type: application/json" \\
-  -H "X-Internal-Token: $INTERNAL_API_TOKEN" \\
-  -d '{"location":"Alameda CA","fromDate":"2026-04-18","toDate":"2026-04-19"}'
-\`\`\`
+There is exactly ONE way to invoke this — output the tag. There is NO curl alternative; you do not have credentials for /weather.
+
+\`[WEATHER: location="Alameda CA" fromDate="2026-04-18" toDate="2026-04-19"]\`
+
+Or shorthand with just a location:
+\`[WEATHER: Alameda CA]\`
 
 Parameters:
 - \`location\` — required, free-form string (use the user's profile location by default)
 - \`fromDate\` — optional YYYY-MM-DD, defaults to today
 - \`toDate\` — optional YYYY-MM-DD, defaults to \`fromDate\` + 6 days
 
-Response is \`{ text: "formatted forecast" }\` — relay the \`text\` field directly. Always use THIS data, not cached/remembered numbers.
+The system calls the plugin and appends the formatted forecast to your response — you don't need to wait for or parse a response, just emit the tag and write a short natural sentence around it.
 
-**Group chats (no Bash)**: use the tag instead. The system will call the plugin and append the results to your response:
-\`[WEATHER: location="Alameda CA" fromDate="2026-04-18" toDate="2026-04-19"]\`
-
-Or shorthand with just a location:
-\`[WEATHER: Alameda CA]\`
-
-When the user asks about weather for "this weekend", "next weekend", "tomorrow", "this week" — resolve the date range yourself using the current date injected above, then pass absolute \`fromDate\`/\`toDate\` values to the plugin. Never pass relative dates — Open-Meteo only understands YYYY-MM-DD.`.trim();
+When the user asks about weather for "this weekend", "next weekend", "tomorrow", "this week" — resolve the date range yourself using the current date injected above, then pass absolute \`fromDate\`/\`toDate\` values. Never pass relative dates — Open-Meteo only understands YYYY-MM-DD.`.trim();
 
 module.exports = { geocode, getForecast, WEATHER_INSTRUCTIONS };

@@ -54,15 +54,19 @@ module.exports = {
       return;
     }
 
-    // Build the Claude prompt for the scheduled dm-task
-    const jobPrompt = `Check ticket prices for "${showName}" using the concert scraper at POST http://localhost:3400/concerts/prices with body {"artist":"${showName}","city":"Alameda"} and header X-Internal-Token: $INTERNAL_API_TOKEN.
+    // Build the Claude prompt for the scheduled dm-task.
+    //
+    // H2 (auth hardening): Claude does NOT have INTERNAL_API_TOKEN and cannot
+    // curl the scraper directly. Instead, emit the [CONCERT_PRICES:] tag — the
+    // in-process tag handler in bot.js will call the plugin with the trusted
+    // token from the closure and append the results.
+    const jobPrompt = `Check ticket prices for "${showName}" by emitting exactly this tag on its own line (the system will fetch prices and append them to your reply):
+[CONCERT_PRICES: artist="${showName}" city="Alameda"]
 
-Parse the JSON response and find the lowest price from any source (stubhub, vividseats, tickpick, seatgeek, ticketmaster). If the response says the scraper is not running, do nothing (empty response).
+Then examine the price list that the system appends. If the lowest price from any source (stubhub, vividseats, tickpick, seatgeek, ticketmaster) is at or below $${threshold}, add a line to your reply:
+"🎟️ Price alert: ${showName} tickets are now $[LOWEST_PRICE] at [SOURCE]!"
 
-If the lowest price found is at or below $${threshold}, reply with:
-"🎟️ Price alert: ${showName} tickets are now $[LOWEST_PRICE] at [SOURCE]! [URL if available]"
-
-Otherwise reply with nothing (empty response — do not send any message).`;
+If nothing is at or below $${threshold}, reply with an empty message (send nothing to the user).`;
 
     // Default: 8am, noon, 4pm, 8pm PT
     const cronRule = '0 8,12,16,20 * * *';
