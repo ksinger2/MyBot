@@ -2980,7 +2980,16 @@ async function _dispatchSignalMessage(msg, chatId, text, state) {
 
       const result = await runClaudeWithContinuation(signalPrompt, claudeOpts, signalProxy);
 
-      // Auto-learn extraction — strip [LEARNED: ...] tags, store preferences, notify user
+      // Auto-learn extraction — strip [LEARNED: ...] tags, store preferences, notify user.
+      //
+      // PII FILTER (deterministic): the LEARNED handler is a covert
+      // storage channel — Claude can write any string to the sender's
+      // profile, and prompt injection or model drift could cause it to
+      // store credit card numbers, SSNs, passwords, or full appointment
+      // text including titles. We refuse to persist anything that looks
+      // like high-risk PII or that violates a hard length cap. Skipped
+      // facts are logged + the user is told it was rejected (so they
+      // know nothing was silently absorbed).
       const { addPreference } = require('./user-profiles');
       const learnedRe = /\[LEARNED:\s*(.+?)\]/gi;
       const learned = [];
@@ -2990,11 +2999,48 @@ async function _dispatchSignalMessage(msg, chatId, text, state) {
         learned.push(learnedMatch[1].trim());
       }
       cleanResultText = cleanResultText.replace(learnedRe, '').trim();
-      // Use cleanResultText instead of result.text for all subsequent operations
       result.text = cleanResultText;
 
-      // Store learned facts and notify
-      for (const fact of learned) {
+      // PII patterns we refuse to store. These run BEFORE addPreference
+      // so the disk write never happens for blocked facts.
+      const _MAX_LEARNED_FACT_CHARS = 200;
+      const _PII_PATTERNS = [
+        // Card numbers (13–19 digits, optionally separated by spaces/dashes)
+        { name: 'card-number', re: /\b(?:\d[ -]*?){13,19}\b/ },
+        // US SSN ddd-dd-dddd
+        { name: 'ssn', re: /\b\d{3}-\d{2}-\d{4}\b/ },
+        // Bare CVV next to a card-related word
+        { name: 'cvv',  re: /\b(?:cvv|cvc)\s*[:=]?\s*\d{3,4}\b/i },
+        // Anything calling itself a password / passcode / pin / secret.
+        // No trailing \b — `pin: 1234` ends the keyword on a `:` followed
+        // by a space, which is non-word↔non-word and never matches \b.
+        // The leading \b alone is sufficient to avoid matching "passport".
+        { name: 'secret-keyword', re: /\b(?:password|passcode|secret|api[\s-]?key|access[\s-]?token|pin\s*[:=])/i },
+        // Bank routing/account hints
+        { name: 'routing', re: /\brouting[\s\-]?(?:number|#)\b/i },
+      ];
+
+      for (const factRaw of learned) {
+        const fact = (factRaw || '').trim();
+        if (!fact) continue;
+
+        // Length cap — Claude shouldn't be writing essays into the
+        // preferences table. If a fact is over 200 chars, almost
+        // certainly an error.
+        if (fact.length > _MAX_LEARNED_FACT_CHARS) {
+          console.warn(`[auto-learn] REJECTED oversized fact (${fact.length} chars) for ${msg.senderId.slice(0,4)}****`);
+          await signalAdapter.sendMessage(msg.chatId, `⚠️ I tried to remember something but it was too long (${fact.length} chars, max ${_MAX_LEARNED_FACT_CHARS}). Not stored — rephrase as a short statement if you want me to keep it.`).catch(() => {});
+          continue;
+        }
+
+        // PII pattern check — drop if any pattern hits.
+        const hit = _PII_PATTERNS.find(p => p.re.test(fact));
+        if (hit) {
+          console.warn(`[auto-learn] REJECTED fact matching PII pattern "${hit.name}" for ${msg.senderId.slice(0,4)}****`);
+          await signalAdapter.sendMessage(msg.chatId, `⚠️ I tried to save something but it looked like sensitive data (${hit.name}). Not stored. If you want me to remember a fact, rephrase without the sensitive details.`).catch(() => {});
+          continue;
+        }
+
         try {
           addPreference(msg.senderId, fact, 'conversation');
           await signalAdapter.sendMessage(msg.chatId, `\u{1F4DD} I noted: ${fact}. Say \`!forget ${fact}\` to remove.`);

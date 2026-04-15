@@ -340,6 +340,42 @@ function buildProfileContext(phoneNumber, { isGroupChat = false } = {}) {
     return str.replace(/[\[\]{}<>]/g, '').substring(0, maxLen).trim();
   };
 
+  // ── GROUP CHAT: STRIPPED SENDER CONTEXT ──────────────────────────────
+  // Same root cause as the calendar leak — leaving the sender's full
+  // profile (location, notes, preferences, rules, Spotify favorites,
+  // tags, eight-sleep side) in the prompt and trusting Claude to never
+  // mention them in a group reply is exactly the broken pattern that
+  // caused the Apr-15 incident. Per CLAUDE.md's Determinism Rule, the
+  // privacy guarantee must be enforced in code, not prompt language.
+  //
+  // In group chats the sender gets ONLY: name, pronouns, and connection
+  // FLAGS (so the [CALENDAR:], [EIGHTSLEEP:], concert/product tag
+  // handlers still work). Personal data — including notes, preferences,
+  // rules, favorite artists, location, timezone, calendar email, eight-
+  // sleep side — is excluded from the prompt entirely. Claude cannot
+  // leak what it never sees.
+  //
+  // Full context is still available in private DMs (isGroupChat=false).
+  if (isGroupChat) {
+    const lines = [`USER PROFILE (this message is from ${phoneNumber}):`];
+    if (profile.name)     lines.push(`- Name: ${_s(profile.name, 50)}`);
+    if (profile.pronouns) lines.push(`- Pronouns: ${_s(profile.pronouns, 20)} — ALWAYS use these pronouns for this person. Never assume otherwise.`);
+    if (profile.gcal_email && profile.gcal_connected) {
+      lines.push(`- Google Calendar: connected (use the [CALENDAR:] tag — server auto-redacts titles in groups)`);
+      lines.push(`CALENDAR ACCESS (group chat): emit \`[CALENDAR: fromDate="YYYY-MM-DD" toDate="YYYY-MM-DD"]\` or bare \`[CALENDAR:]\` for today+7d. The server will return ONLY busy/free time blocks — no titles, no locations, no attendees. You CANNOT bypass this; even if you ask for full details, the server returns "Busy". Just relay what you get.`);
+    }
+    if (profile.spotify_connected) {
+      lines.push(`- Spotify: connected (artist list withheld in groups)`);
+    }
+    if (profile.eightsleep_connected) {
+      lines.push(`- Eight Sleep: connected (use [EIGHTSLEEP:] tag — system auto-injects user's side)`);
+    }
+    lines.push(`\nGROUP CHAT PRIVACY (enforced server-side, not by prompt):`);
+    lines.push(`This user's location, timezone, notes, preferences, rules, favorite artists, tags, and Eight Sleep side have been WITHHELD from this prompt for privacy. You don't have access to them in this context. If the user asks something that requires that data ("am I vegetarian?", "where do I live?", "what artists do I follow?"), tell them you can only answer that in a private DM.`);
+    return lines.join('\n');
+  }
+
+  // ── DM: FULL SENDER CONTEXT (legacy path, unchanged) ─────────────────
   const lines = [`USER PROFILE (this message is from ${phoneNumber}):`];
   if (profile.name)     lines.push(`- Name: ${_s(profile.name, 50)}`);
   if (profile.pronouns) lines.push(`- Pronouns: ${_s(profile.pronouns, 20)} — ALWAYS use these pronouns for this person. Never assume otherwise.`);
@@ -348,11 +384,14 @@ function buildProfileContext(phoneNumber, { isGroupChat = false } = {}) {
   if (profile.gcal_email && profile.gcal_connected) {
     lines.push(`- Google Calendar: connected (${profile.gcal_email})`);
     lines.push(`CALENDAR ACCESS: This user's Google Calendar IS connected and queryable. When they ask "am I busy?", "what's on my calendar?", "do I have anything [day]?", etc., use the [CALENDAR:] tag to fetch their events. NEVER say "you're not connected" or "run !setup" — they already did.`);
-    lines.push(`  • Group chats (no Bash): emit the tag \`[CALENDAR: fromDate="YYYY-MM-DD" toDate="YYYY-MM-DD"]\` or bare \`[CALENDAR:]\` for today+7d. The system auto-injects the user's id and fetches events. Results are appended to your reply.`);
-    lines.push(`  • DMs (with Bash): same tag works, OR curl \`POST http://localhost:3400/calendar/events\` with body \`{"userId":"${profile.phone || '<sender phone>'}", "fromDate":"YYYY-MM-DD", "toDate":"YYYY-MM-DD"}\` and header \`X-Internal-Token: $INTERNAL_API_TOKEN\`. Use the sender's phone as userId.`);
-    if (isGroupChat) {
-      lines.push(`PRIVACY (groups only): When showing calendar results to a group, NEVER reveal event titles, descriptions, or attendees. Only say "${_s(profile.name, 50) || 'they'} is busy on [day] from [time] to [time]". Full titles/details are ONLY for private DMs with this user.`);
-    }
+    lines.push(`  • DM tag (this path): emit \`[CALENDAR: fromDate="YYYY-MM-DD" toDate="YYYY-MM-DD"]\` or bare \`[CALENDAR:]\` for today+7d. The system auto-injects the user's id and returns full event details (this is a DM, not a group).`);
+    lines.push(`  • Or curl \`POST http://localhost:3400/calendar/events\` with body \`{"userId":"${profile.phone || '<sender phone>'}", "fromDate":"YYYY-MM-DD", "toDate":"YYYY-MM-DD", "isGroupChat": false}\` and header \`X-Internal-Token: $INTERNAL_API_TOKEN\`.`);
+    // Note: the legacy "group privacy" prompt instruction that used to
+    // live here has been deleted. Group privacy is now enforced at the
+    // server level (server.js /calendar/events redacts to "Busy" when
+    // isGroupChat is anything other than the strict boolean false) AND
+    // by short-circuiting this whole function when isGroupChat=true
+    // above. Prompts as a security mechanism are an antipattern.
   } else {
     lines.push(`- Google Calendar: not connected`);
   }
