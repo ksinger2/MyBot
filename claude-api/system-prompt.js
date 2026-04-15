@@ -33,6 +33,30 @@ function getFlightInstructions() {
   return _flightInstructions;
 }
 
+let _weatherInstructions = null;
+function getWeatherInstructions() {
+  if (_weatherInstructions !== null) return _weatherInstructions;
+  try {
+    const plugin = require('./plugins/weather');
+    _weatherInstructions = plugin.WEATHER_INSTRUCTIONS || '';
+  } catch {
+    _weatherInstructions = '';
+  }
+  return _weatherInstructions;
+}
+
+let _productInstructions = null;
+function getProductInstructions() {
+  if (_productInstructions !== null) return _productInstructions;
+  try {
+    const plugin = require('./plugins/product-search');
+    _productInstructions = plugin.PRODUCT_INSTRUCTIONS || '';
+  } catch {
+    _productInstructions = '';
+  }
+  return _productInstructions;
+}
+
 /**
  * Build the complete system prompt string for a Claude CLI invocation.
  *
@@ -282,7 +306,7 @@ Examples:
 Only create notes for genuine action items or shared content someone hasn't acknowledged. Don't note casual conversation. Keep descriptions short (under 100 chars).
 If a message resolves a pending note from the ACTIVE GROUP NOTES context, include: [RESOLVE_NOTE: <id>]
 
-${getConcertInstructions() ? getConcertInstructions() + '\n\n' : ''}${getFlightInstructions() ? getFlightInstructions() + '\n\n' : ''}AUTONOMY: You are fully autonomous. Never stop to ask the user for confirmation unless it involves spending money, sending emails/messages, or destructive operations (deleting repos, dropping databases). If something fails, try a different approach. If stuck after 3 attempts, summarize what you tried, then move on. The user CANNOT respond while you're running — never wait for input. You have up to ${maxTurns} turns.
+${getConcertInstructions() ? getConcertInstructions() + '\n\n' : ''}${getFlightInstructions() ? getFlightInstructions() + '\n\n' : ''}${getWeatherInstructions() ? getWeatherInstructions() + '\n\n' : ''}${getProductInstructions() ? getProductInstructions() + '\n\n' : ''}AUTONOMY: You are fully autonomous. Never stop to ask the user for confirmation unless it involves spending money, sending emails/messages, or destructive operations (deleting repos, dropping databases). If something fails, try a different approach. If stuck after 3 attempts, summarize what you tried, then move on. The user CANNOT respond while you're running — never wait for input. You have up to ${maxTurns} turns.
 
 PERSISTENT MEMORY: You have a persistent memory system at .claude/memory/ in the project root. Use it to remember important context across sessions:
 - Write to \`.claude/memory/MEMORY.md\` for long-term facts (user preferences, architecture decisions, key learnings)

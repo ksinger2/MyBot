@@ -330,6 +330,16 @@ class Runner {
         availableAgents: AVAILABLE_AGENTS,
       });
       if (systemPromptText) {
+        // Debug: log profile context presence to help diagnose location/calendar
+        // context not reaching Claude in group chats.
+        try {
+          const pcLen = profileContext ? profileContext.length : 0;
+          const hasLoc = profileContext ? /Location:\s*\S/.test(profileContext) : false;
+          const locMatch = profileContext ? (profileContext.match(/Location:\s*([^\n]+)/) || [])[1] : null;
+          const hasGcal = profileContext ? /Google Calendar:\s*connected/.test(profileContext) : false;
+          const spLen = systemPromptText.length;
+          console.log(`[runner] systemPrompt len=${spLen} profileContext len=${pcLen} hasLocation=${hasLoc} loc="${locMatch || ''}" gcalConn=${hasGcal}`);
+        } catch {}
         args.push('--append-system-prompt', systemPromptText);
       }
 

@@ -309,6 +309,25 @@ function removeTag(phone, label) {
  * Build a system-prompt snippet describing this user to Claude.
  * Injected into every Signal request so Claude knows who it's talking to.
  */
+function buildGroupMemberContext(phoneNumber) {
+  const profile = getProfile(phoneNumber);
+  if (!profile) return null;
+  const _s = (str, maxLen = 200) => {
+    if (!str || typeof str !== 'string') return '';
+    return str.replace(/[\[\]{}<>]/g, '').substring(0, maxLen).trim();
+  };
+  const lines = [`OTHER GROUP MEMBER (${phoneNumber}):`];
+  if (profile.name)     lines.push(`- Name: ${_s(profile.name, 50)}`);
+  if (profile.pronouns) lines.push(`- Pronouns: ${_s(profile.pronouns, 20)} — ALWAYS use these pronouns for this person.`);
+  if (profile.gcal_email && profile.gcal_connected) {
+    lines.push(`- Google Calendar: connected`);
+  }
+  if (profile.eightsleep_connected) {
+    lines.push(`- Eight Sleep: connected`);
+  }
+  return lines.join('\n');
+}
+
 function buildProfileContext(phoneNumber, { isGroupChat = false } = {}) {
   const profile = getProfile(phoneNumber);
   if (!profile) return null;
@@ -327,11 +346,12 @@ function buildProfileContext(phoneNumber, { isGroupChat = false } = {}) {
   if (profile.location) lines.push(`- Location: ${_s(profile.location, 100)}`);
   if (profile.timezone) lines.push(`- Timezone: ${_s(profile.timezone, 50)}`);
   if (profile.gcal_email && profile.gcal_connected) {
-    lines.push(`- Google Calendar: connected`);
+    lines.push(`- Google Calendar: connected (${profile.gcal_email})`);
+    lines.push(`CALENDAR ACCESS: This user's Google Calendar IS connected and queryable. When they ask "am I busy?", "what's on my calendar?", "do I have anything [day]?", etc., use the [CALENDAR:] tag to fetch their events. NEVER say "you're not connected" or "run !setup" — they already did.`);
+    lines.push(`  • Group chats (no Bash): emit the tag \`[CALENDAR: fromDate="YYYY-MM-DD" toDate="YYYY-MM-DD"]\` or bare \`[CALENDAR:]\` for today+7d. The system auto-injects the user's id and fetches events. Results are appended to your reply.`);
+    lines.push(`  • DMs (with Bash): same tag works, OR curl \`POST http://localhost:3400/calendar/events\` with body \`{"userId":"${profile.phone || '<sender phone>'}", "fromDate":"YYYY-MM-DD", "toDate":"YYYY-MM-DD"}\` and header \`X-Internal-Token: $INTERNAL_API_TOKEN\`. Use the sender's phone as userId.`);
     if (isGroupChat) {
-      lines.push(`PRIVACY: In group chats, NEVER reveal event titles or details from this user's calendar. Only say "${_s(profile.name, 50) || 'they'} is busy on [day] from [time] to [time]" — no event names, no descriptions, no attendees. Full calendar details are ONLY for private DMs with this user.`);
-    } else {
-      lines.push(`When this user asks about calendar events, use their Google Calendar (${profile.gcal_email}).`);
+      lines.push(`PRIVACY (groups only): When showing calendar results to a group, NEVER reveal event titles, descriptions, or attendees. Only say "${_s(profile.name, 50) || 'they'} is busy on [day] from [time] to [time]". Full titles/details are ONLY for private DMs with this user.`);
     }
   } else {
     lines.push(`- Google Calendar: not connected`);
@@ -423,6 +443,7 @@ module.exports = {
   getAllProfiles,
   deleteProfile,
   buildProfileContext,
+  buildGroupMemberContext,
   addPreference,
   removePreference,
   clearPreferences,

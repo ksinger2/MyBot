@@ -414,7 +414,7 @@ class ChannelProxy {
           return '';
         });
         // Strip all system tags before they reach the user (they get processed post-session)
-        cleaned = cleaned.replace(/\[(IMAGINE|LEARNED|NOTE|RESOLVE_NOTE|UPDATE_NOTES|CONCERT_PRICES|FLIGHT_SEARCH|FLIGHT_PRICE|EIGHTSLEEP|FLIGHT):\s*[^\]]*\]/gi, '').trim();
+        cleaned = cleaned.replace(/\[(IMAGINE|LEARNED|NOTE|RESOLVE_NOTE|UPDATE_NOTES|CONCERT_PRICES|FLIGHT_SEARCH|FLIGHT_PRICE|EIGHTSLEEP|FLIGHT|WEATHER|CALENDAR|PRODUCT):\s*[^\]]*\]/gi, '').trim();
         if (!cleaned) return Promise.resolve();
         return adapter.sendMessage(recipientChatId, cleaned);
       },
@@ -2066,11 +2066,16 @@ function startSignalAdapter() {
     if (result && result.id) {
       const state = channels.get(`signal:${chatId}`) || channels.get(chatId);
       if (state) {
-        state._lastBotTimestamp = Number(result.id) || null;
-        // Keep a rolling window of last 10 bot message timestamps
-        if (!state._recentBotTimestamps) state._recentBotTimestamps = [];
-        state._recentBotTimestamps.push(Number(result.id));
-        if (state._recentBotTimestamps.length > 10) state._recentBotTimestamps.shift();
+        const ts = Number(result.id) || null;
+        state._lastBotTimestamp = ts;
+        // Rolling window of last 30 outbound messages keyed by timestamp with
+        // text snapshot — reaction handler looks up the original message so
+        // 👍/👎 dispatches carry real context instead of a naked "yes"/"no".
+        if (!state._recentBotMessages) state._recentBotMessages = [];
+        if (ts != null) {
+          state._recentBotMessages.push({ ts, text: typeof text === 'string' ? text : '' });
+          if (state._recentBotMessages.length > 30) state._recentBotMessages.shift();
+        }
       }
     }
     return result;
@@ -2118,7 +2123,14 @@ function startSignalAdapter() {
 
     // Send read receipt so the sender sees blue double-check on Signal.
     // Best-effort, fire-and-forget — don't block message handling.
-    signalAdapter.sendReadReceipt(msg.senderId, msg.timestamp).catch(() => {});
+    // GROUP MESSAGES: skip entirely. The adapter's _isGroupId guard checks
+    // whether the RECIPIENT (the sender's phone) is a group id, which never
+    // fires — so without this check the bot was sending individual read
+    // receipts to every group member, which Signal surfaces as "Bianca read
+    // your message" in the group UI. Fail-closed at the call site.
+    if (!isGroupMessage) {
+      signalAdapter.sendReadReceipt(msg.senderId, msg.timestamp).catch(() => {});
+    }
 
     // Build a synthesized text body that includes attachment file paths so
     // Claude can Read them. The user reported that images sent over Signal
@@ -2348,20 +2360,36 @@ function startSignalAdapter() {
       const fakeMessage = createSignalMessageProxy(msg, chatId, state);
       // If we resolved a different senderId for the wizard, override the proxy
       if (wizardSenderId !== msg.senderId) fakeMessage._signalSenderId = wizardSenderId;
-      // Allow !cancel to escape the wizard
+      // Allow !cancel to explicitly escape the wizard (announces cancellation).
       if (text.toLowerCase() === '!cancel') {
         await cancelWizard(state, fakeMessage);
         return;
       }
-      try {
-        const handled = await handleWizardMessage(state, fakeMessage);
-        if (handled) return;
-      } catch (err) {
-        console.error(`[signal] wizard error: ${err.message}`);
-        state.wizard = null;
-        if (state.senderWizards) delete state.senderWizards[msg.senderId];
-        await signalAdapter.sendMessage(msg.chatId, `Wizard error: ${err.message.substring(0, 200)}. Cancelled.`);
-        return;
+      // Any OTHER !command also escapes — silently cancel the wizard and
+      // fall through to the command router below. This fixes the bug
+      // where a stuck wizard (from a prior broken run) would eat every
+      // subsequent command the user typed, making !concerts, !product,
+      // !prices etc. appear to do nothing.
+      // We check the raw text (after stripping mention prefix and
+      // attachment-note bleed) so the detection is consistent with the
+      // command router's own parsing below.
+      const cmdPeek = text.replace(/^@\S+\s+/, '').replace(/\n?\[The user attached \d+ file\(s\)[\s\S]*$/, '').trim();
+      if (cmdPeek.startsWith('!')) {
+        console.log(`[signal] command "${cmdPeek.split(/\s/)[0]}" arrived during active wizard — silently cancelling wizard`);
+        await cancelWizard(state, fakeMessage, { silent: true });
+        // Fall through to command router below. Do NOT return here.
+      } else {
+        // Normal wizard message consumption (plain text or wizard-expected input)
+        try {
+          const handled = await handleWizardMessage(state, fakeMessage);
+          if (handled) return;
+        } catch (err) {
+          console.error(`[signal] wizard error: ${err.message}`);
+          state.wizard = null;
+          if (state.senderWizards) delete state.senderWizards[msg.senderId];
+          await signalAdapter.sendMessage(msg.chatId, `Wizard error: ${err.message.substring(0, 200)}. Cancelled.`);
+          return;
+        }
       }
     }
 
@@ -2452,24 +2480,48 @@ function startSignalAdapter() {
     }
 
     // Only act if the reaction targets one of the bot's recent messages.
-    // Using a rolling window of last 10 timestamps so cost footers / queue
-    // confirmations don't overwrite the real content message timestamp.
-    const recentTs = state._recentBotTimestamps || (state._lastBotTimestamp ? [state._lastBotTimestamp] : []);
-    if (recentTs.length > 0 && !recentTs.includes(targetTimestamp)) return;
+    // Rolling window (30) of outbound messages keyed by timestamp.
+    // CRITICAL: reject any reaction that isn't a confirmed hit on a bot
+    // message — previously the check was `length > 0 && !hit`, which
+    // silently dispatched a naked "yes"/"no" whenever the cache was empty
+    // (right after container restart, or in chats where Bianca hadn't
+    // sent anything recently). That meant thumbs-ups on OTHER group
+    // members' messages would trigger Bianca responses. The fix: no hit,
+    // no dispatch.
+    const recent = state._recentBotMessages || [];
+    const hit = recent.find(m => m.ts === targetTimestamp);
+    if (!hit) {
+      console.log(`[signal] Reaction ${emoji} ignored — not on a bot message (cache: ${recent.length} entries, target ts=${targetTimestamp})`);
+      return;
+    }
 
-    console.log(`[signal] Reaction ${emoji} from ${senderId} in ${chatId} → dispatching "${answer}"`);
+    // Contextualize the synthetic message with the original bot message text
+    // so Claude knows WHAT was approved/rejected, not just a naked yes/no.
+    const origText = (hit.text || '').slice(0, 2000);
+    let syntheticText;
+    if (answer === 'yes') {
+      syntheticText = origText
+        ? `[Reaction: 👍 approval]\n\nIn reference to your previous message:\n"${origText}"\n\nI approve / thumbs up. Proceed with whatever action that message proposed.`
+        : 'yes';
+    } else {
+      syntheticText = origText
+        ? `[Reaction: 👎 rejection]\n\nIn reference to your previous message:\n"${origText}"\n\nI don't approve / thumbs down. Cancel or do not proceed with whatever that message proposed.`
+        : 'no';
+    }
+
+    console.log(`[signal] Reaction ${emoji} from ${senderId} in ${chatId} → dispatching "${answer}" (ctx=${origText ? origText.length + 'ch' : 'none'})`);
     const syntheticMsg = {
       chatId,
       senderId,
       senderName: senderId,
-      text: answer,
+      text: syntheticText,
       attachments: [],
       mentions: [],
       timestamp: Date.now(),
       raw: null,
     };
     state._triggeredByTimestamp = syntheticMsg.timestamp;
-    _dispatchSignalMessage(syntheticMsg, chatId, answer, state);
+    _dispatchSignalMessage(syntheticMsg, chatId, syntheticText, state);
   });
 
   // Handle "delete for everyone" in Signal — cancel queued/running task if triggered by this message
@@ -2750,9 +2802,10 @@ async function _dispatchSignalMessage(msg, chatId, text, state) {
             });
             console.log(`[signal] Group ${msg.chatId.substring(0, 8)}...: ${rawMembers.length} raw members → ${memberIds.length} resolved IDs: ${memberIds.map(m => m.startsWith('+') ? m.slice(0,4)+'****' : m.slice(0,8)+'...').join(', ')}`);
             const memberContexts = [];
+            const { buildGroupMemberContext } = require('./user-profiles');
             for (const mid of memberIds) {
-              const ctx = buildProfileContext(mid, { isGroupChat: true });
-              if (ctx) memberContexts.push(ctx.replace('USER PROFILE (this message is from', 'OTHER GROUP MEMBER ('));
+              const ctx = buildGroupMemberContext(mid);
+              if (ctx) memberContexts.push(ctx);
               else console.log(`[signal] No profile context for member: ${mid.startsWith('+') ? mid.slice(0,4)+'****' : mid.slice(0,8)+'...'}`);
             }
             if (memberContexts.length > 0) {
@@ -2956,21 +3009,13 @@ async function _dispatchSignalMessage(msg, chatId, text, state) {
       const updateNotesRe = /\[UPDATE_NOTES:\s*@?(\S+)\s+(?:noteTitle="([^"]+)"\s+)?([\s\S]+?)\]/gi;
       let notesMatch;
       while ((notesMatch = updateNotesRe.exec(result.text || '')) !== null) {
-        const targetId = notesMatch[1].trim();
+        // SECURITY: Always use msg.senderId — never trust Claude's target userId.
+        // Claude's output is ignored for identity; only noteTitle and content are used.
+        const resolvedId = msg.senderId;
         const noteTitle = (notesMatch[2] || 'Notes').trim();
         const newContent = notesMatch[3].trim().substring(0, 10000);
         try {
           const { setProfile, getProfile: _gp } = require('./user-profiles');
-          let resolvedId = targetId;
-          if (!_gp(targetId)) {
-            const cached = _groupInfoCache.get(msg.chatId);
-            if (cached?.members) {
-              for (const mid of cached.members) {
-                const p = _gp(mid);
-                if (p?.name?.toLowerCase() === targetId.toLowerCase()) { resolvedId = mid; break; }
-              }
-            }
-          }
           const profile = _gp(resolvedId);
           if (profile) {
             let notes = Array.isArray(profile.notes) ? [...profile.notes]
@@ -3084,6 +3129,128 @@ async function _dispatchSignalMessage(msg, chatId, text, state) {
         }
         // Strip the tags (but keep the appended price results)
         result.text = (result.text || '').replace(concertRe, '').trim();
+      }
+
+      // [CALENDAR:] tag extraction — read the sender's Google Calendar events
+      // via the per-user OAuth token.
+      //
+      // SECURITY / DETERMINISM (CLAUDE.md rule): userId and isGroupChat are
+      // NEVER taken from Claude's output — they come from msg.senderId and
+      // the live chat context, and are re-asserted AFTER parsing Claude's
+      // params so Claude's output cannot overwrite them.
+      //
+      // Concrete attack this blocks: Claude in a group chat emits
+      //   `[CALENDAR: isGroupChat=""]`
+      // Empty string is falsy on the server, which would then return full
+      // event titles (leaking psychiatrist appointments, etc). Same for
+      //   `[CALENDAR: userId="+1..."]`
+      // which could try to fetch another member's calendar. The clobber
+      // lines below make both attacks impossible — parse Claude's output
+      // first, then overwrite the sensitive fields with trusted values.
+      const calendarRe = /\[CALENDAR:\s*(.*?)\]/gi;
+      const calendarMatches = [...(result.text || '').matchAll(calendarRe)];
+      if (calendarMatches.length > 0 && msg?.senderId) {
+        try {
+          const http = require('http');
+          for (const match of calendarMatches) {
+            const raw = (match[1] || '').trim();
+            // Parse Claude's params first (date range is the only thing
+            // Claude is allowed to influence)…
+            const params = {};
+            raw.replace(/(\w+)="([^"]+)"/g, (_, k, v) => { params[k] = v; });
+            // …then clobber the sensitive fields with trusted values.
+            // Order matters: these assignments run AFTER the parse loop
+            // so anything Claude emitted for userId/isGroupChat is
+            // discarded. `!!isGroupChat` coerces to a strict boolean so
+            // "" / "false" / undefined all collapse correctly.
+            params.userId = msg.senderId;
+            params.isGroupChat = !!isGroupChat;
+            try {
+              const body = JSON.stringify(params);
+              const calResult = await new Promise((resolve, reject) => {
+                const req = http.request({
+                  hostname: 'localhost', port: 3400, path: '/calendar/events',
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json', 'X-Internal-Token': process.env.INTERNAL_API_TOKEN || '', 'Content-Length': Buffer.byteLength(body) },
+                  timeout: 15000,
+                }, (res) => {
+                  let data = '';
+                  res.on('data', c => data += c);
+                  res.on('end', () => { try { resolve(JSON.parse(data)); } catch { resolve({ text: data }); } });
+                });
+                req.on('error', reject);
+                req.on('timeout', () => { req.destroy(); reject(new Error('timeout')); });
+                req.write(body); req.end();
+              });
+              if (calResult?.text) {
+                await signalAdapter.sendMessage(msg.chatId, calResult.text);
+                console.log(`[calendar-tag] ${msg.senderId.slice(0,4)}**** events ${params.fromDate || 'today'}..${params.toDate || '+7d'} (${calResult.count ?? '?'})`);
+              }
+            } catch (e) { console.warn(`[calendar-tag] lookup failed: ${e.message}`); }
+          }
+        } catch (e) { console.warn(`[calendar-tag] plugin error: ${e.message}`); }
+        result.text = (result.text || '').replace(calendarRe, '').trim();
+      }
+
+      // [PRODUCT:] tag extraction — multi-store product search (Tier 1+2 free).
+      // Format: [PRODUCT: query="dove 0% aluminum deodorant" wantPrices=true]
+      // Or shorthand: [PRODUCT: dove 0% aluminum deodorant]
+      const productRe = /\[PRODUCT:\s*(.+?)\]/gi;
+      const productMatches = [...(result.text || '').matchAll(productRe)];
+      if (productMatches.length > 0) {
+        try {
+          const productPlugin = require('./plugins/product-search');
+          for (const match of productMatches) {
+            const raw = match[1].trim();
+            const params = {};
+            raw.replace(/(\w+)="([^"]+)"/g, (_, k, v) => { params[k] = v; });
+            // Shorthand: bare query
+            if (!params.query && !raw.includes('=')) params.query = raw;
+            if (!params.query) continue;
+            try {
+              const text = await productPlugin.searchProducts(params.query, {
+                wantPrices: params.wantPrices === 'true',
+              });
+              if (text) {
+                await signalAdapter.sendMessage(msg.chatId, text);
+                console.log(`[product-tag] search "${params.query.slice(0, 50)}"`);
+              }
+            } catch (e) { console.warn(`[product-tag] lookup failed: ${e.message}`); }
+          }
+        } catch (e) { console.warn(`[product-tag] plugin error: ${e.message}`); }
+        result.text = (result.text || '').replace(productRe, '').trim();
+      }
+
+      // [WEATHER:] tag extraction — Open-Meteo forecast without Bash.
+      // Format: [WEATHER: location="Alameda CA" fromDate="YYYY-MM-DD" toDate="YYYY-MM-DD"]
+      // Or shorthand: [WEATHER: Alameda CA]
+      const weatherRe = /\[WEATHER:\s*(.+?)\]/gi;
+      const weatherMatches = [...(result.text || '').matchAll(weatherRe)];
+      if (weatherMatches.length > 0) {
+        try {
+          const weatherPlugin = require('./plugins/weather');
+          for (const match of weatherMatches) {
+            const raw = match[1].trim();
+            const params = {};
+            // Parse key="value" pairs
+            raw.replace(/(\w+)="([^"]+)"/g, (_, k, v) => { params[k] = v; });
+            // Shorthand: bare location with no key=value
+            if (!params.location && !raw.includes('=')) params.location = raw;
+            if (!params.location) continue;
+            try {
+              const text = await weatherPlugin.getForecast(
+                params.location,
+                params.fromDate || null,
+                params.toDate || null,
+              );
+              if (text) {
+                await signalAdapter.sendMessage(msg.chatId, text);
+                console.log(`[weather-tag] forecast for ${params.location} ${params.fromDate || ''}..${params.toDate || ''}`);
+              }
+            } catch (e) { console.warn(`[weather-tag] lookup failed: ${e.message}`); }
+          }
+        } catch (e) { console.warn(`[weather-tag] plugin error: ${e.message}`); }
+        result.text = (result.text || '').replace(weatherRe, '').trim();
       }
 
       // [FLIGHT_SEARCH:] tag extraction — search Google Flights and record snapshot.
@@ -3233,8 +3400,8 @@ async function _dispatchSignalMessage(msg, chatId, text, state) {
             await registerFlight({
               ...fi,
               groupId: msg.chatId,
-              traveler: fi.traveler || msg.senderId,
-              travelerName: fi.travelerName || msg.senderName || (getProfile(msg.senderId) || {}).name || null,
+              traveler: msg.senderId,
+              travelerName: msg.senderName || (getProfile(msg.senderId) || {}).name || null,
               groupMembers: members,
             }, async (groupId, text, opts) => {
               if (signalAdapter && signalAdapter.ready) {

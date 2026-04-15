@@ -21,7 +21,7 @@ function loadSchedules() {
   return readStore().schedules;
 }
 
-function addSchedule({ userId, channelId, message, cronRule, description, type, cwd, timezone }) {
+function addSchedule({ userId, channelId, message, cronRule, description, type, subtype, payload, cwd, timezone }) {
   const store = readStore();
   const schedule = {
     id: store.nextId++,
@@ -31,6 +31,12 @@ function addSchedule({ userId, channelId, message, cronRule, description, type, 
     cronRule,
     description,
     type: type || 'reminder',
+    // subtype + payload are the deterministic-dispatch hooks. When set,
+    // the scheduler routes to a typed handler (e.g. concert-tracker)
+    // that pre-fetches real data server-side and never lets Claude
+    // invent results. See scheduler.js for dispatch.
+    subtype: subtype || null,
+    payload: payload || null,
     cwd: cwd || null,
     timezone: timezone || 'America/Los_Angeles',
     createdAt: new Date().toISOString(),
@@ -67,7 +73,7 @@ function updateSchedule(id, userId, fields) {
   const store = readStore();
   const sched = store.schedules.find(s => s.id === id && s.userId === userId);
   if (!sched) return null;
-  const allowed = ['message', 'cronRule', 'description', 'active', 'timezone'];
+  const allowed = ['message', 'cronRule', 'description', 'active', 'timezone', 'subtype', 'payload'];
   for (const key of allowed) {
     if (key in fields) sched[key] = fields[key];
   }

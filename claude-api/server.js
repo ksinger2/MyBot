@@ -929,16 +929,36 @@ app.get('/auth/spotify/callback', async (req, res) => {
   if (!code || !state) return res.status(400).send('Missing code or state parameter.');
   try {
     const spotifyAuth = require('./spotify-auth');
+    // Synchronous phase: consume state, exchange code, save tokens, mark
+    // profile connected. This is fast (~1-2s).
     const result = await spotifyAuth.handleCallback(code, state);
     const returnUrl = _oauthReturnUrls.get(result.userId);
     if (returnUrl) _oauthReturnUrls.delete(result.userId);
     const redirectScript = returnUrl
       ? `<script>setTimeout(()=>window.location.href='${returnUrl}',1500)</script>`
       : '';
-    res.send(`<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Spotify Connected</title><style>body{font-family:-apple-system,sans-serif;max-width:480px;margin:60px auto;padding:0 20px;text-align:center;}</style></head><body><h1 style="color:#1DB954;">Spotify Connected!</h1><p>${escapeHtml(result.displayName)} is now linked.</p><p style="color:#666;font-size:14px;">Your top artists have been imported.${returnUrl ? ' Returning to setup...' : ''}</p>${redirectScript}</body></html>`);
+    // Respond to the browser IMMEDIATELY so the user doesn't time out and
+    // accidentally reload the callback with an already-consumed state.
+    res.send(`<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Spotify Connected</title><style>body{font-family:-apple-system,sans-serif;max-width:480px;margin:60px auto;padding:0 20px;text-align:center;}</style></head><body><h1 style="color:#1DB954;">Spotify Connected!</h1><p>${escapeHtml(result.displayName)} is now linked.</p><p style="color:#666;font-size:14px;">Importing your artists in the background — this takes 30–120 seconds for large libraries. Feel free to close this tab.${returnUrl ? ' Returning to setup...' : ''}</p>${redirectScript}</body></html>`);
+
+    // Async phase (fire-and-forget): import artists in the background.
+    // For users with 500+ followed/liked tracks, this can take minutes of
+    // sequential Spotify API calls. We intentionally don't await it — the
+    // response has already been sent, and any errors are captured in the
+    // result.errors array that importUserArtists returns.
+    setImmediate(async () => {
+      try {
+        const importResult = await spotifyAuth.importUserArtists(result.userId, result.accessToken);
+        console.log(`[spotify] Background import for ${result.userId.slice(0, 6)}…: imported=${importResult.imported} upgraded=${importResult.upgraded || 0} unique=${importResult.unique} errors=${importResult.errors.length ? importResult.errors.join('|').slice(0, 300) : 'none'}`);
+      } catch (err) {
+        console.error(`[spotify] Background import failed for ${result.userId.slice(0, 6)}…:`, err.message);
+      }
+    });
   } catch (err) {
     console.error('Spotify OAuth callback error:', err.message);
-    res.status(500).send(`<h2>Spotify authorization failed</h2><p>${escapeHtml(err.message)}</p>`);
+    if (!res.headersSent) {
+      res.status(500).send(`<h2>Spotify authorization failed</h2><p>${escapeHtml(err.message)}</p>`);
+    }
   }
 });
 
@@ -1919,6 +1939,166 @@ app.post('/concerts/prices', requireInternalToken, async (req, res) => {
     res.json({ text });
   } catch (err) {
     console.error('[concerts/prices] error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── Per-user Google Calendar events ───────────────────────────────────────
+// Bianca's system prompt was telling her "Google Calendar: connected" based
+// on profile data, but there was no bridge for her to actually READ the
+// user's calendar — the MCP tools `mcp__claude_ai_Google_Calendar__list_events`
+// authenticate against Claude's hosted Google account, NOT the per-user
+// OAuth tokens stored by the bot's setup flow. So she kept saying "you're
+// not connected" despite `gcal_connected=true`. This endpoint fixes the
+// gap — it takes the user's id (phone number for Signal), fetches events
+// via the authenticated google-auth client, and returns a plain-text
+// summary formatted for chat use.
+app.post('/calendar/events', requireInternalToken, async (req, res) => {
+  const { userId, fromDate, toDate, isGroupChat } = req.body || {};
+  if (!userId) return res.status(400).json({ error: 'userId is required' });
+
+  // FAIL-CLOSED privacy gate: event titles + locations are redacted UNLESS
+  // the caller explicitly passes the strict boolean `false`. Absence of the
+  // field, string "true"/"false", `null`, or any other value → treated as
+  // group chat → redacted. This is defense-in-depth. The primary trust
+  // boundary is in bot.js's tag handler (which clobbers the field with the
+  // live chat context before calling this endpoint), but if any future
+  // caller forgets to pass the flag or passes it loosely, we fail safe.
+  //
+  // Translation: you have to opt OUT of redaction, not opt IN.
+  const redactTitles = (isGroupChat !== false);
+
+  try {
+    const googleAuth = require('./google-auth');
+    const calendar = await googleAuth.getCalendarClient(userId);
+    if (!calendar) {
+      return res.json({
+        text: 'Calendar not connected for this user. Run `!setup` and link Google Calendar.',
+        connected: false,
+      });
+    }
+
+    // Default to today through 7 days from today.
+    const now = new Date();
+    const todayStr = now.toISOString().slice(0, 10);
+    const from = fromDate || todayStr;
+    let to = toDate;
+    if (!to) {
+      const d = new Date(from + 'T00:00:00Z');
+      d.setUTCDate(d.getUTCDate() + 7);
+      to = d.toISOString().slice(0, 10);
+    }
+
+    // timeMin / timeMax want full ISO datetimes in UTC. Expand the local
+    // day range to cover the full days in the user's (presumed) timezone.
+    const timeMin = new Date(from + 'T00:00:00Z').toISOString();
+    // +1 day on the end so we include the entire `to` day.
+    const endDate = new Date(to + 'T00:00:00Z');
+    endDate.setUTCDate(endDate.getUTCDate() + 1);
+    const timeMax = endDate.toISOString();
+
+    const resp = await calendar.events.list({
+      calendarId: 'primary',
+      timeMin,
+      timeMax,
+      singleEvents: true,
+      orderBy: 'startTime',
+      maxResults: 50,
+    });
+
+    const events = resp.data.items || [];
+    if (events.length === 0) {
+      return res.json({
+        text: `No events on calendar between ${from} and ${to}. Totally free.`,
+        connected: true,
+        count: 0,
+      });
+    }
+
+    const lines = events.map(ev => {
+      const start = ev.start?.dateTime || ev.start?.date || '';
+      const end = ev.end?.dateTime || ev.end?.date || '';
+      const title = ev.summary || '(no title)';
+      const location = ev.location ? ` @ ${ev.location}` : '';
+      const startTz = ev.start?.timeZone || 'America/Los_Angeles';
+      let when = start;
+      if (ev.start?.dateTime) {
+        try {
+          const d = new Date(start);
+          when = d.toLocaleString('en-US', {
+            weekday: 'short', month: 'short', day: 'numeric',
+            hour: 'numeric', minute: '2-digit', timeZone: startTz,
+          });
+          if (end && ev.end?.dateTime) {
+            const de = new Date(end);
+            const endTime = de.toLocaleString('en-US', {
+              hour: 'numeric', minute: '2-digit', timeZone: startTz,
+            });
+            when += `–${endTime}`;
+          }
+        } catch {}
+      } else if (ev.start?.date) {
+        when = `${ev.start.date} (all day)`;
+      }
+      if (redactTitles) {
+        return `• ${when}: Busy`;
+      }
+      return `• ${when}: ${title}${location}`;
+    });
+
+    res.json({
+      text: [`Events ${from} → ${to}:`, ...lines].join('\n'),
+      connected: true,
+      count: events.length,
+      events: events.map(ev => ({
+        id: ev.id,
+        title: redactTitles ? 'Busy' : (ev.summary || null),
+        start: ev.start?.dateTime || ev.start?.date || null,
+        end: ev.end?.dateTime || ev.end?.date || null,
+        location: redactTitles ? null : (ev.location || null),
+      })),
+    });
+  } catch (err) {
+    console.error('[calendar/events] error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── Product search (DDG HTML scrape + search URLs) ────────────────────────
+// Replaces Bianca's prior "I can't pull up Amazon links" refusals with a
+// deterministic, multi-store product search that always returns at least
+// the three store search URLs even if the DDG scrape comes back empty.
+app.post('/products/search', requireInternalToken, async (req, res) => {
+  const { query, wantPrices, stores } = req.body || {};
+  if (!query) return res.status(400).json({ error: 'query is required' });
+  try {
+    const plugin = require('./plugins/product-search');
+    const text = await plugin.searchProducts(query, {
+      wantPrices: !!wantPrices,
+      stores: Array.isArray(stores) ? stores : null,
+    });
+    res.json({ text });
+  } catch (err) {
+    console.error('[products/search] error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── Weather (Open-Meteo) ──────────────────────────────────────────────────
+// Structured JSON forecast, 16-day range, no API key. Replaces the
+// brittle WebSearch/WebFetch scraping of weather.gov HTML that was
+// returning wrong temperatures (monthly averages from content farms).
+app.post('/weather', requireInternalToken, async (req, res) => {
+  const { location, fromDate, toDate } = req.body || {};
+  if (!location) {
+    return res.status(400).json({ error: 'location is required' });
+  }
+  try {
+    const plugin = require('./plugins/weather');
+    const text = await plugin.getForecast(location, fromDate || null, toDate || null);
+    res.json({ text });
+  } catch (err) {
+    console.error('[weather] error:', err.message);
     res.status(500).json({ error: err.message });
   }
 });

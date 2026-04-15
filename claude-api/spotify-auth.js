@@ -71,6 +71,7 @@ const SCOPES = [
   'user-library-modify',
   'user-follow-read',
   'user-follow-modify',
+  'user-read-recently-played',
   'ugc-image-upload',
 ];
 
@@ -149,17 +150,33 @@ async function handleCallback(code, state) {
     isPremium,
   });
 
-  // Mark profile as Spotify-connected and auto-import artists as tags.
+  // Mark the profile connected synchronously so the setup page reflects
+  // the state immediately when the callback returns.
   try {
     const userProfiles = require('./user-profiles');
     userProfiles.setProfile(discordUserId, { spotify_connected: true, spotify_email: email, spotify_user_id: spotifyUserId });
-    const result = await importUserArtists(discordUserId, tokens.access_token);
-    console.log(`[spotify] Auto-imported ${result.imported} new artist tag(s) (${result.unique} unique from Spotify; sources: top=${result.sources.top} followed=${result.sources.followed} liked=${result.sources.liked} albums=${result.sources.albums}; errors=${result.errors.length ? result.errors.join('|') : 'none'})`);
   } catch (err) {
-    console.warn(`[spotify] Could not auto-tag artists: ${err.message}`);
+    console.warn(`[spotify] setProfile post-connect failed: ${err.message}`);
   }
 
-  return { userId: discordUserId, displayName, email, spotifyUserId, isPremium };
+  // NOTE: artist import is NOT awaited here. For users with large
+  // libraries (500+ followed/liked), the import takes 30-120s of
+  // sequential API calls. Awaiting it here blocks the HTTP response to
+  // the OAuth callback — the browser times out, the user reloads, and
+  // the retry hits the same callback URL with a state token that's
+  // already been consumed (one-time use), producing "OAuth state not
+  // found or expired". The caller (server.js) is responsible for
+  // kicking off importUserArtists() in the background AFTER it has
+  // responded to the browser.
+
+  return {
+    userId: discordUserId,
+    displayName,
+    email,
+    spotifyUserId,
+    isPremium,
+    accessToken: tokens.access_token, // passed through so caller can kick off import without re-auth
+  };
 }
 
 /**
@@ -179,38 +196,83 @@ async function importUserArtists(userId, accessToken) {
   const token = accessToken || await getAccessToken(userId);
   if (!token) throw new Error('no spotify token for user');
 
+  // Fetch profile once; mutate in-memory; write once at the end. This
+  // avoids ~500 disk writes per run and lets us *upgrade* an existing
+  // non-Artist tag (e.g. "Jack Johnson" stored as 'Custom' from a prior
+  // !remember) in place instead of hitting the label-dedup block in
+  // userProfiles.addTag and silently dropping the import.
+  const profile = userProfiles.getProfile(userId) || {};
+  if (!profile.tags) profile.tags = [];
+  const tagsByLabel = new Map();
+  for (const t of profile.tags) tagsByLabel.set(t.label.toLowerCase(), t);
+
   const seen = new Set();
   let imported = 0;
-  const sources = { top: 0, followed: 0, liked: 0, albums: 0, recent: 0, playlists: 0 };
+  let upgraded = 0;
+  // raw = how many names the Spotify API returned from this source (pre-dedup)
+  // added = how many of those were NEW (not already seen in an earlier source)
+  const sources = {
+    top:       { raw: 0, added: 0 },
+    followed:  { raw: 0, added: 0 },
+    liked:     { raw: 0, added: 0 },
+    albums:    { raw: 0, added: 0 },
+    recent:    { raw: 0, added: 0 },
+    playlists: { raw: 0, added: 0 },
+  };
   const errors = [];
 
   const tryAdd = (name, bucket) => {
+    if (!name) return;
+    sources[bucket].raw++;
     const key = name.toLowerCase();
     if (seen.has(key)) return;
     seen.add(key);
-    sources[bucket]++;
-    if (userProfiles.addTag(userId, name, 'Artist')) imported++;
+    sources[bucket].added++;
+
+    const existing = tagsByLabel.get(key);
+    if (existing) {
+      // Spotify is authoritative for "is this an artist?" — upgrade the
+      // category if a tag with this label already exists under some other
+      // category (usually 'Custom' from conversation-learned memories).
+      if (existing.category !== 'Artist') {
+        existing.category = 'Artist';
+        upgraded++;
+      }
+      return;
+    }
+
+    const normalizedLabel = name.trim().substring(0, 100);
+    if (!normalizedLabel) return;
+    if (profile.tags.length >= 500) return;
+    const tag = { label: normalizedLabel, category: 'Artist', addedAt: new Date().toISOString() };
+    profile.tags.push(tag);
+    tagsByLabel.set(key, tag);
+    imported++;
   };
 
   for (const range of ['short_term', 'medium_term', 'long_term']) {
     try {
       const top = await spotifyApi(token, 'GET', `me/top/artists?time_range=${range}&limit=50`);
       for (const a of (top.items || [])) tryAdd(a.name, 'top');
-    } catch (e) { errors.push(`top-${range}: ${e.message.slice(0, 80)}`); }
+    } catch (e) { errors.push(`top-${range}: ${e.message.slice(0, 200)}`); }
   }
 
   try {
     let after = null;
+    let pagesFetched = 0;
     for (let page = 0; page < 20; page++) {
       const url = `me/following?type=artist&limit=50${after ? '&after=' + after : ''}`;
       const followed = await spotifyApi(token, 'GET', url);
       const items = followed.artists?.items || [];
+      pagesFetched++;
       if (items.length === 0) break;
       for (const a of items) tryAdd(a.name, 'followed');
-      after = items[items.length - 1]?.id;
+      // Prefer the cursor from the API response; fall back to last item id.
+      after = followed.artists?.cursors?.after || items[items.length - 1]?.id;
       if (!followed.artists?.next) break;
     }
-  } catch (e) { errors.push(`followed: ${e.message.slice(0, 80)}`); }
+    if (pagesFetched > 0) errors.push(`followed: ok (${pagesFetched}p)`);
+  } catch (e) { errors.push(`followed: ${e.message.slice(0, 200)}`); }
 
   try {
     for (let offset = 0; offset < 2000; offset += 50) {
@@ -222,7 +284,7 @@ async function importUserArtists(userId, accessToken) {
       }
       if (!saved.next) break;
     }
-  } catch (e) { errors.push(`liked: ${e.message.slice(0, 80)}`); }
+  } catch (e) { errors.push(`liked: ${e.message.slice(0, 200)}`); }
 
   try {
     for (let offset = 0; offset < 1000; offset += 50) {
@@ -234,49 +296,33 @@ async function importUserArtists(userId, accessToken) {
       }
       if (!albums.next) break;
     }
-  } catch (e) { errors.push(`albums: ${e.message.slice(0, 80)}`); }
+  } catch (e) { errors.push(`albums: ${e.message.slice(0, 200)}`); }
 
   // Recently-played: last 50 tracks the user listened to. Catches artists
   // that aren't in top/followed/liked yet (Daily Mix, radio, autoplay).
+  // Requires user-read-recently-played scope.
   try {
     const recent = await spotifyApi(token, 'GET', `me/player/recently-played?limit=50`);
     for (const item of (recent.items || [])) {
       for (const a of (item.track?.artists || [])) tryAdd(a.name, 'recent');
     }
-  } catch (e) { errors.push(`recent: ${e.message.slice(0, 80)}`); }
+  } catch (e) { errors.push(`recent: ${e.message.slice(0, 200).replace(/\s+/g, ' ')}`); }
 
-  // Playlists: scan tracks in the user's owned + followed playlists. This
-  // is the catch-all for artists that live in curated collections but were
-  // never explicitly followed/liked/saved.
-  try {
-    const playlists = [];
-    for (let offset = 0; offset < 200; offset += 50) {
-      const page = await spotifyApi(token, 'GET', `me/playlists?limit=50&offset=${offset}`);
-      const items = page.items || [];
-      if (items.length === 0) break;
-      playlists.push(...items);
-      if (!page.next) break;
-    }
-    // Cap scan to the first 40 playlists to bound API cost / rate-limit risk.
-    for (const pl of playlists.slice(0, 40)) {
-      if (!pl?.id) continue;
-      try {
-        for (let offset = 0; offset < 500; offset += 100) {
-          const tracks = await spotifyApi(token, 'GET', `playlists/${pl.id}/tracks?limit=100&offset=${offset}&fields=items(track(artists(name))),next`);
-          const items = tracks.items || [];
-          if (items.length === 0) break;
-          for (const item of items) {
-            for (const a of (item.track?.artists || [])) {
-              if (a?.name) tryAdd(a.name, 'playlists');
-            }
-          }
-          if (!tracks.next) break;
-        }
-      } catch (e) { errors.push(`playlist-${pl.id.slice(0, 6)}: ${e.message.slice(0, 60)}`); }
-    }
-  } catch (e) { errors.push(`playlists: ${e.message.slice(0, 80)}`); }
+  // Playlists source is disabled: on 2024-11-27, Spotify restricted
+  // GET /playlists/{id}/tracks to apps in Extended Quota Mode only (along
+  // with audio-features, recommendations, related-artists, etc). Personal
+  // apps 403 on every playlist tracks call, even on the user's own private
+  // playlists. Confirmed by testing — playlist *metadata* works but the
+  // /tracks endpoint does not. Keeping the `playlists` source key in the
+  // returned shape so existing callers don't break; it will just report
+  // raw=0, added=0 always.
 
-  const summary = { imported, unique: seen.size, sources, errors };
+  // Single write at the end — all adds and category upgrades persist here.
+  if (imported > 0 || upgraded > 0) {
+    userProfiles.setProfile(userId, profile);
+  }
+
+  const summary = { imported, upgraded, unique: seen.size, sources, errors };
   console.log(`[spotify] importUserArtists(${userId.slice(0, 6)}…): ${JSON.stringify(summary)}`);
   return summary;
 }

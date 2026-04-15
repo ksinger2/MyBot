@@ -15,6 +15,8 @@ module.exports = {
       `\`!schedule\` \`!schedules\` \`!unschedule\` \`!autoschedule\`\n` +
       `\`!queue\` \`!queued\` \`!dequeue\`\n` +
       `\`!monitor\` \`!monitors\`\n` +
+      `\`!concerts\` \`!prices\` \`!setalert\` \`!alerts\` \`!removealert\` \`!track\` \`!concerttracker\`\n` +
+      `\`!product\` \`!search\`\n` +
       `\`!briefing\` \`!weekly\` \`!email\` \`!help\` \`!commands\`\n\n` +
       `Use \`!help\` for detailed descriptions.`
     );

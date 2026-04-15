@@ -21,6 +21,15 @@ module.exports = {
         `\`!personality <name>\` — Switch my vibe\n` +
         `\`!personalities\` — See available vibes\n` +
         `\`!unlock <pin>\` — Unlock code editing (admin)\n\n` +
+        `**Concerts:**\n` +
+        `\`!concerts [artist]\` — See upcoming shows for your tracked artists\n` +
+        `\`!prices <artist>\` — Compare ticket prices across sites\n` +
+        `\`!setalert <show> $<price>\` — Get notified when tickets drop\n` +
+        `\`!alerts\` — View your price alerts\n` +
+        `\`!removealert <# or name>\` — Cancel a price alert\n` +
+        `\`!track\` — View/edit your tracked artist list\n\n` +
+        `**Shopping:**\n` +
+        `\`!product <query>\` — Find product links & compare prices\n\n` +
         `**Pro tip:** You don't need commands for most things. Just ask!\n` +
         `"draw me a sunset" • "summarize this TikTok" • "when can we all hang out?" • "remind me tomorrow at 3pm" • "find me earbuds under $50"`;
       const reply = ctx._dreply || ((m, t) => m.reply(t));
@@ -54,7 +63,9 @@ module.exports = {
       `**Services:** \`!services\` · \`!service stop|logs <name>\`\n` +
       `**Config:** \`!config show|turns|continues|timeout <N>\`\n` +
       `**Security:** \`!unlock <pin>\` · \`!permit\` · \`!revoke\` · \`!perms\`\n` +
-      `**Profile:** \`!profile\` · \`!remember\` · \`!forget\` · \`!deleteme\`\n\n` +
+      `**Profile:** \`!profile\` · \`!remember\` · \`!forget\` · \`!deleteme\`\n` +
+      `**Concerts:** \`!concerts\` · \`!prices\` · \`!setalert\` · \`!alerts\` · \`!removealert\` · \`!track\` · \`!concerttracker\`\n` +
+      `**Shopping:** \`!product\` / \`!search\` — find & compare products\n\n` +
       `Just type what you want built. Use \`!stop\` to interrupt.\n\n` +
       `Current: **${state.identity?.name || 'Bot'}** | ${state.personality || 'default'} | \`${state.cwd}\` | ${state.busy ? '🔄 WORKING' : (state.sessionId ? '💤 idle' : '⚫ no session')}`;
     await ctx.sendLongMessage(message, helpText, state.cwd);

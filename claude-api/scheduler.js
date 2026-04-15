@@ -1,18 +1,39 @@
 const schedule = require('node-schedule');
-const { loadSchedules } = require('./schedules-storage');
+const { loadSchedules, updateSchedule } = require('./schedules-storage');
 
 // Track active jobs so we can cancel them
 const activeJobs = new Map(); // scheduleId -> node-schedule Job
 
 /**
- * Start all saved schedules on bot startup
+ * Start all saved schedules on bot startup.
+ *
+ * SAFETY: Any legacy "Concert Price Tracker" schedule that lacks
+ * `subtype === 'concert-tracker'` is force-disabled here. The legacy
+ * format stored a free-text prompt that was fed to Claude, which led
+ * to hallucinated concerts (including shows by dead artists). Until
+ * the user re-runs the !concerttracker wizard (which now writes a
+ * structured payload), these rows must NOT fire. Belt + suspenders:
+ * the dispatch handler also rejects them.
  */
 function startAllSchedules(client) {
   const schedules = loadSchedules();
   console.log(`Loading ${schedules.length} saved schedule(s)...`);
   for (const sched of schedules) {
+    if (_isLegacyConcertTracker(sched)) {
+      if (sched.active) {
+        console.warn(`  Schedule #${sched.id}: "${sched.description}" — LEGACY concert-tracker (no payload), force-disabling. User must re-run !concerttracker.`);
+        try { updateSchedule(sched.id, sched.userId, { active: false }); } catch {}
+        sched.active = false;
+      }
+    }
     registerJob(sched, client);
   }
+}
+
+function _isLegacyConcertTracker(sched) {
+  if (sched.subtype === 'concert-tracker') return false; // new format, OK
+  if (typeof sched.description !== 'string') return false;
+  return sched.description.startsWith('Concert Price Tracker');
 }
 
 /**
@@ -33,7 +54,29 @@ function registerJob(sched, client) {
       if (current && !current.active) return;
 
       if (sched.type === 'dm-task') {
-        // Run prompt through Claude, send result to user's DM
+        // ── DETERMINISTIC DISPATCH for typed dm-tasks ────────────
+        // Subtype-tagged jobs route to a typed handler that hits real
+        // data sources server-side. Claude is NEVER invoked, so there
+        // is no fabrication path. Per CLAUDE.md's Determinism Rule:
+        // "Prompt instructions are UI polish only — not a reliability
+        // mechanism."
+        if (sched.subtype === 'concert-tracker') {
+          try {
+            await runConcertTrackerJob(sched);
+          } catch (err) {
+            console.error(`[concert-tracker] Job #${sched.id} failed: ${err.message}`);
+          }
+          return;
+        }
+        // Hard-stop legacy concert tracker schedules at dispatch
+        // even if startup safeguard somehow missed them.
+        if (_isLegacyConcertTracker(sched)) {
+          console.warn(`[dm-task] Skipping legacy concert tracker schedule #${sched.id} — no payload, would hallucinate. Disabling.`);
+          try { updateSchedule(sched.id, sched.userId, { active: false }); } catch {}
+          return;
+        }
+
+        // Generic dm-task: run prompt through Claude, send to DM.
         const isSignal = sched.userId.startsWith('+');
         try {
           const { askClaude, signalAdapter } = require('./bot');
@@ -169,6 +212,243 @@ function registerJob(sched, client) {
 /**
  * Cancel and remove a job from the active tracker
  */
+/**
+ * Deterministic concert-tracker dispatch.
+ *
+ * Reads the schedule's structured payload, looks up the user's curated
+ * artist list, queries Ticketmaster directly via findUpcomingShows(),
+ * formats a Signal/Discord-ready message, and sends it. Claude is
+ * never invoked in this loop. Dead artists return zero shows from TM
+ * and fall into the "no upcoming shows" bucket — the dead-artist
+ * hallucination bug is fixed as a side effect of using a real source.
+ *
+ * Failure modes — all handled honestly, NEVER by guessing:
+ *   - No TM API key       → DM the user that key is missing
+ *   - No curated list     → DM telling them to run !concerttracker
+ *   - Zero shows found    → DM "no upcoming shows" (with the artist
+ *                            count so they know we actually checked)
+ *   - findUpcomingShows() error → log + skip this run, no DM (don't
+ *                                  spam the user with infra errors)
+ */
+async function runConcertTrackerJob(sched) {
+  const { getProfile } = require('./user-profiles');
+  const { findUpcomingShows } = require('./plugins/concert-tracker/find-shows');
+
+  const userId = sched.userId;
+  const isSignal = typeof userId === 'string' && userId.startsWith('+');
+  const payload = sched.payload || {};
+  const profile = getProfile(userId) || {};
+
+  // Resolve artists. Default behavior: use the curated list at fire
+  // time so `!track add/remove` edits propagate without re-running
+  // the wizard. Fallback: payload.artistsOverride.
+  let artists = null;
+  if (payload.useCuratedList !== false) {
+    artists = Array.isArray(profile.concert_tracker_artists)
+      ? profile.concert_tracker_artists
+      : null;
+  }
+  if ((!artists || artists.length === 0) && Array.isArray(payload.artistsOverride)) {
+    artists = payload.artistsOverride;
+  }
+
+  if (!artists || artists.length === 0) {
+    await _sendUserMessage(
+      sched,
+      `Concert tracker fired but you have no tracked artists. Run \`!concerttracker\` or \`!track add <artist>\` to set one up.`,
+    );
+    return;
+  }
+
+  const location = payload.location || profile.location || null;
+  if (!location) {
+    await _sendUserMessage(
+      sched,
+      `Concert tracker fired but I don't know your location. Set it via \`!setup\` or re-run \`!concerttracker\`.`,
+    );
+    return;
+  }
+
+  const radiusMiles = payload.radiusMiles || 50;
+  const lookAheadMonths = payload.lookAheadMonths || 3;
+  const perArtistLimit = payload.perArtistLimit || 5;
+  const priceThresholds = Array.isArray(payload.priceThresholds) ? payload.priceThresholds : [];
+
+  console.log(`[concert-tracker] Job #${sched.id} firing for ${isSignal ? 'Signal' : 'Discord'} user — ${artists.length} artists, ${location}, ${radiusMiles}mi`);
+
+  const result = await findUpcomingShows({
+    artists,
+    location,
+    radiusMiles,
+    perArtistLimit,
+    lookAheadMonths,
+    cap: false, // curated lists are honored in full
+  });
+
+  if (!result.ok) {
+    if (result.reason === 'no-ticketmaster-key') {
+      await _sendUserMessage(sched, `Concert tracker can't run — TICKETMASTER_API_KEY is not set on the bot. (Free key at developer.ticketmaster.com.)`);
+    } else {
+      console.warn(`[concert-tracker] Job #${sched.id} unsuccessful: ${result.reason}`);
+    }
+    return;
+  }
+
+  if (result.shows.length === 0) {
+    await _sendUserMessage(
+      sched,
+      `🎵 **Concert check** — searched all ${result.searchedArtists.length} of your tracked artists across Ticketmaster. **No upcoming shows within ${result.radiusMiles} miles of ${result.city || location} in the next ${result.lookAheadMonths} months.**\n\nThey may be touring elsewhere — try \`!concerts <artist>\` for a wider search, or update your list with \`!track add/remove\`.`,
+    );
+    console.log(`[concert-tracker] Job #${sched.id}: 0 shows found across ${result.searchedArtists.length} artists`);
+    return;
+  }
+
+  const messages = _formatConcertTrackerMessage(result, priceThresholds);
+  for (const msg of messages) {
+    await _sendUserMessage(sched, msg);
+  }
+  console.log(`[concert-tracker] Job #${sched.id}: ${result.shows.length} shows across ${result.withShowsCount} artists, ${result.noShowArtists.length} no-shows, ${messages.length} message(s) sent`);
+}
+
+/**
+ * Format a findUpcomingShows() result into one or more Signal/Discord
+ * messages, splitting on artist boundaries to avoid mid-artist cuts.
+ * Returns an array of strings — caller sends each one in order.
+ *
+ * Includes Ticketmaster face-value price ranges per show (these come
+ * from `priceMin`/`priceMax` on the formatted event). If a show's
+ * floor price is under any of `priceThresholds`, it's flagged with a
+ * 🚨 ALERT marker. No external scrapers — just TM data — to keep the
+ * scheduled path 100% deterministic.
+ */
+function _formatConcertTrackerMessage(result, priceThresholds = []) {
+  const sortedThresholds = [...priceThresholds].sort((a, b) => a - b);
+
+  const header = [
+    `🎵 **Upcoming concerts for your tracked artists**`,
+    `📍 ${result.radiusMiles}mi of ${result.city || result.location} · next ${result.lookAheadMonths} months`,
+    `✅ ${result.withShowsCount} of ${result.searchedArtists.length} artists with shows · ${result.shows.length} total events`,
+  ];
+  if (sortedThresholds.length > 0) {
+    header.push(`💰 Alerting under: $${sortedThresholds.join(', $')}`);
+  }
+  header.push('');
+
+  const body = [];
+  let alertCount = 0;
+  for (const [artist, shows] of result.byArtist) {
+    body.push(`**${artist}**`);
+    for (const s of shows) {
+      let priceStr = '';
+      if (s.priceMin != null) {
+        priceStr = ` · $${Math.round(s.priceMin)}${s.priceMax != null && s.priceMax > s.priceMin ? `–$${Math.round(s.priceMax)}` : ''}`;
+      }
+      let alertStr = '';
+      if (s.priceMin != null && sortedThresholds.length > 0) {
+        const hits = sortedThresholds.filter(t => s.priceMin <= t);
+        if (hits.length > 0) {
+          alertStr = ` 🚨 under $${hits[0]}`;
+          alertCount++;
+        }
+      }
+      body.push(`  • ${s.date}${s.time} — ${s.venueName}${s.loc ? ` (${s.loc})` : ''}${priceStr}${alertStr}`);
+      if (s.url) body.push(`    ${s.url}`);
+    }
+  }
+
+  // Insert alert summary near top of header if any
+  if (alertCount > 0) {
+    header.splice(3, 0, `🚨 ${alertCount} show${alertCount === 1 ? '' : 's'} under your alert threshold!`);
+  }
+
+  const footer = [
+    '',
+    '_Prices are Ticketmaster face-value (no fees, no resale). Use `!prices <artist>` for resale market._',
+    'Edit your list with `!track add/remove`, or run `!concerttracker` to reconfigure.',
+  ];
+
+  let noShowTail = [];
+  if (result.noShowArtists.length > 0) {
+    noShowTail = ['', `_No current shows: ${result.noShowArtists.join(', ')}_`];
+  }
+
+  // Build single-message view + chunk if needed. Same chunking
+  // strategy as commands/concerts.js — split on artist boundaries.
+  const allLines = [...header, ...body, ...footer, ...noShowTail];
+  const fullLen = allLines.reduce((n, l) => n + l.length + 1, 0);
+  if (fullLen <= 1900) {
+    return [allLines.join('\n')];
+  }
+
+  const messages = [];
+  messages.push(header.join('\n'));
+
+  const artistBlocks = [];
+  let currentBlock = [];
+  for (const line of body) {
+    if (line.startsWith('**') && currentBlock.length > 0) {
+      artistBlocks.push(currentBlock.join('\n'));
+      currentBlock = [line];
+    } else {
+      currentBlock.push(line);
+    }
+  }
+  if (currentBlock.length > 0) artistBlocks.push(currentBlock.join('\n'));
+
+  let buffer = '';
+  for (const block of artistBlocks) {
+    if (buffer && (buffer.length + block.length + 2) > 1800) {
+      messages.push(buffer);
+      buffer = block;
+    } else {
+      buffer = buffer ? buffer + '\n\n' + block : block;
+    }
+  }
+  if (buffer) messages.push(buffer);
+  messages.push([...footer, ...noShowTail].join('\n').trim());
+  return messages;
+}
+
+/**
+ * Send a plain text message to a scheduled job's user via Signal or
+ * Discord. Lazy-requires bot.js to avoid bootstrap order issues.
+ * Best-effort — logs and continues on any error.
+ */
+async function _sendUserMessage(sched, text) {
+  const isSignal = typeof sched.userId === 'string' && sched.userId.startsWith('+');
+  try {
+    if (isSignal) {
+      const { signalAdapter } = require('./bot');
+      if (signalAdapter && signalAdapter.ready) {
+        await signalAdapter.sendLongMessage(sched.userId, text);
+      } else {
+        console.warn(`[concert-tracker] signal adapter not ready, dropping message for #${sched.id}`);
+      }
+    } else {
+      // Discord path — send via the bot client. Falls back to no-op
+      // if the user can't be DMed (privacy settings, etc) or if
+      // Discord is disabled in this build (Signal-only mode).
+      const { client } = require('./bot');
+      if (!client || !client.users || !client.users.fetch) return;
+      const user = await client.users.fetch(sched.userId).catch(() => null);
+      if (!user) return;
+      const dm = await user.createDM().catch(() => null);
+      if (!dm) return;
+      // Discord 2000-char limit
+      let remaining = text;
+      while (remaining.length > 0) {
+        const cut = remaining.length <= 1900
+          ? remaining.length
+          : (remaining.lastIndexOf('\n', 1900) > 500 ? remaining.lastIndexOf('\n', 1900) : 1900);
+        await dm.send(remaining.substring(0, cut));
+        remaining = remaining.substring(cut);
+      }
+    }
+  } catch (err) {
+    console.warn(`[concert-tracker] _sendUserMessage failed for #${sched.id}: ${err.message}`);
+  }
+}
+
 function cancelJob(scheduleId) {
   const job = activeJobs.get(scheduleId);
   if (job) {
@@ -185,4 +465,12 @@ function cancelUserJobs(userId) {
   }
 }
 
-module.exports = { startAllSchedules, registerJob, cancelJob, cancelUserJobs };
+module.exports = {
+  startAllSchedules,
+  registerJob,
+  cancelJob,
+  cancelUserJobs,
+  // Exported for direct invocation by tests + smoke checks.
+  runConcertTrackerJob,
+  _formatConcertTrackerMessage,
+};

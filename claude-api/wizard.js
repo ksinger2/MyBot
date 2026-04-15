@@ -30,6 +30,7 @@ function _makeWiz(def) {
     data: { ...(def.initialData || {}) },
     steps: def.steps,
     onComplete: def.onComplete,
+    onCancel: def.onCancel, // optional: called with partial data on early exit
     silent: !!def.silent,
   };
 }
@@ -60,24 +61,39 @@ async function handleWizardMessage(state, message) {
 /**
  * Cancel any active wizard for the current sender (or channel-wide).
  */
-async function cancelWizard(state, message) {
+async function cancelWizard(state, message, { silent = false } = {}) {
   const senderId = message._signalSenderId || message.author?.id;
+
+  // Best-effort partial-state save hook. Runs BEFORE the wizard is
+  // deleted so onCancel can see wiz.data in its final collected shape.
+  // Errors are logged, not thrown — we never want cancel to fail.
+  const flushOnCancel = async (wiz) => {
+    if (!wiz || typeof wiz.onCancel !== 'function') return;
+    try {
+      await wiz.onCancel({ ...wiz.data }, message, state);
+    } catch (err) {
+      console.warn(`[wizard] ${wiz.type} onCancel failed: ${err.message}`);
+    }
+  };
 
   // Cancel per-sender wizard if there is one for this sender
   if (senderId && state.senderWizards && state.senderWizards[senderId]) {
-    const type = state.senderWizards[senderId].type;
+    const wiz = state.senderWizards[senderId];
+    const type = wiz.type;
+    await flushOnCancel(wiz);
     delete state.senderWizards[senderId];
-    await message.reply(`Cancelled **${type}** setup.`);
+    if (!silent) await message.reply(`Cancelled **${type}** setup.`);
     return;
   }
 
   if (!state.wizard) {
-    await message.reply('Nothing to cancel.');
+    if (!silent) await message.reply('Nothing to cancel.');
     return;
   }
   const type = state.wizard.type;
+  await flushOnCancel(state.wizard);
   state.wizard = null;
-  await message.reply(`Cancelled **${type}** wizard.`);
+  if (!silent) await message.reply(`Cancelled **${type}** wizard.`);
 }
 
 // ─── Internal helpers ─────────────────────────────────────────────────────────
