@@ -365,6 +365,7 @@ class Runner {
         identity,
         personalityFile,
         readOnly,
+        isGroupChat: !!groupAllowedTools,
         profileContext,
         discordUserId,
         maxTurns,
