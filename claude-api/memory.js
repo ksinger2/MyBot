@@ -49,19 +49,6 @@ function loadMemory(cwd) {
     } catch {}
   }
 
-  // Load yesterday's daily notes
-  const yesterday = new Date(Date.now() - 86400000).toISOString().split('T')[0];
-  const yesterdayPath = path.join(cwd, MEMORY_DIR, `${yesterday}.md`);
-  if (fs.existsSync(yesterdayPath)) {
-    try {
-      let content = fs.readFileSync(yesterdayPath, 'utf-8').trim();
-      if (content) {
-        if (content.length > MAX_DAILY_CHARS) content = content.substring(0, MAX_DAILY_CHARS) + '\n...(truncated)';
-        parts.push(`[Yesterday's Notes — ${yesterday}.md]\n${content}`);
-      }
-    } catch {}
-  }
-
   return parts.length ? parts.join('\n\n') : '';
 }
 

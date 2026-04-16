@@ -79,7 +79,7 @@ function shouldGroupImmediately(text) {
   if (MESSAGE_GROUP_DELAY_MS === 0) return true;
   const t = (text || '').trim();
   if (/[?!.…]$/.test(t)) return true;
-  if (t.length > 120) return true;
+  if (t.length > 60) return true;  // Most single thoughts are complete at 60 chars
   return false;
 }
 
@@ -194,7 +194,7 @@ const MAX_LOOP_WALLCLOCK_MS = parseInt(process.env.MAX_LOOP_WALLCLOCK_MS, 10) ||
 const MAX_LOOP_ITERATIONS_PER_DAY = parseInt(process.env.MAX_LOOP_ITERATIONS_PER_DAY, 10) || 200;
 // Message grouping debounce — wait this many ms for follow-up messages before
 // dispatching. Set MESSAGE_GROUP_DELAY_MS=0 to disable.
-const MESSAGE_GROUP_DELAY_MS = parseInt(process.env.MESSAGE_GROUP_DELAY_MS, 10) || 2500;
+const MESSAGE_GROUP_DELAY_MS = parseInt(process.env.MESSAGE_GROUP_DELAY_MS, 10) || 800;
 // M3: in-memory per-channel iteration counter, keyed by UTC date. Resets on
 // day rollover. Map<channelId, { date: 'YYYY-MM-DD', count: number }>.
 const _loopIterationsToday = new Map();
@@ -763,19 +763,48 @@ async function runClaudeWithContinuation(prompt, opts, channelProxy) {
   // Don't auto-continue in group chats (short tasks, noisy for non-technical users)
   const isGroupContext = opts.channelState?._isGroupChat;
 
+  // Context refresh: every REFRESH_EVERY continuations, save progress to NextSteps.md,
+  // end the session, and start fresh. Prevents context bloat and stale-loop issues.
+  const REFRESH_EVERY = 3;
+
   while (result.hitTurnLimit && continueCount < maxContinues && !result.stopped && !isGroupContext) {
     continueCount++;
-    // Only show debug messages to the owner in DM contexts (not groups, not other users)
     const isOwnerDm = channelProxy.platform === 'discord' || (opts.channelState && !opts.channelState._isGroupChat);
-    if (isOwnerDm) {
-      await channelProxy.send(
-        `*Turn limit reached (${continueCount}/${maxContinues}) — auto-continuing...*`
-      ).catch(() => {});
+
+    // Checkpoint & restart: save to NextSteps.md → kill session → fresh start
+    if (continueCount % REFRESH_EVERY === 0 && continueCount < maxContinues) {
+      if (isOwnerDm) {
+        await channelProxy.send(
+          `*Context refresh (${continueCount}/${maxContinues}) — saving progress and restarting with clean context...*`
+        ).catch(() => {});
+      }
+      // Step 1: Tell Claude to save progress
+      try {
+        const saveResult = await askClaude(
+          'CHECKPOINT: Update NextSteps.md NOW with your current progress — what you accomplished, what\'s working, what\'s broken, and specific next steps to continue. Bullet points only, be concise. This is a mid-task checkpoint.',
+          { ...opts, sessionId: result.sessionId, maxTurns: 2 }
+        );
+        totalCost += saveResult.cost || 0;
+        totalTurns += saveResult.numTurns || 0;
+        if (saveResult.streamed) anyStreamed = true;
+      } catch {}
+      // Step 2: Start fresh session (no sessionId — runner.js auto-injects NextSteps.md + CLAUDE.md)
+      result = await askClaude(
+        'Continue working on the current task. Check NextSteps.md for context on where you left off. Do NOT re-trigger any rebuild or restart actions mentioned there — those were already handled. Focus on the original user request. If the task is complete, say DONE.',
+        { ...opts } // NO sessionId = fresh context
+      );
+    } else {
+      // Normal continuation within the same session
+      if (isOwnerDm) {
+        await channelProxy.send(
+          `*Turn limit reached (${continueCount}/${maxContinues}) — auto-continuing...*`
+        ).catch(() => {});
+      }
+      result = await askClaude(
+        'You hit the turn limit. Continue where you left off. If the task is complete, say DONE and do not add anything else.',
+        { ...opts, sessionId: result.sessionId }
+      );
     }
-    result = await askClaude(
-      'You hit the turn limit. Continue where you left off. If the task is complete, say DONE and do not add anything else.',
-      { ...opts, sessionId: result.sessionId }
-    );
     totalCost += result.cost || 0;
     totalTurns += result.numTurns || 0;
     if (result.streamed) anyStreamed = true;
@@ -1082,6 +1111,17 @@ client.on('clientReady', () => {
 
   // Restore persisted channel states from previous container lifecycle
   _savedChannelStates = loadAllChannelStates();
+  // After a rebuild, clear all session IDs so conversations start fresh.
+  // Stale sessions contain the pre-rebuild conversation history which can
+  // include instructions like "rebuild" that cause infinite rebuild loops.
+  if (_startupMarkers.wasRebuild) {
+    for (const state of Object.values(_savedChannelStates)) {
+      if (state.sessionId) {
+        console.log(`[rebuild] Clearing stale sessionId for fresh start`);
+        state.sessionId = null;
+      }
+    }
+  }
   const savedCount = Object.keys(_savedChannelStates).length;
   if (savedCount > 0) {
     console.log(`Restored ${savedCount} channel state(s) from persistence`);
@@ -2736,7 +2776,7 @@ function startSignalAdapter() {
 }
 
 async function _dispatchSignalMessage(msg, chatId, text, state) {
-  const { buildProfileContext, getProfile } = require('./user-profiles');
+  const { buildMinimalProfileContext, buildProfileLookup, buildProfileContext, getProfile } = require('./user-profiles');
   const { isSignalOwner } = require('./project-permissions');
   const isGroupMessage = msg.chatId !== msg.senderId;
   const senderIsOwner = isSignalOwner(msg.senderId);
@@ -2772,10 +2812,24 @@ async function _dispatchSignalMessage(msg, chatId, text, state) {
 
       const signalProxy = ChannelProxy.fromSignal(signalAdapter, msg.chatId);
 
-      // Build profile context. For 1:1 messages, just the sender. For group
-      // messages, also list all OTHER known members of the group so the bot
-      // can answer things like "plan for us" using everyone's calendars.
-      let combinedProfileContext = buildProfileContext(msg.senderId, { isGroupChat: isGroupMessage });
+      // Build profile context. DMs use minimal profile + heuristic on-demand
+      // data injection. Groups use the existing stripped path.
+      let combinedProfileContext = buildMinimalProfileContext(msg.senderId, { isGroupChat: isGroupMessage });
+      // Heuristic: inject heavy profile data only when message likely needs it
+      if (!isGroupMessage && text) {
+        const lowerText = text.toLowerCase();
+        const extraFields = [];
+        if (/\b(concert|ticket|music|artist|show|tour|live|gig|setlist|spotify|festival|!concerts|!prices|!setalert)\b/.test(lowerText)) {
+          extraFields.push('artists');
+        }
+        if (/\b(note|list|saved|restaurant|remember|wrote down|my\s+(?:list|notes?))\b/.test(lowerText)) {
+          extraFields.push('notes');
+        }
+        if (extraFields.length > 0) {
+          const lookup = buildProfileLookup(msg.senderId, extraFields);
+          if (lookup) combinedProfileContext = (combinedProfileContext || '') + '\n\n' + lookup;
+        }
+      }
       // (isGroupMessage already declared above in the access control block)
       if (isGroupMessage) {
         try {
@@ -3495,7 +3549,7 @@ async function _dispatchSignalMessage(msg, chatId, text, state) {
           if (isSignalOwner(msg.senderId) && !isGroupChat) {
             const http = require('http');
             try {
-              await new Promise((resolve, reject) => {
+              const rebuildResult = await new Promise((resolve, reject) => {
                 const req = http.request({
                   hostname: 'localhost', port: 3400, path: '/rebuild',
                   method: 'POST',
@@ -3504,13 +3558,24 @@ async function _dispatchSignalMessage(msg, chatId, text, state) {
                 }, (res) => {
                   let data = '';
                   res.on('data', c => data += c);
-                  res.on('end', () => { try { resolve(JSON.parse(data)); } catch { resolve({ text: data }); } });
+                  res.on('end', () => {
+                    try { resolve({ status: res.statusCode, ...JSON.parse(data) }); }
+                    catch { resolve({ status: res.statusCode, text: data }); }
+                  });
                 });
                 req.on('error', reject);
                 req.on('timeout', () => { req.destroy(); reject(new Error('timeout')); });
                 req.end();
               });
-              console.log(`[rebuild-tag] triggered by ${msg.senderId.slice(0,4)}****`);
+              if (rebuildResult.status === 400 && rebuildResult.error) {
+                // NextSteps.md gate or syntax check blocked the rebuild — notify the user
+                console.warn(`[rebuild-tag] blocked by server: ${rebuildResult.error}`);
+                await signalAdapter.sendMessage(msg.chatId,
+                  `⚠️ Rebuild blocked: ${rebuildResult.error}`
+                ).catch(() => {});
+              } else {
+                console.log(`[rebuild-tag] triggered by ${msg.senderId.slice(0,4)}****`);
+              }
             } catch (e) { console.warn(`[rebuild-tag] failed: ${e.message}`); }
           } else {
             console.warn(`[rebuild-tag] denied — sender ${msg.senderId.slice(0,4)}**** is not owner or in group chat`);

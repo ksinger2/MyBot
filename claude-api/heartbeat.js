@@ -34,8 +34,18 @@ function buildHeartbeatPrompt(cwd) {
   const orders = loadStandingOrders(cwd);
   const nextStepsPath = path.join(cwd, 'NextSteps.md');
   let nextSteps = '';
+  let stalePrefix = '';
   if (fs.existsSync(nextStepsPath)) {
     try { nextSteps = fs.readFileSync(nextStepsPath, 'utf-8').trim(); } catch {}
+    if (nextSteps) {
+      try {
+        const ageHours = (Date.now() - fs.statSync(nextStepsPath).mtimeMs) / 3.6e6;
+        if (ageHours >= 24) {
+          const d = Math.floor(ageHours / 24), h = Math.round(ageHours % 24);
+          stalePrefix = `[STALE — last updated ${d}d ${h}h ago. Do NOT blindly execute these items — verify they are still relevant.]\n`;
+        }
+      } catch {}
+    }
   }
 
   const parts = [
@@ -46,7 +56,16 @@ function buildHeartbeatPrompt(cwd) {
   ];
 
   if (orders) parts.push(`\n[Standing Orders — AGENTS.md]\n${orders}`);
-  if (nextSteps) parts.push(`\n[Project State — NextSteps.md]\n${nextSteps.substring(0, 4000)}`);
+  if (nextSteps) {
+    // Sanitize rebuild-triggering phrases so heartbeat doesn't re-execute them
+    let sanitized = nextSteps.substring(0, 4000)
+      .replace(/\[REBUILD\]/gi, '[rebuild-tag]')
+      .replace(/\byes\s+rebuild\b/gi, '(user confirmed rebuild)')
+      .replace(/\bdo\s+rebuild\b/gi, '(rebuild was requested)')
+      .replace(/\bneed(?:s)?\s+(?:to\s+)?rebuild\b/gi, '(rebuild was noted)')
+      .replace(/\brebuild\s+(?:needed|required|next)\b/gi, '(rebuild was noted)');
+    parts.push(`\n[Project State — NextSteps.md — READ-ONLY, do NOT execute rebuild/restart actions listed here]\n${stalePrefix}${sanitized}`);
+  }
 
   return parts.join('\n');
 }
