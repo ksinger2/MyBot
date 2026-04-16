@@ -175,20 +175,8 @@ async function checkFlightPrices(origin, destination, date, { airline = 'Delta',
  * System prompt instructions for Claude.
  */
 const FLIGHT_INSTRUCTIONS = `
-FLIGHT PRICE TRACKING: You can check and track flight prices via Google Flights.
-
-Use these tags at the END of your response (system handles them automatically):
-[FLIGHT_SEARCH: origin=SFO destination=JFK date=2026-05-15 airline=Delta]
-- origin/destination: airport codes (required)
-- date: YYYY-MM-DD (required)
-- airline: filter to specific airline (optional, defaults to showing all)
-- returnDate: YYYY-MM-DD for round trip (optional)
-
-The system searches Google Flights, records the price snapshot for trend tracking, and appends results to your message. Each subsequent check for the same route shows price trends ("↓ $15 cheaper", "prices rising").
-
-When the user asks about their tracked flights, check all routes and report trends.
-For "track this flight" requests, set up a scheduled job via !setup that runs the search periodically.
-`.trim();
+**FLIGHT PRICES**: \`[FLIGHT_SEARCH: origin=SFO destination=JFK date=YYYY-MM-DD]\` Optional: airline=Delta, returnDate=YYYY-MM-DD. System searches Google Flights and tracks price trends.
+Re-queries show trends ("↓ $15 cheaper", "prices rising"). When user asks about tracked flights, check all routes and report trends.`.trim();
 
 module.exports = {
   recordSnapshot,

@@ -237,22 +237,8 @@ function _addDays(yyyymmdd, n) {
 // ── System prompt instructions ────────────────────────────────────────────────
 
 const WEATHER_INSTRUCTIONS = `
-**WEATHER**: When the user asks about weather, temperature, forecast, "should I go to X outside", "will it rain", etc., use the weather tag instead of WebSearch/WebFetch. WebSearch returns stale monthly averages from content farms; the plugin hits Open-Meteo (official, no API key, 16-day forecast) and returns real structured data.
-
-There is exactly ONE way to invoke this — output the tag. There is NO curl alternative; you do not have credentials for /weather.
-
-\`[WEATHER: location="Alameda CA" fromDate="2026-04-18" toDate="2026-04-19"]\`
-
-Or shorthand with just a location:
-\`[WEATHER: Alameda CA]\`
-
-Parameters:
-- \`location\` — required, free-form string (use the user's profile location by default)
-- \`fromDate\` — optional YYYY-MM-DD, defaults to today
-- \`toDate\` — optional YYYY-MM-DD, defaults to \`fromDate\` + 6 days
-
-The system calls the plugin and appends the formatted forecast to your response — you don't need to wait for or parse a response, just emit the tag and write a short natural sentence around it.
-
-When the user asks about weather for "this weekend", "next weekend", "tomorrow", "this week" — resolve the date range yourself using the current date injected above, then pass absolute \`fromDate\`/\`toDate\` values. Never pass relative dates — Open-Meteo only understands YYYY-MM-DD.`.trim();
+**WEATHER**: Use the weather tag (NOT WebSearch) for forecasts. Hits Open-Meteo with real data.
+\`[WEATHER: location="Alameda CA" fromDate="YYYY-MM-DD" toDate="YYYY-MM-DD"]\` or \`[WEATHER: Alameda CA]\`
+location required, dates optional (defaults: today + 6 days). NEVER pass relative dates — Open-Meteo only understands YYYY-MM-DD. Resolve "this weekend", "tomorrow", "next week" to absolute dates using the current date injected above.`.trim();
 
 module.exports = { geocode, getForecast, WEATHER_INSTRUCTIONS };

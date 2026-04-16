@@ -663,6 +663,41 @@ app.post('/rebuild', requireInternalToken, async (req, res) => {
   const APP_DIR = '/workspace/MyBot/claude-api';
   const COMPOSE_FILE = '/workspace/MyBot/docker-compose.yml';
 
+  // 0. DETERMINISM: NextSteps.md must have real content before rebuild.
+  // Without this gate, Claude can emit [REBUILD] without saving session
+  // context, and the rebuild wipes NextSteps.md → context lost forever.
+  // The caller can pass skipNextStepsCheck=true for force-rebuild scenarios.
+  if (req.body?.skipNextStepsCheck) {
+    console.warn('[rebuild] NextSteps.md check SKIPPED via skipNextStepsCheck flag');
+  }
+  if (!req.body?.skipNextStepsCheck) {
+    const nsPath = path.join('/workspace/MyBot', 'NextSteps.md');
+    try {
+      const nsContent = fs.readFileSync(nsPath, 'utf-8');
+      // Strip HTML comments, markdown headers, and whitespace — if nothing
+      // substantive remains, NextSteps.md was never updated this session.
+      const stripped = nsContent
+        .replace(/<!--[\s\S]*?-->/g, '')
+        .replace(/^#+\s.*$/gm, '')
+        .replace(/\s+/g, '')
+        .trim();
+      if (!stripped) {
+        console.warn('[rebuild] BLOCKED — NextSteps.md has no substantive content');
+        return res.status(400).json({
+          ok: false,
+          error: 'NextSteps.md must be updated before rebuild — update it with current session progress first',
+        });
+      }
+    } catch (e) {
+      // If the file doesn't exist at all, that also counts as "not updated"
+      console.warn(`[rebuild] BLOCKED — NextSteps.md unreadable: ${e.message}`);
+      return res.status(400).json({
+        ok: false,
+        error: 'NextSteps.md must exist and be updated before rebuild',
+      });
+    }
+  }
+
   // 1. Syntax check every .js file
   let jsFiles = [];
   try {
@@ -752,11 +787,79 @@ app.post('/rebuild', requireInternalToken, async (req, res) => {
           for (const state of Object.values(diskStates)) captureChannelState(state);
         }
       } catch {}
-      if (pendingItems.length > 0) {
-        fs.writeFileSync(path.join('/home/node/.claude', '.pending-work'), pendingItems.join('\n'));
+      // Drop "In progress:" items — the active task IS the one that triggered
+      // the rebuild, so it's complete. Only queued items should survive.
+      // Without this filter, the raw user prompt (e.g. "yes rebuild") gets
+      // re-dispatched as a synthetic message on startup → infinite rebuild loop.
+      const safeItems = pendingItems.filter(l => !l.startsWith('In progress: '));
+      if (safeItems.length > 0) {
+        fs.writeFileSync(path.join('/home/node/.claude', '.pending-work'), safeItems.join('\n'));
       }
     } catch {}
   } catch {}
+
+  // 3b. DETERMINISTIC LOOP PREVENTION — wipe all sources of stale instructions
+  // before the container dies. Without this, the new session reads old context
+  // ("yes rebuild", "do X") and re-executes it, causing infinite rebuild loops.
+  try {
+    // (a) Snapshot NextSteps.md before resetting — the gate in step 0 already
+    // verified it has content, so this preserves the session context for the
+    // rebuild-complete DM and future debugging.
+    const nextStepsPath = path.join('/workspace/MyBot', 'NextSteps.md');
+    try {
+      const currentContent = fs.readFileSync(nextStepsPath, 'utf-8');
+      if (currentContent.trim()) {
+        fs.writeFileSync(path.join('/home/node/.claude', '.last-nextsteps'), currentContent);
+        console.log('[rebuild] Snapshotted NextSteps.md → .last-nextsteps');
+      }
+    } catch (e) {
+      console.warn(`[rebuild] NextSteps.md snapshot failed: ${e.message}`);
+    }
+
+    // (a2) Reset NextSteps.md for the current project to its clean template.
+    // Runner.js auto-injects NextSteps.md into every new session — stale content
+    // like "rebuild" gets re-interpreted as an instruction.
+    const cleanTemplate = `# MyBot — Next Steps
+
+<!--
+Session handoff document. Updated automatically during long sessions
+and at the end of each session. Keeps the next session from looping
+on stale work.
+
+RULES:
+- Bullet points only, no essays
+- Always include a date stamp in section headers
+- Clear completed items — don't let them accumulate
+- If nothing is broken or pending, say so explicitly
+-->
+
+## What's Working
+<!-- Updated each session -->
+
+## What's Broken / In Progress
+<!-- Active issues, blockers, half-done work -->
+
+## Next Steps
+<!-- Prioritized — what to pick up next -->
+`;
+    fs.writeFileSync(nextStepsPath, cleanTemplate);
+    console.log('[rebuild] Reset NextSteps.md to clean template');
+  } catch (e) {
+    console.warn(`[rebuild] NextSteps.md reset failed: ${e.message}`);
+  }
+
+  try {
+    // (b) Clear session journal — it records promptSummary (the user's raw message)
+    // which gets injected as "[Session history — Last session — Asked: yes rebuild]".
+    // The new session interprets that as an instruction and loops.
+    const journalFile = path.join('/home/node/.claude', 'session-journal.json');
+    if (fs.existsSync(journalFile)) {
+      fs.writeFileSync(journalFile, '{}');
+      console.log('[rebuild] Cleared session journal');
+    }
+  } catch (e) {
+    console.warn(`[rebuild] Session journal clear failed: ${e.message}`);
+  }
 
   // L4: validate HOST_PROJECT_PATH before we commit to spawning anything.
   // Even though flipping this env var requires container access, validating

@@ -120,31 +120,7 @@ async function getPrices(artist, venue, date, city) {
 // ── System prompt instructions ────────────────────────────────────────────────
 
 const SCRAPER_INSTRUCTIONS = `
-10. **CONCERT TICKET PRICES**: When the user asks about concert tickets, cheapest tickets for a show, ticket prices, or whether it's worth going to a concert, you can get real scraped prices from 5 ticket sites (StubHub, VividSeats, TickPick, SeatGeek, Ticketmaster) by emitting this tag:
-
-\`[CONCERT_PRICES: artist="Chappell Roan" venue="Chase Center" date="2026-05-15" city="San Francisco"]\`
-
-Or just the artist:
-\`[CONCERT_PRICES: Chappell Roan]\`
-
-Parameters (all optional except artist):
-- \`artist\` — artist/band name (required)
-- \`venue\`  — venue name (omit if unknown)
-- \`date\`   — show date as YYYY-MM-DD (omit if unknown)
-- \`city\`   — city name (omit if unknown)
-
-There is NO curl alternative — the system calls the scraper and appends the formatted price list (with fee disclosure: StubHub/TickPick show all-in prices; Ticketmaster/VividSeats/SeatGeek add fees at checkout) to your response. You do not have credentials for /concerts/prices.
-
-When the user asks about shows for their favorite artists (from their Spotify profile), always offer to check prices.
-
-**CONCERT BOT COMMANDS** — Tell users about these when they ask about concerts, shows, or ticket prices:
-
-- \`!concerts [artist]\` — Search for upcoming shows near Alameda, CA. If no artist is given, searches based on their Spotify favorites.
-- \`!prices [artist or show name]\` — Check real-time prices from StubHub, VividSeats, TickPick, SeatGeek, and Ticketmaster. Examples: \`!prices Chappell Roan\` or \`!prices Jack Johnson Greek Theatre June 14\`
-- \`!setalert [show] $[price]\` — Set a price alert. Checks 4x daily (8am, noon, 4pm, 8pm PT) and DMs the user when tickets drop to their target. Example: \`!setalert Chappell Roan $75\`
-- \`!alerts\` — List all active price alerts with show name, threshold, and schedule.
-- \`!removealert [# or show name]\` — Cancel a price alert by list number or show name.
-
-Suggest \`!setalert\` proactively when a user says they want to go to a show but prices are too high.`.trim();
+**CONCERTS**: For ticket prices, emit: \`[CONCERT_PRICES: artist="Name" venue="Venue" date="YYYY-MM-DD" city="City"]\` (only artist required). Scrapes StubHub, VividSeats, TickPick, SeatGeek, Ticketmaster. StubHub/TickPick all-in; others add fees at checkout.
+Commands: \`!concerts [artist]\`, \`!prices [artist/show]\`, \`!setalert [show] $[price]\`, \`!alerts\`, \`!removealert [#]\`. Suggest !setalert when prices are too high.`.trim();
 
 module.exports = { isAvailable, getPrices, SCRAPER_INSTRUCTIONS };
