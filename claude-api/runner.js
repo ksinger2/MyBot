@@ -257,18 +257,30 @@ class Runner {
           const timeStr = now.toLocaleTimeString('en-US', { timeZone: 'America/Los_Angeles', hour: '2-digit', minute: '2-digit' });
           contextParts.push(`[Current date/time — America/Los_Angeles]: ${dateStr}, ${timeStr}`);
         } catch {}
-        const claudeMdPath = path.join(cwd, 'CLAUDE.md');
-        if (fs.existsSync(claudeMdPath)) {
-          try {
-            let claudeMd = fs.readFileSync(claudeMdPath, 'utf-8');
-            if (claudeMd.trim()) {
-              if (claudeMd.length > 6000) claudeMd = claudeMd.substring(0, 6000) + '\n...(truncated)';
-              contextParts.push(`[Project CLAUDE.md — conventions, stack, how to build/test]:\n${claudeMd}`);
-            }
-          } catch {}
+        // Skip CLAUDE.md and NextSteps.md for clearly casual prompts (saves ~750+
+        // tokens). Uses a negative heuristic: skip for known-casual patterns,
+        // inject for everything else. This avoids false negatives on engineering
+        // prompts that use common verbs like "add" or "update".
+        const lowerPrompt = prompt.toLowerCase();
+        const isCasual = !lowerPrompt.startsWith('!')
+          && lowerPrompt.length < 200
+          && /^(hey|hi|hello|good morning|good night|gm|gn|thanks|thank you|ok|okay|yes|no|yeah|nah|sure|lol|haha|wow|nice|cool|love it|got it)\b/i.test(lowerPrompt.trim());
+        const isPluginQuery = /\b(weather|forecast|rain|temperature|concert|ticket|show|music|flight|product|buy|shop|price|calendar|schedule|busy|sleep|bed)\b/i.test(lowerPrompt);
+        const skipProjectContext = isCasual || (isPluginQuery && lowerPrompt.length < 100);
+        if (!skipProjectContext) {
+          const claudeMdPath = path.join(cwd, 'CLAUDE.md');
+          if (fs.existsSync(claudeMdPath)) {
+            try {
+              let claudeMd = fs.readFileSync(claudeMdPath, 'utf-8');
+              if (claudeMd.trim()) {
+                if (claudeMd.length > 6000) claudeMd = claudeMd.substring(0, 6000) + '\n...(truncated)';
+                contextParts.push(`[Project CLAUDE.md — conventions, stack, how to build/test]:\n${claudeMd}`);
+              }
+            } catch {}
+          }
         }
         const nextStepsPath = path.join(cwd, 'NextSteps.md');
-        if (fs.existsSync(nextStepsPath)) {
+        if (!skipProjectContext && fs.existsSync(nextStepsPath)) {
           try {
             let nextSteps = fs.readFileSync(nextStepsPath, 'utf-8');
             if (nextSteps.trim()) {

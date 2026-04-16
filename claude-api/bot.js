@@ -2819,7 +2819,7 @@ async function _dispatchSignalMessage(msg, chatId, text, state) {
       if (!isGroupMessage && text) {
         const lowerText = text.toLowerCase();
         const extraFields = [];
-        if (/\b(concert|ticket|music|artist|show|tour|live|gig|setlist|spotify|festival|!concerts|!prices|!setalert)\b/.test(lowerText)) {
+        if (/\b(concerts?|tickets?|music|artists?|shows?|tours?|touring|live|gigs?|setlist|spotify|festival|events?|playing|performing|!concerts|!prices|!setalert)\b/.test(lowerText)) {
           extraFields.push('artists');
         }
         if (/\b(note|list|saved|restaurant|remember|wrote down|my\s+(?:list|notes?))\b/.test(lowerText)) {
@@ -3007,9 +3007,25 @@ async function _dispatchSignalMessage(msg, chatId, text, state) {
         groupAllowedTools: isGroupChat ? 'Read,WebSearch,WebFetch,Task,TodoWrite' : undefined,
         profileContext: (combinedProfileContext || '') + groupOnboardHint + pendingEventContext + groupNotesContext + activeFlightsContext + imageRefinementContext + (isGroupChat ? `\n\nCHAT_ID: ${msg.chatId}\nSENDER_ID: ${msg.senderId}` : ''),
         streamReplies: true,
-        maxTurns: isGroupChat ? 8 : (senderIsOwner ? (parseInt(process.env.SIGNAL_OWNER_MAX_TURNS, 10) || 200) : undefined),
-        // Owner DMs get Opus, everything else gets Sonnet
-        model: (!isGroupChat && senderIsOwner) ? 'opus' : 'sonnet',
+        maxTurns: isGroupChat ? 8 : (senderIsOwner ? (parseInt(process.env.SIGNAL_OWNER_MAX_TURNS, 10) || 75) : undefined),
+        // Smart model selection: Opus for engineering/complex tasks, Sonnet for
+        // casual chat and plugin queries. Opus has ~5x lower rate limits than
+        // Sonnet, so reserving it for code work prevents rate limit hits on
+        // casual conversations. Owner can force Opus with "!opus" prefix.
+        model: (() => {
+          if (isGroupChat) return 'sonnet';
+          if (!senderIsOwner) return 'sonnet';
+          const lt = text.toLowerCase().trim();
+          // Explicit model override
+          if (lt.startsWith('!opus')) return 'opus';
+          // Short casual messages → Sonnet
+          if (lt.length < 50 && /^(hey|hi|hello|yo|sup|good\s*(morning|night|evening)|gm|gn|thanks|thank you|ok|okay|yes|no|yeah|nah|sure|lol|haha|hahaha|wow|nice|cool|love it|got it|k|omg|wtf|yep|nope|bet|word)\b/i.test(lt)) return 'sonnet';
+          // Plugin queries → Sonnet (weather, concerts, flights, products, calendar, sleep)
+          if (lt.length < 150 && /\b(weather|forecast|rain|temperature|degree|concert|ticket|show|music|flight|product|buy|shop|price|calendar|schedule|busy|sleep|bed|remind|reminder|imagine|picture|image|draw)\b/i.test(lt)
+            && !/\b(fix|bug|code|edit|build|deploy|refactor|debug|error|crash|endpoint|api|function|server|docker|commit|merge|branch|pr\b)\b/i.test(lt)) return 'sonnet';
+          // Everything else (engineering, complex, long) → Opus
+          return 'opus';
+        })(),
       };
 
       // Auto-detect social/location links — pre-fetch metadata and build action prompt.

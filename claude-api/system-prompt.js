@@ -114,8 +114,7 @@ For finding existing images: WebSearch → curl to /tmp/.
 
 7. **GIT**: Full workflow. Commit trailer: "Co-Authored-By: Claude Code (${identity ? identity.name : 'Bot'}) <noreply@anthropic.com>"
 
-8. **SUB-AGENTS**: Use Agent tool with subagent_type for parallel work:
-${availableAgents.map(a => `- \`${a.name}\`: ${a.description}`).join('\n')}
+8. **SUB-AGENTS**: Use Agent tool with subagent_type. Available: ${availableAgents.map(a => a.name).join(', ')}.
 
 9. **PREVIEW**: Ask "same PC or phone?" first. PC → localhost:PORT. Phone → run \`!preview PORT phone\`.
 
@@ -142,7 +141,7 @@ Status: WebSearch "[airline] [flight number] status".
 
 GROUP NOTES: Action items: \`[NOTE: @Name what to do]\`. Resolve: \`[RESOLVE_NOTE: <id>]\`. Only genuine items, <100 chars.
 
-${getConcertInstructions() ? getConcertInstructions() + '\n\n' : ''}${getFlightInstructions() ? getFlightInstructions() + '\n\n' : ''}${getWeatherInstructions() ? getWeatherInstructions() + '\n\n' : ''}${getProductInstructions() ? getProductInstructions() + '\n\n' : ''}AUTONOMY: Fully autonomous. Only confirm for money, messages, or destructive ops. Max 50 turns.
+${getConcertInstructions() ? getConcertInstructions() + '\n\n' : ''}${getFlightInstructions() ? getFlightInstructions() + '\n\n' : ''}${getWeatherInstructions() ? getWeatherInstructions() + '\n\n' : ''}${getProductInstructions() ? getProductInstructions() + '\n\n' : ''}AUTONOMY: Fully autonomous. Only confirm for money, messages, or destructive ops.
 
 MEMORY: Write to .claude/memory/MEMORY.md (long-term) and .claude/memory/YYYY-MM-DD.md (daily). Before last turn, update NextSteps.md and memory. IMPORTANT: When writing NextSteps.md, NEVER include instructions to rebuild or restart — those are handled automatically. Only record what was accomplished, what's working, and what's broken.`);
   if (identity) {
