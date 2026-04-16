@@ -816,33 +816,37 @@ app.post('/rebuild', requireInternalToken, async (req, res) => {
       console.warn(`[rebuild] NextSteps.md snapshot failed: ${e.message}`);
     }
 
-    // (a2) Reset NextSteps.md for the current project to its clean template.
-    // Runner.js auto-injects NextSteps.md into every new session — stale content
-    // like "rebuild" gets re-interpreted as an instruction.
-    const cleanTemplate = `# MyBot — Next Steps
-
-<!--
-Session handoff document. Updated automatically during long sessions
-and at the end of each session. Keeps the next session from looping
-on stale work.
-
-RULES:
-- Bullet points only, no essays
-- Always include a date stamp in section headers
-- Clear completed items — don't let them accumulate
-- If nothing is broken or pending, say so explicitly
--->
+    // (a2) Write NextSteps.md with rebuild context in future tense — tells
+    // the NEXT bot session what just happened so it has continuity. Uses
+    // the snapshot content to summarize what was in progress. No rebuild
+    // instructions — just context.
+    let prevSummary = '';
+    try {
+      const snapshot = currentContent
+        .replace(/<!--[\s\S]*?-->/g, '')
+        .replace(/^#+\s.*$/gm, '')
+        .replace(/\[REBUILD\]/gi, '')
+        .replace(/\brebuild\b/gi, 'update')
+        .trim();
+      if (snapshot) prevSummary = snapshot;
+    } catch {}
+    const rebuildHandoff = `# MyBot — Next Steps
 
 ## What's Working
 <!-- Updated each session -->
+- The bot has just been rebuilt and restarted with new code changes
+- All previous sessions have been cleared — you are starting fresh
 
 ## What's Broken / In Progress
 <!-- Active issues, blockers, half-done work -->
+${prevSummary ? `- Before the rebuild, the previous session was working on:\n${prevSummary.split('\n').map(l => l.trim()).filter(l => l).slice(0, 10).map(l => '  - ' + l).join('\n')}` : '- Nothing carried over from previous session'}
 
 ## Next Steps
 <!-- Prioritized — what to pick up next -->
+- Check if the rebuild was successful (smoke test if applicable)
+- Resume any queued tasks from the user
 `;
-    fs.writeFileSync(nextStepsPath, cleanTemplate);
+    fs.writeFileSync(nextStepsPath, rebuildHandoff);
     console.log('[rebuild] Reset NextSteps.md to clean template');
   } catch (e) {
     console.warn(`[rebuild] NextSteps.md reset failed: ${e.message}`);
