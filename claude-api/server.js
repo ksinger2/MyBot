@@ -534,9 +534,12 @@ app.post('/event/join', requireInternalToken, async (req, res) => {
 app.get('/health', (req, res) => res.json({ status: 'ok' }));
 
 // ── Voice endpoint — for iOS Shortcut / Siri integration ──
-// "Hey Siri, ask Bianca..." → Shortcut POSTs text here → response spoken by Siri
+// "Hey Siri, [trigger phrase]..." → Shortcut POSTs text here → full bot pipeline → Siri speaks response
+// Routes through the same askClaude pipeline as Signal DMs so Bianca has full
+// context: Eight Sleep, calendar, profile, personality, conversation history.
 app.post('/voice', async (req, res) => {
-  const { text, pin } = req.body;
+  console.log(`[voice] HIT — body: ${JSON.stringify(req.body).substring(0, 200)}`);
+  let { text, pin } = req.body;
   if (!text) return res.status(400).json({ error: 'text required' });
 
   // Auth via PIN (simpler than bearer token for iOS Shortcuts)
@@ -545,64 +548,292 @@ app.post('/voice', async (req, res) => {
     return res.status(401).json({ error: 'invalid pin' });
   }
 
-  try {
-    const args = [
-      '-p', text,
-      '--output-format', 'json',
-      '--model', 'sonnet',
-      '--max-turns', '3',
-      '--dangerously-skip-permissions',
-      '--no-session-persistence',
-    ];
+  // Strip Siri trigger phrase — iOS Shortcuts sometimes prepend the shortcut
+  // name to the dictated text (e.g. "Summon Bianca what time is it")
+  text = text.replace(/^(summon\s+bianca|hey\s+bianca|bianca|hey\s+b)\s*/i, '').trim();
+  if (!text) return res.json({ response: "What would you like to know?" });
 
-    // Add personality for consistent voice
-    const personalityFile = '/app/personalities/tiffany_pollard.md';
-    if (fs.existsSync(personalityFile)) {
-      args.push('--append-system-prompt', `BREVITY: Reply in 1-3 sentences max. This response will be spoken aloud by Siri — keep it conversational and concise. No markdown, no code blocks, no lists.\n\n${fs.readFileSync(personalityFile, 'utf-8')}`);
+  console.log(`[voice] Siri request: "${text.substring(0, 100)}"`);
+
+  try {
+    const { askClaude, getChannelState, getPersonalityFile, signalAdapter } = require('./bot');
+    const { SIGNAL_OWNER } = require('./project-permissions');
+    const { buildMinimalProfileContext, buildProfileLookup } = require('./user-profiles');
+
+    // Use the owner's Signal DM channel state for identity + personality
+    const chatId = `signal:${SIGNAL_OWNER}`;
+    const state = getChannelState(chatId);
+    const personalityFile = getPersonalityFile(state.personality || 'tiffany_pollard');
+    let profileContext = buildMinimalProfileContext(SIGNAL_OWNER) || '';
+
+    // Heuristic: inject heavy profile data when the message needs it
+    const lowerText = text.toLowerCase();
+    const extraFields = [];
+    if (/\b(concerts?|tickets?|music|artists?|shows?|tours?|touring|live|gigs?|spotify|festival)\b/.test(lowerText)) {
+      extraFields.push('artists');
+    }
+    if (/\b(note|list|saved|restaurant|remember|wrote down|my\s+(?:list|notes?))\b/.test(lowerText)) {
+      extraFields.push('notes');
+    }
+    if (extraFields.length > 0) {
+      const lookup = buildProfileLookup(SIGNAL_OWNER, extraFields);
+      if (lookup) profileContext += '\n\n' + lookup;
     }
 
-    const child = spawn('claude', args, {
-      env: {
-        HOME: '/home/node', CI: 'true',
-        PATH: process.env.PATH,
-        LANG: process.env.LANG || 'en_US.UTF-8',
-      },
-      stdio: ['ignore', 'pipe', 'pipe'],
+    const voicePrompt = text;
+
+    // Run through the full bot pipeline with voice-optimized settings:
+    // - haiku for speed (~3x faster than sonnet, fine for simple queries)
+    // - isVoice: true for ultra-compact system prompt (~1K tokens vs ~10K)
+    // - maxTurns: 3 (tag output + done, no rabbit holes)
+    const claudePromise = askClaude(voicePrompt, {
+      sessionId: null, // independent session — don't interfere with active Signal DM
+      personalityFile,
+      identity: state.identity,
+      cwd: state.cwd,
+      profileContext,
+      model: 'haiku',
+      maxTurns: 3,
+      streamReplies: false,
+      isVoice: true,
     });
 
-    let stdout = '';
-    let stderr = '';
-    child.stdout.on('data', d => { stdout += d; });
-    child.stderr.on('data', d => { stderr += d; });
-
-    // 30s timeout for Siri (Shortcuts time out after ~30s)
-    const timeout = setTimeout(() => {
-      try { child.kill(); } catch {}
-    }, 28000);
-
-    child.on('close', (code) => {
-      clearTimeout(timeout);
-      if (code !== 0) {
-        console.error(`[voice] Claude exited ${code}: ${stderr.substring(0, 200)}`);
-        return res.json({ response: "Sorry, I couldn't process that right now." });
-      }
-      try {
-        const result = JSON.parse(stdout);
-        const response = (result.result || '').trim()
-          .replace(/```[\s\S]*?```/g, '')
-          .replace(/`[^`]+`/g, '')
-          .replace(/\*\*(.+?)\*\*/g, '$1')
-          .replace(/\*(.+?)\*/g, '$1')
-          .replace(/^#+\s+/gm, '')
-          .trim();
-        res.json({ response: response || "I'm not sure what to say to that." });
-      } catch (e) {
-        res.json({ response: stdout.substring(0, 500) || "Hmm, something went wrong." });
-      }
+    // Race against Siri's ~30s timeout
+    const timeoutPromise = new Promise(resolve => {
+      setTimeout(() => resolve({ text: null, _timedOut: true }), 25000);
     });
+
+    const result = await Promise.race([claudePromise, timeoutPromise]);
+
+    // ── Tag processing: execute action tags and inline results ──
+    // Claude outputs tags like [EIGHTSLEEP: status left] that are normally
+    // processed by bot.js's post-processing pipeline. For voice, we process
+    // them here and replace the tag with the actual result text.
+    if (result.text && !result._timedOut) {
+      let processed = result.text;
+
+      // [EIGHTSLEEP:] → execute Eight Sleep commands
+      const esRe = /\[EIGHTSLEEP:\s*(.+?)\]/gi;
+      const esMatches = [...processed.matchAll(esRe)];
+      if (esMatches.length > 0) {
+        try {
+          const eightSleep = require('./eight-sleep');
+          const { getProfile } = require('./user-profiles');
+          const profile = getProfile(SIGNAL_OWNER);
+          for (const m of esMatches) {
+            const parts = m[1].trim().split(/\s+/);
+            const action = (parts[0] || '').toLowerCase();
+            let side = (parts[1] || 'my').toLowerCase();
+            if (side === 'my' || side === 'mine') side = profile?.eightsleep_side || 'left';
+            let tagResult = '';
+            try {
+              if (action === 'status') {
+                const s = await eightSleep.getStatus(SIGNAL_OWNER, side);
+                if (s && !s.error) {
+                  const levelStr = s.level != null ? `level ${s.level > 0 ? '+' : ''}${s.level}` : '';
+                  tagResult = `Your ${side} side is ${s.on ? 'on' : 'off'}${levelStr ? ', ' + levelStr : ''}`;
+                } else tagResult = s?.error || 'Could not read Eight Sleep status';
+              } else if (action === 'set') {
+                const level = parseInt(parts[2], 10) || 0;
+                await eightSleep.setTemp(SIGNAL_OWNER, side, level);
+                tagResult = `Set your ${side} side to level ${level}`;
+              } else if (action === 'on') {
+                await eightSleep.turnOn(SIGNAL_OWNER, side);
+                tagResult = `Turned your ${side} side on`;
+              } else if (action === 'off') {
+                await eightSleep.turnOff(SIGNAL_OWNER, side);
+                tagResult = `Turned your ${side} side off`;
+              }
+            } catch (e) { tagResult = `Eight Sleep error: ${e.message?.substring(0, 100)}`; }
+            processed = processed.replace(m[0], tagResult);
+          }
+        } catch (e) { console.warn(`[voice] eightsleep module error: ${e.message}`); }
+      }
+
+      // [CALENDAR:] → fetch calendar events
+      const calRe = /\[CALENDAR:\s*(.*?)\]/gi;
+      const calMatches = [...processed.matchAll(calRe)];
+      if (calMatches.length > 0) {
+        try {
+          const http = require('http');
+          for (const m of calMatches) {
+            const raw = (m[1] || '').trim();
+            const params = {};
+            raw.replace(/(\w+)="([^"]+)"/g, (_, k, v) => { params[k] = v; });
+            params.userId = SIGNAL_OWNER;
+            params.isGroupChat = false;
+            let tagResult = '';
+            try {
+              const body = JSON.stringify(params);
+              const calResult = await new Promise((resolve, reject) => {
+                const req = http.request({
+                  hostname: 'localhost', port: 3400, path: '/calendar/events',
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json', 'X-Internal-Token': INTERNAL_API_TOKEN, 'Content-Length': Buffer.byteLength(body) },
+                  timeout: 10000,
+                }, (res) => {
+                  let data = '';
+                  res.on('data', c => data += c);
+                  res.on('end', () => { try { resolve(JSON.parse(data)); } catch { resolve({ text: data }); } });
+                });
+                req.on('error', reject);
+                req.on('timeout', () => { req.destroy(); reject(new Error('timeout')); });
+                req.write(body); req.end();
+              });
+              tagResult = calResult?.text || 'No calendar events found';
+            } catch (e) { tagResult = 'Could not check calendar'; }
+            processed = processed.replace(m[0], tagResult);
+          }
+        } catch (e) { console.warn(`[voice] calendar error: ${e.message}`); }
+      }
+
+      // [WEATHER:] → fetch forecast
+      const wxRe = /\[WEATHER:\s*(.+?)\]/gi;
+      const wxMatches = [...processed.matchAll(wxRe)];
+      if (wxMatches.length > 0) {
+        try {
+          const weatherPlugin = require('./plugins/weather');
+          for (const m of wxMatches) {
+            const raw = m[1].trim();
+            const params = {};
+            raw.replace(/(\w+)="([^"]+)"/g, (_, k, v) => { params[k] = v; });
+            if (!params.location && !raw.includes('=')) params.location = raw;
+            let tagResult = '';
+            try {
+              tagResult = await weatherPlugin.getForecast(params.location, params.fromDate || null, params.toDate || null) || 'No forecast available';
+            } catch (e) { tagResult = 'Could not fetch weather'; }
+            processed = processed.replace(m[0], tagResult);
+          }
+        } catch (e) { console.warn(`[voice] weather error: ${e.message}`); }
+      }
+
+      // [PRODUCT:] → search products
+      const prodRe = /\[PRODUCT:\s*(.+?)\]/gi;
+      const prodMatches = [...processed.matchAll(prodRe)];
+      if (prodMatches.length > 0) {
+        try {
+          const productPlugin = require('./plugins/product-search');
+          for (const m of prodMatches) {
+            const raw = m[1].trim();
+            const params = {};
+            raw.replace(/(\w+)="([^"]+)"/g, (_, k, v) => { params[k] = v; });
+            if (!params.query && !raw.includes('=')) params.query = raw;
+            let tagResult = '';
+            try {
+              tagResult = await productPlugin.searchProducts(params.query, { wantPrices: params.wantPrices === 'true' }) || 'No results found';
+            } catch (e) { tagResult = 'Could not search products'; }
+            processed = processed.replace(m[0], tagResult);
+          }
+        } catch (e) { console.warn(`[voice] product error: ${e.message}`); }
+      }
+
+      // [REMIND:] → create reminder
+      const remRe = /\[REMIND:\s*(.+?)\]/gi;
+      const remMatches = [...processed.matchAll(remRe)];
+      if (remMatches.length > 0) {
+        try {
+          const http = require('http');
+          for (const m of remMatches) {
+            const raw = (m[1] || '').trim();
+            const params = {};
+            raw.replace(/(\w+)="([^"]+)"/g, (_, k, v) => { params[k] = v; });
+            raw.replace(/(\w+)=(\d+)/g, (_, k, v) => { params[k] = v; });
+            params.user_id = SIGNAL_OWNER;
+            params.discord_user_id = SIGNAL_OWNER;
+            let tagResult = '';
+            if (params.title && params.datetime) {
+              try {
+                const body = JSON.stringify({
+                  title: params.title, datetime: params.datetime,
+                  duration_minutes: parseInt(params.duration_minutes, 10) || 15,
+                  user_id: SIGNAL_OWNER, discord_user_id: SIGNAL_OWNER,
+                });
+                await new Promise((resolve, reject) => {
+                  const req = http.request({
+                    hostname: 'localhost', port: 3400, path: '/remind',
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json', 'X-Internal-Token': INTERNAL_API_TOKEN, 'Content-Length': Buffer.byteLength(body) },
+                    timeout: 10000,
+                  }, (res) => {
+                    let data = '';
+                    res.on('data', c => data += c);
+                    res.on('end', () => resolve(data));
+                  });
+                  req.on('error', reject);
+                  req.on('timeout', () => { req.destroy(); reject(new Error('timeout')); });
+                  req.write(body); req.end();
+                });
+                tagResult = `Reminder set: ${params.title}`;
+              } catch (e) { tagResult = 'Could not create reminder'; }
+            }
+            processed = processed.replace(m[0], tagResult);
+          }
+        } catch (e) { console.warn(`[voice] remind error: ${e.message}`); }
+      }
+
+      // [LEARNED:] → save preference, strip from response
+      const learnRe = /\[LEARNED:\s*(.+?)\]/gi;
+      const learnMatches = [...processed.matchAll(learnRe)];
+      if (learnMatches.length > 0) {
+        try {
+          const { addPreference } = require('./user-profiles');
+          for (const m of learnMatches) {
+            const fact = m[1].trim();
+            if (fact && fact.length <= 200) {
+              try { addPreference(SIGNAL_OWNER, fact, 'conversation'); } catch {}
+            }
+          }
+        } catch {}
+        processed = processed.replace(learnRe, '');
+      }
+
+      result.text = processed.trim();
+      console.log(`[voice] After tag processing: ${result.text?.substring(0, 100)}`);
+    }
+
+    // Strip markdown/tags for clean spoken output
+    const cleanForSpeech = (raw) => {
+      if (!raw) return "I'm not sure what to say to that.";
+      return raw
+        .replace(/\[(?:LEARNED|IMAGINE|WEATHER|CALENDAR|PRODUCT|CONCERT_PRICES|FLIGHT_SEARCH|REMIND|EVENT|EIGHTSLEEP|REBUILD|NOTE|RESOLVE_NOTE|UPDATE_NOTES|FLIGHT|EVENT_JOIN)[:\s][^\]]*\]/gi, '')
+        .replace(/```[\s\S]*?```/g, '')
+        .replace(/`[^`]+`/g, '')
+        .replace(/\*\*(.+?)\*\*/g, '$1')
+        .replace(/\*(.+?)\*/g, '$1')
+        .replace(/^#+\s+/gm, '')
+        .replace(/^[-*]\s+/gm, '')
+        .replace(/!\[.*?\]\(.*?\)/g, '')
+        .replace(/\[(.+?)\]\(.*?\)/g, '$1')
+        .replace(/\/[\w/.-]+\.\w{2,4}/g, '')
+        .replace(/\n{3,}/g, '\n\n')
+        .trim() || "I'm not sure what to say to that.";
+    };
+
+    if (result._timedOut) {
+      // Claude is still working — let it finish and deliver via Signal
+      claudePromise.then(async (fullResult) => {
+        if (fullResult.text && signalAdapter) {
+          await signalAdapter.sendMessage(SIGNAL_OWNER,
+            `🎙️ *Siri asked:* ${text}\n\n${fullResult.text}`
+          ).catch(() => {});
+          console.log(`[voice] Timed-out result delivered via Signal`);
+        }
+      }).catch(err => console.error(`[voice] Background completion failed: ${err.message}`));
+      res.json({ response: "Let me think about that. I'll send the full answer to Signal." });
+    } else {
+      const response = cleanForSpeech(result.text);
+      console.log(`[voice] Responding (${response.length} chars)`);
+      // Mirror to Signal DM so conversation history is maintained
+      if (signalAdapter) {
+        signalAdapter.sendMessage(SIGNAL_OWNER,
+          `🎙️ *Via Siri:* ${text}\n\n${result.text || response}`
+        ).catch(() => {});
+      }
+      res.json({ response });
+    }
   } catch (err) {
     console.error(`[voice] Error: ${err.message}`);
-    res.status(500).json({ error: err.message });
+    res.json({ response: "Sorry, I couldn't process that right now." });
   }
 });
 

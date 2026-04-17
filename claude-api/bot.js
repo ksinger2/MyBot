@@ -732,7 +732,7 @@ function listPersonalities() {
     .map(f => f.replace('.md', ''));
 }
 
-function askClaude(prompt, { sessionId = null, personalityFile = null, identity = null, cwd = DEFAULT_WORKSPACE, maxTurns = null, channelState = null, discordChannel = null, channelProxy = null, discordUserId = null, readOnly = false, groupAllowedTools = undefined, profileContext = null, streamReplies = false, model = 'sonnet' } = {}) {
+function askClaude(prompt, { sessionId = null, personalityFile = null, identity = null, cwd = DEFAULT_WORKSPACE, maxTurns = null, channelState = null, discordChannel = null, channelProxy = null, discordUserId = null, readOnly = false, groupAllowedTools = undefined, profileContext = null, streamReplies = false, model = 'sonnet', ownerDmMode = false, planMode = false, isVoice = false } = {}) {
   // Wrap raw Discord channel in ChannelProxy if needed
   if (!channelProxy && discordChannel) {
     channelProxy = ChannelProxy.fromDiscord(discordChannel);
@@ -741,7 +741,7 @@ function askClaude(prompt, { sessionId = null, personalityFile = null, identity 
   const runner = new Runner(prompt, {
     sessionId, personalityFile, identity, cwd, maxTurns,
     channelState, channelProxy, discordUserId, readOnly,
-    groupAllowedTools, profileContext, streamReplies, model,
+    groupAllowedTools, profileContext, streamReplies, model, ownerDmMode, planMode, isVoice,
     // Inject bot.js functions so runner.js doesn't need to import bot.js
     freshProgressFn: freshProgress,
     saveChannelStateFn: saveChannelState,
@@ -763,11 +763,17 @@ async function runClaudeWithContinuation(prompt, opts, channelProxy) {
   // Don't auto-continue in group chats (short tasks, noisy for non-technical users)
   const isGroupContext = opts.channelState?._isGroupChat;
 
+  // Owner DM parity mode runs without a turn cap (maxTurns=1000 in runner.js),
+  // so hitTurnLimit should never fire. If it does, respect the natural end —
+  // don't spin up the auto-continue / NextSteps.md checkpoint machinery, which
+  // is designed for the shorter capped sessions.
+  const skipAutoContinue = !!opts.ownerDmMode;
+
   // Context refresh: every REFRESH_EVERY continuations, save progress to NextSteps.md,
   // end the session, and start fresh. Prevents context bloat and stale-loop issues.
   const REFRESH_EVERY = 3;
 
-  while (result.hitTurnLimit && continueCount < maxContinues && !result.stopped && !isGroupContext) {
+  while (result.hitTurnLimit && continueCount < maxContinues && !result.stopped && !isGroupContext && !skipAutoContinue) {
     continueCount++;
     const isOwnerDm = channelProxy.platform === 'discord' || (opts.channelState && !opts.channelState._isGroupChat);
 
@@ -810,7 +816,7 @@ async function runClaudeWithContinuation(prompt, opts, channelProxy) {
     if (result.streamed) anyStreamed = true;
   }
 
-  if (result.hitTurnLimit && continueCount >= maxContinues) {
+  if (result.hitTurnLimit && continueCount >= maxContinues && !skipAutoContinue) {
     // Final handoff turn — ensure NextSteps.md is updated
     try {
       const handoff = await askClaude(
@@ -3016,9 +3022,19 @@ async function _dispatchSignalMessage(msg, chatId, text, state) {
         }
       } catch {}
 
+      // Owner Signal DM → Claude Code parity mode. Forces Opus 4.7, no brevity,
+      // no personality, no turn limit, no stall/hard-timeout kill. Everything
+      // else keeps its historical wrapper (groups, other Signal users). See
+      // /home/karen/.claude/plans/no-i-have-another-glimmering-marshmallow.md
+      // for the design rationale.
+      const ownerDmMode = senderIsOwner && !isGroupChat;
+      // Plan mode (owner DM only): read-only exploration, no edits/bash/writes.
+      // Toggled via `!mode plan` / `!mode auto`; default is auto.
+      const planMode = ownerDmMode && state.codingMode === 'plan';
+
       const claudeOpts = {
         sessionId: isGroupChat ? null : state.sessionId,
-        personalityFile,
+        personalityFile: ownerDmMode ? null : personalityFile,
         identity: state.identity,
         cwd: state.cwd,
         channelState: state,
@@ -3035,25 +3051,18 @@ async function _dispatchSignalMessage(msg, chatId, text, state) {
         groupAllowedTools: isGroupChat ? 'Read,WebSearch,WebFetch,Task,TodoWrite' : undefined,
         profileContext: (combinedProfileContext || '') + groupOnboardHint + pendingEventContext + groupNotesContext + activeFlightsContext + imageRefinementContext + (isGroupChat ? `\n\nCHAT_ID: ${msg.chatId}\nSENDER_ID: ${msg.senderId}` : ''),
         streamReplies: true,
-        maxTurns: isGroupChat ? 8 : (senderIsOwner ? (parseInt(process.env.SIGNAL_OWNER_MAX_TURNS, 10) || 75) : undefined),
-        // Smart model selection: Opus for engineering/complex tasks, Sonnet for
-        // casual chat and plugin queries. Opus has ~5x lower rate limits than
-        // Sonnet, so reserving it for code work prevents rate limit hits on
-        // casual conversations. Owner can force Opus with "!opus" prefix.
-        model: (() => {
-          if (isGroupChat) return 'sonnet';
-          if (!senderIsOwner) return 'sonnet';
-          const lt = text.toLowerCase().trim();
-          // Explicit model override
-          if (lt.startsWith('!opus')) return 'opus';
-          // Short casual messages → Sonnet
-          if (lt.length < 50 && /^(hey|hi|hello|yo|sup|good\s*(morning|night|evening)|gm|gn|thanks|thank you|ok|okay|yes|no|yeah|nah|sure|lol|haha|hahaha|wow|nice|cool|love it|got it|k|omg|wtf|yep|nope|bet|word)\b/i.test(lt)) return 'sonnet';
-          // Plugin queries → Sonnet (weather, concerts, flights, products, calendar, sleep)
-          if (lt.length < 150 && /\b(weather|forecast|rain|temperature|degree|concert|ticket|show|music|flight|product|buy|shop|price|calendar|schedule|busy|sleep|bed|remind|reminder|imagine|picture|image|draw)\b/i.test(lt)
-            && !/\b(fix|bug|code|edit|build|deploy|refactor|debug|error|crash|endpoint|api|function|server|docker|commit|merge|branch|pr\b)\b/i.test(lt)) return 'sonnet';
-          // Everything else (engineering, complex, long) → Opus
-          return 'opus';
-        })(),
+        maxTurns: ownerDmMode ? null
+          : (isGroupChat ? 8 : (senderIsOwner ? (parseInt(process.env.SIGNAL_OWNER_MAX_TURNS, 10) || 75) : undefined)),
+        ownerDmMode,
+        planMode,
+        // Model selection.
+        //   - Owner DM → always Opus 4.7 (full 200k context)
+        //   - Groups and non-owner DMs → Sonnet by default
+        //   - (owner's historical !opus / plugin-query heuristics are gone in
+        //      owner DM — everything is Opus 4.7 there)
+        model: ownerDmMode ? 'claude-opus-4-7'
+          : (isGroupChat ? 'sonnet'
+          : (!senderIsOwner ? 'sonnet' : 'sonnet')),
       };
 
       // Auto-detect social/location links — pre-fetch metadata and build action prompt.

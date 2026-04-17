@@ -198,6 +198,16 @@ class Runner {
     profileContext = null,
     streamReplies = false,
     model = 'sonnet', // 'sonnet' or 'opus'
+    // Owner Signal DM parity mode — strips brevity/personality, disables
+    // turn cap + stall kill + hard timeout, surfaces stderr on non-zero exit,
+    // and emits informational liveness pings instead of killing. Set ONLY
+    // from the Signal dispatcher when sender is SIGNAL_OWNER and chat is a DM.
+    ownerDmMode = false,
+    // Plan mode (owner DM only): forces a read-only allowlist and swaps the
+    // system preamble so Claude researches + proposes instead of editing.
+    // Toggled by the `!mode plan` / `!mode auto` command.
+    planMode = false,
+    isVoice = false, // Siri voice mode — ultra-compact prompt, no engineering tools
     // Injected from bot.js so runner doesn't need to import bot.js:
     freshProgressFn = null,
     saveChannelStateFn = null,
@@ -208,7 +218,14 @@ class Runner {
     this.personalityFile = personalityFile;
     this.identity = identity;
     this.cwd = cwd;
-    this.maxTurns = maxTurns || (channelState?.config?.maxTurns) || DEFAULT_MAX_TURNS;
+    // Owner DM mode intentionally passes maxTurns=null and uses a very high
+    // ceiling so Claude runs to natural completion. Everyone else uses the
+    // historical default.
+    this.ownerDmMode = ownerDmMode;
+    this.planMode = planMode;
+    this.maxTurns = ownerDmMode
+      ? (maxTurns || 1000)
+      : (maxTurns || (channelState?.config?.maxTurns) || DEFAULT_MAX_TURNS);
     this.channelState = channelState;
     this.channelProxy = channelProxy;
     this.model = model;
@@ -217,6 +234,7 @@ class Runner {
     this.groupAllowedTools = groupAllowedTools;
     this.profileContext = profileContext;
     this.streamReplies = streamReplies;
+    this.isVoice = isVoice;
     // Use injected functions or local fallbacks
     this._freshProgress = freshProgressFn || freshProgress;
     this._saveChannelState = saveChannelStateFn || (() => {});
@@ -228,7 +246,7 @@ class Runner {
       const {
         prompt, sessionId, personalityFile, identity, cwd, maxTurns,
         channelState, channelProxy, discordUserId, readOnly,
-        groupAllowedTools, profileContext, streamReplies,
+        groupAllowedTools, profileContext, streamReplies, ownerDmMode, planMode,
       } = this;
 
       // Auto-inject .claude/commands/ into project if missing
@@ -346,6 +364,13 @@ class Runner {
         // Group chat: social assistant mode — web search, links, calendar (Bash
         // for curl), sub-agents. NO Edit/Write/Grep/Glob (engineering tools).
         args.push('--allowedTools', groupAllowedTools);
+      } else if (ownerDmMode && planMode) {
+        // Plan mode: read-only exploration. Claude can research the codebase,
+        // web-search, and draft a plan — but can't edit, write, or shell out.
+        args.push(
+          '--allowedTools',
+          ['Read', 'Grep', 'Glob', 'LS', 'WebSearch', 'WebFetch', 'TodoWrite', 'Task'].join(',')
+        );
       } else if (readOnly) {
         args.push(
           '--allowedTools',
@@ -366,10 +391,13 @@ class Runner {
         personalityFile,
         readOnly,
         isGroupChat: !!groupAllowedTools,
+        isVoice: this.isVoice,
         profileContext,
         discordUserId,
         maxTurns,
         availableAgents: AVAILABLE_AGENTS,
+        ownerDmMode,
+        planMode,
       });
       if (systemPromptText) {
         // Debug: log profile context presence to help diagnose location/calendar
@@ -695,7 +723,10 @@ class Runner {
       });
 
       // --- Hard cap timeout ---
-      const hardTimeout = setTimeout(async () => {
+      // Owner DM mode disables the hard cap entirely — Claude runs until it
+      // naturally stops or the user sends !stop. For every other path, the
+      // 90-minute guillotine stays on as a safety net.
+      const hardTimeout = ownerDmMode ? null : setTimeout(async () => {
         console.log(`[hard-timeout] Claude CLI hit hard timeout after ${MAX_TIMEOUT / 60000} minutes`);
         await forceKillProcess(child, 5000);
         if (channelState) {
@@ -712,10 +743,38 @@ class Runner {
       }, MAX_TIMEOUT);
 
       // --- Stall detector ---
+      // Owner DM mode: emit informational liveness pings at 15/45/90 min of
+      // silence, never kill. User has !stop as the manual escape hatch.
+      // Everyone else: original behavior (warn at 80%, kill at 100%).
+      const ownerPingsSent = { m15: false, m45: false, m90: false };
       const stallCheck = setInterval(() => {
         if (!channelState) return;
         const p = channelState.progress;
         const idle = Date.now() - p.lastActivity;
+
+        if (ownerDmMode) {
+          if (!channelProxy) return;
+          const mins = Math.round(idle / 60000);
+          if (mins >= 15 && !ownerPingsSent.m15) {
+            ownerPingsSent.m15 = true;
+            const toolInfo = p.currentTool ? `(${p.currentTool}${p.toolDetail ? `: ${p.toolDetail.substring(0, 60)}` : ''})` : '(thinking)';
+            channelProxy.send(`🐢 still working — no output in ${mins}m ${toolInfo}. Reply \`!stop\` to abort.`).catch(() => {});
+          } else if (mins >= 45 && !ownerPingsSent.m45) {
+            ownerPingsSent.m45 = true;
+            channelProxy.send(`🐢 still working (${mins}m). Turn count: ${p.turnCount}. Reply \`!stop\` to abort.`).catch(() => {});
+          } else if (mins >= 90 && !ownerPingsSent.m90) {
+            ownerPingsSent.m90 = true;
+            channelProxy.send(`🐢 still working (${mins}m). No timeout in owner DM — reply \`!stop\` to abort.`).catch(() => {});
+          }
+          // Reset ping flags on any activity so we re-ping on next stall
+          if (idle < 5 * 60 * 1000) {
+            ownerPingsSent.m15 = false;
+            ownerPingsSent.m45 = false;
+            ownerPingsSent.m90 = false;
+          }
+          return;
+        }
+
         let threshold = getStallThreshold(p.currentTool);
         if (p.activeAgents.size > 0) {
           threshold = Math.max(threshold, 30 * 60 * 1000);
@@ -779,7 +838,7 @@ class Runner {
 
       // --- Close handler ---
       child.on('close', (code) => {
-        clearTimeout(hardTimeout);
+        if (hardTimeout) clearTimeout(hardTimeout);
         clearInterval(stallCheck);
         clearInterval(checkinTimer);
         const turnCount = channelState?.progress?.turnCount || 0;
@@ -821,6 +880,13 @@ class Runner {
             });
           }
           console.error(`[exit-error] code=${code} stderr:`, stderr.substring(0, 1000));
+          // Owner DM: surface stderr tail to the channel so the user can see
+          // what went wrong instead of seeing silence. Only when there's no
+          // valid result to fall back to (handled below).
+          if (ownerDmMode && channelProxy && stderr) {
+            const stderrTail = stderr.substring(Math.max(0, stderr.length - 500));
+            channelProxy.send(`❌ Claude exited code=${code}\n\`\`\`\n${stderrTail}\n\`\`\``).catch(() => {});
+          }
           const hasValidResult = resultText && resultText.length > 10;
           if (hasValidResult) {
             console.log(`[exit-recovery] CLI exited ${code} but has valid result (${resultText.length} chars, $${resultCost}) — using it`);
