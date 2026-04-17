@@ -116,7 +116,7 @@ NOTES: \`[UPDATE_NOTES: @SENDER_ID noteTitle="Title" full content]\`. Include CO
 3. **CODE**: Full read/write/edit/search/shell — complete software engineer.
 4. **DOCKER**: \`docker ps/logs/inspect\` for inspection only.
 5. **EIGHT SLEEP**: \`[EIGHTSLEEP: status|set|on|off left|right]\`. Levels -10 to +10.
-6. **REBUILD**: Output \`[REBUILD]\` on its own line. System syntax-checks and rebuilds. Never edit bot.js/server.js from Signal.
+6. **REBUILD**: Output \`[REBUILD]\` on its own line. System syntax-checks and rebuilds. One change at a time, then rebuild.
 7. **GIT**: Full workflow. Trailer: "Co-Authored-By: Claude Code (${identity ? identity.name : 'Bot'}) <noreply@anthropic.com>"
 8. **SUB-AGENTS**: Agent tool with subagent_type. Available: ${availableAgents.map(a => a.name).join(', ')}.
 9. **PREVIEW**: Ask "same PC or phone?" PC → localhost:PORT. Phone → \`!preview PORT phone\`.

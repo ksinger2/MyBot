@@ -68,7 +68,7 @@ const DEFAULT_WORKSPACE = '/workspace';
 const DEFAULT_MAX_TURNS = parseInt(process.env.DEFAULT_MAX_TURNS, 10) || 50;
 const MAX_TIMEOUT = (parseInt(process.env.MAX_TIMEOUT_MINUTES, 10) || 90) * 60 * 1000;
 const STALL_THRESHOLDS = {
-  thinking: 5 * 60 * 1000,
+  thinking: 10 * 60 * 1000, // 10 min — was 5 min but killed legitimate API backoff/thinking
   bash:     10 * 60 * 1000,
   default:  10 * 60 * 1000,
 };
