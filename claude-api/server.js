@@ -533,6 +533,79 @@ app.post('/event/join', requireInternalToken, async (req, res) => {
 
 app.get('/health', (req, res) => res.json({ status: 'ok' }));
 
+// ── Voice endpoint — for iOS Shortcut / Siri integration ──
+// "Hey Siri, ask Bianca..." → Shortcut POSTs text here → response spoken by Siri
+app.post('/voice', async (req, res) => {
+  const { text, pin } = req.body;
+  if (!text) return res.status(400).json({ error: 'text required' });
+
+  // Auth via PIN (simpler than bearer token for iOS Shortcuts)
+  const expectedPin = process.env.BOT_UNLOCK_PIN;
+  if (!expectedPin || pin !== expectedPin) {
+    return res.status(401).json({ error: 'invalid pin' });
+  }
+
+  try {
+    const args = [
+      '-p', text,
+      '--output-format', 'json',
+      '--model', 'sonnet',
+      '--max-turns', '3',
+      '--dangerously-skip-permissions',
+      '--no-session-persistence',
+    ];
+
+    // Add personality for consistent voice
+    const personalityFile = '/app/personalities/tiffany_pollard.md';
+    if (fs.existsSync(personalityFile)) {
+      args.push('--append-system-prompt', `BREVITY: Reply in 1-3 sentences max. This response will be spoken aloud by Siri — keep it conversational and concise. No markdown, no code blocks, no lists.\n\n${fs.readFileSync(personalityFile, 'utf-8')}`);
+    }
+
+    const child = spawn('claude', args, {
+      env: {
+        HOME: '/home/node', CI: 'true',
+        PATH: process.env.PATH,
+        LANG: process.env.LANG || 'en_US.UTF-8',
+      },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+
+    let stdout = '';
+    let stderr = '';
+    child.stdout.on('data', d => { stdout += d; });
+    child.stderr.on('data', d => { stderr += d; });
+
+    // 30s timeout for Siri (Shortcuts time out after ~30s)
+    const timeout = setTimeout(() => {
+      try { child.kill(); } catch {}
+    }, 28000);
+
+    child.on('close', (code) => {
+      clearTimeout(timeout);
+      if (code !== 0) {
+        console.error(`[voice] Claude exited ${code}: ${stderr.substring(0, 200)}`);
+        return res.json({ response: "Sorry, I couldn't process that right now." });
+      }
+      try {
+        const result = JSON.parse(stdout);
+        const response = (result.result || '').trim()
+          .replace(/```[\s\S]*?```/g, '')
+          .replace(/`[^`]+`/g, '')
+          .replace(/\*\*(.+?)\*\*/g, '$1')
+          .replace(/\*(.+?)\*/g, '$1')
+          .replace(/^#+\s+/gm, '')
+          .trim();
+        res.json({ response: response || "I'm not sure what to say to that." });
+      } catch (e) {
+        res.json({ response: stdout.substring(0, 500) || "Hmm, something went wrong." });
+      }
+    });
+  } catch (err) {
+    console.error(`[voice] Error: ${err.message}`);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // ── Debug image upload — drag & drop screenshots for sharing with Claude Code ─
 const DEBUG_UPLOAD_DIR = '/tmp/debug-uploads';
 fs.mkdirSync(DEBUG_UPLOAD_DIR, { recursive: true });

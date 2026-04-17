@@ -2251,13 +2251,39 @@ function startSignalAdapter() {
       return match;
     });
     const downloadedFiles = (msg.attachments || []).filter(a => a.localPath);
-    if (downloadedFiles.length > 0) {
+    // Voice message detection: transcribe audio attachments via Whisper
+    let isVoiceMessage = false;
+    const audioAttachments = downloadedFiles.filter(a => a.type && a.type.startsWith('audio/'));
+    if (audioAttachments.length > 0 && !text) {
+      // Pure voice message (no accompanying text) — transcribe it
+      try {
+        const OpenAI = require('openai');
+        const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+        const audioPath = audioAttachments[0].localPath;
+        console.log(`[voice] Transcribing voice message: ${audioPath}`);
+        const transcription = await openai.audio.transcriptions.create({
+          file: fs.createReadStream(audioPath),
+          model: 'whisper-1',
+          response_format: 'text',
+        });
+        const transcript = (typeof transcription === 'string' ? transcription : transcription.text || '').trim();
+        if (transcript) {
+          text = transcript;
+          isVoiceMessage = true;
+          console.log(`[voice] Transcribed: "${transcript.substring(0, 100)}"`);
+        }
+      } catch (err) {
+        console.error(`[voice] Whisper transcription failed: ${err.message}`);
+        await signalAdapter.sendMessage(msg.chatId, `Couldn't understand that voice message — try again?`).catch(() => {});
+        return;
+      }
+    }
+    if (downloadedFiles.length > 0 && !isVoiceMessage) {
       const fileList = downloadedFiles
         .map(a => `- ${a.localPath} (${a.type}${a.size ? `, ${a.size} bytes` : ''})`)
         .join('\n');
       const fileBlock = `[The user attached ${downloadedFiles.length} file(s). Read or analyze them with the Read/Bash tools as needed:]\n${fileList}`;
       text = text ? `${text}\n\n${fileBlock}` : fileBlock;
-
     }
     if (!text) return; // truly empty (no text, no attachments)
 
@@ -2503,12 +2529,14 @@ function startSignalAdapter() {
         if (buf.length === 0) return;
         const combined = buf.map(e => e.content).join('\n');
         state._triggeredByTimestamp = buf[buf.length - 1].msg?.timestamp;
+        state._isVoiceMessage = isVoiceMessage;
         _dispatchSignalMessage(buf[buf.length - 1].msg, buf[buf.length - 1].chatId, combined, state);
       }, MESSAGE_GROUP_DELAY_MS);
       return;
     }
     // Immediate path (ends with punctuation or long message)
     state._triggeredByTimestamp = msg.timestamp;
+    state._isVoiceMessage = isVoiceMessage;
     _dispatchSignalMessage(msg, chatId, text, state);
   });
 
@@ -3781,6 +3809,25 @@ async function _dispatchSignalMessage(msg, chatId, text, state) {
       if (result.sessionId) {
         state.sessionId = result.sessionId;
       }
+
+      // Voice response: if the user sent a voice message, speak the response back
+      if (state._isVoiceMessage && !result.stopped && result.text) {
+        try {
+          const voiceTts = require('./voice-tts');
+          if (voiceTts.isAvailable()) {
+            const audioBuf = await voiceTts.synthesizeSpeech(result.text);
+            await signalAdapter.sendMessage(msg.chatId, '', {
+              attachments: [audioBuf],
+              attachmentNames: ['bianca.mp3'],
+            });
+            console.log(`[voice] Sent TTS response (${audioBuf.length} bytes)`);
+          }
+        } catch (ttsErr) {
+          console.warn(`[voice] TTS failed: ${ttsErr.message}`);
+          // Text response was already sent via streaming — no fallback needed
+        }
+      }
+      state._isVoiceMessage = false;
 
       if (!result.stopped) {
         appendEntry(chatId, {

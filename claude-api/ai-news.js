@@ -89,16 +89,15 @@ function buildPrompt(seenHeadlines) {
     ? `\nPriority sources to check: ${SOURCES.join(', ')}`
     : '';
 
-  return `You are an AI industry news scanner. Your job: find the LATEST AI news, prioritizing RECENCY above all else.
+  return `You are an AI industry news scanner. Your ONLY data source is the WebSearch tool — you MUST NOT use training data or prior knowledge for news items.
 
-RECENCY RULES (CRITICAL):
-- STRONGLY PRIORITIZE stories published in the last 3 hours
-- Include stories up to 6 hours old only if highly significant
-- IGNORE anything older than 24 hours — it's stale
-- Order results NEWEST FIRST, then by importance within the same time window
+STEP 1 (MANDATORY — do this FIRST, before writing anything):
+Run WebSearch for EACH of these queries. You MUST call WebSearch at least 5 times with different queries:
+${TOPICS.slice(0, 8).map(t => `- WebSearch("${t} ${new Date().toISOString().slice(0, 10)}")`).join('\n')}
 
-USE WEB SEARCH to find real, current stories. Search these topics:
-${TOPICS.map(t => `- "${t}"`).join('\n')}
+STEP 2: From the search results, extract stories published in the last 24 hours ONLY. Ignore anything older.
+
+RECENCY: Order NEWEST FIRST. Prioritize last 3 hours, then last 6, then last 24. Nothing older.
 ${sourcesHint}
 
 FORMAT RULES (CRITICAL — follow exactly):
@@ -133,7 +132,7 @@ async function sendAINews(client) {
   try {
     const result = await askClaude(prompt, {
       cwd: '/app',
-      maxTurns: 5,
+      maxTurns: 15, // needs multiple WebSearch calls for different topics
     });
 
     if (!result.text) {
