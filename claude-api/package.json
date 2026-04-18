@@ -3,7 +3,6 @@
   "version": "1.0.0",
   "private": true,
   "dependencies": {
-    "discord.js": "^14.16.0",
     "express": "^4.21.0",
     "node-schedule": "^2.1.1",
     "openai": "^4.80.0",

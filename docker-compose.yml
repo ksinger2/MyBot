@@ -1,11 +1,16 @@
 services:
   claude-api:
-    build: ./claude-api
+    build:
+      context: ./claude-api
+      args:
+        # To bump Claude Code CLI version: update this value and `docker compose up -d --build`.
+        # Check https://www.npmjs.com/package/@anthropic-ai/claude-code for latest stable.
+        CLAUDE_CODE_VERSION: "latest"
+    platform: linux/amd64
     restart: unless-stopped
     group_add:
       - "989"
     environment:
-      - DISCORD_BOT_TOKEN=${DISCORD_BOT_TOKEN}
       # Shared secret for internal API auth. Required for /ask, /imagine,
       # /remind, /rebuild, /active-sessions, and (via ?token= query) the
       # /signal/webhook receiver. Consumed by bot.js internal callers, the
@@ -109,9 +114,9 @@ services:
       start_period: 30s
 
   # Signal messenger sidecar — REST API for signal-cli
-  # Enable by setting SIGNAL_PHONE_NUMBER in .env and running registration
-  # Registration: docker compose exec signal-api curl -X POST 'http://localhost:8080/v1/register/+1YOURNUMBER'
-  # Verify: docker compose exec signal-api curl -X POST 'http://localhost:8080/v1/register/+1YOURNUMBER/verify/CODE'
+  # Enable by setting SIGNAL_PHONE_NUMBER in .env and running registration:
+  #   docker compose exec signal-api curl -X POST 'http://localhost:8080/v1/register/+1YOURNUMBER'
+  #   docker compose exec signal-api curl -X POST 'http://localhost:8080/v1/register/+1YOURNUMBER/verify/CODE'
   signal-api:
     # Pinned 2026-04-11 to 0.98 to avoid silent supply-chain drift on rebuild.
     # To bump: check https://hub.docker.com/r/bbernhard/signal-cli-rest-api/tags

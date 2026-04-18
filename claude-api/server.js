@@ -10,6 +10,7 @@ const path = require('path');
 // leaking the token to subprocesses via inherited env. Loaded first so every
 // subsequent module sees the scrubbed process.env.
 const { getInternalToken } = require('./internal-token');
+const { atomicWriteJsonSync } = require('./atomic-write');
 
 // Security: fail-closed if TOKEN_ENCRYPTION_KEY is not set. User profiles,
 // OAuth tokens, and Spotify tokens are encrypted at rest with this key.
@@ -372,8 +373,7 @@ try {
 
 function _savePendingEvents() {
   try {
-    const obj = Object.fromEntries(_pendingGroupEvents);
-    fs.writeFileSync(PENDING_EVENTS_FILE, JSON.stringify(obj, null, 2));
+    atomicWriteJsonSync(PENDING_EVENTS_FILE, Object.fromEntries(_pendingGroupEvents));
   } catch (err) {
     console.warn(`[events] Could not save pending events: ${err.message}`);
   }
@@ -396,7 +396,7 @@ if (!global.__mybotPendingEventSweeper) {
 }
 
 app.post('/event', requireInternalToken, async (req, res) => {
-  const { title, datetime, end_datetime, duration_minutes, location, description, user_ids, chat_id } = req.body;
+  const { title, datetime, end_datetime, duration_minutes, location, description, user_ids, chat_id, color_id, color_name, reminder_minutes } = req.body;
   if (!title || !datetime || !user_ids || !Array.isArray(user_ids) || user_ids.length === 0) {
     return res.status(400).json({ error: 'title, datetime (ISO 8601), and user_ids (array of phone numbers or Discord IDs) are required' });
   }
@@ -435,6 +435,13 @@ app.post('/event', requireInternalToken, async (req, res) => {
           start: { dateTime: startTime.toISOString() },
           end: { dateTime: endTime.toISOString() },
           attendees: attendeeEmails.map(email => ({ email })),
+          ...(color_id ? { colorId: String(color_id) } : {}),
+          ...(reminder_minutes != null ? {
+            reminders: {
+              useDefault: false,
+              overrides: [{ method: 'popup', minutes: parseInt(reminder_minutes, 10) }],
+            },
+          } : {}),
         },
       });
       const tok = userTokens.getToken(userId);
@@ -453,6 +460,7 @@ app.post('/event', requireInternalToken, async (req, res) => {
       end_datetime: endTime.toISOString(),
       location: location || null,
       description: description || null,
+      color_id: color_id || null,
       createdAt: Date.now(),
       createdBy: user_ids[0],
       attendees: created.map(c => c.userId),
@@ -531,7 +539,24 @@ app.post('/event/join', requireInternalToken, async (req, res) => {
   }
 });
 
-app.get('/health', (req, res) => res.json({ status: 'ok' }));
+let _healthCache = { ts: 0, ok: true, claudeVersion: null };
+app.get('/health', (req, res) => {
+  const now = Date.now();
+  if (now - _healthCache.ts < 30000) {
+    return res.status(_healthCache.ok ? 200 : 503).json({
+      status: _healthCache.ok ? 'ok' : 'degraded',
+      claude: _healthCache.claudeVersion || 'unknown',
+    });
+  }
+  try {
+    const v = require('child_process').execSync('claude --version', { timeout: 5000 }).toString().trim();
+    _healthCache = { ts: now, ok: true, claudeVersion: v };
+    res.json({ status: 'ok', claude: v });
+  } catch (e) {
+    _healthCache = { ts: now, ok: false, claudeVersion: null };
+    res.status(503).json({ status: 'degraded', error: 'Claude CLI not functional', detail: e.message });
+  }
+});
 
 // ── Voice endpoint — for iOS Shortcut / Siri integration ──
 // "Hey Siri, [trigger phrase]..." → Shortcut POSTs text here → full bot pipeline → Siri speaks response
@@ -1162,7 +1187,7 @@ ${prevSummary ? `- Before the rebuild, the previous session was working on:\n${p
     // The new session interprets that as an instruction and loops.
     const journalFile = path.join('/home/node/.claude', 'session-journal.json');
     if (fs.existsSync(journalFile)) {
-      fs.writeFileSync(journalFile, '{}');
+      atomicWriteJsonSync(journalFile, {});
       console.log('[rebuild] Cleared session journal');
     }
   } catch (e) {
@@ -2151,8 +2176,7 @@ app.post('/setup/:userId/jobs', express.json(), (req, res) => {
   // Activate immediately
   try {
     const { registerJob } = require('./scheduler');
-    const { client } = require('./bot');
-    registerJob(sched, client);
+    registerJob(sched);
   } catch (err) { console.warn(`[jobs] Could not register job #${sched.id}: ${err.message}`); }
 
   res.json({ ok: true, job: sched });
@@ -2185,9 +2209,8 @@ app.put('/setup/:userId/jobs/:jobId', express.json(), (req, res) => {
   // Re-register cron
   try {
     const { cancelJob, registerJob } = require('./scheduler');
-    const { client } = require('./bot');
     cancelJob(jobId);
-    if (sched.active) registerJob(sched, client);
+    if (sched.active) registerJob(sched);
   } catch {}
 
   res.json({ ok: true, job: sched });
@@ -2219,8 +2242,7 @@ app.post('/setup/:userId/jobs/:jobId/toggle', express.json(), (req, res) => {
 
   try {
     const { cancelJob, registerJob } = require('./scheduler');
-    const { client } = require('./bot');
-    if (sched.active) registerJob(sched, client);
+    if (sched.active) registerJob(sched);
     else cancelJob(jobId);
   } catch {}
 
@@ -2280,12 +2302,11 @@ app.get('/auth/google/callback', async (req, res) => {
 // Reports channels with active Claude processes — used by Claude before self-rebuilding
 app.get('/active-sessions', requireInternalToken, (req, res) => {
   try {
-    const { channels, client } = require('./bot');
+    const { channels } = require('./bot');
     const active = [];
     for (const [channelId, state] of channels) {
       if (state.busy || state.process) {
-        const ch = client.channels.cache.get(channelId);
-        active.push({ channelId, name: ch ? ch.name : channelId });
+        active.push({ channelId, name: channelId });
       }
     }
     res.json({ active, count: active.length });
@@ -2529,7 +2550,7 @@ app.post('/weather', requireInternalToken, async (req, res) => {
   }
 });
 
-const PORT = 3400;
+const PORT = parseInt(process.env.PORT, 10) || 3400;
 app.listen(PORT, () => {
   console.log(`Claude API wrapper listening on port ${PORT}`);
 

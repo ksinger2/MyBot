@@ -60,13 +60,21 @@ function seedMediaPulse() {
   }
 
   try {
-    const { getUserSchedules, addSchedule } = require('./schedules-storage');
+    const { getUserSchedules, addSchedule, updateSchedule } = require('./schedules-storage');
     const existing = getUserSchedules(ownerPhone).filter(s => s.type === 'dm-task');
-    const alreadySeeded = existing.some(s => s.description === MEDIA_PULSE_DESCRIPTION);
+    const existingMediaPulse = existing.find(s => s.description === MEDIA_PULSE_DESCRIPTION);
 
-    if (alreadySeeded) {
-      console.log('[media-pulse] Job already exists — skipping seed');
-      return;
+    if (existingMediaPulse) {
+      // Migrate legacy rows to the typed-dispatch path so dedup kicks in.
+      // startAllSchedules() re-reads from disk right after this, so the
+      // updated subtype is what registerJob sees.
+      if (existingMediaPulse.subtype !== 'media-pulse') {
+        updateSchedule(existingMediaPulse.id, ownerPhone, { subtype: 'media-pulse' });
+        console.log(`[media-pulse] Migrated job #${existingMediaPulse.id} → subtype='media-pulse' (enables dedup)`);
+      } else {
+        console.log('[media-pulse] Job already exists with subtype — skipping seed');
+      }
+      return null;
     }
 
     const sched = addSchedule({
@@ -76,6 +84,7 @@ function seedMediaPulse() {
       cronRule: MEDIA_PULSE_CRON,
       description: MEDIA_PULSE_DESCRIPTION,
       type: 'dm-task',
+      subtype: 'media-pulse',
       cwd: null,
       timezone: MEDIA_PULSE_TZ,
     });

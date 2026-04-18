@@ -7,8 +7,8 @@
 const schedule = require('node-schedule');
 const fs = require('fs');
 const path = require('path');
-const { MessageFlags } = require('discord.js');
 const { atomicWriteJsonSync } = require('./atomic-write');
+const { SIGNAL_OWNER } = require('./project-permissions');
 
 // Persist seen headlines so we don't repeat across 3-hour cycles
 const SEEN_FILE = path.join(__dirname, 'data', 'ai-news-seen.json');
@@ -40,7 +40,9 @@ const AI_NEWS_CONFIG = {
   // Every 3 hours
   schedule: '0 8,11,14,17,20 * * *',
   timezone: 'America/Los_Angeles',
-  channelId: '1481550166501626039', // same channel as morning briefing
+  // Signal recipient — defaults to the bot owner. Override by setting
+  // AI_NEWS_RECIPIENT in the environment.
+  recipient: process.env.AI_NEWS_RECIPIENT || SIGNAL_OWNER || null,
 };
 
 // Companies + topics to track
@@ -115,19 +117,18 @@ FORMAT RULES (CRITICAL — follow exactly):
 ${seenList}`;
 }
 
-async function sendAINews(client) {
+async function sendAINews() {
   console.log('[ai-news] Running AI news pulse...');
 
-  const channel = await client.channels.fetch(AI_NEWS_CONFIG.channelId).catch(() => null);
-  if (!channel) {
-    console.error('[ai-news] Cannot access channel', AI_NEWS_CONFIG.channelId);
+  const { askClaude, signalAdapter } = require('./bot');
+  const recipient = AI_NEWS_CONFIG.recipient;
+  if (!recipient || !signalAdapter || !signalAdapter.ready) {
+    console.warn('[ai-news] No Signal recipient or adapter not ready, skipping');
     return;
   }
 
   const seen = loadSeen();
   const prompt = buildPrompt(seen);
-
-  const { askClaude } = require('./bot');
 
   try {
     const result = await askClaude(prompt, {
@@ -141,63 +142,39 @@ async function sendAINews(client) {
     }
 
     const text = result.text.trim();
-
-    // If nothing new, skip sending
     if (text.includes('Nothing new since last check')) {
       console.log('[ai-news] No new stories this cycle, not sending');
       return;
     }
 
-    // Extract new headlines to add to seen set
     const bulletLines = text.split('\n').filter(l => l.trim().startsWith('•') || l.trim().startsWith('-'));
     for (const line of bulletLines) {
-      // Extract the plain text of the bullet as the dedup key
       const plain = line.replace(/\[([^\]]+)\]\([^)]+\)/g, '$1').replace(/[•\-\*]/g, '').trim().substring(0, 80);
       if (plain) seen.add(plain);
     }
     saveSeen(seen);
 
-    // Send to Discord with embeds suppressed (no link previews)
-    const sendOpts = (content) => ({ content, flags: [MessageFlags.SuppressEmbeds] });
-
-    if (text.length <= 1900) {
-      await channel.send(sendOpts(text));
-    } else {
-      // Split on newlines if too long
-      const chunks = [];
-      let remaining = text;
-      while (remaining.length > 0) {
-        if (remaining.length <= 1900) { chunks.push(remaining); break; }
-        let splitAt = remaining.lastIndexOf('\n', 1900);
-        if (splitAt < 500) splitAt = 1900;
-        chunks.push(remaining.substring(0, splitAt));
-        remaining = remaining.substring(splitAt);
-      }
-      for (const chunk of chunks.slice(0, 6)) {
-        await channel.send(sendOpts(chunk));
-      }
-    }
-
-    console.log(`[ai-news] Sent ${bulletLines.length} bullets to #${channel.name || AI_NEWS_CONFIG.channelId}`);
+    await signalAdapter.sendLongMessage(recipient, text);
+    console.log(`[ai-news] Sent ${bulletLines.length} bullets to ${recipient}`);
   } catch (err) {
     console.error('[ai-news] Failed:', err.message);
   }
 }
 
-function startAINewsScheduler(client) {
+function startAINewsScheduler() {
   if (!AI_NEWS_CONFIG.enabled) {
     console.log('[ai-news] Disabled in config');
     return;
   }
 
-  if (!AI_NEWS_CONFIG.channelId) {
-    console.warn('[ai-news] No channelId set, skipping scheduler');
+  if (!AI_NEWS_CONFIG.recipient) {
+    console.warn('[ai-news] No recipient set, skipping scheduler');
     return;
   }
 
   schedule.scheduleJob(
     { rule: AI_NEWS_CONFIG.schedule, tz: AI_NEWS_CONFIG.timezone },
-    () => sendAINews(client)
+    () => sendAINews()
   );
 
   console.log(`[ai-news] Scheduler started: 8am–8pm every 3 hours (${AI_NEWS_CONFIG.timezone})`);

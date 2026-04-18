@@ -18,9 +18,13 @@ module.exports = {
 
     const maxIterations = 10;
     const personalityFile = ctx.getPersonalityFile(state.personality);
-    const proxy = message.channel.send ? ctx.ChannelProxy.fromDiscord(message.channel) : null;
+    // Signal-only: no streaming proxy. The adapter handles message sends directly.
+    const proxy = null;
     const channelId = message.channel.id;
     const nsPath = path.join(state.cwd, 'NextSteps.md');
+
+    // Signal sender helper — routes everything through the Signal adapter.
+    const send = (text) => ctx._sreply(message, text);
 
     // L-Fix-2: hold loopActive + busy for the ENTIRE loop.
     state.loopActive = true;
@@ -50,7 +54,7 @@ module.exports = {
 
           // M3: hard wallclock ceiling across the whole !loop run.
           if (Date.now() - loopStartedAt > ctx.MAX_LOOP_WALLCLOCK_MS) {
-            await message.channel.send(`🛑 !loop wallclock cap reached (${Math.round(ctx.MAX_LOOP_WALLCLOCK_MS / 60000)}m) — stopping. Total cost: $${totalCost.toFixed(4)}.`);
+            await send(`🛑 !loop wallclock cap reached (${Math.round(ctx.MAX_LOOP_WALLCLOCK_MS / 60000)}m) — stopping. Total cost: $${totalCost.toFixed(4)}.`);
             exitReason = 'wallclock-cap';
             break;
           }
@@ -58,7 +62,7 @@ module.exports = {
           // M3: per-channel daily iteration counter.
           const iterationsToday = ctx._bumpLoopIterationCount(channelId);
           if (iterationsToday > ctx.MAX_LOOP_ITERATIONS_PER_DAY) {
-            await message.channel.send(`🛑 !loop daily iteration cap reached (${ctx.MAX_LOOP_ITERATIONS_PER_DAY}) — try again tomorrow. Total cost this run: $${totalCost.toFixed(4)}.`);
+            await send(`🛑 !loop daily iteration cap reached (${ctx.MAX_LOOP_ITERATIONS_PER_DAY}) — try again tomorrow. Total cost this run: $${totalCost.toFixed(4)}.`);
             exitReason = 'daily-iter-cap';
             break;
           }
@@ -67,7 +71,7 @@ module.exports = {
           if (i > 1 && fs.existsSync(nsPath)) {
             const ns = fs.readFileSync(nsPath, 'utf-8');
             if (ns.includes('<<TASK_COMPLETE>>')) {
-              await message.channel.send(`*Loop completed after ${i - 1} iteration${i === 2 ? '' : 's'} — \`<<TASK_COMPLETE>>\` sentinel found in NextSteps.md. Total cost: $${totalCost.toFixed(4)}.*`);
+              await send(`*Loop completed after ${i - 1} iteration${i === 2 ? '' : 's'} — \`<<TASK_COMPLETE>>\` sentinel found in NextSteps.md. Total cost: $${totalCost.toFixed(4)}.*`);
               exitReason = 'sentinel';
               break;
             }
@@ -76,7 +80,7 @@ module.exports = {
             if (lastNsHash && nsHash === lastNsHash) {
               unchangedIterations++;
               if (unchangedIterations >= 2) {
-                await message.channel.send(`*Loop appears stalled — NextSteps.md unchanged for 2 iterations. Stopping after ${i - 1} iterations. Total cost: $${totalCost.toFixed(4)}.*`);
+                await send(`*Loop appears stalled — NextSteps.md unchanged for 2 iterations. Stopping after ${i - 1} iterations. Total cost: $${totalCost.toFixed(4)}.*`);
                 exitReason = 'idle';
                 break;
               }
@@ -91,7 +95,7 @@ module.exports = {
 
           // L-Fix-5: cumulative cost cap.
           if (totalCost > ctx.MAX_LOOP_COST_USD) {
-            await message.channel.send(`*Loop bailed: cumulative cost $${totalCost.toFixed(4)} exceeds cap of $${ctx.MAX_LOOP_COST_USD}. Update NextSteps.md is up to Claude. Resume manually if needed.*`);
+            await send(`*Loop bailed: cumulative cost $${totalCost.toFixed(4)} exceeds cap of $${ctx.MAX_LOOP_COST_USD}. Update NextSteps.md is up to Claude. Resume manually if needed.*`);
             exitReason = 'cost-cap';
             break;
           }
@@ -107,7 +111,6 @@ module.exports = {
             identity: state.identity,
             cwd: state.cwd,
             channelState: state,
-            discordChannel: message.channel,
           }, proxy);
 
           let result;
@@ -117,7 +120,7 @@ module.exports = {
           try {
             result = await runIteration();
           } catch (err) {
-            await message.channel.send(`*Loop iteration ${i} hit an error (${err.message.substring(0, 150)}). Retrying once after 30s...*`);
+            await send(`*Loop iteration ${i} hit an error (${err.message.substring(0, 150)}). Retrying once after 30s...*`);
             await new Promise(r => setTimeout(r, 30000));
             if (!state.loopActive) {
               exitReason = 'user-stopped';
@@ -126,7 +129,7 @@ module.exports = {
             try {
               result = await runIteration();
             } catch (retryErr) {
-              await message.channel.send(`*Loop iteration ${i} failed twice: ${retryErr.message.substring(0, 200)}. Stopping.*`);
+              await send(`*Loop iteration ${i} failed twice: ${retryErr.message.substring(0, 200)}. Stopping.*`);
               ctx.sendErrorAlert(retryErr, { source: '!loop iteration retry', channel: channelId });
               exitReason = 'iteration-error';
               break;
@@ -137,27 +140,27 @@ module.exports = {
           if (result.cost) totalCost += result.cost;
 
           if (result.stopped) {
-            await message.channel.send('*Loop stopped by user.*');
+            await send('*Loop stopped by user.*');
             exitReason = 'user-stopped';
             break;
           }
 
           await ctx.sendLongMessage(message, result.text, state.cwd);
-          await message.channel.send(`*— Loop iteration ${i}/${maxIterations} complete · cumulative $${totalCost.toFixed(4)} —*`);
+          await send(`*— Loop iteration ${i}/${maxIterations} complete · cumulative $${totalCost.toFixed(4)} —*`);
 
           // L-Fix-7: configurable cooldown.
           await new Promise(r => setTimeout(r, ctx.LOOP_ITERATION_COOLDOWN_MS));
         }
 
         if (exitReason === 'max-iterations') {
-          await message.channel.send(`*Loop hit ${maxIterations} iteration limit without seeing <<TASK_COMPLETE>>. Total cost: $${totalCost.toFixed(4)}. Send another message to continue.*`);
+          await send(`*Loop hit ${maxIterations} iteration limit without seeing <<TASK_COMPLETE>>. Total cost: $${totalCost.toFixed(4)}. Send another message to continue.*`);
         }
       } catch (err) {
         // L-Fix-1: top-level safety net — any unhandled error goes here.
         console.error('[!loop] Unhandled error:', err);
         ctx.sendErrorAlert(err, { source: '!loop top-level', channel: channelId });
         try {
-          await message.channel.send(`*Loop crashed: ${err.message.substring(0, 300)}*`).catch(() => {});
+          await send(`*Loop crashed: ${err.message.substring(0, 300)}*`).catch(() => {});
         } catch {}
       } finally {
         // ONLY place that clears loopActive — restores normal channel state.

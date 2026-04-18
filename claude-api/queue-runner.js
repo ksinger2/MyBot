@@ -1,7 +1,14 @@
 const { getPendingItems, updateItem } = require('./queue-storage');
 
 let running = false;
-let clientRef = null;
+
+// Resolve a queue item's destination as a Signal chatId (no `signal:` prefix).
+// item.channelId may be a bare phone/chatId or `signal:<chatId>`.
+function _resolveSignalChatId(item) {
+  const cid = item?.channelId || '';
+  if (typeof cid !== 'string' || !cid) return null;
+  return cid.replace(/^signal:/, '');
+}
 
 async function processNextItem() {
   if (running) return;
@@ -15,23 +22,22 @@ async function processNextItem() {
   console.log(`[queue-runner] Starting item #${item.id}: "${item.prompt.substring(0, 80)}"`);
   updateItem(item.id, { status: 'running', startedAt: new Date().toISOString() });
 
-  let channel;
-  try {
-    channel = await clientRef.channels.fetch(item.channelId).catch(() => null);
-  } catch {}
+  const { signalAdapter } = require('./bot');
+  const chatId = _resolveSignalChatId(item);
+  const canSend = signalAdapter && signalAdapter.ready && chatId;
+  const send = (text) => canSend
+    ? signalAdapter.sendMessage(chatId, text).catch(() => {})
+    : Promise.resolve();
 
-  if (channel) {
-    await channel.send(`*Starting background task **#${item.id}**: "${item.prompt.substring(0, 80)}"*`).catch(() => {});
-  }
+  await send(`Starting background task #${item.id}: "${item.prompt.substring(0, 80)}"`);
 
-  const typingInterval = channel
-    ? setInterval(() => channel.sendTyping().catch(() => {}), 8000)
+  const typingInterval = canSend
+    ? setInterval(() => signalAdapter.sendTyping(chatId).catch(() => {}), 8000)
     : null;
 
   try {
     const { runClaudeWithContinuation, getPersonalityFile, freshProgress, sendLongMessage } = require('./bot');
 
-    // Create a transient channel state so we don't conflict with interactive use
     const transientState = {
       sessionId: null,
       personality: item.personality,
@@ -52,8 +58,7 @@ async function processNextItem() {
       identity: item.identity,
       cwd: item.cwd,
       channelState: transientState,
-      discordChannel: channel,
-    }, channel);
+    }, null);
 
     const summary = result.text
       ? result.text.substring(0, 200) + (result.text.length > 200 ? '...' : '')
@@ -65,16 +70,15 @@ async function processNextItem() {
       resultSummary: summary,
     });
 
-    if (channel && result.text && !result.stopped) {
-      const fakeMsg = { reply: (opts) => channel.send(opts), channel };
+    if (canSend && result.text && !result.stopped) {
+      const fakeMsg = { _signalChatId: chatId, channel: { id: item.channelId } };
       await sendLongMessage(fakeMsg, result.text, item.cwd);
 
-      // Completion stats
       const parts = [];
       if (result.numTurns) parts.push(`${result.numTurns} turns`);
       if (result.cost) parts.push(`$${result.cost.toFixed(4)}`);
       if (parts.length) {
-        await channel.send(`*— Background task #${item.id} complete: ${parts.join(' · ')} —*`).catch(() => {});
+        await send(`— Background task #${item.id} complete: ${parts.join(' · ')} —`);
       }
     }
 
@@ -86,9 +90,7 @@ async function processNextItem() {
       completedAt: new Date().toISOString(),
       error: err.message.substring(0, 300),
     });
-    if (channel) {
-      await channel.send(`*Background task **#${item.id}** failed: ${err.message.substring(0, 200)}*`).catch(() => {});
-    }
+    await send(`Background task #${item.id} failed: ${err.message.substring(0, 200)}`);
   } finally {
     if (typingInterval) clearInterval(typingInterval);
     running = false;
@@ -97,8 +99,7 @@ async function processNextItem() {
   }
 }
 
-function startQueueRunner(client) {
-  clientRef = client;
+function startQueueRunner() {
   console.log('[queue-runner] Started — polling every 30s');
 
   // Also recover any items stuck in 'running' state from a previous crash

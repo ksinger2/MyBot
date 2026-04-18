@@ -1,4 +1,4 @@
-FROM node:20-slim
+FROM --platform=linux/amd64 node:20-slim
 
 # Install git, gh CLI, and dev tools Claude Code needs
 RUN apt-get update && apt-get install -y git openssh-client curl && rm -rf /var/lib/apt/lists/*
@@ -41,8 +41,19 @@ RUN curl -fsSL https://github.com/cloudflare/cloudflared/releases/latest/downloa
     && dpkg -i /tmp/cloudflared.deb \
     && rm /tmp/cloudflared.deb
 
-# Install Claude Code CLI, PM2, and Playwright MCP globally
-RUN npm install -g @anthropic-ai/claude-code pm2 @playwright/mcp
+# Install Claude Code CLI — pinned to avoid silent binary drift on rebuild.
+# @anthropic-ai/claude-code-linux-x64 is an optionalDependency; --include=optional
+# forces npm to fetch it. The retry loop handles transient CDN flakes.
+# Build-time `claude --version` verification fails the build if the binary is
+# missing — turns a silent runtime failure into a loud build failure.
+# To bump: update CLAUDE_CODE_VERSION in docker-compose.yml build.args.
+ARG CLAUDE_CODE_VERSION=latest
+RUN for i in 1 2 3; do \
+      npm install -g --include=optional --foreground-scripts @anthropic-ai/claude-code@${CLAUDE_CODE_VERSION} pm2 @playwright/mcp \
+      && claude --version \
+      && break; \
+    done \
+    || (echo "FATAL: claude binary failed to install after 3 attempts" && exit 1)
 
 # Install Playwright with Chromium for browser automation testing
 RUN npx playwright install --with-deps chromium

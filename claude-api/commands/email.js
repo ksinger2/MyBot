@@ -15,8 +15,8 @@ module.exports = {
       return;
     }
     const personalityFile = ctx.getPersonalityFile(emailState.personality);
-    await message.channel.sendTyping();
-    const typingInterval = setInterval(() => { message.channel.sendTyping().catch(() => {}); }, 8000);
+    await ctx._styping(message);
+    const typingInterval = setInterval(() => { ctx._styping(message).catch(() => {}); }, 8000);
     try {
       const result = await ctx.askClaude(emailPrompt, {
         sessionId: emailState.sessionId,
@@ -24,7 +24,6 @@ module.exports = {
         identity: emailState.identity,
         cwd: emailState.cwd,
         channelState: emailState,
-        discordChannel: message.channel,
       });
       if (result.sessionId) emailState.sessionId = result.sessionId;
       if (!result.stopped) await ctx.sendLongMessage(message, result.text, emailState.cwd);

@@ -1,6 +1,6 @@
-const crypto = require('crypto');
 const { google } = require('googleapis');
 const userTokens = require('./user-tokens');
+const oauthState = require('./oauth-state');
 
 // Requires env vars: GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET
 // The redirect URI should match what's configured in Google Cloud Console.
@@ -8,60 +8,9 @@ const userTokens = require('./user-tokens');
 //   http://localhost:3400/auth/google/callback  (dev)
 //   https://yourdomain.com/auth/google/callback (prod)
 
-// ---------------------------------------------------------------------------
-// OAuth state map (M6 hardening) — random server-side tokens mapped to userId.
-// The state param sent to Google is no longer the userId; it's an unguessable
-// 48-hex-char token that we look up on callback. This prevents a CSRF-style
-// link hijack from matching a callback to the wrong user.
-// ---------------------------------------------------------------------------
-const STATE_TTL_MS = 15 * 60 * 1000; // 15 minutes
-const _stateMap = new Map();
-
-// F3/F14: hard-cap _stateMap at 1000 entries. Evict oldest (FIFO) on overflow.
-const _STATE_MAP_CAP = 1000;
-let _stateMapLastEvictWarn = 0;
-
-function _putState(userId) {
-  const stateToken = crypto.randomBytes(24).toString('hex');
-  _stateMap.set(stateToken, {
-    userId,
-    provider: 'google',
-    expiresAt: Date.now() + STATE_TTL_MS,
-  });
-  // F3/F14: enforce cap
-  if (_stateMap.size > _STATE_MAP_CAP) {
-    const excess = _stateMap.size - _STATE_MAP_CAP;
-    const iter = _stateMap.keys();
-    for (let i = 0; i < excess; i++) {
-      _stateMap.delete(iter.next().value);
-    }
-    const now = Date.now();
-    if (now - _stateMapLastEvictWarn > 60000) {
-      _stateMapLastEvictWarn = now;
-      console.warn(`[google-auth] _stateMap overflow — evicted ${excess} oldest entries (cap: ${_STATE_MAP_CAP})`);
-    }
-  }
-  return stateToken;
-}
-
-function _takeState(stateToken) {
-  const entry = _stateMap.get(stateToken);
-  if (!entry) return null;
-  _stateMap.delete(stateToken); // one-time use
-  if (entry.expiresAt < Date.now()) return null;
-  return entry;
-}
-
-// Guard against double-register if the module is imported more than once.
-if (!global.__mybot_google_state_sweeper) {
-  global.__mybot_google_state_sweeper = true;
-  setInterval(() => {
-    const now = Date.now();
-    for (const [token, entry] of _stateMap.entries()) {
-      if (entry.expiresAt < now) _stateMap.delete(token);
-    }
-  }, 5 * 60 * 1000).unref?.();
-}
+// OAuth state is now persisted to disk in oauth-state.js so a rebuild between
+// `!setup` and the provider redirect does not invalidate pending authorizations.
+// (Previously an in-memory Map — see git history for the M6 hardening rationale.)
 
 const SCOPES = [
   'https://www.googleapis.com/auth/calendar.readonly',
@@ -90,7 +39,7 @@ function getOAuth2Client() {
  */
 function getAuthUrl(discordUserId) {
   const client = getOAuth2Client();
-  const stateToken = _putState(discordUserId);
+  const stateToken = oauthState.putState(discordUserId, 'google');
   return client.generateAuthUrl({
     access_type: 'offline',
     prompt: 'consent',
@@ -106,7 +55,7 @@ function getAuthUrl(discordUserId) {
  * @returns {Promise<{ email: string, displayName: string }>}
  */
 async function handleCallback(code, state) {
-  const entry = _takeState(state);
+  const entry = oauthState.takeState(state, 'google');
   if (!entry) {
     throw new Error('OAuth state not found or expired — please restart the connect flow');
   }

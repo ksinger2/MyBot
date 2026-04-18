@@ -19,7 +19,7 @@ module.exports = {
       if (fs.existsSync(target) && fs.statSync(target).isDirectory()) {
         state.cwd = resolved;
         state.sessionId = null;
-        ctx.saveChannelState(message.channel.id, state);
+        ctx.saveChannelState(message.channel.id, state, { critical: true });
         await message.reply(`Working directory: \`${target}\`\nSession cleared for new project context.`);
       } else {
         await message.reply(`Directory not found: \`${target}\`\nAvailable in /workspace:\n${ctx.listWorkspaceDirs()}`);

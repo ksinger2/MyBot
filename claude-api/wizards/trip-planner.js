@@ -309,16 +309,11 @@ async function sharePlanWithCompanions(message, userIds, planText, data) {
 
   for (const userId of userIds) {
     try {
-      const user = await message.client.users.fetch(userId);
-      if (user) {
-        await user.send(
-          `**Trip Plan from ${message.author.username}** — ${data.destination}\n` +
-          `Dates: ${data.dates}\n\n${summary}`
-        );
-        sent++;
-      }
+      // Signal-only: no cross-user DM API; trip plan must be shared in-channel.
+      console.log(`[trip-planner] Signal-only: skipping per-user DM for ${userId}`);
+      failed++;
     } catch (err) {
-      console.warn(`Failed to DM user ${userId}:`, err.message);
+      console.warn(`Failed to notify user ${userId}:`, err.message);
       failed++;
     }
   }

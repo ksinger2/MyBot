@@ -1,16 +1,29 @@
 const schedule = require('node-schedule');
 const https = require('https');
+const http = require('http');
 const path = require('path');
-const { MessageFlags } = require('discord.js');
+const { geocode: weatherGeocode } = require('./plugins/weather');
 const config = require('./briefing-config');
 const { loadActiveTasks, addTasks, formatTaskList } = require('./tasks-storage');
 const { sendErrorAlert } = require('./error-alerting');
+const { SIGNAL_OWNER } = require('./project-permissions');
+const { getInternalToken } = require('./internal-token');
+const INTERNAL_API_TOKEN = getInternalToken();
+
+// Strip any unprocessed bot-tags from text before sending to Discord.
+// Belt-and-suspenders: the briefing path doesn't run the Signal tag pipeline,
+// so if Claude emits [WEATHER:], [CALENDAR:], etc. we must strip them so the
+// user never sees raw tag syntax in their briefing.
+function stripBotTags(text) {
+  if (!text) return text;
+  return text.replace(/\[(?:WEATHER|CALENDAR|REMIND|PRODUCT|EVENT|EIGHTSLEEP|CONCERT|LIGHTS|LEARNED|NOTE|RESOLVE_NOTE|EVENT_JOIN|IMAGINE):[^\]]*\]/gi, '').replace(/\n{3,}/g, '\n\n').trim();
+}
 
 const PERSONALITIES_DIR = path.join(__dirname, 'personalities');
 const DEFAULT_PERSONALITY = 'tiffany_pollard';
 const DEFAULT_IDENTITY = {
   name: 'Claude Bot',
-  description: 'a helpful AI assistant on Discord. You are friendly, concise, and capable.'
+  description: 'a helpful AI assistant on Signal. You are friendly, concise, and capable.'
 };
 
 // --- Data Fetchers ---
@@ -58,57 +71,97 @@ async function fetchStocks(stockConfig) {
   }
 }
 
-function fetchWeather(weatherConfig) {
-  if (!weatherConfig.enabled || !weatherConfig.location) return Promise.resolve(null);
+async function fetchWeather(weatherConfig) {
+  if (!weatherConfig.enabled || !weatherConfig.location) return null;
 
-  const units = weatherConfig.units || 'u';
-  const location = encodeURIComponent(weatherConfig.location);
-  const url = `https://wttr.in/${location}?format=j1&${units}`;
+  try {
+    const place = await weatherGeocode(weatherConfig.location);
+    if (!place) { console.error('[briefing] Weather geocode returned null for', weatherConfig.location); return null; }
 
+    const params = new URLSearchParams({
+      latitude: String(place.lat),
+      longitude: String(place.lon),
+      current: 'temperature_2m,relative_humidity_2m,apparent_temperature,weather_code',
+      daily: 'temperature_2m_max,temperature_2m_min,precipitation_probability_max,weather_code',
+      temperature_unit: 'fahrenheit',
+      wind_speed_unit: 'mph',
+      precipitation_unit: 'inch',
+      timezone: place.tz,
+      forecast_days: '1',
+    });
+    const res = await fetch(`https://api.open-meteo.com/v1/forecast?${params}`, { signal: AbortSignal.timeout(10000) });
+    if (!res.ok) throw new Error(`Open-Meteo HTTP ${res.status}`);
+    const data = await res.json();
+
+    const WMO = {
+      0:'Clear',1:'Mostly clear',2:'Partly cloudy',3:'Overcast',
+      45:'Fog',48:'Icy fog',51:'Light drizzle',53:'Drizzle',55:'Heavy drizzle',
+      61:'Light rain',63:'Rain',65:'Heavy rain',71:'Light snow',73:'Snow',75:'Heavy snow',
+      80:'Light showers',81:'Showers',82:'Heavy showers',95:'Thunderstorm',
+    };
+    const code = data.current?.weather_code;
+    const condition = WMO[code] || `Code ${code}`;
+
+    return {
+      location: `${place.name}, ${place.region}`,
+      high: Math.round(data.daily?.temperature_2m_max?.[0] ?? 0),
+      low: Math.round(data.daily?.temperature_2m_min?.[0] ?? 0),
+      units: 'F',
+      condition,
+      feelsLike: Math.round(data.current?.apparent_temperature ?? data.current?.temperature_2m ?? 0),
+      humidity: data.current?.relative_humidity_2m ?? null,
+      chanceOfRain: data.daily?.precipitation_probability_max?.[0] ?? 0,
+    };
+  } catch (err) {
+    console.error('Weather fetch failed:', err.message);
+    return null;
+  }
+}
+
+// --- Calendar Fetcher ---
+// Hits the internal /calendar/events endpoint with SIGNAL_OWNER as the userId.
+// Security: userId is hardcoded here to the Signal owner — NEVER parameterized
+// from config or Claude output. This is the briefing owner's calendar only.
+function fetchCalendar() {
   return new Promise((resolve) => {
-    const req = https.get(url, { timeout: 10000 }, (res) => {
+    const today = new Date();
+    const toDate = new Date(today);
+    toDate.setDate(toDate.getDate() + 7);
+    const fmt = (d) => d.toISOString().slice(0, 10);
+    const body = JSON.stringify({
+      userId: SIGNAL_OWNER,
+      isGroupChat: false,
+      fromDate: fmt(today),
+      toDate: fmt(toDate),
+    });
+    const req = http.request({
+      hostname: 'localhost', port: 3400, path: '/calendar/events',
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Internal-Token': INTERNAL_API_TOKEN, 'Content-Length': Buffer.byteLength(body) },
+      timeout: 15000,
+    }, (res) => {
       let data = '';
-      res.on('data', (chunk) => { data += chunk; });
+      res.on('data', c => data += c);
       res.on('end', () => {
         try {
           const parsed = JSON.parse(data);
-          const today = parsed.weather?.[0];
-          const current = parsed.current_condition?.[0];
-          if (!today) { resolve(null); return; }
-
-          resolve({
-            location: weatherConfig.location,
-            high: today.maxtempF || today.maxtempC,
-            low: today.mintempF || today.mintempC,
-            units: units === 'u' ? 'F' : 'C',
-            condition: current?.weatherDesc?.[0]?.value || 'Unknown',
-            feelsLike: current?.FeelsLikeF || current?.FeelsLikeC,
-            humidity: current?.humidity,
-            chanceOfRain: today.hourly?.reduce((max, h) => Math.max(max, parseInt(h.chanceofrain) || 0), 0),
-            hourly: today.hourly?.map(h => ({
-              time: h.time.padStart(4, '0').replace(/(\d{2})(\d{2})/, '$1:$2'),
-              temp: units === 'u' ? h.tempF : h.tempC,
-              condition: h.weatherDesc?.[0]?.value,
-              chanceOfRain: h.chanceofrain,
-            })),
-          });
-        } catch (err) {
-          console.error('Weather parse failed:', err.message);
+          resolve(parsed?.text || null);
+        } catch {
+          console.warn('[briefing] calendar parse failed');
           resolve(null);
         }
       });
     });
-
     req.on('error', (err) => {
-      console.error('Weather fetch failed:', err.message);
+      console.warn(`[briefing] calendar fetch error: ${err.message}`);
       resolve(null);
     });
-
     req.on('timeout', () => {
       req.destroy();
-      console.error('Weather fetch timed out');
+      console.warn('[briefing] calendar fetch timeout');
       resolve(null);
     });
+    req.write(body); req.end();
   });
 }
 
@@ -127,17 +180,16 @@ function buildJobsSection(jobsConfig) {
 
 // --- Prompt Builder ---
 
-function buildPrompt(stockData, weatherData, jobsData, cfg, tasks = null) {
+function buildPrompt(stockData, weatherData, calendarText, jobsData, cfg, tasks = null) {
   const sections = [];
 
-  sections.push(`You are writing a SHORT morning briefing for Discord. CRITICAL RULES:
-- Use Discord markdown (bold, emoji, ## headers)
-- Keep it SCANNABLE — bullet points, not paragraphs
-- NO fluff, NO filler, NO long intros
-- Every news item MUST have a link to an article
-- Every job listing MUST have a link to the posting
-- USE WEB SEARCH to find real, current information with real URLs
-- DO NOT add a "Sources:", "References:", or any link list at the bottom — links go inline with each item only`);
+  sections.push(`You are writing a TIGHT morning briefing for Discord. HARD RULES:
+- MUST fit in ONE Discord message (~1800 chars total, including markdown)
+- Discord markdown only (bold, ## headers). NO emoji spam.
+- Every line earns its place. Cut ruthlessly.
+- Inline links only: [text](url). No "Sources:" footer.
+- DO NOT emit tag syntax like [WEATHER:...] or [CALENDAR:...] — weather and calendar are pre-fetched below, just reformat them.
+- USE WEB SEARCH for news/jobs. Real URLs only.`);
 
   // Stock data (pre-fetched, just format it)
   if (stockData && stockData.length > 0) {
@@ -169,62 +221,52 @@ function buildPrompt(stockData, weatherData, jobsData, cfg, tasks = null) {
 
   // Weather data (pre-fetched)
   if (weatherData) {
-    let weatherSection = `## WEATHER — ${weatherData.location} (pre-fetched)\n`;
-    weatherSection += `${weatherData.condition}, ${weatherData.low}°–${weatherData.high}°${weatherData.units}, feels like ${weatherData.feelsLike}°${weatherData.units}`;
-    if (weatherData.humidity) weatherSection += `, ${weatherData.humidity}% humidity`;
-    if (weatherData.chanceOfRain > 0) weatherSection += `, ${weatherData.chanceOfRain}% rain chance`;
+    let weatherSection = `## WEATHER (pre-fetched — reformat, do NOT emit a [WEATHER:] tag)\n`;
+    weatherSection += `${weatherData.location}: ${weatherData.condition}, ${weatherData.low}°–${weatherData.high}°${weatherData.units}, feels ${weatherData.feelsLike}°`;
+    if (weatherData.chanceOfRain > 0) weatherSection += `, ${weatherData.chanceOfRain}% rain`;
     weatherSection += '\n';
     sections.push(weatherSection);
   }
 
-  // Instructions
-  let instructions = '## YOUR TASK\nWrite the briefing with these sections. Keep it SHORT and SCANNABLE.\n\n';
-  let step = 1;
-
-  // Greeting — one line max
-  instructions += `${step++}. **Greeting** — ONE sentence. In character. No motivational speech.\n\n`;
-
-  // Weather — just reformat the data above, 1-2 lines
-  if (weatherData) {
-    instructions += `${step++}. **Weather** — Reformat the weather data above into 1-2 lines. Just the key info: temp range, conditions, rain risk. Skip hourly breakdown.\n\n`;
+  // Calendar data (pre-fetched from Signal owner's calendar)
+  if (calendarText) {
+    sections.push(`## CALENDAR — today + next 7 days (pre-fetched — reformat, do NOT emit a [CALENDAR:] tag)\n${calendarText}\n`);
   }
 
-  // Stocks — compact table (always included, fallback to web search if no pre-fetched data)
+  // Instructions — tight, max ~1800 chars total output
+  let instructions = '## YOUR TASK\nWrite the briefing. Total length MUST be under 1800 chars. Skip any section that has no real content.\n\n';
+  let step = 1;
+
+  // No standalone greeting — just lead with the weather line.
+  // Weather
+  if (weatherData) {
+    instructions += `${step++}. **Weather** — ONE line from the data above.\n`;
+  }
+
+  // Calendar
+  if (calendarText) {
+    instructions += `${step++}. **Today** — ONE line listing today's calendar events (time + title). If nothing today, skip. Do NOT list the whole week — just today.\n`;
+  }
+
+  // Stocks — compact
   if (stockData && stockData.length > 0) {
-    instructions += `${step++}. **Stocks** — Present the pre-fetched stock data above in a compact format. One line per ticker. Portfolio total at end. No commentary needed unless something moved more than 3%.\n\n`;
-  } else {
-    const tickers = config.stocks.tickers.join(', ');
-    instructions += `${step++}. **Stocks** — Pre-fetched data unavailable. USE WEB SEARCH to get current prices for: ${tickers}. Show price and % change for each. One line per ticker.\n\n`;
+    instructions += `${step++}. **Portfolio** — ONE line: total value + day's gain/loss. Skip per-ticker breakdown unless a ticker moved >3% (then add ONE line).\n`;
   }
 
   // Tasks for today
   if (tasks) {
-    instructions += `${step++}. **Today's Tasks** — The user set these tasks for today. Format each as a ☐ checkbox on its own line. Do NOT modify or add to the task list — just format what's here:\n${tasks}\n\n`;
+    instructions += `${step++}. **Tasks** — Format each task below as ☐ on its own line. Do NOT add or change tasks:\n${tasks}\n`;
   }
 
-  // News — this is the big one, needs web search
+  // News — tight, only top 3 items total
   if (cfg.news.enabled) {
-    instructions += `${step++}. **News** — USE WEB SEARCH for each topic below. I need SPECIFIC details about what happened, not vague summaries. Each item MUST include a link to the source article.\n\n`;
-    instructions += `Search for and report on:\n`;
-    for (const topic of cfg.news.topics) {
-      instructions += `- "${topic.query}" (last ${topic.timeframe})${topic.depth === 'detailed' ? ' — give me specifics: who, what, when, consequences' : ' — 1-2 bullet points'}\n`;
-    }
-    instructions += `\nPriority sources: prefer articles from wired.com, theverge.com, and reuters.com. Use site: search operators to find them (e.g. "site:wired.com AI news", "site:theverge.com tech acquisition"). Use the article URL from search results directly — do NOT attempt to fetch or scrape these pages (they block bots).\n`;
-    instructions += `\nFormat each news item as:\n**Headline** — 1-2 sentence summary of EXACTLY what happened. [Read more](url)\n\nIMPORTANT: All article links MUST be hyperlinked text using [text](url) markdown format. Do NOT paste bare URLs. Do NOT use Discord embed-style links — wrap URLs in < > angle brackets to suppress embeds if needed. Keep it compact.\n\n`;
+    const topTopics = cfg.news.topics.slice(0, 3).map(t => `"${t.query}"`).join(', ');
+    instructions += `${step++}. **News** — Web search these topics: ${topTopics}. Return the TOP 3 stories total (not per topic). One line each: **Headline** — [source](url). Prefer reuters.com, wired.com, theverge.com.\n`;
   }
 
-  // Jobs — needs web search
+  // Jobs — trimmed
   if (jobsData) {
-    instructions += `${step++}. **Jobs** — USE WEB SEARCH to find real Product Management job postings from the last ${jobsData.timeframe}. Search for:\n`;
-    instructions += `Roles: ${jobsData.titles.join(', ')}\n`;
-    instructions += `Locations: ${jobsData.locations.join(', ')}\n`;
-    instructions += `SENIORITY: Senior, Staff, Director, VP, or Head of Product ONLY. The user has 10+ years of experience. Do NOT include Associate PM, APM, junior PM, entry-level, or mid-level roles. If a title doesn't say Senior/Staff/Director/VP/Head, SKIP IT.\n`;
-    instructions += `Company categories to search:\n`;
-    for (const cat of jobsData.companyCategories) {
-      instructions += `- ${cat}\n`;
-    }
-    instructions += `\nFor each job found, format as:\n**Role** at **Company** (Location) — [Apply](url)\n`;
-    instructions += `Find at least 3-5 real, current postings. Only include jobs with working links.\n\n`;
+    instructions += `${step++}. **Jobs** — Web search for ${jobsData.titles.join('/')} roles (${jobsData.locations.join(', ')}). Return TOP 3 only. Senior/Staff/Director+ ONLY. One line each: **Role** @ **Company** — [Apply](url).\n`;
   }
 
   // Mindfulness — keep it to 2 lines
@@ -241,10 +283,10 @@ function buildPrompt(stockData, weatherData, jobsData, cfg, tasks = null) {
       'alternate nostril breathing (close right nostril inhale left, switch, exhale right, repeat)',
     ];
     const todayTechnique = techniques[dayIndex % techniques.length];
-    instructions += `${step++}. **Mindfulness** — Today is ${dayOfWeek}. Use this technique today: "${todayTechnique}". Describe it in 2 lines max with specific instructions. NO news, NO AI articles, NO tech content, NO links. This section is STRICTLY wellness only.\n\n`;
+    instructions += `${step++}. **Mindfulness** — ${dayOfWeek}'s technique: "${todayTechnique}". ONE line with the instruction only. No wellness fluff.\n`;
   }
 
-  instructions += 'End with a one-line sign-off in character. THE ENTIRE BRIEFING SHOULD FIT IN ~3 DISCORD MESSAGES MAX.';
+  instructions += '\nOne-line sign-off in character. HARD CAP: 1800 chars TOTAL. If over, cut news/jobs first.';
 
   if (cfg.motivation.userContext) {
     instructions += `\n\nContext: ${cfg.motivation.userContext}`;
@@ -257,60 +299,59 @@ function buildPrompt(stockData, weatherData, jobsData, cfg, tasks = null) {
 
 // --- Send Briefing ---
 
-async function sendToChannel(channel, text) {
-  if (!text || text.length === 0) {
-    await channel.send('*(Briefing generated no output)*');
-    return;
+// Resolve the briefing recipient (Signal). config.channelId may hold a Signal
+// chatId/phone; otherwise we fall back to SIGNAL_OWNER.
+function _resolveRecipient() {
+  let recipient = config.channelId || SIGNAL_OWNER || null;
+  if (!recipient) return null;
+  if (typeof recipient === 'string' && recipient.startsWith('signal:')) {
+    recipient = recipient.replace(/^signal:/, '');
   }
-
-  const sendOpts = (content) => ({ content, flags: [MessageFlags.SuppressEmbeds] });
-
-  if (text.length <= 1900) {
-    await channel.send(sendOpts(text));
-    return;
-  }
-
-  const chunks = [];
-  let remaining = text;
-  while (remaining.length > 0) {
-    if (remaining.length <= 1900) {
-      chunks.push(remaining);
-      break;
-    }
-    let splitAt = remaining.lastIndexOf('\n', 1900);
-    if (splitAt < 500) splitAt = 1900;
-    chunks.push(remaining.substring(0, splitAt));
-    remaining = remaining.substring(splitAt);
-  }
-
-  for (let i = 0; i < chunks.length && i < 8; i++) {
-    await channel.send(sendOpts(chunks[i]));
-  }
-  if (chunks.length > 8) {
-    await channel.send(`*(${chunks.length - 8} more sections truncated)*`);
-  }
+  return recipient;
 }
 
-async function sendBriefing(client) {
+async function sendToChannel(_unused, text) {
+  // Signal-only sender. The first param is kept for back-compat callers but
+  // ignored — the recipient is resolved from config/SIGNAL_OWNER.
+  const { signalAdapter } = require('./bot');
+  const recipient = _resolveRecipient();
+  if (!recipient || !signalAdapter || !signalAdapter.ready) {
+    console.warn('[briefing] no Signal recipient or adapter; dropping briefing');
+    return;
+  }
+  if (!text || text.length === 0) {
+    await signalAdapter.sendMessage(recipient, '(Briefing generated no output)').catch(() => {});
+    return;
+  }
+  await signalAdapter.sendLongMessage(recipient, text).catch(err => {
+    console.warn(`[briefing] sendLongMessage failed: ${err.message}`);
+  });
+}
+
+async function sendBriefing() {
   console.log('Running morning briefing...');
 
-  const channel = await client.channels.fetch(config.channelId).catch(() => null);
-  if (!channel) {
-    console.error(`Briefing failed: cannot access channel ${config.channelId}`);
-    sendErrorAlert(new Error(`Cannot access channel ${config.channelId}`), { source: 'sendBriefing', detail: 'Channel fetch failed' });
+  const recipient = _resolveRecipient();
+  if (!recipient) {
+    console.error('Briefing failed: no recipient configured (config.channelId / SIGNAL_OWNER)');
+    sendErrorAlert(new Error('No briefing recipient'), { source: 'sendBriefing' });
     return;
   }
 
   // Fetch data in parallel
-  const [stockData, weatherData] = await Promise.all([
+  const [stockData, weatherData, calendarText] = await Promise.all([
     fetchStocks(config.stocks),
     fetchWeather(config.weather),
+    fetchCalendar(),
   ]);
+
+  if (!weatherData) console.warn('[briefing] weather pre-fetch returned null — Claude has no weather data');
+  if (!calendarText) console.warn('[briefing] calendar pre-fetch returned null — Claude has no calendar data');
 
   const jobsData = buildJobsSection(config.jobs);
   const activeTasks = loadActiveTasks();
   const tasksText = formatTaskList(activeTasks);
-  const prompt = buildPrompt(stockData, weatherData, jobsData, config, tasksText);
+  const prompt = buildPrompt(stockData, weatherData, calendarText, jobsData, config, tasksText);
 
   // Resolve identity and personality
   const { askClaude } = require('./bot');
@@ -327,14 +368,15 @@ async function sendBriefing(client) {
     });
 
     if (result.text) {
-      await sendToChannel(channel, result.text);
-      console.log(`Briefing sent to #${channel.name || config.channelId}${result.cost ? ` ($${result.cost.toFixed(4)})` : ''}`);
+      const cleanText = stripBotTags(result.text);
+      await sendToChannel(null, cleanText);
+      console.log(`Briefing sent to ${recipient}${result.cost ? ` ($${result.cost.toFixed(4)})` : ''}`);
     } else {
-      await channel.send('*(Morning briefing came back empty — Claude might be having a slow morning too)*');
+      await sendToChannel(null, '(Morning briefing came back empty — Claude might be having a slow morning too)');
     }
   } catch (err) {
     console.error('Briefing Claude call failed:', err.message);
-    await channel.send('*(Morning briefing failed to generate — check the logs)*').catch(() => {});
+    await sendToChannel(null, '(Morning briefing failed to generate — check the logs)').catch(() => {});
     sendErrorAlert(err, { source: 'sendBriefing', detail: 'Claude call failed' });
   }
 }
@@ -392,13 +434,13 @@ Write a "Week Ahead" preview. Keep it SHORT and SCANNABLE.\n\n`;
   return sections.join('\n\n');
 }
 
-async function sendWeeklyPreview(client) {
+async function sendWeeklyPreview() {
   console.log('Running Sunday weekly preview...');
 
-  const channel = await client.channels.fetch(config.channelId).catch(() => null);
-  if (!channel) {
-    console.error(`Weekly preview failed: cannot access channel ${config.channelId}`);
-    sendErrorAlert(new Error(`Cannot access channel ${config.channelId}`), { source: 'sendWeeklyPreview', detail: 'Channel fetch failed' });
+  const recipient = _resolveRecipient();
+  if (!recipient) {
+    console.error('Weekly preview failed: no recipient configured');
+    sendErrorAlert(new Error('No briefing recipient'), { source: 'sendWeeklyPreview' });
     return;
   }
 
@@ -420,71 +462,67 @@ async function sendWeeklyPreview(client) {
     });
 
     if (result.text) {
-      await sendToChannel(channel, result.text);
-      console.log(`Weekly preview sent to #${channel.name || config.channelId}${result.cost ? ` ($${result.cost.toFixed(4)})` : ''}`);
+      const cleanText = stripBotTags(result.text);
+      await sendToChannel(null, cleanText);
+      console.log(`Weekly preview sent to ${recipient}${result.cost ? ` ($${result.cost.toFixed(4)})` : ''}`);
     } else {
-      await channel.send('*(Weekly preview came back empty)*');
+      await sendToChannel(null, '(Weekly preview came back empty)');
     }
   } catch (err) {
     console.error('Weekly preview failed:', err.message);
-    await channel.send('*(Weekly preview failed to generate — check the logs)*').catch(() => {});
+    await sendToChannel(null, '(Weekly preview failed to generate — check the logs)').catch(() => {});
     sendErrorAlert(err, { source: 'sendWeeklyPreview', detail: 'Claude call failed' });
   }
 }
 
 // --- Scheduler ---
 
-function startScheduler(client) {
+function startScheduler() {
   if (!config.enabled) {
     console.log('Briefings: disabled in config');
     return;
   }
 
-  if (!config.channelId) {
-    console.warn('Briefings: no channelId configured — skipping scheduler');
+  const recipient = _resolveRecipient();
+  if (!recipient) {
+    console.warn('Briefings: no recipient configured (config.channelId / SIGNAL_OWNER) — skipping scheduler');
     return;
   }
 
   schedule.scheduleJob(
     { rule: config.schedule, tz: config.timezone },
-    () => sendBriefing(client)
+    () => sendBriefing()
   );
 
-  console.log(`Briefing scheduled: "${config.schedule}" (${config.timezone}) → channel ${config.channelId}`);
+  console.log(`Briefing scheduled: "${config.schedule}" (${config.timezone}) → ${recipient}`);
 
   // Sunday weekly preview
   if (config.weeklyPreview?.enabled) {
     schedule.scheduleJob(
       { rule: config.weeklyPreview.schedule, tz: config.timezone },
-      () => sendWeeklyPreview(client)
+      () => sendWeeklyPreview()
     );
     console.log(`Weekly preview scheduled: "${config.weeklyPreview.schedule}" (${config.timezone})`);
   }
 
-  // Evening check-in
+  // Evening check-in — Signal-only. Posts a quick task-collection prompt to
+  // the configured recipient. (The previous Discord wizard flow used the
+  // channel.send/reply API; on Signal we just send the question and rely on
+  // the user replying in DM, which Bianca answers via the normal pipeline.)
   if (config.eveningCheckin?.enabled) {
     schedule.scheduleJob(
       { rule: config.eveningCheckin.schedule, tz: config.timezone },
       async () => {
-        const channel = await client.channels.fetch(config.channelId).catch(() => null);
-        if (!channel) {
-          sendErrorAlert(new Error(`Cannot access channel ${config.channelId}`), { source: 'eveningCheckin', detail: 'Channel fetch failed' });
+        const { signalAdapter } = require('./bot');
+        if (!signalAdapter || !signalAdapter.ready) {
+          console.warn('[eveningCheckin] Signal adapter not ready, skipping');
           return;
         }
-        const { getChannelState } = require('./bot');
-        const { startWizard } = require('./wizard');
-        const { addTasks: addNewTasks } = require('./tasks-storage');
-        const state = getChannelState(config.channelId);
-        await startWizard(state, { reply: (msg) => channel.send(msg), channel }, {
-          type: 'eveningTasks',
-          steps: [{
-            key: 'tasks',
-            prompt: "Hey girl 🐄 What do you need to get done tomorrow? Drop your task list and I'll add them to your board. (Just reply right here — I'm listening!)",
-          }],
-          onComplete: async (data, msg) => {
-            addNewTasks(data.tasks);
-            await msg.reply("Added to your task board! They'll show up in every briefing until you mark them done with `!done <#>` 🐄");
-          },
+        await signalAdapter.sendMessage(
+          recipient,
+          "Hey — what do you need to get done tomorrow? Reply with your task list and I'll add them to your board."
+        ).catch(err => {
+          sendErrorAlert(err, { source: 'eveningCheckin', detail: 'Signal send failed' });
         });
       }
     );

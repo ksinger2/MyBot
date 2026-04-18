@@ -1,26 +1,77 @@
 const fs = require('fs');
 const path = require('path');
+const { atomicWriteJsonSync } = require('../atomic-write');
 
 // Persist UUID→phone mappings across restarts so group members are recognized
 // even after a bot rebuild wipes the in-memory cache.
+//
+// Schema v2 shape:
+//   { version: 2,
+//     byUuid: { "<uuid>": { phone, firstSeen, lastSeen } },
+//     byPhone: { "<phone>": ["<uuid>", ...] } }
+//
+// Phone is the canonical user key; UUID is a lookup aid. A phone may be linked
+// to multiple UUIDs over time (e.g., Signal re-registration on a new device),
+// and when that happens we only extend byPhone[phone] — we NEVER auto-migrate
+// tokens or profiles tied to the old UUID. That is an owner-initiated action.
 const UUID_CACHE_FILE = '/app/data/signal-uuid-phone.json';
 
-function _loadPersistedUuidCache() {
-  try {
-    if (fs.existsSync(UUID_CACHE_FILE)) {
-      const raw = JSON.parse(fs.readFileSync(UUID_CACHE_FILE, 'utf8'));
-      return new Map(Object.entries(raw));
-    }
-  } catch {}
-  return new Map();
+function _emptyUuidMap() {
+  return { version: 2, byUuid: {}, byPhone: {} };
 }
 
-function _persistUuidCache(map) {
+function _loadUuidMap() {
   try {
-    const obj = Object.fromEntries(map);
-    fs.mkdirSync(path.dirname(UUID_CACHE_FILE), { recursive: true });
-    fs.writeFileSync(UUID_CACHE_FILE, JSON.stringify(obj), 'utf8');
+    if (!fs.existsSync(UUID_CACHE_FILE)) return _emptyUuidMap();
+    const raw = JSON.parse(fs.readFileSync(UUID_CACHE_FILE, 'utf8'));
+    if (raw && raw.version === 2 && raw.byUuid && raw.byPhone) return raw;
+    // Migrate v1 { uuid: phone, ... } → v2
+    const now = Date.now();
+    const v2 = _emptyUuidMap();
+    for (const [uuid, phone] of Object.entries(raw || {})) {
+      if (!uuid || typeof phone !== 'string') continue;
+      v2.byUuid[uuid] = { phone, firstSeen: now, lastSeen: now };
+      if (!v2.byPhone[phone]) v2.byPhone[phone] = [];
+      if (!v2.byPhone[phone].includes(uuid)) v2.byPhone[phone].push(uuid);
+    }
+    try { atomicWriteJsonSync(UUID_CACHE_FILE, v2); } catch {}
+    console.log(`[signal] Migrated UUID map v1 → v2: ${Object.keys(v2.byUuid).length} entries`);
+    return v2;
+  } catch {
+    return _emptyUuidMap();
+  }
+}
+
+function _persistUuidMap(uuidMap) {
+  try {
+    atomicWriteJsonSync(UUID_CACHE_FILE, uuidMap);
   } catch {}
+}
+
+/**
+ * Record (or refresh) a UUID→phone mapping in the v2 structure.
+ * - Adds firstSeen only on first insertion; always updates lastSeen.
+ * - If the phone already has other UUIDs in byPhone, append (don't replace).
+ * Returns true if a new uuid entry was created, false if it already existed.
+ */
+function _recordUuidPhone(uuidMap, uuid, phone) {
+  if (!uuid || !phone || typeof phone !== 'string' || !phone.startsWith('+')) return false;
+  const now = Date.now();
+  let added = false;
+  const existing = uuidMap.byUuid[uuid];
+  if (!existing) {
+    uuidMap.byUuid[uuid] = { phone, firstSeen: now, lastSeen: now };
+    added = true;
+  } else {
+    existing.lastSeen = now;
+    // If the phone for this UUID changed (unusual — UUIDs are supposed to be
+    // stable per account), update, but this is still just cache. No token
+    // migration happens here.
+    if (existing.phone !== phone) existing.phone = phone;
+  }
+  if (!uuidMap.byPhone[phone]) uuidMap.byPhone[phone] = [];
+  if (!uuidMap.byPhone[phone].includes(uuid)) uuidMap.byPhone[phone].push(uuid);
+  return added;
 }
 
 /**
@@ -119,7 +170,9 @@ class SignalAdapter extends MessagePlatform {
 
     // Track known conversations for chat metadata
     this._chats = new Map(); // chatId → { name, lastSeen }
-    this._uuidToPhone = _loadPersistedUuidCache(); // UUID → phone, persisted across restarts
+    // Schema v2 UUID↔phone map (see _loadUuidMap above). Structure:
+    //   { version: 2, byUuid: { uuid: {phone, firstSeen, lastSeen} }, byPhone: { phone: [uuid, ...] } }
+    this._uuidMap = _loadUuidMap();
     this._uuidToName = new Map();  // UUID → display name (from signal-cli profile)
     this._groups = new Map(); // internal_id → { publicId, name, isMember }
     this._joinedGroups = new Set(); // internal_ids we've already attempted to join
@@ -208,10 +261,10 @@ class SignalAdapter extends MessagePlatform {
     // in MODE=json-rpc).
     this._stopping = false;
     if (this.useWebhook) {
-      console.log(`[signal] Webhook mode — not polling. Inbound arrives at /signal/webhook for ${_redactPhone(this.phoneNumber)} (${this._uuidToPhone.size} contacts mapped)`);
+      console.log(`[signal] Webhook mode — not polling. Inbound arrives at /signal/webhook for ${_redactPhone(this.phoneNumber)} (${Object.keys(this._uuidMap.byUuid).length} contacts mapped)`);
     } else {
       this._poll();
-      console.log(`[signal] Adapter started — polling every ${this.pollInterval}ms for ${_redactPhone(this.phoneNumber)} (${this._uuidToPhone.size} contacts mapped)`);
+      console.log(`[signal] Adapter started — polling every ${this.pollInterval}ms for ${_redactPhone(this.phoneNumber)} (${Object.keys(this._uuidMap.byUuid).length} contacts mapped)`);
     }
     this.ready = true;
     this.emit('ready');
@@ -245,10 +298,38 @@ class SignalAdapter extends MessagePlatform {
    */
   phoneToUuid(phone) {
     if (!phone || !phone.startsWith('+')) return null;
-    for (const [uuid, p] of this._uuidToPhone.entries()) {
-      if (p === phone) return uuid;
+    const uuids = this._uuidMap.byPhone[phone];
+    if (uuids && uuids.length > 0) {
+      // Prefer the most-recently-seen UUID for this phone
+      let best = uuids[0];
+      let bestSeen = this._uuidMap.byUuid[best]?.lastSeen || 0;
+      for (let i = 1; i < uuids.length; i++) {
+        const seen = this._uuidMap.byUuid[uuids[i]]?.lastSeen || 0;
+        if (seen > bestSeen) { best = uuids[i]; bestSeen = seen; }
+      }
+      return best;
     }
     return null;
+  }
+
+  /**
+   * Return the list of UUIDs ever observed for a phone number (most recent last).
+   */
+  phoneToUuids(phone) {
+    if (!phone || !phone.startsWith('+')) return [];
+    return (this._uuidMap.byPhone[phone] || []).slice();
+  }
+
+  /**
+   * Expose the shared v2 UUID map so external modules (data-recovery) can
+   * update it in-place and have the adapter re-persist.
+   */
+  getUuidMap() {
+    return this._uuidMap;
+  }
+
+  persistUuidMap() {
+    _persistUuidMap(this._uuidMap);
   }
 
   /**
@@ -761,7 +842,8 @@ class SignalAdapter extends MessagePlatform {
         this._selfUuid = selfRow.uuid;
         // Also seed the UUID→phone cache with the self mapping so replies
         // that come back addressed by UUID resolve correctly.
-        this._uuidToPhone.set(selfRow.uuid, this.phoneNumber);
+        _recordUuidPhone(this._uuidMap, selfRow.uuid, this.phoneNumber);
+        _persistUuidMap(this._uuidMap);
         console.log(`[signal] Self UUID resolved: ${this._selfUuid}`);
       } else {
         console.warn(`[signal] No identity row found for self (${this.phoneNumber}) — UUID mention detection disabled`);
@@ -778,7 +860,7 @@ class SignalAdapter extends MessagePlatform {
         const contacts = await resp.json();
         for (const c of contacts) {
           if (c.uuid && c.number) {
-            this._uuidToPhone.set(c.uuid, c.number);
+            _recordUuidPhone(this._uuidMap, c.uuid, c.number);
           }
           // Cache profile display names for UUID→name resolution (even without phone)
           if (c.uuid) {
@@ -786,8 +868,8 @@ class SignalAdapter extends MessagePlatform {
             if (displayName) this._uuidToName.set(c.uuid, displayName);
           }
         }
-        _persistUuidCache(this._uuidToPhone);
-        console.log(`[signal] Loaded ${this._uuidToPhone.size} UUID→phone, ${this._uuidToName.size} UUID→name mappings`);
+        _persistUuidMap(this._uuidMap);
+        console.log(`[signal] Loaded ${Object.keys(this._uuidMap.byUuid).length} UUID→phone, ${this._uuidToName.size} UUID→name mappings`);
       }
     } catch (err) {
       console.warn(`[signal] Could not load contacts: ${err.message}`);
@@ -800,7 +882,7 @@ class SignalAdapter extends MessagePlatform {
   _resolveRecipient(uuidOrPhone) {
     if (!uuidOrPhone) return uuidOrPhone;
     if (uuidOrPhone.startsWith('+')) return uuidOrPhone; // already a phone number
-    return this._uuidToPhone.get(uuidOrPhone) || uuidOrPhone;
+    return this._uuidMap.byUuid[uuidOrPhone]?.phone || uuidOrPhone;
   }
 
   /**
@@ -813,7 +895,7 @@ class SignalAdapter extends MessagePlatform {
     const cached = this._uuidToName.get(uuid);
     if (cached) return cached;
     // Try UUID→phone→profile
-    const phone = this._uuidToPhone.get(uuid);
+    const phone = this._uuidMap.byUuid[uuid]?.phone;
     if (phone) {
       try {
         const { getProfile } = require('../user-profiles');
@@ -906,18 +988,24 @@ class SignalAdapter extends MessagePlatform {
     }
     // Cache any new UUID→phone mapping we discover — persist to disk so it
     // survives bot restarts (in-memory map alone gets wiped on every rebuild).
-    if (senderUuid && envelope.sourceNumber && !this._uuidToPhone.has(senderUuid)) {
-      this._uuidToPhone.set(senderUuid, envelope.sourceNumber);
-      _persistUuidCache(this._uuidToPhone);
-      console.log(`[signal] Learned UUID→phone: ${_redactUuid(senderUuid)} → ${_redactPhone(envelope.sourceNumber)}`);
+    if (senderUuid && envelope.sourceNumber) {
+      const wasNew = _recordUuidPhone(this._uuidMap, senderUuid, envelope.sourceNumber);
+      // Always update lastSeen (cheap), but only persist + log on new entry or
+      // if this is a phone that gained a new UUID (cache-only — no token migration).
+      if (wasNew) {
+        _persistUuidMap(this._uuidMap);
+        console.log(`[signal] Learned UUID→phone: ${_redactUuid(senderUuid)} → ${_redactPhone(envelope.sourceNumber)}`);
+      } else {
+        _persistUuidMap(this._uuidMap); // refresh lastSeen on disk
+      }
     }
     // Even when envelope.sourceNumber is absent (newer Signal clients omit it),
     // if senderId resolved to a phone number from the UUID cache, store the
     // reverse mapping so future group lookups can find this user by UUID.
     if (senderUuid && senderId && senderId !== senderUuid && senderId.startsWith('+')) {
-      if (!this._uuidToPhone.has(senderUuid)) {
-        this._uuidToPhone.set(senderUuid, senderId);
-        _persistUuidCache(this._uuidToPhone);
+      if (!this._uuidMap.byUuid[senderUuid]) {
+        _recordUuidPhone(this._uuidMap, senderUuid, senderId);
+        _persistUuidMap(this._uuidMap);
         console.log(`[signal] Stored UUID→phone from resolved sender: ${_redactUuid(senderUuid)} → ${_redactPhone(senderId)}`);
       }
     }

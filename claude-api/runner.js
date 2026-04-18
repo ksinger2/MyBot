@@ -62,6 +62,37 @@ const { init: initErrorAlerting, sendErrorAlert } = require('./error-alerting');
 const { appendEntry, getJournalContext } = require('./session-journal');
 const { loadMemory } = require('./memory');
 
+// Global concurrency semaphore — caps simultaneous Claude CLI processes so
+// multiple Discord channels + background runners don't pile on the API at once
+// and trigger rate limits. Configurable via MAX_CONCURRENT_CLAUDE env var.
+const MAX_CONCURRENT = parseInt(process.env.MAX_CONCURRENT_CLAUDE, 10) || 1;
+let _activeSlots = 0;
+const _slotQueue = [];
+
+function _acquireSlot() {
+  return new Promise((resolve) => {
+    if (_activeSlots < MAX_CONCURRENT) {
+      _activeSlots++;
+      console.log(`[semaphore] acquired slot (${_activeSlots}/${MAX_CONCURRENT} active)`);
+      resolve();
+    } else {
+      console.log(`[semaphore] at capacity (${_activeSlots}/${MAX_CONCURRENT}), queuing — ${_slotQueue.length + 1} waiting`);
+      _slotQueue.push(resolve);
+    }
+  });
+}
+
+function _releaseSlot() {
+  if (_slotQueue.length > 0) {
+    const next = _slotQueue.shift();
+    console.log(`[semaphore] slot released → waking queued runner (${_slotQueue.length} still waiting)`);
+    next(); // _activeSlots stays the same — passing directly to next waiter
+  } else {
+    _activeSlots = Math.max(0, _activeSlots - 1);
+    console.log(`[semaphore] slot released (${_activeSlots}/${MAX_CONCURRENT} active)`);
+  }
+}
+
 // These constants mirror the ones in bot.js. We accept them as constructor
 // options (with defaults) so the Runner doesn't import from bot.js.
 const DEFAULT_WORKSPACE = '/workspace';
@@ -241,8 +272,15 @@ class Runner {
     this._flushPendingWrites = flushPendingWritesFn || (() => {});
   }
 
-  run() {
+  async run() {
+    await _acquireSlot();
+    const _originalResolve_DO_NOT_USE = null; // sentinel — use wrappedResolve/wrappedReject below
+    let _slotReleased = false;
+    const releaseOnce = () => { if (!_slotReleased) { _slotReleased = true; _releaseSlot(); } };
+
     return new Promise((resolve, reject) => {
+      const wrappedResolve = (val) => { releaseOnce(); resolve(val); };
+      const wrappedReject = (err) => { releaseOnce(); reject(err); };
       const {
         prompt, sessionId, personalityFile, identity, cwd, maxTurns,
         channelState, channelProxy, discordUserId, readOnly,
@@ -283,20 +321,17 @@ class Runner {
         const isCasual = !lowerPrompt.startsWith('!')
           && lowerPrompt.length < 200
           && /^(hey|hi|hello|good morning|good night|gm|gn|thanks|thank you|ok|okay|yes|no|yeah|nah|sure|lol|haha|wow|nice|cool|love it|got it)\b/i.test(lowerPrompt.trim());
-        const isPluginQuery = /\b(weather|forecast|rain|temperature|concert|ticket|show|music|flight|product|buy|shop|price|calendar|schedule|busy|sleep|bed)\b/i.test(lowerPrompt);
-        const skipProjectContext = isCasual || (isPluginQuery && lowerPrompt.length < 100);
-        if (!skipProjectContext) {
-          const claudeMdPath = path.join(cwd, 'CLAUDE.md');
-          if (fs.existsSync(claudeMdPath)) {
-            try {
-              let claudeMd = fs.readFileSync(claudeMdPath, 'utf-8');
-              if (claudeMd.trim()) {
-                if (claudeMd.length > 6000) claudeMd = claudeMd.substring(0, 6000) + '\n...(truncated)';
-                contextParts.push(`[Project CLAUDE.md — conventions, stack, how to build/test]:\n${claudeMd}`);
-              }
-            } catch {}
-          }
+        const isPersonalRequest = /\b(weather|forecast|rain|temperature|concert|ticket|show|music|flight|product|buy|shop|price|calendar|schedule|busy|sleep|bed|remind|location|event)\b/i.test(lowerPrompt);
+        const skipProjectContext = isCasual || (isPersonalRequest && lowerPrompt.length < 100);
+
+        // Profile context — inject only for personal assistant requests (weather, calendar,
+        // Spotify, etc.), NOT for engineering sessions where it wastes tokens every turn.
+        // Moved here from system prompt so the system prompt stays static and cacheable.
+        if (isPersonalRequest && profileContext) {
+          contextParts.push(profileContext);
         }
+
+        // CLAUDE.md intentionally NOT injected — Claude Code CLI reads it natively from cwd.
         const nextStepsPath = path.join(cwd, 'NextSteps.md');
         if (!skipProjectContext && fs.existsSync(nextStepsPath)) {
           try {
@@ -739,7 +774,7 @@ class Runner {
         }
         const timeoutErr = new Error(`Claude CLI hit hard timeout after ${MAX_TIMEOUT / 60000} minutes`);
         sendErrorAlert(timeoutErr, { source: 'askClaude hard timeout' });
-        reject(timeoutErr);
+        wrappedReject(timeoutErr);
       }, MAX_TIMEOUT);
 
       // --- Stall detector ---
@@ -811,7 +846,7 @@ class Runner {
           channelState.progress = this._freshProgress();
           const stallErr = new Error(`Claude CLI stalled — no output for ${Math.round(idle / 60000)}min (threshold: ${Math.round(threshold / 60000)}min, tool: ${p.currentTool || 'none'}, turns: ${p.turnCount})`);
           sendErrorAlert(stallErr, { source: 'askClaude stall detector' });
-          reject(stallErr);
+          wrappedReject(stallErr);
         }
       }, 30000);
 
@@ -852,7 +887,7 @@ class Runner {
         }
 
         if (code === 143 || code === null) {
-          return resolve({ text: '*(Process stopped)*', sessionId: channelState?.sessionId, cost: null, stopped: true });
+          return wrappedResolve({ text: '*(Process stopped)*', sessionId: channelState?.sessionId, cost: null, stopped: true });
         }
 
         if (code !== 0) {
@@ -862,14 +897,14 @@ class Runner {
             if (channelProxy) {
               channelProxy.send('⏳ Hit Anthropic rate limit mid-task. Wait a minute and try again.').catch(() => {});
             }
-            return resolve({ text: '', sessionId: resultSessionId, cost: resultCost, numTurns: resultNumTurns, stopped: true, rateLimited: true });
+            return wrappedResolve({ text: '', sessionId: resultSessionId, cost: resultCost, numTurns: resultNumTurns, stopped: true, rateLimited: true });
           }
 
           // error_max_turns: CLI exits 1 with empty text — treat as graceful turn limit,
           // not a crash. This lets runClaudeWithContinuation auto-continue as normal.
           if (resultSubtype === 'error_max_turns') {
             console.log(`[exit-recovery] error_max_turns after ${resultNumTurns} turns — resolving as hitTurnLimit`);
-            return resolve({
+            return wrappedResolve({
               text: resultText || '',
               sessionId: resultSessionId,
               cost: resultCost,
@@ -890,7 +925,7 @@ class Runner {
           const hasValidResult = resultText && resultText.length > 10;
           if (hasValidResult) {
             console.log(`[exit-recovery] CLI exited ${code} but has valid result (${resultText.length} chars, $${resultCost}) — using it`);
-            return resolve({
+            return wrappedResolve({
               text: scrubSecrets(resultText),
               sessionId: resultSessionId,
               cost: resultCost,
@@ -902,10 +937,10 @@ class Runner {
           }
           const exitErr = new Error(`Claude CLI exited with code ${code}\n${stderr.substring(0, 300)}`);
           sendErrorAlert(exitErr, { source: 'askClaude', detail: `Exit code ${code}` });
-          return reject(exitErr);
+          return wrappedReject(exitErr);
         }
 
-        resolve({
+        wrappedResolve({
           text: scrubSecrets(resultText || accumulatedText || ''),
           sessionId: resultSessionId,
           cost: resultCost,

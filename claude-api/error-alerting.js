@@ -1,16 +1,15 @@
-const config = require('./briefing-config');
-
-let _client = null;
 let _signalAdapter = null;
 const _recentErrors = new Map(); // dedupKey -> timestamp
 
-function init(client, signalAdapter) {
-  _client = client;
-  if (signalAdapter) _signalAdapter = signalAdapter;
+// Signal-only init. Accepts a Signal adapter (or nothing — the function is
+// called early during boot before the adapter exists). The legacy two-arg
+// `init(client, adapter)` signature is preserved by ignoring extra args.
+function init(adapter) {
+  if (adapter) _signalAdapter = adapter;
 }
 
-function initSignal(signalAdapter) {
-  _signalAdapter = signalAdapter;
+function initSignal(adapter) {
+  _signalAdapter = adapter;
 }
 
 async function sendErrorAlert(error, { source = 'unknown', channel = null, detail = null } = {}) {
@@ -32,21 +31,6 @@ async function sendErrorAlert(error, { source = 'unknown', channel = null, detai
 
     const errorMsg = error.message || String(error);
     const truncated = errorMsg.length > 800 ? errorMsg.substring(0, 800) + '...' : errorMsg;
-
-    // Discord alerting (if available)
-    if (_client && config.errorChannelId) {
-      try {
-        const errChannel = await _client.channels.fetch(config.errorChannelId).catch(() => null);
-        if (errChannel) {
-          const parts = [`**Error in ${source}**`];
-          if (channel) parts.push(`Channel: <#${channel}>`);
-          if (detail) parts.push(detail);
-          parts.push(`\`\`\`\n${truncated}\n\`\`\``);
-          parts.push(`<t:${Math.floor(now / 1000)}:R>`);
-          await errChannel.send(parts.join('\n'));
-        }
-      } catch {}
-    }
 
     // Signal alerting (if available)
     if (_signalAdapter?.ready) {

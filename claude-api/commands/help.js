@@ -4,10 +4,15 @@ module.exports = {
   adminOnly: false,
   description: 'Show help text',
   async run(message, arg, state, ctx) {
-    // Signal users get a clean, minimal help. Discord (owner) gets the full list.
-    const isSignal = !!message._signalSenderId;
+    // Signal-only bot. Owner (admin) gets the full developer command list;
+    // everyone else gets the friendly minimal help.
+    let isOwner = false;
+    try {
+      const { SIGNAL_OWNER } = require('../project-permissions');
+      isOwner = SIGNAL_OWNER && message._signalSenderId === SIGNAL_OWNER;
+    } catch {}
 
-    if (isSignal) {
+    if (!isOwner) {
       const helpText =
         `**Hey! Here's what I can do:**\n\n` +
         `Just talk to me naturally — ask me anything, send links, ask for recommendations, plan events, etc.\n\n` +
@@ -32,12 +37,11 @@ module.exports = {
         `\`!product <query>\` — Find product links & compare prices\n\n` +
         `**Pro tip:** You don't need commands for most things. Just ask!\n` +
         `"draw me a sunset" • "summarize this TikTok" • "when can we all hang out?" • "remind me tomorrow at 3pm" • "find me earbuds under $50"`;
-      const reply = ctx._dreply || ((m, t) => m.reply(t));
-      await reply(message, helpText);
+      await message.reply(helpText);
       return;
     }
 
-    // Discord — full developer command list
+    // Owner — full developer command list
     const helpText =
       `**Claude Code Bot — Commands:**\n\n` +
       `**Control:**\n` +

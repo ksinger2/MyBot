@@ -19,16 +19,15 @@ module.exports = {
     const auditLabel = auditFocus === 'full' ? 'full audit' : `${auditFocus} audit`;
     await message.reply(`Starting **${auditLabel}** of \`${state.cwd}\`...`);
     const auditPersonalityFile = ctx.getPersonalityFile(state.personality);
-    await message.channel.sendTyping();
-    const auditTypingInterval = setInterval(() => { message.channel.sendTyping().catch(() => {}); }, 8000);
+    await ctx._styping(message);
+    const auditTypingInterval = setInterval(() => { ctx._styping(message).catch(() => {}); }, 8000);
     try {
       const auditResult = await ctx.runClaudeWithContinuation(auditPrompt, {
         personalityFile: auditPersonalityFile,
         identity: state.identity,
         cwd: state.cwd,
         channelState: state,
-        discordChannel: message.channel,
-      }, ctx.ChannelProxy.fromDiscord(message.channel));
+      }, null);
       if (auditResult.sessionId) {
         state.sessionId = auditResult.sessionId;
         ctx.saveChannelState(message.channel.id, state);

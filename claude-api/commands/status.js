@@ -6,10 +6,8 @@ module.exports = {
   async run(message, arg, state, ctx) {
     const allChannels = [];
     for (const [chId, s] of ctx.channels) {
-      const ch = ctx.client.channels.cache.get(chId);
-      const chName = ch ? `#${ch.name}` : chId;
       const status = s.busy ? '🔄 WORKING' : (s.sessionId ? '💤 idle' : '⚫ no session');
-      allChannels.push(`${chName}: ${status} | **${s.identity.name}** | ${s.personality} | \`${s.cwd}\`${s.sessionId ? ` | session \`${s.sessionId.substring(0, 8)}...\`` : ''}`);
+      allChannels.push(`${chId}: ${status} | **${s.identity.name}** | ${s.personality} | \`${s.cwd}\`${s.sessionId ? ` | session \`${s.sessionId.substring(0, 8)}...\`` : ''}`);
     }
     await message.reply(
       `**Bot Status:**\n` +

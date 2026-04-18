@@ -20,17 +20,17 @@ module.exports = {
     } else if (configKey === 'turns' && configVal) {
       state.config = state.config || {};
       state.config.maxTurns = parseInt(configVal, 10);
-      ctx.saveChannelState(message.channel.id, state);
+      ctx.saveChannelState(message.channel.id, state, { critical: true });
       await message.reply(`Max turns set to **${state.config.maxTurns}** for this channel.`);
     } else if (configKey === 'continues' && configVal) {
       state.config = state.config || {};
       state.config.maxContinues = parseInt(configVal, 10);
-      ctx.saveChannelState(message.channel.id, state);
+      ctx.saveChannelState(message.channel.id, state, { critical: true });
       await message.reply(`Auto-continues set to **${state.config.maxContinues}** for this channel.`);
     } else if (configKey === 'timeout' && configVal) {
       state.config = state.config || {};
       state.config.maxTimeout = parseInt(configVal, 10) * 60 * 1000;
-      ctx.saveChannelState(message.channel.id, state);
+      ctx.saveChannelState(message.channel.id, state, { critical: true });
       await message.reply(`Timeout set to **${configVal} minutes** for this channel.`);
     } else {
       await message.reply('Usage: `!config show` | `!config turns <N>` | `!config continues <N>` | `!config timeout <minutes>`');

@@ -2,8 +2,31 @@ const fs = require('fs');
 const path = require('path');
 const { atomicWriteJsonSync } = require('./atomic-write');
 
-// Store in mounted .claude dir so state persists across container rebuilds
-const STATE_FILE = path.join('/home/node/.claude', 'channel-state.json');
+// Store on the dedicated bot-data Docker volume so state survives rebuilds.
+// Previously lived in /home/node/.claude (a bind mount shared with the Claude
+// CLI config dir). That path was fragile: ownership mismatches between the
+// container's `node` user and the host operator, plus Claude CLI writing its
+// own files there, caused channel-state.json to be wiped on rebuilds. The
+// bot-data named volume is isolated and purpose-built for bot persistence —
+// same volume as user-tokens.json, user-profiles.json, and oauth-state.json.
+const STATE_FILE = '/app/data/channel-state.json';
+const LEGACY_STATE_FILE = '/home/node/.claude/channel-state.json';
+
+// One-time migration: if the new location is empty but the legacy file has
+// data, copy it forward. Runs at module load.
+(function migrateLegacyState() {
+  try {
+    if (fs.existsSync(STATE_FILE)) return;
+    if (!fs.existsSync(LEGACY_STATE_FILE)) return;
+    const legacy = fs.readFileSync(LEGACY_STATE_FILE, 'utf8');
+    if (!legacy.trim()) return;
+    fs.mkdirSync(path.dirname(STATE_FILE), { recursive: true });
+    atomicWriteJsonSync(STATE_FILE, JSON.parse(legacy));
+    console.log('[channel-persistence] Migrated channel-state.json from legacy path to /app/data/');
+  } catch (err) {
+    console.error('[channel-persistence] Legacy migration failed:', err.message);
+  }
+})();
 
 // Debounce writes to avoid filesystem thrashing
 const pendingWrites = new Map();

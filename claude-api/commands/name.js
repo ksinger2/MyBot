@@ -10,7 +10,7 @@ module.exports = {
       const newName = arg.trim().substring(0, 50);
       state.identity.name = newName;
       state.sessionId = null;
-      ctx.saveChannelState(message.channel.id, state);
+      ctx.saveChannelState(message.channel.id, state, { critical: true });
       await message.reply(`Name changed to **${state.identity.name}**! Session cleared.`);
     }
   }

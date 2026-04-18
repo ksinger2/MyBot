@@ -25,8 +25,8 @@ module.exports = {
     state.busy = true;
     state.startedAt = Date.now();
     state.progress = ctx.freshProgress();
-    await message.channel.sendTyping();
-    const planTyping = setInterval(() => { message.channel.sendTyping().catch(() => {}); }, 8000);
+    await ctx._styping(message);
+    const planTyping = setInterval(() => { ctx._styping(message).catch(() => {}); }, 8000);
 
     try {
       const personalityFile = ctx.getPersonalityFile(state.personality);
@@ -37,7 +37,6 @@ module.exports = {
         cwd: state.cwd,
         maxTurns: 20,
         channelState: state,
-        discordChannel: message.channel,
       });
       if (result.sessionId) state.sessionId = result.sessionId;
       if (!result.stopped) await ctx.sendLongMessage(message, result.text, state.cwd);

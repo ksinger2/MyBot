@@ -15,9 +15,7 @@ module.exports = {
       const activeChannels = [];
       for (const [chId, s] of ctx.channels) {
         if (s.busy && s.process) {
-          const ch = ctx.client.channels.cache.get(chId);
-          const chName = ch ? `#${ch.name}` : chId;
-          activeChannels.push(`${chName}: PID ${s.process.pid}`);
+          activeChannels.push(`${chId}: PID ${s.process.pid}`);
         }
       }
 

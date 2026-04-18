@@ -284,14 +284,10 @@ async function processHangoutStep(state, message) {
         // Send DMs with auth links to unconnected users
         for (const userId of notConnected) {
           try {
-            const user = await message.client.users.fetch(userId);
-            const authUrl = googleAuth.getAuthUrl(userId);
-            await user.send(
-              `**${message.author.username}** is planning a hangout and wants to check your calendar!\n` +
-              `Connect your Google Calendar to participate in scheduling:\n${authUrl}`
-            );
+            // Signal-only: no cross-user DM API. Auth links should be shared in-channel.
+            console.log(`[hangout] Signal-only: skipping per-user DM auth link for ${userId}`);
           } catch (err) {
-            console.error(`[hangout] Could not DM user ${userId}:`, err.message);
+            console.error(`[hangout] Could not notify user ${userId}:`, err.message);
           }
         }
       }

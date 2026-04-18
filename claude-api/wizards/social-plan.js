@@ -178,17 +178,11 @@ async function processSocialPlanStep(state, message) {
 
       wiz.data._planText = result.text || 'Could not generate plan.';
 
-      // Try to send with embed + quick actions
+      // Signal-only: no embeds/components. Send as plain text.
       try {
-        const embed = createPlanSummaryEmbed({
-          title: 'Trip Plan',
-          description: wiz.data._planText.substring(0, 4000),
-        });
-        const actions = createQuickActions({ eventId: `social-${Date.now()}` });
-        await message.channel.send({ embeds: [embed], components: [actions] });
+        await sendLongMessage(message, wiz.data._planText);
       } catch {
-        // Fallback: send as plain text
-        await sendLongMessage(message.channel, wiz.data._planText);
+        await message.reply(wiz.data._planText.substring(0, 1800));
       }
 
       step.prompt = 'What should I do?\n' +
@@ -220,14 +214,10 @@ async function executeSocialPlan(data, message, channelState, extractedLinks, ch
     for (const userId of participants) {
       if (userId === message.author.id) continue;
       try {
-        const user = await message.client.users.fetch(userId);
-        const summary = planText.length > 1800
-          ? planText.substring(0, 1800) + '\n\n*(truncated — check the channel)*'
-          : planText;
-        await user.send(`**Trip plan from ${message.author.username}:**\n\n${summary}`);
-        sent++;
+        // Signal-only: no cross-user DM API; share the plan in-channel instead.
+        console.log(`[social-plan] Signal-only: skipping per-user DM for ${userId}`);
       } catch (err) {
-        console.warn(`[social-plan] Failed to DM ${userId}:`, err.message);
+        console.warn(`[social-plan] Failed to notify ${userId}:`, err.message);
       }
     }
     if (sent > 0) await message.reply(`Sent the plan to ${sent} person(s) via DM!`);

@@ -78,7 +78,7 @@ module.exports = {
   },
 
   jobs: {
-    enabled: true,
+    enabled: false,
     titles: ['Senior Product Manager', 'Staff Product Manager', 'Director of Product Management'],
     locations: ['United States', 'Remote'],
     // Companies and categories to search for new postings

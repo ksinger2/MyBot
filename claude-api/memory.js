@@ -13,8 +13,8 @@ const path = require('path');
 
 const MEMORY_DIR = '.claude/memory';
 const MEMORY_FILE = 'MEMORY.md';
-const MAX_MEMORY_CHARS = 8000;  // Cap memory injection to avoid bloating context
-const MAX_DAILY_CHARS = 4000;
+const MAX_MEMORY_CHARS = 3000;  // Cap memory injection to avoid bloating context
+const MAX_DAILY_CHARS = 2000;
 
 /**
  * Load persistent memory for a project.

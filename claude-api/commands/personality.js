@@ -14,7 +14,7 @@ module.exports = {
       } else {
         state.personality = arg;
         state.sessionId = null;
-        ctx.saveChannelState(message.channel.id, state);
+        ctx.saveChannelState(message.channel.id, state, { critical: true });
         await message.reply(`Personality switched to **${arg}**! Session cleared.`);
       }
     }

@@ -38,24 +38,22 @@ const POLLERS = {
 
 const MAX_FIXES_PER_HOUR = 3;
 
-function startMonitorRunner(client) {
+function startMonitorRunner() {
   const monitors = listMonitors().filter(m => m.enabled);
   console.log(`[monitor-runner] Loading ${monitors.length} monitor(s)...`);
   for (const mon of monitors) {
-    scheduleMonitor(mon, client);
+    scheduleMonitor(mon);
   }
 }
 
-function scheduleMonitor(monitor, client) {
-  // Clear existing timer if re-scheduling
+function scheduleMonitor(monitor) {
   if (timers.has(monitor.id)) clearInterval(timers.get(monitor.id));
 
   const intervalMs = (monitor.pollInterval || 5) * 60 * 1000;
-  const timer = setInterval(() => runPoll(monitor.id, client), intervalMs);
+  const timer = setInterval(() => runPoll(monitor.id), intervalMs);
   timers.set(monitor.id, timer);
 
-  // Run first check after short delay
-  setTimeout(() => runPoll(monitor.id, client), 5000);
+  setTimeout(() => runPoll(monitor.id), 5000);
   console.log(`  Monitor #${monitor.id}: ${monitor.type} (every ${monitor.pollInterval || 5}min)`);
 }
 
@@ -81,7 +79,7 @@ function recordFixAction(monitorId) {
   fixCounts.set(monitorId, counts);
 }
 
-async function runPoll(monitorId, client) {
+async function runPoll(monitorId) {
   const monitor = getMonitor(monitorId);
   if (!monitor || !monitor.enabled) return;
 
@@ -92,16 +90,19 @@ async function runPoll(monitorId, client) {
     const result = await poller(monitor);
     updateMonitor(monitorId, { lastCheck: new Date().toISOString() });
     if (!result.changed) return;
-
-    // Update last known state
     if (result.newState) updateMonitor(monitorId, { lastState: result.newState });
 
-    const channel = await client.channels.fetch(monitor.channelId).catch(() => null);
-    if (!channel) return;
+    // Signal-only delivery. monitor.channelId is expected to be a Signal
+    // chat id (or `signal:<chatId>`); if it's not we skip the send.
+    const { signalAdapter } = require('./bot');
+    if (!signalAdapter || !signalAdapter.ready) return;
+    const chatId = (monitor.channelId || '').replace(/^signal:/, '');
+    if (!chatId) return;
+    const send = (text) => signalAdapter.sendMessage(chatId, text).catch(() => {});
 
     // Notify-only or no prompt (e.g. recovery)
     if (monitor.action === 'notify' || !result.prompt) {
-      await channel.send(`**Monitor #${monitor.id}:**\n${result.summary}`).catch(() => {});
+      await send(`Monitor #${monitor.id}:\n${result.summary}`);
       return;
     }
 
@@ -110,32 +111,28 @@ async function runPoll(monitorId, client) {
     const { saveChannelState } = require('./channel-persistence');
     const state = getChannelState(monitor.channelId);
 
-    // If channel is busy, degrade to notify
     if (state.busy) {
-      await channel.send(`*Monitor #${monitor.id} alert (channel busy):*\n${result.summary}`).catch(() => {});
+      await send(`Monitor #${monitor.id} alert (channel busy):\n${result.summary}`);
       return;
     }
 
-    // Rate limit fix actions
     if (isRateLimited(monitorId)) {
-      await channel.send(`**Monitor #${monitor.id}** (rate limited — ${MAX_FIXES_PER_HOUR} fixes/hr):\n${result.summary}`).catch(() => {});
+      await send(`Monitor #${monitor.id} (rate limited — ${MAX_FIXES_PER_HOUR} fixes/hr):\n${result.summary}`);
       return;
     }
 
-    // L8: daily spend cap across all monitors. If we're already at/over the
-    // cap, skip dispatching another auto-fix until UTC midnight.
     const spentToday = _getDailyAutoFixCost();
     if (spentToday >= MAX_AUTO_FIX_COST_PER_DAY_USD) {
       console.log(`[monitor] daily auto-fix cost cap reached ($${spentToday.toFixed(4)}) — skipping fix dispatch until tomorrow`);
-      await channel.send(`**Monitor #${monitor.id}** (daily cost cap $${MAX_AUTO_FIX_COST_PER_DAY_USD.toFixed(2)} reached — notify only):\n${result.summary}`).catch(() => {});
+      await send(`Monitor #${monitor.id} (daily cost cap $${MAX_AUTO_FIX_COST_PER_DAY_USD.toFixed(2)} reached — notify only):\n${result.summary}`);
       return;
     }
 
     recordFixAction(monitorId);
-    await channel.send(`**Monitor #${monitor.id} — auto-fixing:**\n${result.summary}`).catch(() => {});
+    await send(`Monitor #${monitor.id} — auto-fixing:\n${result.summary}`);
 
     const personalityFile = getPersonalityFile(state.personality);
-    const typingInterval = setInterval(() => channel.sendTyping().catch(() => {}), 8000);
+    const typingInterval = setInterval(() => signalAdapter.sendTyping(chatId).catch(() => {}), 8000);
 
     try {
       state.busy = true;
@@ -148,15 +145,12 @@ async function runPoll(monitorId, client) {
         identity: state.identity,
         cwd: monitor.cwd || state.cwd,
         channelState: state,
-        discordChannel: channel,
-      }, channel);
+      }, null);
 
       if (fixResult.sessionId) {
         state.sessionId = fixResult.sessionId;
         saveChannelState(monitor.channelId, state);
       }
-      // L8: record Claude spend against the UTC-day bucket. runClaudeWithContinuation
-      // returns { cost } in USD (see bot.js — used by !loop and inline replies).
       if (fixResult && fixResult.cost) {
         _addDailyAutoFixCost(fixResult.cost);
         const spent = _getDailyAutoFixCost();
@@ -165,11 +159,11 @@ async function runPoll(monitorId, client) {
         }
       }
       if (fixResult.text && !fixResult.stopped) {
-        const fakeMsg = { reply: (opts) => channel.send(opts), channel };
+        const fakeMsg = { _signalChatId: chatId, channel: { id: monitor.channelId } };
         await sendLongMessage(fakeMsg, fixResult.text, monitor.cwd || state.cwd);
       }
     } catch (err) {
-      await channel.send(`*Monitor #${monitor.id} fix failed: ${err.message.substring(0, 200)}*`).catch(() => {});
+      await send(`Monitor #${monitor.id} fix failed: ${err.message.substring(0, 200)}`);
     } finally {
       clearInterval(typingInterval);
       state.busy = false;

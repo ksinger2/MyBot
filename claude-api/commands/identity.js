@@ -19,7 +19,7 @@ module.exports = {
         state.identity.description = arg.trim().substring(0, 250);
       }
       state.sessionId = null;
-      ctx.saveChannelState(message.channel.id, state);
+      ctx.saveChannelState(message.channel.id, state, { critical: true });
       await message.reply(`Identity updated: **${state.identity.name}** — ${state.identity.description}\nSession cleared.`);
     }
   }

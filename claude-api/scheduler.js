@@ -15,7 +15,7 @@ const activeJobs = new Map(); // scheduleId -> node-schedule Job
  * structured payload), these rows must NOT fire. Belt + suspenders:
  * the dispatch handler also rejects them.
  */
-function startAllSchedules(client) {
+function startAllSchedules() {
   const schedules = loadSchedules();
   console.log(`Loading ${schedules.length} saved schedule(s)...`);
   for (const sched of schedules) {
@@ -26,7 +26,7 @@ function startAllSchedules(client) {
         sched.active = false;
       }
     }
-    registerJob(sched, client);
+    registerJob(sched);
   }
 }
 
@@ -39,7 +39,7 @@ function _isLegacyConcertTracker(sched) {
 /**
  * Register a single schedule as a node-schedule job
  */
-function registerJob(sched, client) {
+function registerJob(sched) {
   // Cancel existing job if re-registering
   if (activeJobs.has(sched.id)) {
     activeJobs.get(sched.id).cancel();
@@ -68,6 +68,15 @@ function registerJob(sched, client) {
           }
           return;
         }
+        if (sched.subtype === 'media-pulse') {
+          try {
+            const { runMediaPulseJob } = require('./media-pulse');
+            await runMediaPulseJob(sched);
+          } catch (err) {
+            console.error(`[media-pulse] Job #${sched.id} failed: ${err.message}`);
+          }
+          return;
+        }
         // Hard-stop legacy concert tracker schedules at dispatch
         // even if startup safeguard somehow missed them.
         if (_isLegacyConcertTracker(sched)) {
@@ -76,13 +85,17 @@ function registerJob(sched, client) {
           return;
         }
 
-        // Generic dm-task: run prompt through Claude, send to DM.
-        const isSignal = sched.userId.startsWith('+');
+        // Generic dm-task: run prompt through Claude, send to Signal DM.
+        // Signal-only — userId is a phone number prefixed with '+'.
+        if (!sched.userId || !sched.userId.startsWith('+')) {
+          console.warn(`[dm-task] Job #${sched.id} skipped — non-Signal userId`);
+          return;
+        }
         try {
           const { askClaude, signalAdapter } = require('./bot');
           const { buildProfileContext } = require('./user-profiles');
           const profileContext = buildProfileContext(sched.userId);
-          console.log(`[dm-task] Running job #${sched.id} "${sched.description}" for ${isSignal ? 'Signal' : 'Discord'} user`);
+          console.log(`[dm-task] Running job #${sched.id} "${sched.description}" for Signal user`);
 
           const result = await askClaude(sched.message, {
             cwd: '/app',
@@ -95,33 +108,11 @@ function registerJob(sched, client) {
             return;
           }
 
-          if (isSignal) {
-            if (signalAdapter && signalAdapter.ready) {
-              await signalAdapter.sendLongMessage(sched.userId, result.text);
-              console.log(`[dm-task] Job #${sched.id} sent to Signal DM`);
-            } else {
-              console.warn(`[dm-task] Job #${sched.id} — Signal adapter not ready, skipping`);
-            }
+          if (signalAdapter && signalAdapter.ready) {
+            await signalAdapter.sendLongMessage(sched.userId, result.text);
+            console.log(`[dm-task] Job #${sched.id} sent to Signal DM`);
           } else {
-            const user = await client.users.fetch(sched.userId).catch(() => null);
-            if (user) {
-              const dm = await user.createDM().catch(() => null);
-              if (dm) {
-                // Chunk for Discord 2000-char limit
-                const text = result.text;
-                if (text.length <= 1900) {
-                  await dm.send(text);
-                } else {
-                  let remaining = text;
-                  while (remaining.length > 0) {
-                    const splitAt = remaining.length <= 1900 ? remaining.length : (remaining.lastIndexOf('\n', 1900) > 500 ? remaining.lastIndexOf('\n', 1900) : 1900);
-                    await dm.send(remaining.substring(0, splitAt));
-                    remaining = remaining.substring(splitAt);
-                  }
-                }
-                console.log(`[dm-task] Job #${sched.id} sent to Discord DM`);
-              }
-            }
+            console.warn(`[dm-task] Job #${sched.id} — Signal adapter not ready, skipping`);
           }
         } catch (err) {
           console.error(`[dm-task] Job #${sched.id} failed: ${err.message}`);
@@ -130,20 +121,25 @@ function registerJob(sched, client) {
       }
 
       if (sched.type === 'task') {
-        // Autonomous task execution
-        const channel = await client.channels.fetch(sched.channelId).catch(() => null);
-        if (!channel) return;
-        const { runClaudeWithContinuation, getChannelState, getPersonalityFile, sendLongMessage, freshProgress } = require('./bot');
+        // Signal-only autonomous task execution. sched.channelId is a Signal
+        // channel id (e.g. `signal:<chatId>`). Skip if the adapter is missing.
+        const { signalAdapter, runClaudeWithContinuation, getChannelState, getPersonalityFile, sendLongMessage, freshProgress } = require('./bot');
         const { saveChannelState } = require('./channel-persistence');
-        const state = getChannelState(sched.channelId);
+        if (!signalAdapter || !signalAdapter.ready) {
+          console.warn(`[task] Schedule #${sched.id} skipped — Signal adapter not ready`);
+          return;
+        }
+        const chatId = (sched.channelId || '').replace(/^signal:/, '');
+        if (!chatId) return;
 
+        const state = getChannelState(sched.channelId);
         if (state.busy) {
-          await channel.send(`*Scheduled task skipped — channel busy. Task: "${sched.message.substring(0, 100)}"*`).catch(() => {});
+          await signalAdapter.sendMessage(chatId, `Scheduled task skipped — channel busy. Task: "${sched.message.substring(0, 100)}"`).catch(() => {});
           return;
         }
 
         const personalityFile = getPersonalityFile(state.personality);
-        const typingInterval = setInterval(() => channel.sendTyping().catch(() => {}), 8000);
+        const typingInterval = setInterval(() => signalAdapter.sendTyping(chatId).catch(() => {}), 8000);
 
         try {
           state.busy = true;
@@ -156,20 +152,18 @@ function registerJob(sched, client) {
             identity: state.identity,
             cwd: sched.cwd || state.cwd,
             channelState: state,
-            discordChannel: channel,
-          }, channel);
+          }, null);
 
           if (result.sessionId) {
             state.sessionId = result.sessionId;
             saveChannelState(sched.channelId, state);
           }
           if (result.text && !result.stopped) {
-            // Send result to channel using a fake message-like object for sendLongMessage
-            const fakeMsg = { reply: (opts) => channel.send(opts), channel };
+            const fakeMsg = { _signalChatId: chatId, channel: { id: sched.channelId } };
             await sendLongMessage(fakeMsg, result.text, sched.cwd || state.cwd);
           }
         } catch (err) {
-          await channel.send(`*Scheduled task failed: ${err.message.substring(0, 200)}*`).catch(() => {});
+          await signalAdapter.sendMessage(chatId, `Scheduled task failed: ${err.message.substring(0, 200)}`).catch(() => {});
         } finally {
           clearInterval(typingInterval);
           state.busy = false;
@@ -179,22 +173,15 @@ function registerJob(sched, client) {
         return;
       }
 
-      // Existing reminder logic
+      // Reminder — Signal-only.
       try {
-        // Try DM first
-        const user = await client.users.fetch(sched.userId).catch(() => null);
-        if (user) {
-          const dm = await user.createDM().catch(() => null);
-          if (dm) {
-            await dm.send(`**Scheduled reminder:**\n${sched.message}`);
-            return;
-          }
-        }
-        // Fallback to the channel where it was created
-        const channel = client.channels.cache.get(sched.channelId);
-        if (channel) {
-          await channel.send(`<@${sched.userId}> **Scheduled reminder:**\n${sched.message}`);
-        }
+        const { signalAdapter } = require('./bot');
+        if (!signalAdapter || !signalAdapter.ready) return;
+        const recipient = sched.userId && sched.userId.startsWith('+')
+          ? sched.userId
+          : (sched.channelId || '').replace(/^signal:/, '');
+        if (!recipient) return;
+        await signalAdapter.sendMessage(recipient, `Scheduled reminder:\n${sched.message}`);
       } catch (err) {
         console.error(`Schedule #${sched.id} failed to send:`, err.message);
       }
@@ -415,34 +402,13 @@ function _formatConcertTrackerMessage(result, priceThresholds = []) {
  * Best-effort — logs and continues on any error.
  */
 async function _sendUserMessage(sched, text) {
-  const isSignal = typeof sched.userId === 'string' && sched.userId.startsWith('+');
+  // Signal-only.
   try {
-    if (isSignal) {
-      const { signalAdapter } = require('./bot');
-      if (signalAdapter && signalAdapter.ready) {
-        await signalAdapter.sendLongMessage(sched.userId, text);
-      } else {
-        console.warn(`[concert-tracker] signal adapter not ready, dropping message for #${sched.id}`);
-      }
+    const { signalAdapter } = require('./bot');
+    if (signalAdapter && signalAdapter.ready) {
+      await signalAdapter.sendLongMessage(sched.userId, text);
     } else {
-      // Discord path — send via the bot client. Falls back to no-op
-      // if the user can't be DMed (privacy settings, etc) or if
-      // Discord is disabled in this build (Signal-only mode).
-      const { client } = require('./bot');
-      if (!client || !client.users || !client.users.fetch) return;
-      const user = await client.users.fetch(sched.userId).catch(() => null);
-      if (!user) return;
-      const dm = await user.createDM().catch(() => null);
-      if (!dm) return;
-      // Discord 2000-char limit
-      let remaining = text;
-      while (remaining.length > 0) {
-        const cut = remaining.length <= 1900
-          ? remaining.length
-          : (remaining.lastIndexOf('\n', 1900) > 500 ? remaining.lastIndexOf('\n', 1900) : 1900);
-        await dm.send(remaining.substring(0, cut));
-        remaining = remaining.substring(cut);
-      }
+      console.warn(`[concert-tracker] signal adapter not ready, dropping message for #${sched.id}`);
     }
   } catch (err) {
     console.warn(`[concert-tracker] _sendUserMessage failed for #${sched.id}: ${err.message}`);

@@ -17,8 +17,8 @@ module.exports = {
     state.busy = true;
     state.startedAt = Date.now();
     state.progress = ctx.freshProgress();
-    await message.channel.sendTyping();
-    const bugTypingInterval = setInterval(() => { message.channel.sendTyping().catch(() => {}); }, 8000);
+    await ctx._styping(message);
+    const bugTypingInterval = setInterval(() => { ctx._styping(message).catch(() => {}); }, 8000);
 
     const bugPrompt = `${bugSkill.instructions}\n\n${arg ? `Initial context/bugs to address:\n${arg}` : 'Ready to receive bugs. List them one by one and I will orchestrate agents to fix them.'}`;
     const personalityFile = ctx.getPersonalityFile(state.personality);
@@ -31,7 +31,6 @@ module.exports = {
         cwd: state.cwd,
         maxTurns: 100,
         channelState: state,
-        discordChannel: message.channel,
       });
 
       if (result.sessionId) state.sessionId = result.sessionId;

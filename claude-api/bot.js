@@ -8,7 +8,6 @@ if (INTERNAL_API_TOKEN) {
   console.log(`[security] bot.js: INTERNAL_API_TOKEN loaded via closure; process.env state: ${envState}`);
 }
 
-const { Client, GatewayIntentBits, Partials, AttachmentBuilder } = require('discord.js');
 const { spawn, execSync, execFileSync } = require('child_process');
 const fs = require('fs');
 const path = require('path');
@@ -26,7 +25,6 @@ const { getSkill, listSkills } = require('./skills/skill-loader');
 const { detectLinks, buildExtractionPrompt, buildSmartPrompt, enrichLinks } = require('./link-extractor');
 const { startHangoutWizard, processHangoutStep } = require('./wizards/hangout');
 const { startTripPlannerWizard, runResearchPhase } = require('./wizards/trip-planner');
-const { handleComponentInteraction } = require('./discord-components');
 let startSocialPlanWizard, processSocialPlanStep;
 try { ({ startSocialPlanWizard, processSocialPlanStep } = require('./wizards/social-plan')); } catch {}
 let spotifyAuth;
@@ -34,31 +32,9 @@ try { spotifyAuth = require('./spotify-auth'); } catch {}
 const { Runner } = require('./runner');
 const { sweepOrphanTmpFiles, atomicWriteJsonSync } = require('./atomic-write');
 const { extractImageAttachments } = require('./adapters/base');
-const { DiscordAdapter } = require('./adapters/discord');
 const { loadCommands } = require('./commands');
 const { addNote, extractNotes, stripNoteTags, getGroupNotes, startReminderLoop } = require('./group-notes');
 const { registerFlight, restoreFlightJobs, extractFlightTag, stripFlightTags } = require('./flight-tracker');
-
-// F23: Module-level DiscordAdapter instance — all Discord sends route through this
-let discordAdapter = null;
-
-// F23: Convenience helpers — route through adapter when available, fall back to raw Discord.js
-function _isSignalProxy(message) { return !!message._signalSenderId; }
-async function _dsend(channel, text) {
-  if (discordAdapter && typeof channel.id === 'string' && !channel.id.startsWith('signal:'))
-    return discordAdapter.sendMessage(channel.id, text);
-  return channel.send(text);
-}
-async function _dreply(message, text) {
-  if (discordAdapter && !_isSignalProxy(message))
-    return discordAdapter.sendMessage(message.channel.id, text, { rawMessage: message });
-  return message.reply(text);
-}
-async function _dtyping(channel) {
-  if (discordAdapter && typeof channel.id === 'string' && !channel.id.startsWith('signal:'))
-    return discordAdapter.sendTyping(channel.id);
-  return channel.sendTyping();
-}
 
 // F10: Deterministic greeting fast-path — replies without invoking Claude.
 // 100% reliable, $0, ~50ms. The system prompt rule stays as a backstop.
@@ -153,27 +129,11 @@ function _tryUnlock(channelId, suppliedPin) {
   return true;
 }
 
-// Access control — comma-separated Discord user IDs.
-// SECURITY: fail-closed. Empty set = deny all (NOT allow all as it used to).
-// If you're locked out on first boot, set ADMIN_USER_IDS / ALLOWED_USER_IDS in .env.
-const ALLOWED_USER_IDS = new Set((process.env.ALLOWED_USER_IDS || '').split(',').filter(Boolean));
-const ADMIN_USER_IDS = new Set((process.env.ADMIN_USER_IDS || '').split(',').filter(Boolean));
-if (ADMIN_USER_IDS.size === 0) {
-  console.warn('[security] WARNING: ADMIN_USER_IDS is empty — no Discord users can run admin commands. Set ADMIN_USER_IDS in .env.');
-}
-if (ALLOWED_USER_IDS.size === 0 && ADMIN_USER_IDS.size === 0) {
-  console.warn('[security] WARNING: ALLOWED_USER_IDS and ADMIN_USER_IDS are both empty — NO Discord user will be allowed to talk to the bot. Set ALLOWED_USER_IDS (and/or ADMIN_USER_IDS) in .env.');
-}
-function isAllowed(userId) {
-  if (!userId) return false;
-  // Admin always implies allowed. Otherwise must be in the explicit allow-list.
-  if (ADMIN_USER_IDS.has(userId)) return true;
-  return ALLOWED_USER_IDS.has(userId);
-}
-function isAdmin(userId) {
-  if (!userId) return false;
-  return ADMIN_USER_IDS.has(userId);
-}
+// Signal-only bot — Signal access control is handled by SIGNAL_ALLOWED_NUMBERS
+// and isSignalOwner() (see project-permissions.js). These stubs are kept for
+// any legacy callers but should not be used.
+function isAllowed() { return false; }
+function isAdmin() { return false; }
 
 const PERSONALITIES_DIR = path.join(__dirname, 'personalities');
 const DEFAULT_PERSONALITY = 'tiffany_pollard';
@@ -219,7 +179,7 @@ const STALL_THRESHOLDS = {
 const CHECKIN_INTERVAL = 5 * 60 * 1000; // Progress check-in every 5 minutes
 const DEFAULT_IDENTITY = {
   name: 'My Bot',
-  description: 'a helpful AI assistant on Discord. You are friendly, concise, and capable.'
+  description: 'a helpful AI assistant on Signal. You are friendly, concise, and capable.'
 };
 
 // Tool labels for !btw progress display
@@ -330,83 +290,6 @@ class ChannelProxy {
 
   async sendTyping() {
     try { await this._typingFn(); } catch {}
-  }
-
-  /** Create a ChannelProxy from a Discord message.channel object */
-  static fromDiscord(channel) {
-    // F23: Route through DiscordAdapter when available for symmetry with Signal path
-    if (discordAdapter) {
-      return new ChannelProxy({
-        sendFn: (text) => discordAdapter.sendMessage(channel.id, text).then(r => r),
-        typingFn: () => discordAdapter.sendTyping(channel.id),
-        platform: 'discord',
-        chatId: channel.id,
-      });
-    }
-    return new ChannelProxy({
-      sendFn: (text) => channel.send(text),
-      typingFn: () => channel.sendTyping(),
-      platform: 'discord',
-      chatId: channel.id,
-    });
-  }
-
-  /**
-   * Create a streaming-capable Discord proxy that edits a single message
-   * as text arrives, instead of sending one message per chunk.
-   * - First chunk: sends a new message
-   * - Subsequent chunks: edits the message (debounced every 2s to avoid rate limits)
-   * - When text exceeds 1800 chars: finalizes current message, starts a new one
-   * - flush(): must be called after streaming ends to remove the trailing cursor
-   */
-  static fromDiscordStreaming(channel) {
-    let currentMsg = null;
-    let buffer = '';
-    let dirty = false;
-    let flushTimer = null;
-
-    async function doFlush(final = false) {
-      if (!buffer) return;
-      if (!dirty && !final) return;
-      dirty = false;
-      try {
-        if (currentMsg && buffer.length > 1800) {
-          // Finalize the current message with its portion of text
-          await currentMsg.edit(buffer.substring(0, 1800)).catch(() => {});
-          buffer = buffer.substring(1800);
-          currentMsg = null;
-        }
-        const display = buffer.length > 1800 ? buffer.substring(0, 1800) : buffer;
-        const text = final ? display : display + ' \u2588';
-        if (!currentMsg) {
-          currentMsg = await channel.send(text);
-        } else {
-          await currentMsg.edit(text).catch(() => {});
-        }
-      } catch (err) {
-        console.error('[discord-stream] flush error:', err.message);
-      }
-    }
-
-    const proxy = new ChannelProxy({
-      sendFn: (text) => {
-        buffer += (buffer && !buffer.endsWith('\n') ? '\n' : '') + text;
-        dirty = true;
-        if (flushTimer) clearTimeout(flushTimer);
-        flushTimer = setTimeout(() => doFlush(false), 2000);
-        return Promise.resolve();
-      },
-      typingFn: () => discordAdapter ? discordAdapter.sendTyping(channel.id) : channel.sendTyping(),
-      platform: 'discord',
-      chatId: channel.id,
-    });
-
-    proxy.flush = async () => {
-      if (flushTimer) clearTimeout(flushTimer);
-      await doFlush(true);
-    };
-
-    return proxy;
   }
 
   /** Create a ChannelProxy for a Signal conversation */
@@ -660,31 +543,6 @@ async function gracefulShutdown(signal) {
 process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
 process.on('SIGINT', () => gracefulShutdown('SIGINT'));
 
-const client = new Client({
-  intents: [
-    GatewayIntentBits.Guilds,
-    GatewayIntentBits.GuildMessages,
-    GatewayIntentBits.GuildMembers,
-    GatewayIntentBits.MessageContent,
-    GatewayIntentBits.DirectMessages,
-    GatewayIntentBits.GuildMessageReactions,
-  ],
-  partials: [Partials.Channel, Partials.Message, Partials.Reaction],
-});
-
-// Detect active participants in a channel by scanning recent messages
-async function getChannelParticipants(channel, excludeBots = true) {
-  try {
-    const messages = await channel.messages.fetch({ limit: 50 });
-    const userIds = new Set();
-    for (const [, msg] of messages) {
-      if (excludeBots && msg.author.bot) continue;
-      userIds.add(msg.author.id);
-    }
-    return [...userIds];
-  } catch { return []; }
-}
-
 function getChannel(channelId) {
   if (!channels.has(channelId)) {
     // Check for persisted state from previous container lifecycle
@@ -707,8 +565,6 @@ function getChannel(channelId) {
       groupingBuffer: [],    // buffered messages waiting to be combined
       groupingSenderId: null, // sender of the buffered messages
       _triggeredByTimestamp: null, // Signal timestamp of the message that started the active task
-      _triggeredByMessageId: null, // Discord message ID that started the active task
-      lastBotMessageId: null, // Discord: ID of the last message the bot sent in this channel
     });
   }
   return channels.get(channelId);
@@ -732,12 +588,10 @@ function listPersonalities() {
     .map(f => f.replace('.md', ''));
 }
 
-function askClaude(prompt, { sessionId = null, personalityFile = null, identity = null, cwd = DEFAULT_WORKSPACE, maxTurns = null, channelState = null, discordChannel = null, channelProxy = null, discordUserId = null, readOnly = false, groupAllowedTools = undefined, profileContext = null, streamReplies = false, model = 'sonnet', ownerDmMode = false, planMode = false, isVoice = false } = {}) {
-  // Wrap raw Discord channel in ChannelProxy if needed
-  if (!channelProxy && discordChannel) {
-    channelProxy = ChannelProxy.fromDiscord(discordChannel);
-  }
-  // Delegate to Runner (extracted in F20/F21)
+function askClaude(prompt, { sessionId = null, personalityFile = null, identity = null, cwd = DEFAULT_WORKSPACE, maxTurns = null, channelState = null, channelProxy = null, discordUserId = null, readOnly = false, groupAllowedTools = undefined, profileContext = null, streamReplies = false, model = 'sonnet', ownerDmMode = false, planMode = false, isVoice = false } = {}) {
+  // Delegate to Runner (extracted in F20/F21).
+  // `discordUserId` retained as the param name for backward-compatibility with
+  // runner.js — it actually holds the Signal sender id in this codebase.
   const runner = new Runner(prompt, {
     sessionId, personalityFile, identity, cwd, maxTurns,
     channelState, channelProxy, discordUserId, readOnly,
@@ -775,7 +629,7 @@ async function runClaudeWithContinuation(prompt, opts, channelProxy) {
 
   while (result.hitTurnLimit && continueCount < maxContinues && !result.stopped && !isGroupContext && !skipAutoContinue) {
     continueCount++;
-    const isOwnerDm = channelProxy.platform === 'discord' || (opts.channelState && !opts.channelState._isGroupChat);
+    const isOwnerDm = opts.channelState && !opts.channelState._isGroupChat;
 
     // Checkpoint & restart: save to NextSteps.md → kill session → fresh start
     if (continueCount % REFRESH_EVERY === 0 && continueCount < maxContinues) {
@@ -837,112 +691,47 @@ async function runClaudeWithContinuation(prompt, opts, channelProxy) {
 
 // extractImageAttachments imported from adapters/base.js (F8/F22)
 
+// Signal-only sendLongMessage. `message` is a Signal proxy created via
+// createSignalMessageProxy() — its `_signalChatId` field is the recipient.
+// Image attachments embedded in the response text are sent as attachments
+// after the text body via signalAdapter.sendMessage.
 async function sendLongMessage(message, text, cwd = DEFAULT_WORKSPACE) {
-  if (!text || text.length === 0) {
-    // Silently skip — don't send a confusing placeholder to the user.
-    // The caller handles turn-limit messaging separately.
+  if (!text || text.length === 0) return;
+
+  const chatId = message?._signalChatId
+    || (message?.channel?.id ? String(message.channel.id).replace(/^signal:/, '') : null);
+  if (!chatId || !signalAdapter) {
+    console.warn('[sendLongMessage] no Signal chatId or adapter; dropping message');
     return;
   }
 
-  // Resolve relative paths against cwd before scanning
+  // Resolve relative paths against cwd before scanning for image attachments
   const resolvedText = text.replace(/(?:^|\s)([\w./][^\s"'`()]*\.(?:png|jpg|jpeg|gif|webp))/gim, (m, p) => {
     const abs = path.isAbsolute(p) ? p : path.join(cwd, p);
     return m.replace(p, abs);
   });
-
   const imagePaths = extractImageAttachments(resolvedText);
 
-  // F23: Route all sends through the DiscordAdapter when available.
-  // Skip for Signal proxy messages — those already go through signalAdapter.
-  // The adapter's sendMessage handles AttachmentBuilder creation internally via Buffer,
-  // so we read image files into buffers. For non-image file attachments (like full-response.txt),
-  // we also pass buffers.
-  if (discordAdapter && !_isSignalProxy(message)) {
-    const imageBuffers = [];
-    const imageNames = [];
-    for (const imgPath of imagePaths) {
-      try {
-        imageBuffers.push(fs.readFileSync(imgPath));
-        imageNames.push(path.basename(imgPath));
-      } catch (e) { console.error(`[sendLongMessage] Could not read image ${imgPath}: ${e.message}`); }
-    }
-
-    const chunks = [];
-    if (text.length <= 1900) {
-      chunks.push(text);
-    } else {
-      let r = text;
-      while (r.length > 0) {
-        if (r.length <= 1990) { chunks.push(r); break; }
-        let splitAt = r.lastIndexOf('\n', 1990);
-        if (splitAt < 500) splitAt = 1990;
-        chunks.push(r.substring(0, splitAt));
-        r = r.substring(splitAt);
-      }
-    }
-
-    // First chunk: reply to original message, include image attachments
-    const firstOpts = { rawMessage: message };
-    if (imageBuffers.length) {
-      firstOpts.attachments = imageBuffers;
-      firstOpts.attachmentNames = imageNames;
-    }
-    await discordAdapter.sendMessage(message.channel.id, chunks[0], firstOpts).catch(e => console.error('Reply failed:', e.message));
-
-    if (chunks.length > 8) {
-      for (let i = 1; i < Math.min(chunks.length, 4); i++) {
-        await discordAdapter.sendMessage(message.channel.id, chunks[i]).catch(e => console.error('Chunk send failed:', e.message));
-      }
-      const fullTextBuffer = Buffer.from(text, 'utf-8');
-      await discordAdapter.sendMessage(
-        message.channel.id,
-        `*Response was too long for Discord (${chunks.length} chunks). Full text attached:*`,
-        { attachments: [fullTextBuffer], attachmentNames: ['full-response.txt'] }
-      ).catch(e => console.error('Attachment send failed:', e.message));
-    } else {
-      for (let i = 1; i < chunks.length; i++) {
-        await discordAdapter.sendMessage(message.channel.id, chunks[i]).catch(e => console.error('Chunk send failed:', e.message));
-      }
-    }
-    return;
+  // Strip image paths from the text — images go as separate attachments
+  let textToSend = text;
+  for (const imgPath of imagePaths) {
+    textToSend = textToSend.replace(imgPath, '').trim();
   }
 
-  // Legacy path: direct Discord.js calls (fallback when adapter not initialized)
-  const files = imagePaths.map(p => new AttachmentBuilder(p));
+  if (textToSend) {
+    await signalAdapter.sendLongMessage(chatId, textToSend).catch(e =>
+      console.error('[sendLongMessage] Signal send failed:', e.message));
+  }
 
-  const chunks = [];
-  let remaining = text.length <= 1900 ? text : (() => {
-    let r = text, out = [];
-    while (r.length > 0) {
-      if (r.length <= 1990) { out.push(r); break; }
-      let splitAt = r.lastIndexOf('\n', 1990);
-      if (splitAt < 500) splitAt = 1990;
-      out.push(r.substring(0, splitAt));
-      r = r.substring(splitAt);
-    }
-    return out;
-  })();
-
-  if (typeof remaining === 'string') chunks.push(remaining);
-  else chunks.push(...remaining);
-
-  // Send first chunk with any image attachments
-  await _dreply(message,{ content: chunks[0], files: files.length ? files : undefined }).catch(e => console.error('Reply failed:', e.message));
-
-  if (chunks.length > 8) {
-    // Too many chunks — send first 4 inline, then upload full text as attachment
-    for (let i = 1; i < Math.min(chunks.length, 4); i++) {
-      await message.channel.send(chunks[i]).catch(e => console.error('Chunk send failed:', e.message));
-    }
-    const fullTextBuffer = Buffer.from(text, 'utf-8');
-    const attachment = new AttachmentBuilder(fullTextBuffer, { name: 'full-response.txt' });
-    await message.channel.send({
-      content: `*Response was too long for Discord (${chunks.length} chunks). Full text attached:*`,
-      files: [attachment],
-    }).catch(e => console.error('Attachment send failed:', e.message));
-  } else {
-    for (let i = 1; i < chunks.length; i++) {
-      await message.channel.send(chunks[i]).catch(e => console.error('Chunk send failed:', e.message));
+  for (const imgPath of imagePaths) {
+    try {
+      const buf = fs.readFileSync(imgPath);
+      await signalAdapter.sendMessage(chatId, '', {
+        attachments: [buf],
+        attachmentNames: [path.basename(imgPath)],
+      });
+    } catch (e) {
+      console.error(`[sendLongMessage] Could not send image ${imgPath}: ${e.message}`);
     }
   }
 }
@@ -960,10 +749,29 @@ const { parseFrequency } = require('./parse-frequency');
 
 const commands = loadCommands();
 
+// Signal-only reply helper — sends `text` back to the chat that produced
+// `message`. Works with the proxy objects created by createSignalMessageProxy().
+async function _sreply(message, text) {
+  if (!signalAdapter || !text) return null;
+  const chatId = message?._signalChatId
+    || (message?.channel?.id ? String(message.channel.id).replace(/^signal:/, '') : null);
+  if (!chatId) return null;
+  try { return await signalAdapter.sendMessage(chatId, text); }
+  catch (e) { console.warn('[_sreply] send failed:', e.message); return null; }
+}
+
+async function _styping(message) {
+  if (!signalAdapter) return;
+  const chatId = message?._signalChatId
+    || (message?.channel?.id ? String(message.channel.id).replace(/^signal:/, '') : null);
+  if (!chatId) return;
+  try { await signalAdapter.sendTyping(chatId); } catch {}
+}
+
 function buildCommandCtx() {
   return {
-    // Discord client & channel state
-    client, channels, getChannel, saveChannelState, flushPendingWrites,
+    // Channel state
+    channels, getChannel, saveChannelState, flushPendingWrites,
     // Messaging helpers
     sendLongMessage, ChannelProxy,
     // Claude invocation
@@ -1003,10 +811,12 @@ function buildCommandCtx() {
     STALL_THRESHOLDS, CHECKIN_INTERVAL,
     // Progress display
     TOOL_LABELS,
-    // Access control
-    isAdmin, isAllowed,
-    // F23 adapter helpers
-    _dsend, _dreply, _dtyping,
+    // Signal messaging helpers (replaces former _dsend/_dreply/_dtyping)
+    _sreply, _styping,
+    // Back-compat aliases so any command still using these names keeps working.
+    _dsend: (_msgOrCh, text) => _sreply(_msgOrCh, text),
+    _dreply: (msg, text) => _sreply(msg, text),
+    _dtyping: (msgOrCh) => _styping(msgOrCh),
   };
 }
 
@@ -1028,18 +838,14 @@ async function handleCommand(message) {
   if (!cmd) return false;
 
   // Gate admin-only commands. Signal messages go through a proxy that sets
-  // `_signalSenderId`; for Signal, admin = `isSignalOwner(senderId)`. Discord
-  // uses the fail-closed ADMIN_USER_IDS allowlist.
+  // `_signalSenderId`; admin = `isSignalOwner(senderId)`.
   if (cmd.adminOnly) {
-    let isAdminCaller;
-    if (message._signalSenderId) {
-      const { isSignalOwner } = require('./project-permissions');
-      isAdminCaller = isSignalOwner(message._signalSenderId);
-    } else {
-      isAdminCaller = isAdmin(message.author.id);
-    }
+    const { isSignalOwner } = require('./project-permissions');
+    const isAdminCaller = message._signalSenderId
+      ? isSignalOwner(message._signalSenderId)
+      : false;
     if (!isAdminCaller) {
-      await _dreply(message, '🚫 Owner only — that command requires admin access.');
+      await _sreply(message, 'Owner only — that command requires admin access.');
       return true;
     }
   }
@@ -1062,10 +868,6 @@ function listWorkspaceDirs() {
   }
 }
 
-client.on('error', (err) => {
-  console.error('Discord client error:', err.message);
-});
-
 process.on('unhandledRejection', (err) => {
   console.error('Unhandled rejection:', err);
   sendErrorAlert(err instanceof Error ? err : new Error(String(err)), { source: 'unhandledRejection' });
@@ -1076,25 +878,13 @@ process.on('uncaughtException', (err) => {
   sendErrorAlert(err, { source: 'uncaughtException' });
 });
 
-client.on('clientReady', () => {
-  // F23: Initialize DiscordAdapter wrapping the existing client (avoids a second Client instance).
-  // From this point, sendMessage/sendLongMessage/sendTyping go through the adapter for symmetry
-  // with the Signal path.
-  discordAdapter = new DiscordAdapter({ client });
-  discordAdapter.ready = true;
-  module.exports.discordAdapter = discordAdapter;
-
-  // Track the bot's last sent message ID per channel so reaction handlers know
-  // which message a 👍/👎 reaction is responding to.
-  const _origSendMessage = discordAdapter.sendMessage.bind(discordAdapter);
-  discordAdapter.sendMessage = async function(chatId, text, opts = {}) {
-    const result = await _origSendMessage(chatId, text, opts);
-    if (result && result.id) {
-      const state = channels.get(chatId);
-      if (state) state.lastBotMessageId = result.id;
-    }
-    return result;
-  };
+// Idempotency guard — startBot() may be called from the Signal adapter's
+// .start().then() and ALSO from a fallback in start() if the adapter never
+// comes online. Run the body at most once.
+let _startBotRan = false;
+async function startBot() {
+  if (_startBotRan) return;
+  _startBotRan = true;
 
   // F16: sweep orphaned .tmp files from previous crash before reading stores
   try { sweepOrphanTmpFiles(['/app/data', '/home/node/.claude']); } catch {}
@@ -1103,9 +893,6 @@ client.on('clientReady', () => {
   if (!process.env.HOST_HOME) console.warn('[security] WARNING: HOST_HOME not set in .env — falling back to hardcoded default /home/karen. Set HOST_HOME in .env if your home directory differs.');
   if (!process.env.SIGNAL_OWNER_NUMBER) console.warn('[security] WARNING: SIGNAL_OWNER_NUMBER not set in .env — falling back to hardcoded default. Set SIGNAL_OWNER_NUMBER in .env.');
 
-  console.log(`Discord bot logged in as ${client.user.tag}`);
-  console.log(`Bot is in ${client.guilds.cache.size} server(s)`);
-  client.guilds.cache.forEach(g => console.log(` - guild ${g.id}`));
   console.log(`Default personality: ${DEFAULT_PERSONALITY}`);
   console.log(`Workspace: ${DEFAULT_WORKSPACE}`);
   console.log(`Max turns: ${DEFAULT_MAX_TURNS} | Timeout: ${MAX_TIMEOUT / 60000}min`);
@@ -1137,22 +924,24 @@ client.on('clientReady', () => {
     }
   }
 
-  // Notify channel if we're coming back from a !restart
+  // Notify channel if we're coming back from a !restart. The .restart-channel
+  // file holds a Signal channelId of the form `signal:<chatId>`.
   const restartFile = path.join(__dirname, '.restart-channel');
   if (fs.existsSync(restartFile)) {
     try {
       const channelId = fs.readFileSync(restartFile, 'utf-8').trim();
       fs.unlinkSync(restartFile);
-      const ch = client.channels.cache.get(channelId);
-      if (ch) _dsend(ch, "I'm back! Restart complete.").catch(() => {});
+      if (channelId.startsWith('signal:') && signalAdapter) {
+        const chatId = channelId.replace(/^signal:/, '');
+        signalAdapter.sendMessage(chatId, "I'm back! Restart complete.").catch(() => {});
+      }
     } catch {}
   }
 
-  // Initialize error alerting
-  initErrorAlerting(client);
+  // Initialize error alerting (Signal-only)
+  initErrorAlerting(signalAdapter);
 
-  // Use pre-computed startup markers (read once at module load to prevent race
-  // condition between Discord and Signal startup handlers).
+  // Use pre-computed startup markers (read once at module load).
   const wasRolledBack = _startupMarkers.wasRolledBack;
   const wasCleanShutdown = _startupMarkers.wasClean;
 
@@ -1174,42 +963,67 @@ client.on('clientReady', () => {
     flushPendingWrites();
   }
 
+  // P1-B: Startup reconciliation between user-profiles.json and token stores.
+  // If a profile claims a provider is connected but no token exists (stale flag
+  // left behind by a failed removeUser / lost token file / manual edit), clear
+  // the flag so the UI and prompts don't advertise a connection we can't serve.
+  try {
+    const userProfilesMod = require('./user-profiles');
+    const userTokensMod = require('./user-tokens');
+    let spotifyTokensMod = null;
+    try { spotifyTokensMod = require('./spotify-tokens'); } catch {}
+
+    const allProfiles = userProfilesMod.getAllProfiles();
+    let reconciled = 0;
+    for (const [phone, profile] of Object.entries(allProfiles)) {
+      const patch = {};
+      if (profile.gcal_connected && !userTokensMod.getToken(phone)) {
+        patch.gcal_connected = false;
+        patch.gcal_email = null;
+      }
+      if (profile.spotify_connected && spotifyTokensMod && !spotifyTokensMod.getToken(phone)) {
+        patch.spotify_connected = false;
+      }
+      if (Object.keys(patch).length > 0) {
+        userProfilesMod.setProfile(phone, patch);
+        reconciled++;
+      }
+    }
+    console.log(`[startup] reconciliation: ${reconciled} profile(s) reconciled`);
+  } catch (err) {
+    console.warn(`[startup] reconciliation failed: ${err.message}`);
+  }
+
   // Start scheduled briefings
   const briefings = require('./briefings');
-  briefings.startScheduler(client);
+  briefings.startScheduler();
 
   // Start AI news pulse (every 3 hours)
   const aiNews = require('./ai-news');
-  aiNews.startAINewsScheduler(client);
+  aiNews.startAINewsScheduler();
 
   // Seed media pulse job for Signal owner (first boot only — editable via setup page)
   const { seedMediaPulse } = require('./media-pulse-seed');
   const mediaPulseSeed = seedMediaPulse();
   if (mediaPulseSeed) {
-    // Newly created — register it immediately so it doesn't wait for next restart
-    try { const { registerJob } = require('./scheduler'); registerJob(mediaPulseSeed, client); } catch {}
+    try { const { registerJob } = require('./scheduler'); registerJob(mediaPulseSeed); } catch {}
   }
 
   // Start user-created schedules
-  startAllSchedules(client);
+  startAllSchedules();
 
   // Start background task queue runner
   const { startQueueRunner } = require('./queue-runner');
-  startQueueRunner(client);
+  startQueueRunner();
 
   // Start event monitors (CI, health checks)
   const { startMonitorRunner } = require('./monitor-runner');
-  startMonitorRunner(client);
+  startMonitorRunner();
 
-  // Auto-resume interrupted work after a crash (not a clean !restart)
-  // All channels resume IN PARALLEL so one doesn't block the others
+  // Auto-resume interrupted work after a crash (not a clean !restart).
+  // Signal-only: every channelId is `signal:<chatId>`.
   if (!wasCleanShutdown && !wasRolledBack) {
     setTimeout(() => {
-      // A channel needs notification if it had actual interrupted work:
-      //   (a) an activeTask in flight when we went down, OR
-      //   (b) a non-empty pendingQueue (user messages we never got to)
-      // Rebuild-triggered notifications were removed — too noisy for users
-      // in channels that weren't actively talking to the bot.
       const channelsToNotify = Object.entries(_savedChannelStates).filter(([, s]) => {
         if (!s) return false;
         if (s.activeTask) return true;
@@ -1225,17 +1039,15 @@ client.on('clientReady', () => {
         const failed = results.filter(r => r.status === 'rejected').length;
         console.log(`[auto-resume] Done: ${succeeded} notified, ${failed} failed`);
       });
-    }, 10000); // 10s delay for Discord cache to populate
+    }, 5000);
   }
-});
+}
 
 async function resumeChannel(channelId, savedState) {
   const task = savedState.activeTask;
   const state = getChannel(channelId);
 
-  // Build the restart notification message. We show whatever signal we have
-  // about what was happening so the user knows WHY the bot went silent and
-  // what (if anything) they should resend.
+  // Build the restart notification message.
   function buildRestartMessage() {
     const wantsNotice = savedState.wantsRestartNotification;
     const queueLen = (savedState.pendingQueue || []).length;
@@ -1247,184 +1059,69 @@ async function resumeChannel(channelId, savedState) {
 
     if (wantsNotice?.reason === 'rebuild') {
       return summary
-        ? `*Back online — I just rebuilt myself. Mid-rebuild I was working on: "${summary}". If anything you sent didn't get answered, resend it now.*`
-        : `*Back online — I just rebuilt myself. If anything you sent didn't get answered, resend it now.*`;
+        ? `Back online — I just rebuilt myself. Mid-rebuild I was working on: "${summary}". If anything you sent didn't get answered, resend it now.`
+        : `Back online — I just rebuilt myself. If anything you sent didn't get answered, resend it now.`;
     }
     return summary
-      ? `*I'm back from an unexpected restart. I was working on: "${summary}" — that got interrupted. Resend if you still need it.*`
-      : `*I'm back from an unexpected restart. Anything you sent in the last few minutes may have been dropped — resend if you still need it.*`;
+      ? `I'm back from an unexpected restart. I was working on: "${summary}" — that got interrupted. Resend if you still need it.`
+      : `I'm back from an unexpected restart. Anything you sent in the last few minutes may have been dropped — resend if you still need it.`;
   }
 
-  // Signal-aware path: notify the Signal user via the adapter. We don't try
-  // to actually re-run the previous task — that's risky if it was the cause
-  // of a crash. Just acknowledge that the bot is back and the user should
-  // resend if needed.
-  if (channelId.startsWith('signal:')) {
-    const signalChatId = channelId.replace(/^signal:/, '');
-    state.activeTask = null;
-    state.busy = false;
-    state.wantsRestartNotification = null;
-    saveChannelState(channelId, state, { critical: true });
-    if (signalAdapter && signalAdapter.ready) {
-      signalAdapter.sendMessage(signalChatId, buildRestartMessage()).catch(err => {
-        console.warn(`[auto-resume] Could not notify Signal channel ${channelId}: ${err.message}`);
-      });
-      console.log(`[auto-resume] Notified Signal channel ${channelId} of restart`);
-    } else {
-      console.log(`[auto-resume] Signal adapter not ready, skipping notification for ${channelId}`);
-    }
+  // Signal-only: every channelId we persist is prefixed `signal:`.
+  if (!channelId.startsWith('signal:')) {
+    console.warn(`[auto-resume] Skipping non-signal channelId ${channelId}`);
     return;
   }
 
-  // Discord path with no resumable task: just send a notification and bail.
-  // This catches the case where the channel had a pending queue but the
-  // activeTask was already cleared (e.g. between turns when /rebuild fired).
-  if (!task) {
-    state.busy = false;
-    state.wantsRestartNotification = null;
-    saveChannelState(channelId, state, { critical: true });
-    const ch = client.channels.cache.get(channelId);
-    if (ch) {
-      _dsend(ch, buildRestartMessage()).catch(() => {});
-      console.log(`[auto-resume] Notified Discord channel ${channelId} of restart (no resumable task)`);
-    }
-    return;
-  }
+  const signalChatId = channelId.replace(/^signal:/, '');
+  state.activeTask = null;
+  state.busy = false;
+  state.wantsRestartNotification = null;
+  saveChannelState(channelId, state, { critical: true });
 
-  // Safety: don't retry more than 2 times
-  if ((task.resumeAttempts || 0) >= 2) {
-    console.log(`[auto-resume] Giving up on channel ${channelId} after ${task.resumeAttempts} attempts`);
-    state.activeTask = null;
-    state.busy = false;
-    saveChannelState(channelId, state, { critical: true });
-    const ch = client.channels.cache.get(channelId);
-    if (ch) _dsend(ch, '*I crashed while working and failed to resume after 2 attempts. Send your request again if needed.*').catch(() => {});
-    return;
-  }
-
-  // Look up the channel BEFORE marking busy. If we can't find it we must NOT
-  // strand state.busy = true, or every subsequent message will be queued forever.
-  const ch = client.channels.cache.get(channelId);
-  if (!ch) {
-    console.log(`[auto-resume] Channel ${channelId} not in cache, clearing stale activeTask`);
-    state.activeTask = null;
-    state.busy = false;
-    saveChannelState(channelId, state, { critical: true });
-    return;
-  }
-
-  // CRITICAL: Set busy immediately before any async work to prevent race
-  state.busy = true;
-
-  // Increment attempt counter
-  task.resumeAttempts = (task.resumeAttempts || 0) + 1;
-  state.activeTask = task;
-  saveChannelState(channelId, state);
-  flushPendingWrites();
-
-  console.log(`[auto-resume] Resuming work in channel ${channelId} (attempt ${task.resumeAttempts}/2)`);
-  await _dsend(ch, `*I crashed while working on your request. Resuming now... (attempt ${task.resumeAttempts}/2)*`).catch(() => {});
-  await _dtyping(ch).catch(() => {});
-  const typingInterval = setInterval(() => _dtyping(ch).catch(() => {}), 8000);
-
-  const pendingQueue = savedState.pendingQueue || [];
-  let resumePrompt = 'You were interrupted by a system crash. Continue where you left off. If you were nearly done, just wrap up and summarize what you accomplished.';
-  if (pendingQueue.length > 0) {
-    resumePrompt += '\n\n[Messages from user while you were working]\n' + pendingQueue.map(q => `- ${q}`).join('\n');
-  }
-
-  const personalityFile = getPersonalityFile(state.personality);
-
-  try {
-    state.busy = true;
-    state.startedAt = Date.now();
-    state.progress = freshProgress();
-
-    let result;
-    try {
-      result = await runClaudeWithContinuation(resumePrompt, {
-        sessionId: state.sessionId,
-        personalityFile,
-        identity: state.identity,
-        cwd: state.cwd,
-        channelState: state,
-        discordChannel: ch,
-      }, ChannelProxy.fromDiscord(ch));
-    } catch (err) {
-      // If session resume fails, try fresh with the original prompt
-      if (state.sessionId) {
-        console.log(`[auto-resume] Session resume failed for ${channelId}, retrying fresh:`, err.message);
-        state.sessionId = null;
-        result = await askClaude(
-          `[Resuming after crash — original request was: "${task.prompt}"]\n\nCheck the current state of the project and continue or complete this work. If it appears already done, just confirm.`,
-          { personalityFile, identity: state.identity, cwd: state.cwd, channelState: state, discordChannel: ch }
-        );
-      } else {
-        throw err;
-      }
-    }
-
-    if (result.sessionId) {
-      state.sessionId = result.sessionId;
-      saveChannelState(channelId, state);
-    }
-
-    if (!result.stopped && result.text) {
-      appendEntry(channelId, {
-        cwd: state.cwd,
-        promptSummary: '[auto-resume] ' + task.prompt,
-        resultSummary: result.text,
-        turnCount: result.numTurns || 0,
-      });
-      // Send result to the channel directly — F23: route through adapter
-      const lines = result.text.split('\n');
-      let chunk = '';
-      for (const line of lines) {
-        if ((chunk + '\n' + line).length > 1990) {
-          await _dsend(ch, chunk).catch(() => {});
-          chunk = line;
-        } else {
-          chunk = chunk ? chunk + '\n' + line : line;
-        }
-      }
-      if (chunk) await _dsend(ch, chunk).catch(() => {});
-    }
-
-    // Success — clear active task
-    state.activeTask = null;
-    saveChannelState(channelId, state);
-    console.log(`[auto-resume] Successfully resumed work in channel ${channelId}`);
-  } catch (err) {
-    console.error(`[auto-resume] Failed for channel ${channelId}:`, err.message);
-    await _dsend(ch, `*Auto-resume failed: ${err.message.substring(0, 200)}. Send another message to retry manually.*`).catch(() => {});
-    sendErrorAlert(err, { source: 'auto-resume', channel: channelId });
-  } finally {
-    clearInterval(typingInterval);
-    state.busy = false;
-    state.startedAt = null;
-    state.progress = freshProgress();
+  if (signalAdapter && signalAdapter.ready) {
+    signalAdapter.sendMessage(signalChatId, buildRestartMessage()).catch(err => {
+      console.warn(`[auto-resume] Could not notify Signal channel ${channelId}: ${err.message}`);
+    });
+    console.log(`[auto-resume] Notified Signal channel ${channelId} of restart`);
+  } else {
+    console.log(`[auto-resume] Signal adapter not ready, skipping notification for ${channelId}`);
   }
 }
 
+// Signal-only: drain any queued messages for this channel state.
+// Items in state.queue are: { content, message?, _messageId? } where `message`
+// is a Signal proxy created via createSignalMessageProxy().
 async function processQueue(state) {
   if (!state.queue.length) return;
 
   // CRITICAL: Set busy BEFORE splicing to prevent race with incoming messages
   state.busy = true;
 
-  // Combine all queued messages into one prompt
   const queued = state.queue.splice(0);
   const combined = queued.length === 1
     ? queued[0].content
     : '[Additional messages from user while you were working]\n' + queued.map(q => `- ${q.content}`).join('\n');
 
-  // Reply threaded to the last queued message
   const replyTarget = queued[queued.length - 1].message;
+  // Resolve signal chatId — strip `signal:` prefix if present.
+  const channelId = state._channelId || replyTarget?._signalChatId
+    ? (state._channelId || `signal:${replyTarget._signalChatId}`)
+    : null;
+  const signalChatId = replyTarget?._signalChatId
+    || (channelId ? channelId.replace(/^signal:/, '') : null);
+
+  if (!signalChatId || !signalAdapter) {
+    console.warn('[processQueue] No Signal chatId or adapter; dropping queued messages');
+    state.busy = false;
+    return;
+  }
+
   const personalityFile = getPersonalityFile(state.personality);
 
-  await _dtyping(replyTarget.channel);
+  await signalAdapter.sendTyping(signalChatId).catch(() => {});
   const typingInterval = setInterval(() => {
-    _dtyping(replyTarget.channel).catch(() => {});
+    signalAdapter.sendTyping(signalChatId).catch(() => {});
   }, 8000);
 
   try {
@@ -1438,21 +1135,14 @@ async function processQueue(state) {
       identity: state.identity,
       cwd: state.cwd,
       channelState: state,
-      discordChannel: replyTarget.channel,
     };
     try {
-      result = await runClaudeWithContinuation(combined, queueOpts, ChannelProxy.fromDiscord(replyTarget.channel));
+      result = await runClaudeWithContinuation(combined, queueOpts, null);
     } catch (err) {
       if (state.sessionId) {
         console.log('Session resume failed in queue, retrying fresh:', err.message);
         state.sessionId = null;
-        result = await askClaude(combined, {
-          personalityFile,
-          identity: state.identity,
-          cwd: state.cwd,
-          channelState: state,
-          discordChannel: replyTarget.channel,
-        });
+        result = await askClaude(combined, queueOpts);
       } else {
         throw err;
       }
@@ -1460,24 +1150,25 @@ async function processQueue(state) {
 
     if (result.sessionId) {
       state.sessionId = result.sessionId;
-      saveChannelState(replyTarget.channel.id, state);
+      if (channelId) saveChannelState(channelId, state);
     }
 
     if (result.stopped) {
       if (!state._userStopped) {
-        await _dsend(replyTarget.channel, '*Process was interrupted unexpectedly — I stopped without finishing. Send another message to continue.*').catch(() => {});
+        await signalAdapter.sendMessage(signalChatId, 'Process was interrupted unexpectedly — I stopped without finishing. Send another message to continue.').catch(() => {});
       }
       state._userStopped = false;
     } else {
-      appendEntry(replyTarget.channel.id, {
-        cwd: state.cwd,
-        promptSummary: combined,
-        resultSummary: result.text,
-        turnCount: result.numTurns || 0,
-      });
+      if (channelId) {
+        appendEntry(channelId, {
+          cwd: state.cwd,
+          promptSummary: combined,
+          resultSummary: result.text,
+          turnCount: result.numTurns || 0,
+        });
+      }
       await sendLongMessage(replyTarget, result.text, state.cwd);
 
-      // Completion summary for non-trivial tasks
       const elapsed = state.startedAt ? Math.round((Date.now() - state.startedAt) / 1000) : 0;
       const completedProgress = state.progress;
       if (result.numTurns >= 3 || elapsed > 60) {
@@ -1496,7 +1187,7 @@ async function processQueue(state) {
         const topTools = Object.entries(toolCounts).sort((a, b) => b[1] - a[1]).slice(0, 3)
           .map(([t, c]) => `${c} ${TOOL_LABELS[t] || t}`).join(', ');
         if (topTools) parts.push(topTools);
-        await _dsend(replyTarget.channel, `*— ${parts.join(' · ')} —*`).catch(() => {});
+        await signalAdapter.sendMessage(signalChatId, `— ${parts.join(' · ')} —`).catch(() => {});
       }
 
       const meta = [];
@@ -1507,595 +1198,22 @@ async function processQueue(state) {
   } catch (err) {
     console.error('Error processing queued message:', err.message);
     const errorMsg = err.message.length > 500 ? err.message.substring(0, 500) + '...' : err.message;
-    await replyTarget.reply(`Error: ${errorMsg}`).catch(() => {});
-    sendErrorAlert(err, { source: 'queue handler', channel: replyTarget.channel.id });
+    await signalAdapter.sendMessage(signalChatId, `Error: ${errorMsg}`).catch(() => {});
+    sendErrorAlert(err, { source: 'queue handler', channel: channelId });
   } finally {
     clearInterval(typingInterval);
     state.busy = false;
     state.startedAt = null;
     state.progress = freshProgress();
     state.activeTask = null;
-    // Persist cleared state — otherwise disk still shows pendingQueue/activeTask
-    // and the next restart will trigger spurious auto-resume.
-    const persistChannelId = state._channelId || replyTarget?.channel?.id;
-    if (persistChannelId) {
-      saveChannelState(persistChannelId, state, { critical: true });
+    if (channelId) {
+      saveChannelState(channelId, state, { critical: true });
     }
     // Recursively drain if more messages came in during processing
     await processQueue(state);
   }
 }
 
-client.on('messageCreate', async (message) => {
-  if (message.author.bot) return;
-
-  // Access control — reject unauthorized users
-  if (!isAllowed(message.author.id)) return;
-
-  // In guild channels, only respond when @mentioned (or a ! command)
-  const isGuild = !!message.guild;
-  const isMentioned = message.mentions.has(client.user);
-
-  // F1: diagnostic logging — every guild message reaches the handler.
-  // Without this we cannot tell if mentions are detected, content is empty, etc.
-  if (isGuild) {
-    console.log(`[discord-msg] guild=${message.guild.id} ch=${message.channel.id} user=${message.author.tag} mentions=${message.mentions.size} contentLen=${message.content.length} isMentioned=${isMentioned}`);
-  }
-
-  // F3: detect MESSAGE_CONTENT privileged-intent failure. If a guild message
-  // arrives with empty content + no attachments + no embeds + no mentions, the
-  // dev portal MESSAGE_CONTENT toggle is almost certainly off. Log loudly, once.
-  if (isGuild && !message.content && message.attachments.size === 0 && (!message.embeds || message.embeds.length === 0) && message.mentions.size === 0) {
-    if (!global.__messageContentIntentWarned) {
-      global.__messageContentIntentWarned = true;
-      console.error('[CRITICAL] Guild message has empty content and no other payload — the MESSAGE_CONTENT privileged intent is almost certainly disabled in the Discord developer portal. Fix: https://discord.com/developers/applications → your bot → Bot → Privileged Gateway Intents → enable MESSAGE CONTENT INTENT.');
-    }
-  }
-
-  if (isGuild && !isMentioned && !message.content.startsWith('!')) {
-    const guildState = getChannel(message.channel.id);
-    if (!guildState.listenToAll) return;
-
-    // listenToAll is on — but still skip human-to-human exchanges:
-    // 1. Message @mentions other users but NOT the bot → skip only if it's
-    //    an imperative directed AT them. Mentions in the context of a request
-    //    to the bot ("@Alice wants to join the event") should still reach Claude.
-    const mentionsOthers = message.mentions.users.size > 0 && !message.mentions.has(client.user);
-    if (mentionsOthers) {
-      const contentWithoutMentions = message.content.replace(/<@!?\d+>/g, '').trim().toLowerCase();
-      const isAddressingOther =
-        /^(say|go|come|check|look|tell|do|get|send|show|ask|reply|answer|respond|introduce|hi|hey|hello|wave|lol|haha|omg|nice|wow|ok|okay|sure|thanks|thank)\b/.test(contentWithoutMentions) ||
-        /^(can u|can you|could u|could you|would u|would you|do u|do you|are you|will you|wanna|want to|you should|u should)\b/.test(contentWithoutMentions) ||
-        /^(please |plz |pls )\b/.test(contentWithoutMentions) ||
-        contentWithoutMentions.length === 0;
-      const thirdPersonVerb = /\b(wants?|is|has|would like|needs?|going|trying|asked|said|told|mentioned)\b/.test(contentWithoutMentions);
-      if (isAddressingOther && !thirdPersonVerb) return;
-      // 3rd-person mention — fall through to Claude
-    }
-
-    // 2. Short conversational message with no question/task/bot-name → skip
-    const botName = (guildState.identity?.name || '').toLowerCase();
-    const contentLower = message.content.toLowerCase();
-    const hasQuestion = contentLower.includes('?');
-    const hasTask = /\b(can you|could you|please|remind|schedule|search|find|look up|what|who|when|where|how|tell me|do you|help)\b/i.test(contentLower);
-    const namesMeByName = botName && contentLower.includes(botName);
-    if (!hasQuestion && !hasTask && !namesMeByName) return;
-  }
-
-  // Strip the @mention prefix from message content so Claude doesn't see it
-  if (isGuild && isMentioned) {
-    message.content = message.content.replace(/<@!?\d+>/g, '').trim();
-    // F2: mention-only messages would otherwise be silently dropped by the
-    // empty-content check below. Use a friendly default so the bot still replies.
-    if (!message.content) message.content = 'hi';
-  }
-
-  const state = getChannel(message.channel.id);
-
-  // Handle commands — also cancel any active wizard when a command is issued.
-  // CRITICAL: must go through cancelWizard() so the wizard's onCancel hook
-  // runs (e.g. concert-tracker saves the curated artist list on early exit).
-  // The previous code set `state.wizard = null` directly, which silently
-  // dropped any partial-save data — that's the exact bug the Signal-side
-  // silent-cancel path already fixes via `await cancelWizard(...,{silent:true})`.
-  if (message.content.startsWith('!')) {
-    if (state.wizard && message.content.trim().toLowerCase() !== '!cancel') {
-      try {
-        await cancelWizard(state, message, { silent: true });
-      } catch (err) {
-        console.warn(`[discord] silent wizard cancel failed: ${err.message}`);
-        state.wizard = null;
-      }
-    }
-    try {
-      const handled = await handleCommand(message);
-      if (handled) return;
-    } catch (err) {
-      console.error('Command error:', err.message);
-      await _dreply(message, `Command failed: ${err.message}`).catch(() => {});
-      return;
-    }
-  }
-
-  // Handle pending preview device selection
-  if (state._pendingPreview) {
-    const reply = message.content.trim().toLowerCase();
-    const port = state._pendingPreview;
-    if (['local', 'localhost', 'pc', 'computer', 'same'].includes(reply)) {
-      state._pendingPreview = null;
-      await _dreply(message,`**Open on this PC:** http://localhost:${port}`);
-      return;
-    }
-    if (['phone', 'mobile', 'tablet', 'remote', 'tunnel'].includes(reply)) {
-      state._pendingPreview = null;
-      // Reuse the !preview <port> phone flow by simulating the command
-      message.content = `!preview ${port} phone`;
-      await handleCommand(message);
-      return;
-    }
-    // Cancel if they type something unrelated
-    if (reply.startsWith('!')) {
-      state._pendingPreview = null;
-      // fall through to normal command handling (already handled above)
-    }
-  }
-
-  // If a wizard is active, let it handle the message
-  if (state.wizard) {
-    // Run async step processing for social-plan and hangout wizards
-    if (processSocialPlanStep && state.wizard.type === 'social-plan') {
-      try { await processSocialPlanStep(state, message); } catch {}
-    }
-    if (state.wizard?.type === 'hangout') {
-      try { await processHangoutStep(state, message); } catch {}
-    }
-    const handled = await handleWizardMessage(state, message);
-    if (handled) return;
-  }
-
-  // Ignore empty messages (e.g. stickers, attachments with no text)
-  if (!message.content.trim()) return;
-
-  // Auto-onboard Discord users who haven't set up a profile yet
-  if (!message.content.startsWith('!') && !state.wizard) {
-    const { getProfile: _gpDiscord } = require('./user-profiles');
-    const discordProfile = _gpDiscord(message.author.id);
-    if (!discordProfile?.setup_complete) {
-      const { buildDiscordOnboardingWizard } = require('./wizards/discord-onboarding');
-      try {
-        await startWizard(state, message, buildDiscordOnboardingWizard());
-      } catch (err) {
-        console.warn(`[discord] onboarding wizard kickoff failed: ${err.message}`);
-      }
-      return;
-    }
-  }
-
-  // F10: Deterministic greeting fast-path for Discord too
-  const discordText = message.content.trim();
-  if (discordText.length < 50 && GREETING_RE.test(discordText) && !discordText.startsWith('!')) {
-    const personality = state.personality || DEFAULT_PERSONALITY;
-    // F23: Route through adapter
-    if (discordAdapter) {
-      await discordAdapter.sendMessage(message.channel.id, _pickGreetingResponse(personality), { rawMessage: message });
-    } else {
-      await _dreply(message,_pickGreetingResponse(personality));
-    }
-    return;
-  }
-
-  // If Claude is already working, queue the message.
-  // L-Fix-2: a !loop holds state.busy=true for its whole duration, so messages
-  // sent during a loop fall into this path and get queued. processQueue won't
-  // run them until the loop's outer finally clears state.busy.
-  if (state.busy) {
-    state.queue.push({ message, content: message.content, _messageId: message.id });
-    saveChannelState(message.channel.id, state, { critical: true }); // persist queue immediately
-    const pos = state.queue.length;
-    const ctx = state.loopActive ? ' (loop in progress — use `!stop` to interrupt)' : '';
-    // F23: Route through adapter
-    const queueMsg = pos >= 5
-      ? `Queued (#${pos}) — queue is getting long. Use \`!stop\` to interrupt if needed.${ctx}`
-      : `Queued (#${pos}) — I'll get to that next.${ctx}`;
-    if (discordAdapter) {
-      await discordAdapter.sendMessage(message.channel.id, queueMsg, { rawMessage: message });
-    } else {
-      await _dreply(message,queueMsg);
-    }
-    return;
-  }
-
-  // Message grouping debounce — buffer rapid follow-up messages from the same user
-  if (MESSAGE_GROUP_DELAY_MS > 0 && !shouldGroupImmediately(message.content)) {
-    const userId = message.author?.id || message._signalSenderId;
-    // Different user flushing: immediately fire previous buffer
-    if (state.groupingTimer && state.groupingSenderId && state.groupingSenderId !== userId) {
-      clearTimeout(state.groupingTimer);
-      state.groupingTimer = null;
-      const prev = state.groupingBuffer.splice(0);
-      state.groupingSenderId = null;
-      if (prev.length > 0) {
-        const combined = prev.map(e => e.content).join('\n');
-        setImmediate(() => _dispatchDiscordMessage(prev[prev.length - 1].message, combined, state));
-      }
-    }
-    if (!state.groupingBuffer) state.groupingBuffer = [];
-    state.groupingBuffer.push({ content: message.content, message });
-    state.groupingSenderId = userId;
-    if (state.groupingTimer) clearTimeout(state.groupingTimer);
-    state.groupingTimer = setTimeout(() => {
-      const buf = state.groupingBuffer.splice(0);
-      state.groupingTimer = null;
-      state.groupingSenderId = null;
-      if (buf.length === 0) return;
-      const combined = buf.map(e => e.content).join('\n');
-      _dispatchDiscordMessage(buf[buf.length - 1].message, combined, state);
-    }, MESSAGE_GROUP_DELAY_MS);
-    return;
-  }
-  // Immediate path (ends with punctuation or long message)
-  _dispatchDiscordMessage(message, message.content, state);
-});
-
-async function _dispatchDiscordMessage(message, messageText, state) {
-  state.busy = true;
-  state._triggeredByMessageId = message.id || null;
-  const personalityFile = getPersonalityFile(state.personality);
-
-  // Keep typing indicator alive — F23: route through adapter
-  const _channelId = message.channel.id;
-  if (discordAdapter) {
-    await discordAdapter.sendTyping(_channelId);
-  } else {
-    await message.channel.sendTyping();
-  }
-  const typingInterval = setInterval(() => {
-    if (discordAdapter) discordAdapter.sendTyping(_channelId).catch(() => {});
-    else message.channel.sendTyping().catch(() => {});
-  }, 8000);
-
-  try {
-    // Track active task so we can resume after crash/restart
-    state.activeTask = {
-      prompt: messageText.substring(0, 500),
-      channelId: message.channel.id,
-      startedAt: new Date().toISOString(),
-      resumeAttempts: 0,
-    };
-    saveChannelState(message.channel.id, state, { critical: true });
-
-    let result;
-    // Auto-detect social/location links — pre-fetch metadata and build action prompt
-    const detectedLinks = detectLinks(messageText);
-    let messagePrompt = messageText;
-    if (detectedLinks.length > 0) {
-      const enriched = await enrichLinks(detectedLinks);
-      messagePrompt = buildSmartPrompt(enriched) + messageText;
-    }
-    // TikTok transcript injection — fetch captions and prepend as context
-    try {
-      const { extractTikTokUrls, getTikTokTranscriptWithFallback } = require('./tiktok-transcript');
-      const tiktokUrls = extractTikTokUrls(messageText);
-      for (const turl of tiktokUrls) {
-        const result = await getTikTokTranscript(turl);
-        if (result && result.transcript) {
-          messagePrompt += `\n\n<video-transcript url="${turl}">\n${result.transcript}\n</video-transcript>`;
-        }
-      }
-    } catch (err) {
-      console.error('[tiktok] Discord transcript error:', err.message);
-    }
-    // Instagram Reels transcript injection
-    try {
-      const { extractInstagramReelUrls, getInstagramTranscript } = require('./instagram-transcript');
-      const igUrls = extractInstagramReelUrls(messageText);
-      for (const igUrl of igUrls) {
-        const igResult = await getInstagramTranscript(igUrl);
-        if (igResult) {
-          let block = `<video-transcript url="${igUrl}">`;
-          if (igResult.transcript) block += `\n${igResult.transcript}`;
-          else if (igResult.description) block += `\n[No audio transcript. Creator caption: ${igResult.description}]`;
-          block += `\n</video-transcript>`;
-          messagePrompt += `\n\n${block}`;
-        }
-      }
-    } catch (err) {
-      console.error('[instagram] Discord transcript error:', err.message);
-    }
-
-    const streamingProxy = ChannelProxy.fromDiscordStreaming(message.channel);
-    const claudeOpts = {
-      sessionId: state.sessionId,
-      personalityFile,
-      identity: state.identity,
-      cwd: state.cwd,
-      channelState: state,
-      discordChannel: message.channel,
-      channelProxy: streamingProxy,
-      discordUserId: message.author.id,
-      streamReplies: true,
-      // Sudo-style PIN gate: when BOT_UNLOCK_PIN is set, Claude starts in
-      // read-only mode (can chat/search/browse but not Edit/Write/Bash) until
-      // the channel is elevated via !unlock <PIN>.
-      readOnly: !_isChannelElevated(message.channel.id),
-    };
-    try {
-      result = await runClaudeWithContinuation(messagePrompt, claudeOpts, streamingProxy);
-    } catch (err) {
-      if (state.sessionId) {
-        console.log('Session resume failed, retrying fresh:', err.message);
-        state.sessionId = null;
-        await _dsend(message.channel, '*Session error — retrying fresh (1/2)...*').catch(() => {});
-        try {
-          result = await askClaude(messageText, {
-            personalityFile,
-            identity: state.identity,
-            cwd: state.cwd,
-            channelState: state,
-            discordChannel: message.channel,
-          });
-        } catch (freshErr) {
-          // Fresh call also failed — wait 3s and try once more
-          console.log('Fresh call also failed, retrying after delay:', freshErr.message);
-          await _dsend(message.channel, '*Still failing — retrying one more time (2/2)...*').catch(() => {});
-          await new Promise(r => setTimeout(r, 3000));
-          result = await askClaude(messageText, {
-            personalityFile,
-            identity: state.identity,
-            cwd: state.cwd,
-            channelState: state,
-            discordChannel: message.channel,
-          });
-        }
-      } else {
-        // No session — wait 3s and retry once
-        console.log('CLI failed, retrying after delay:', err.message);
-        await _dsend(message.channel, '*Hit an error — retrying in 3s...*').catch(() => {});
-        await new Promise(r => setTimeout(r, 3000));
-        try {
-          result = await askClaude(messageText, {
-            personalityFile,
-            identity: state.identity,
-            cwd: state.cwd,
-            channelState: state,
-            discordChannel: message.channel,
-          });
-        } catch (retryErr) {
-          throw retryErr;
-        }
-      }
-    }
-
-    // Store session for continuity
-    if (result.sessionId) {
-      state.sessionId = result.sessionId;
-      saveChannelState(message.channel.id, state);
-    }
-
-    // Flush the streaming proxy so the last edit lands (removes trailing cursor)
-    if (streamingProxy.flush) await streamingProxy.flush().catch(() => {});
-
-    if (result.stopped) {
-      // If stop was NOT initiated by the user (external kill, OOM, container restart), alert them
-      if (!state._userStopped) {
-        await _dsend(message.channel, '*Process was interrupted unexpectedly — I stopped without finishing. Send another message to continue.*').catch(() => {});
-      }
-      state._userStopped = false;
-    } else {
-      // Save journal entry so next session (even after restart) knows what happened
-      appendEntry(message.channel.id, {
-        cwd: state.cwd,
-        promptSummary: messageText,
-        resultSummary: result.text,
-        turnCount: result.numTurns || 0,
-      });
-
-      // If text was streamed live, skip re-sending it. But still send any
-      // image attachments (registry = primary, text extraction = fallback).
-      if (result.streamed) {
-        const _imgReg = require('./image-registry');
-        const _regPaths = _imgReg.getOutputs(message.channel.id);
-        const _txtPaths = extractImageAttachments(result.text || '');
-        const imagePaths = [...new Set([..._regPaths, ..._txtPaths])];
-        if (imagePaths.length > 0) {
-          const imageBuffers = [];
-          const imageNames = [];
-          for (const imgPath of imagePaths) {
-            try {
-              imageBuffers.push(fs.readFileSync(imgPath));
-              imageNames.push(path.basename(imgPath));
-            } catch {}
-          }
-          if (imageBuffers.length > 0 && discordAdapter) {
-            await discordAdapter.sendMessage(message.channel.id, '', {
-              attachments: imageBuffers, attachmentNames: imageNames,
-            }).catch(() => {});
-          }
-        }
-      } else if (result.text) {
-        await sendLongMessage(message, result.text, state.cwd);
-      } else if (result.hitTurnLimit) {
-        await _dreply(message, 'I ran out of turns before I could respond — try again or simplify your request.');
-      }
-      // If no text and no turn limit, silently skip — don't send a placeholder
-
-      // Step 3: Completion summary for non-trivial tasks
-      const elapsed = state.startedAt ? Math.round((Date.now() - state.startedAt) / 1000) : 0;
-      const completedProgress = state.progress;
-      if (result.numTurns >= 3 || elapsed > 60) {
-        const mins = Math.floor(elapsed / 60);
-        const secs = elapsed % 60;
-        const parts = [];
-        if (mins > 0) parts.push(`${mins}m ${secs}s`);
-        else parts.push(`${secs}s`);
-        if (result.numTurns) parts.push(`${result.numTurns} turns`);
-        if (result.cost) parts.push(`$${result.cost.toFixed(4)}`);
-        // Aggregate tool usage from progress.toolHistory
-        const toolCounts = {};
-        for (const t of completedProgress.toolHistory) {
-          const tName = typeof t === 'string' ? t : t.name;
-          toolCounts[tName] = (toolCounts[tName] || 0) + 1;
-        }
-        const topTools = Object.entries(toolCounts).sort((a, b) => b[1] - a[1]).slice(0, 3)
-          .map(([t, c]) => `${c} ${TOOL_LABELS[t] || t}`).join(', ');
-        if (topTools) parts.push(topTools);
-        await _dsend(message.channel, `*— ${parts.join(' · ')} —*`).catch(() => {});
-      }
-
-      // Show cost and turns info
-      const meta = [];
-      if (result.numTurns > 1) meta.push(`${result.numTurns} turns`);
-      if (result.cost) meta.push(`$${result.cost.toFixed(4)}`);
-      if (meta.length) {
-        console.log(`Completed: ${meta.join(' | ')}`);
-      }
-    }
-  } catch (err) {
-    // Step 4: Error recovery — retry once with session context
-    if (state.sessionId && !err.message.includes('stalled') && !state._retried) {
-      state._retried = true;
-      await _dreply(message, '*Hit an error — retrying with session context...*').catch(() => {});
-      try {
-        const retryResult = await askClaude(
-          'You were interrupted by an error. Continue where you left off. If you were stuck, try a different approach.',
-          { sessionId: state.sessionId, personalityFile, identity: state.identity, cwd: state.cwd, channelState: state, discordChannel: message.channel }
-        );
-        if (retryResult.sessionId) {
-          state.sessionId = retryResult.sessionId;
-          saveChannelState(message.channel.id, state);
-        }
-        if (!retryResult.stopped) await sendLongMessage(message, retryResult.text, state.cwd);
-        state._retried = false;
-        return;
-      } catch (retryErr) {
-        console.error('Retry also failed:', retryErr.message);
-      }
-    }
-    state._retried = false;
-
-    // Step 3: Richer error messages
-    console.error('Error handling message:', err.message);
-    const errorMsg = err.message.length > 500 ? err.message.substring(0, 500) + '...' : err.message;
-    const elapsed = state.startedAt ? Math.round((Date.now() - state.startedAt) / 1000) : 0;
-    const errorParts = [];
-    if (elapsed > 0) errorParts.push(`Error after ${Math.floor(elapsed / 60)}m ${elapsed % 60}s`);
-    if (state.progress.turnCount > 0) errorParts.push(`${state.progress.turnCount} turns completed`);
-    errorParts.push(errorMsg);
-    const lastLogs = state.progress.rawLog.slice(-3).map(e => e.text).join('\n');
-    if (lastLogs) errorParts.push(`\nLast activity:\n${lastLogs}`);
-    if (state.sessionId) errorParts.push('\n*Session preserved — send another message to retry, or `!refresh` to reset everything.*');
-    else errorParts.push('\n*Try again, or `!refresh` to reset everything.*');
-    await _dreply(message, errorParts.join(' · ')).catch(() => {});
-    sendErrorAlert(err, { source: 'message handler', channel: message.channel.id, detail: messageText.substring(0, 100) });
-  } finally {
-    clearInterval(typingInterval);
-    state.busy = false;
-    state.startedAt = null;
-    state.progress = freshProgress();
-    // Clear active task — work is done (or failed)
-    state.activeTask = null;
-    saveChannelState(message.channel.id, state, { critical: true });
-    // Drain queued messages
-    await processQueue(state);
-  }
-}
-
-// Handle Discord button/select menu interactions (for plan components, voting, etc.)
-client.on('interactionCreate', async (interaction) => {
-  try {
-    await handleComponentInteraction(interaction);
-  } catch (err) {
-    console.error('Interaction error:', err.message);
-  }
-});
-
-// Handle Discord "delete for everyone" — cancel queued/running task if it came from the deleted message
-client.on('messageDelete', (message) => {
-  try {
-    const channelId = message.channel?.id;
-    if (!channelId) return;
-    const state = getChannel(channelId);
-    const msgId = message.id;
-    // 1. Cancel grouping timer if this message is still buffered
-    if (state.groupingTimer && state.groupingBuffer?.length > 0) {
-      const inBuffer = state.groupingBuffer.some(e => e.message?.id === msgId);
-      if (inBuffer) {
-        state.groupingBuffer = state.groupingBuffer.filter(e => e.message?.id !== msgId);
-        if (state.groupingBuffer.length === 0) {
-          clearTimeout(state.groupingTimer);
-          state.groupingTimer = null;
-          state.groupingSenderId = null;
-          console.log(`[discord] Deleted message ${msgId} was in grouping buffer — cancelled`);
-          return;
-        }
-      }
-    }
-    // 2. Remove from queue
-    const qBefore = state.queue.length;
-    state.queue = state.queue.filter(q => q._messageId !== msgId);
-    if (state.queue.length < qBefore) {
-      console.log(`[discord] Deleted message ${msgId} removed from queue`);
-      saveChannelState(channelId, state, { critical: true });
-    }
-    // 3. Stop active task if triggered by this message
-    if (state.busy && state._triggeredByMessageId === msgId && state.process) {
-      console.log(`[discord] Deleted message ${msgId} was the active task — stopping`);
-      try { state.process.kill('SIGTERM'); } catch {}
-      state.busy = false;
-      state._triggeredByMessageId = null;
-    }
-  } catch (err) {
-    console.error('[discord] messageDelete error:', err.message);
-  }
-});
-
-// Handle Discord emoji reactions — treat 👍/👎 on the bot's last message as yes/no
-client.on('messageReactionAdd', async (reaction, user) => {
-  try {
-    if (user.bot) return;
-    if (!isAllowed(user.id)) return;
-
-    // Fetch partial reaction/message if needed (older messages arrive as partials)
-    if (reaction.partial) {
-      try { await reaction.fetch(); } catch { return; }
-    }
-    if (reaction.message.partial) {
-      try { await reaction.message.fetch(); } catch { return; }
-    }
-
-    const channelId = reaction.message.channel?.id;
-    if (!channelId) return;
-    const state = getChannel(channelId);
-
-    // Only act on reactions to the bot's last sent message in this channel
-    if (!state.lastBotMessageId || reaction.message.id !== state.lastBotMessageId) return;
-
-    const emoji = reaction.emoji.name;
-    let answer = null;
-    if (emoji === '👍') answer = 'yes';
-    else if (emoji === '👎') answer = 'no';
-    if (!answer) return;
-
-    if (state.busy) {
-      console.log(`[discord] Reaction ${emoji} from ${user.tag} ignored — channel busy`);
-      return;
-    }
-
-    console.log(`[discord] Reaction ${emoji} from ${user.tag} in ${channelId} → dispatching "${answer}"`);
-    // Synthesize a minimal message-like object for _dispatchDiscordMessage
-    const syntheticMessage = {
-      id: reaction.message.id,
-      channel: reaction.message.channel,
-      author: user,
-      content: answer,
-      mentions: { has: () => false },
-      attachments: { size: 0 },
-    };
-    _dispatchDiscordMessage(syntheticMessage, answer, state);
-  } catch (err) {
-    console.error('[discord] messageReactionAdd error:', err.message);
-  }
-});
 
 // --- Signal adapter integration ---
 
@@ -2665,10 +1783,21 @@ function startSignalAdapter() {
     }
   });
 
-  signalAdapter.start().then(() => {
+  signalAdapter.start().then(async () => {
     // Wire Signal into error alerting so critical errors go to owner's phone
     const { initSignal: _initSignalAlerts } = require('./error-alerting');
     _initSignalAlerts(signalAdapter);
+
+    // Rebuild UUID→phone mapping from sidecar on startup. Non-fatal: if the
+    // sidecar is unreachable we just proceed with whatever is already on disk.
+    try {
+      const { runDataRecovery } = require('./data-recovery');
+      const apiUrl = process.env.SIGNAL_API_URL || 'http://signal-api:8080';
+      const res = await runDataRecovery(signalAdapter.getUuidMap(), apiUrl, signalAdapter.phoneNumber);
+      if (res && res.added > 0) signalAdapter.persistUuidMap();
+    } catch (e) {
+      console.warn('[startup] data-recovery failed (non-fatal):', e.message);
+    }
 
     // Seed known group members from signal-api so existing group members
     // can DM the bot immediately (not just after their first group message
@@ -2698,9 +1827,11 @@ function startSignalAdapter() {
           }
         }
         // Also seed from the UUID→phone cache so UUIDs are recognized too
-        if (signalAdapter._uuidToPhone) {
-          for (const [uuid, ph] of signalAdapter._uuidToPhone) {
-            if (_knownGroupMembers.has(ph)) _addKnownGroupMember(uuid);
+        const _uuidMap = signalAdapter.getUuidMap && signalAdapter.getUuidMap();
+        if (_uuidMap && _uuidMap.byUuid) {
+          for (const [uuid, entry] of Object.entries(_uuidMap.byUuid)) {
+            const ph = entry && entry.phone;
+            if (ph && _knownGroupMembers.has(ph)) _addKnownGroupMember(uuid);
           }
         }
         if (seeded > 0) {
@@ -2781,29 +1912,11 @@ function startSignalAdapter() {
       console.log('[signal] Sent crash notification to owner');
     }
 
-    // If Discord is disabled, run the platform-agnostic startup tasks here
-    // (schedulers, queue runner, monitors). When Discord IS enabled these run
-    // in the clientReady handler instead so they have access to the Discord client.
-    const enabledPlatforms = (process.env.ENABLED_PLATFORMS || 'signal').split(',').map(s => s.trim());
-    if (!enabledPlatforms.includes('discord')) {
-      // Seed media pulse job for Signal owner (first boot only — editable via setup page)
-      const { seedMediaPulse } = require('./media-pulse-seed');
-      const mediaPulseSeed = seedMediaPulse();
-      if (mediaPulseSeed) {
-        try { const { registerJob } = require('./scheduler'); registerJob(mediaPulseSeed, null); } catch {}
-      }
-
-      // Start user-created schedules (Signal dm-task jobs)
-      startAllSchedules(null);
-
-      // Start background task queue runner
-      const { startQueueRunner } = require('./queue-runner');
-      startQueueRunner(null);
-
-      // Start event monitors (CI, health checks)
-      const { startMonitorRunner } = require('./monitor-runner');
-      startMonitorRunner(null);
-    }
+    // Once the Signal adapter is ready, run the main bot startup
+    // (schedulers, queue runner, monitors, channel-state restore, auto-resume).
+    // startBot() is idempotent — the fallback timeout in start() is a no-op
+    // when this path runs first.
+    startBot().catch(err => console.error('[startBot] failed:', err.message));
   }).catch(err => {
     console.error(`[signal] Failed to start: ${err.message}`);
   });
@@ -3479,6 +2592,24 @@ async function _dispatchSignalMessage(msg, chatId, text, state) {
         result.text = (result.text || '').replace(remindRe, '').trim();
       }
 
+      // [SET_PREF:] tag — save a user preference rule to disk (deterministic preference storage).
+      // Applied later at handler level (e.g. EVENT) — Claude never has to "remember" it.
+      const setPrefRe = /\[SET_PREF:\s*(.+?)\]/gi;
+      const setPrefMatches = [...(result.text || '').matchAll(setPrefRe)];
+      if (setPrefMatches.length > 0 && msg?.senderId) {
+        try {
+          const { setPref, parseSetPrefTag } = require('./user-prefs');
+          for (const match of setPrefMatches) {
+            const { domain, rule } = parseSetPrefTag(match[1]);
+            if (rule.match && rule.match.length > 0) {
+              setPref(msg.senderId, domain, rule);
+              console.log(`[pref] Saved ${domain} pref for ${msg.senderId.slice(0,4)}****: match=${rule.match.join(',')} color=${rule.color || '-'} duration=${rule.duration_minutes || '-'}`);
+            }
+          }
+        } catch (e) { console.warn(`[pref] SET_PREF handler error: ${e.message}`); }
+        result.text = (result.text || '').replace(setPrefRe, '').trim();
+      }
+
       // [EVENT:] tag extraction — create a shared group calendar event.
       //
       // SECURITY / DETERMINISM (H2): chat_id is clobbered with msg.chatId; the
@@ -3505,6 +2636,19 @@ async function _dispatchSignalMessage(msg, chatId, text, state) {
             raw.replace(/(\w+)="([^"]+)"/g, (_, k, v) => { params[k] = v; });
             raw.replace(/(\w+)=(\d+)/g, (_, k, v) => { params[k] = v; });
             if (!params.title || !params.datetime) continue;
+            // DETERMINISTIC PREF OVERLAY: load sender's saved event rules and
+            // apply any that keyword-match this title, before we build the body.
+            try {
+              const { matchEventPrefs } = require('./user-prefs');
+              const prefOverrides = matchEventPrefs(msg.senderId, params.title);
+              if (prefOverrides.colorId) params.colorId = prefOverrides.colorId;
+              if (prefOverrides.color) params.color = prefOverrides.color;
+              if (prefOverrides.duration_minutes && !params.duration_minutes) params.duration_minutes = prefOverrides.duration_minutes;
+              if (prefOverrides.reminder_minutes != null && params.reminder_minutes == null) params.reminder_minutes = prefOverrides.reminder_minutes;
+              if (Object.keys(prefOverrides).length > 0) {
+                console.log(`[event-tag] Applied pref overrides for "${params.title.slice(0,30)}": ${JSON.stringify(prefOverrides)}`);
+              }
+            } catch (e) { console.warn(`[event-tag] pref overlay error: ${e.message}`); }
             // Parse user_ids list and filter to known group members.
             // user_ids can be comma-separated phone numbers in the params.
             let claimed = [];
@@ -3527,6 +2671,9 @@ async function _dispatchSignalMessage(msg, chatId, text, state) {
                 description: params.description || '',
                 user_ids: Array.from(uids),
                 chat_id: msg.chatId,  // CLOBBER: never trust Claude
+                color_id: params.colorId || null,
+                color_name: params.color || null,
+                reminder_minutes: params.reminder_minutes != null ? parseInt(params.reminder_minutes, 10) : null,
               });
               const evResult = await new Promise((resolve, reject) => {
                 const req = http.request({
@@ -3927,7 +3074,6 @@ function createSignalMessageProxy(msg, chatId, state) {
       sendTyping: () => Promise.resolve(),
     },
     reply,
-    client, // for commands that need client.channels
     _signalSenderId: msg.senderId, // used by wizards/onComplete to key profile saves
     _signalChatId: msg.chatId,
     _signalMentions: msg.mentions || [], // for !onboard target resolution
@@ -3937,20 +3083,12 @@ function createSignalMessageProxy(msg, chatId, state) {
 }
 
 function start() {
-  const enabledPlatforms = (process.env.ENABLED_PLATFORMS || 'signal').split(',').map(s => s.trim());
-  const discordEnabled = enabledPlatforms.includes('discord');
-
-  const token = process.env.DISCORD_BOT_TOKEN;
-  if (!discordEnabled) {
-    console.log('Discord disabled (not in ENABLED_PLATFORMS) — skipping Discord login');
-  } else if (!token) {
-    console.warn('DISCORD_BOT_TOKEN not set — Discord bot disabled');
-  } else {
-    client.login(token);
-  }
-
-  // Start Signal adapter if configured
+  // Signal-only. startSignalAdapter() will call startBot() once the adapter is
+  // ready. We also schedule a fallback startBot() invocation in case Signal
+  // never comes online (e.g. SIGNAL_PHONE_NUMBER unset) — startBot() is
+  // idempotent so the second call is a no-op when the first already ran.
   startSignalAdapter();
+  setTimeout(() => { startBot().catch(err => console.error('[startBot] fallback failed:', err.message)); }, 15000);
 }
 
-module.exports = { start, askClaude, runClaudeWithContinuation, client, getChannelState, getPersonalityFile, sendLongMessage, freshProgress, channels, signalAdapter, discordAdapter, _tryUnlock, _isChannelElevated, _addKnownGroupMember };
+module.exports = { start, askClaude, runClaudeWithContinuation, getChannelState, getPersonalityFile, sendLongMessage, freshProgress, channels, signalAdapter, _tryUnlock, _isChannelElevated, _addKnownGroupMember };

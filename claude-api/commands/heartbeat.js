@@ -33,7 +33,6 @@ module.exports = {
         identity: state.identity,
         cwd: state.cwd,
         channelState: state,
-        discordChannel: message.channel,
       }),
       onResult: async (result) => {
         if (result.sessionId) { state.sessionId = result.sessionId; ctx.saveChannelState(message.channel.id, state); }

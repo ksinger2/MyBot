@@ -25,7 +25,7 @@ module.exports = {
       state.listenToAll = !state.listenToAll;
     }
 
-    ctx.saveChannelState(channelId, state);
+    ctx.saveChannelState(channelId, state, { critical: true });
 
     if (state.listenToAll) {
       await reply(message, '👂 Now listening to **all messages** in this chat. Use `!listen off` to go back to mentions-only.');

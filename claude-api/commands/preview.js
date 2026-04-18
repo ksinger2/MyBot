@@ -85,7 +85,7 @@ module.exports = {
           const baseUrl = urlMatch[0];
           const magicUrl = publicIp ? `${baseUrl}?access=${publicIp}` : baseUrl;
           const ipNote = publicIp ? `\nYour public IP \`${publicIp}\` is pre-injected — just tap the link, no password needed.` : '';
-          message.channel.send(
+          message.reply(
             `**Tunnel live! Tap this on your phone:**\n${magicUrl}${ipNote}\n\nUse \`!preview stop\` to close.`
           ).catch(() => {});
         }
@@ -108,7 +108,7 @@ module.exports = {
         if (!urlFound && state._tunnel === tunnel) {
           tunnel.kill();
           state._tunnel = null;
-          message.channel.send(`Failed to start tunnel — is anything running on port ${previewPort}?`).catch(() => {});
+          message.reply(`Failed to start tunnel — is anything running on port ${previewPort}?`).catch(() => {});
         }
       }, 15000);
       return;
