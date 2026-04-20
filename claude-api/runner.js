@@ -475,6 +475,9 @@ class Runner {
           // F6: owner is trusted; gh capability is documented. Risk: prompt-injection
           // could exfiltrate via Bash — mitigated by scrubSecrets (F5).
           GH_TOKEN: process.env.GH_TOKEN || '',
+          ...(!ownerDmMode && process.env.ANTHROPIC_API_KEY
+            ? { ANTHROPIC_API_KEY: process.env.ANTHROPIC_API_KEY }
+            : {}),
         },
         stdio: ['ignore', 'pipe', 'pipe'],
       });

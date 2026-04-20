@@ -3035,6 +3035,7 @@ async function _dispatchSignalMessage(msg, chatId, text, state) {
       }
     } catch (err) {
       console.error(`[signal] Error: ${err.message}`);
+      console.error(`[signal] Stack: ${err.stack}`);
       await signalAdapter.sendMessage(msg.chatId, `Error: ${err.message.substring(0, 500)}`);
       sendErrorAlert(err, { source: 'signal handler', channel: chatId });
     } finally {
