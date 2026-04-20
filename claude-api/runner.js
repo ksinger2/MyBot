@@ -461,7 +461,11 @@ class Runner {
       const child = spawn('claude', args, {
         cwd,
         env: {
-          HOME: '/home/node', CI: 'true',
+          // Owner sessions use /home/node (Karen's OAuth + account MCPs).
+          // Non-owner sessions use /home/node-nonowner (clean, no ~/.claude.json,
+          // no account MCPs). This prevents Karen's Google Calendar MCP from
+          // being available to non-owner CLI escalations.
+          HOME: ownerDmMode ? '/home/node' : '/home/node-nonowner', CI: 'true',
           PATH: process.env.PATH,
           NODE_PATH: process.env.NODE_PATH || '',
           CHROME_PATH: process.env.CHROME_PATH || '',

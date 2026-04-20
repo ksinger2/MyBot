@@ -76,6 +76,9 @@ RUN chmod +x /app/entrypoint.sh
 
 # Create writable directories for runtime data (node user can't write to /app)
 RUN mkdir -p /home/node/.claude /app/data && chown -R node:node /home/node/.claude /app/data
+# Isolated home for non-owner CLI spawns — no ~/.claude.json here, so Karen's
+# account-level MCPs (Google Calendar, etc.) are never exposed to non-owner sessions.
+RUN mkdir -p /home/node-nonowner/.claude && chown -R node:node /home/node-nonowner
 
 # Run as non-root user (required by Claude CLI)
 USER node
