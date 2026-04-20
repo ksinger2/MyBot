@@ -409,10 +409,7 @@ class Runner {
       } else if (readOnly) {
         args.push(
           '--allowedTools',
-          [
-            'Read', 'Grep', 'Glob', 'LS',
-            'WebSearch', 'TodoWrite', 'Task', // F7: WebFetch removed — exfil chain with prompt injection
-          ].join(',')
+          ['Read', 'Grep', 'Glob', 'LS', 'WebSearch', 'WebFetch', 'TodoWrite', 'Task', 'Agent'].join(',')
         );
       }
 
@@ -475,6 +472,13 @@ class Runner {
           // F6: owner is trusted; gh capability is documented. Risk: prompt-injection
           // could exfiltrate via Bash — mitigated by scrubSecrets (F5).
           GH_TOKEN: process.env.GH_TOKEN || '',
+          // Owner sessions (ownerDmMode) use the OAuth session from ~/.claude.json
+          // so they get full Opus access with no API rate limits.
+          // Non-owner CLI escalations (action tags, [NEEDS_AGENT]) use the
+          // dedicated ANTHROPIC_API_KEY so they never touch Karen's OAuth account.
+          ...(!opts.ownerDmMode && process.env.ANTHROPIC_API_KEY
+            ? { ANTHROPIC_API_KEY: process.env.ANTHROPIC_API_KEY }
+            : {}),
         },
         stdio: ['ignore', 'pipe', 'pipe'],
       });
@@ -507,8 +511,6 @@ class Runner {
 
       // --- stdout handler: stream-json event parsing ---
       child.stdout.on('data', (d) => {
-        if (channelState) channelState.progress.lastActivity = Date.now();
-
         stdoutBuf += d;
         const lines = stdoutBuf.split('\n');
         stdoutBuf = lines.pop();
@@ -518,11 +520,21 @@ class Runner {
           try {
             const event = JSON.parse(line);
 
+            // rate_limit_event is a keep-alive/retry ping — do NOT update lastActivity
+            // or it resets the stall clock and the session hangs indefinitely.
+            // All other events count as real activity.
+            if (event.type !== 'rate_limit_event' && channelState) {
+              channelState.progress.lastActivity = Date.now();
+            }
+
             console.log(`[event] type=${event.type}${event.subtype ? ` subtype=${event.subtype}` : ''}${event.message?.role ? ` role=${event.message.role}` : ''}${event.parent_tool_use_id ? ` parent=${event.parent_tool_use_id}` : ''}`);
 
             if (event.type === 'rate_limit_event') {
+              if (!hitRateLimit && channelProxy) {
+                channelProxy.send('⏳ Hit an API rate limit — retrying automatically. This may take a minute.').catch(() => {});
+              }
               hitRateLimit = true;
-              console.warn(`[rate-limit] Hit Anthropic rate limit — will notify user on close`);
+              console.warn(`[rate-limit] Hit Anthropic rate limit — notified user, continuing`);
             }
 
             const parentId = event.parent_tool_use_id || null;
@@ -540,6 +552,11 @@ class Runner {
               resultSessionId = event.session_id || resultSessionId;
               resultCost = event.total_cost_usd != null ? event.total_cost_usd : resultCost;
               resultNumTurns = event.num_turns != null ? event.num_turns : resultNumTurns;
+              // Surface live cost on the progress object so !status / !btw can
+              // show a running total mid-loop (the result event fires per turn).
+              if (channelState && channelState.progress && resultCost != null) {
+                channelState.progress._lastCost = resultCost;
+              }
               console.log(`[result] subtype=${resultSubtype} turns=${resultNumTurns} cost=$${resultCost} text_len=${(resultText || '').length} text=${JSON.stringify((resultText || '').substring(0, 300))}`);
               continue;
             }

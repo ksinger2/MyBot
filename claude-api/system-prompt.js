@@ -66,8 +66,12 @@ RULES:
 TAGS (output these exactly when needed):
 - Generate image: \`[IMAGINE: description]\`
 - Set reminder: \`[REMIND: title="what" datetime="ISO 8601" duration_minutes=15]\` (TZ: America/Los_Angeles)
-- Rebuild bot: \`[REBUILD]\`
-- Group event: \`[EVENT: title="name" datetime="ISO" duration_minutes=120 location="venue" description="details" user_ids="..."]\`
+- Rebuild bot (owner only): \`[REBUILD]\`
+- Calendar event: \`[EVENT: title="name" datetime="ISO" duration_minutes=120 location="venue" description="details" user_ids=""]\` — user_ids is ONLY filled when the user explicitly asks to include other specific people by name; leave empty for personal/self events. Never guess phone numbers or add the owner.
+- Read calendar: \`[CALENDAR: fromDate="YYYY-MM-DD" toDate="YYYY-MM-DD"]\`
+- Weather: \`[WEATHER: location="City, State" fromDate="YYYY-MM-DD" toDate="YYYY-MM-DD"]\`
+- Eight Sleep: \`[EIGHTSLEEP: status]\` · \`[EIGHTSLEEP: set left 3]\` · \`[EIGHTSLEEP: on left]\` · \`[EIGHTSLEEP: off right]\`
+- Product search: \`[PRODUCT: query]\`
 - Save user preference: \`[SET_PREF: domain="events" match="study,exam,homework" color="Tomato" duration_minutes=60 reminder_minutes=15]\` — saves a rule that auto-applies when creating matching events. Only include fields the user specified. match= is comma-separated keywords found in event title. Valid colors: Tomato, Flamingo, Tangerine, Banana, Sage, Basil, Peacock, Blueberry, Lavender, Grape, Graphite.
 - Learn preference: \`[LEARNED: short fact]\` (max 200 chars)
 - Update notes: \`[UPDATE_NOTES: @SENDER_ID noteTitle="Title" full content]\`
@@ -79,7 +83,9 @@ ${isGroupChat ? '' : `MEMORY: Write learned preferences to .claude/memory/MEMORY
     try { systemParts.push(fs.readFileSync(personalityFile, 'utf-8')); } catch {}
   }
   if (readOnly) {
-    systemParts.push(`READ-ONLY MODE: You may ONLY answer questions, read files when asked, look up weather, and read Google Calendar. You may NOT edit/create/delete files, run Bash, commit code, rebuild, or change config.`);
+    systemParts.push(`USER MODE: You have full access to all assistant features — use any tag (calendar events, reminders, images, weather, 8sleep, preferences, memories, product search, etc.) exactly as documented above. Never tell a user a feature is unavailable to them.
+You may NOT: edit/create/delete files, run Bash, commit code, trigger [REBUILD], or access other users' private data.
+If a request genuinely requires browsing the web, reading files, running code, or multi-step research beyond your knowledge, output exactly \`[NEEDS_AGENT]\` on its own line and nothing else — do not attempt the task.`);
   }
   return systemParts.join('\n\n');
 }

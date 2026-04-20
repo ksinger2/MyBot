@@ -17,7 +17,7 @@ const { addSchedule, removeSchedule, getUserSchedules, formatScheduleList } = re
 const { addMonitor, removeMonitor, listMonitors, getMonitor, updateMonitor } = require('./monitor-config');
 const OpenAI = require('openai');
 const { startAllSchedules, registerJob, cancelJob } = require('./scheduler');
-const { saveChannelState, loadAllChannelStates, flushPendingWrites } = require('./channel-persistence');
+const { saveChannelState, loadAllChannelStates, flushPendingWrites, clearChannelState } = require('./channel-persistence');
 const { appendEntry, getJournalContext } = require('./session-journal');
 const { loadMemory } = require('./memory');
 const { startHeartbeat, stopHeartbeat, getHeartbeatStatus, listHeartbeats, loadStandingOrders } = require('./heartbeat');
@@ -915,6 +915,18 @@ async function startBot() {
       }
     }
   }
+  // One-time cleanup: remove stale non-Signal channel states (Discord leftovers
+  // from when this bot was Discord-based). Signal channelIds always start with
+  // `signal:` (group/DM) or `+` (legacy phone-prefixed). Anything else is dead.
+  const staleKeys = Object.keys(_savedChannelStates).filter(k => !k.startsWith('signal:') && !k.startsWith('+'));
+  if (staleKeys.length > 0) {
+    for (const k of staleKeys) {
+      delete _savedChannelStates[k];
+      try { clearChannelState(k); } catch (e) { console.warn(`[startup] failed to clear stale state ${k}:`, e.message); }
+    }
+    console.log(`[startup] Cleaned up ${staleKeys.length} stale non-Signal channel state(s)`);
+  }
+
   const savedCount = Object.keys(_savedChannelStates).length;
   if (savedCount > 0) {
     console.log(`Restored ${savedCount} channel state(s) from persistence`);
@@ -1020,6 +1032,44 @@ async function startBot() {
   const { startMonitorRunner } = require('./monitor-runner');
   startMonitorRunner();
 
+  // Restore persisted heartbeats — periodic autonomous wakes must survive
+  // container rebuilds. Stored via !heartbeat command as { intervalMinutes, cwd }.
+  let restoredHeartbeats = 0;
+  for (const [channelId, savedState] of Object.entries(_savedChannelStates)) {
+    if (!savedState?.heartbeat?.intervalMinutes) continue;
+    const state = getChannel(channelId);
+    const { intervalMinutes, cwd: hbCwd } = savedState.heartbeat;
+    const personalityFile = getPersonalityFile(state.personality);
+
+    startHeartbeat(channelId, {
+      cwd: hbCwd || state.cwd,
+      intervalMinutes,
+      onWake: (prompt) => askClaude(prompt, {
+        sessionId: state.sessionId,
+        personalityFile,
+        identity: state.identity,
+        cwd: hbCwd || state.cwd,
+        channelState: state,
+      }),
+      onResult: async (result) => {
+        if (result.sessionId) {
+          state.sessionId = result.sessionId;
+          saveChannelState(channelId, state);
+        }
+        if (result.text) {
+          // No message proxy at restore time — send directly via Signal adapter.
+          const signalChatId = channelId.startsWith('signal:') ? channelId.replace(/^signal:/, '') : channelId;
+          await signalAdapter.sendLongMessage(signalChatId, result.text).catch(e =>
+            console.error(`[heartbeat-restore] send failed for ${channelId}:`, e.message));
+        }
+      },
+    });
+    restoredHeartbeats++;
+  }
+  if (restoredHeartbeats > 0) {
+    console.log(`[startup] Restored ${restoredHeartbeats} heartbeat(s)`);
+  }
+
   // Auto-resume interrupted work after a crash (not a clean !restart).
   // Signal-only: every channelId is `signal:<chatId>`.
   if (!wasCleanShutdown && !wasRolledBack) {
@@ -1097,6 +1147,7 @@ async function processQueue(state) {
 
   // CRITICAL: Set busy BEFORE splicing to prevent race with incoming messages
   state.busy = true;
+  state.busySince = Date.now();
 
   const queued = state.queue.splice(0);
   const combined = queued.length === 1
@@ -1203,6 +1254,7 @@ async function processQueue(state) {
   } finally {
     clearInterval(typingInterval);
     state.busy = false;
+    state.busySince = null;
     state.startedAt = null;
     state.progress = freshProgress();
     state.activeTask = null;
@@ -1462,7 +1514,13 @@ function startSignalAdapter() {
         (m.uuid && botUuid && m.uuid === botUuid)
       );
 
-      if (!state.listenToAll && !hasPendingSenderWizard) {
+      const { isOwnerGroup: _isOwnerGroupMentionCheck } = require('./owner-groups');
+      // Only bypass @mention requirement when the OWNER is the sender in an owner group.
+      // Non-owners in an owner group still need to @mention — prevents anyone Karen
+      // adds to the group from driving the bot unrestricted without an @mention.
+      const _senderIsOwnerForMention = isSignalOwner(msg.senderId);
+      const _ownerGroupNoMentionNeeded = _isOwnerGroupMentionCheck(chatId) && _senderIsOwnerForMention;
+      if (!state.listenToAll && !hasPendingSenderWizard && !_ownerGroupNoMentionNeeded) {
         if (!botMentioned) {
           console.log(`[signal] Group message — bot not mentioned, ignoring (${mentionList.length} other mention(s))`);
           return;
@@ -1620,7 +1678,15 @@ function startSignalAdapter() {
       saveChannelState(chatId, state, { critical: true });
       if (!isGroupMessage) {
         const pos = state.queue.length;
-        await signalAdapter.sendMessage(msg.chatId, `Queued (#${pos}) — I'll get to that next.`);
+        // Include an excerpt of the active task so the user knows WHY they're waiting.
+        const activePrompt = (state.activeTask?.prompt || '').replace(/\s+/g, ' ').trim();
+        const excerpt = activePrompt
+          ? activePrompt.length > 40 ? activePrompt.slice(0, 40) + '…' : activePrompt
+          : 'previous task';
+        await signalAdapter.sendMessage(
+          msg.chatId,
+          `⏳ Queued (#${pos}) — working on "${excerpt}"...`
+        );
       }
       return;
     }
@@ -1927,6 +1993,8 @@ async function _dispatchSignalMessage(msg, chatId, text, state) {
   const { isSignalOwner } = require('./project-permissions');
   const isGroupMessage = msg.chatId !== msg.senderId;
   const senderIsOwner = isSignalOwner(msg.senderId);
+  const { isOwnerGroup } = require('./owner-groups');
+  const isOwnerGroupChat = isGroupMessage && isOwnerGroup(chatId);
   const personalityFile = getPersonalityFile(state.personality);
 
   // Detect "still broken" feedback and mark the latest repair as failed
@@ -1955,6 +2023,7 @@ async function _dispatchSignalMessage(msg, chatId, text, state) {
       resumeAttempts: 0,
     };
     state.busy = true;
+    state.busySince = Date.now();
     saveChannelState(chatId, state, { critical: true });
 
       const signalProxy = ChannelProxy.fromSignal(signalAdapter, msg.chatId);
@@ -2140,7 +2209,7 @@ async function _dispatchSignalMessage(msg, chatId, text, state) {
       // else keeps its historical wrapper (groups, other Signal users). See
       // /home/karen/.claude/plans/no-i-have-another-glimmering-marshmallow.md
       // for the design rationale.
-      const ownerDmMode = senderIsOwner && !isGroupChat;
+      const ownerDmMode = senderIsOwner && (!isGroupChat || isOwnerGroupChat);
       // Plan mode (owner DM only): read-only exploration, no edits/bash/writes.
       // Toggled via `!mode plan` / `!mode auto`; default is auto.
       const planMode = ownerDmMode && state.codingMode === 'plan';
@@ -2161,7 +2230,9 @@ async function _dispatchSignalMessage(msg, chatId, text, state) {
         // Group chats: social tools only. NO Bash (prevents file deletion/modification
         // by non-owner group members). NO Edit/Write/Grep/Glob (engineering tools).
         // Image generation in groups works via user photo attachments + image registry.
-        groupAllowedTools: isGroupChat ? 'Read,WebSearch,WebFetch,Task,TodoWrite' : undefined,
+        // Unrestricted tools only when OWNER is the sender in an owner group.
+        // Non-owners in an owner group still get the restricted social toolset.
+        groupAllowedTools: (isGroupChat && !(isOwnerGroupChat && senderIsOwner)) ? 'Read,Grep,Glob,WebSearch,WebFetch,Task,TodoWrite,Agent' : undefined,
         profileContext: (combinedProfileContext || '') + groupOnboardHint + pendingEventContext + groupNotesContext + activeFlightsContext + imageRefinementContext + (isGroupChat ? `\n\nCHAT_ID: ${msg.chatId}\nSENDER_ID: ${msg.senderId}` : ''),
         streamReplies: true,
         maxTurns: ownerDmMode ? null
@@ -2217,6 +2288,32 @@ async function _dispatchSignalMessage(msg, chatId, text, state) {
       } catch (err) {
         console.error('[instagram] Signal transcript error:', err.message);
       }
+
+      // ── SDK fast-path: non-owner chats (DMs + groups) use Sonnet SDK ─────
+      // Avoids CLI spawn for conversational messages. Falls through to CLI on
+      // action tags, [NEEDS_AGENT], SDK error, or any message with attachments.
+      // Owner DMs and owner groups always use CLI (full tools, OAuth session).
+      if (!senderIsOwner && !isOwnerGroupChat && !msg.attachments?.length) {
+        try {
+          const { chatRespond } = require('./chat-responder');
+          const sdkReply = await chatRespond({
+            channelId: msg.chatId,
+            userText: text,
+            identity: state.identity,
+            personalityFile,
+            profileContext: claudeOpts.profileContext,
+            isGroupChat,
+          });
+          if (sdkReply !== null) {
+            await signalProxy.send(sdkReply);
+            return;
+          }
+          console.log(`[sdk-path] [NEEDS_AGENT] from ${msg.senderId?.slice(0,6)}... — escalating to CLI`);
+        } catch (e) {
+          console.warn(`[sdk-path] error for ${msg.senderId?.slice(0,6)}..., falling back to CLI: ${e.message}`);
+        }
+      }
+      // ── End SDK fast-path ─────────────────────────────────────────────────
 
       const result = await runClaudeWithContinuation(signalPrompt, claudeOpts, signalProxy);
 
@@ -2655,12 +2752,17 @@ async function _dispatchSignalMessage(msg, chatId, text, state) {
             if (params.user_ids) {
               claimed = params.user_ids.split(/[,;\s]+/).map(s => s.trim()).filter(Boolean);
             }
-            // Always include the sender. Filter every other id against the
-            // group member cache so Claude can't add strangers.
+            // Always include the sender. In DMs (chatId === senderId), ONLY
+            // create for the sender — never add others Claude guessed at.
+            // In group chats, also add explicitly claimed members that are
+            // known group participants.
+            const isDm = msg.chatId === msg.senderId;
             const uids = new Set();
             uids.add(msg.senderId);
-            for (const id of claimed) {
-              if (allowedMembers.has(id)) uids.add(id);
+            if (!isDm) {
+              for (const id of claimed) {
+                if (allowedMembers.has(id) && id !== msg.senderId) uids.add(id);
+              }
             }
             try {
               const body = JSON.stringify({
@@ -2691,6 +2793,19 @@ async function _dispatchSignalMessage(msg, chatId, text, state) {
                 req.write(body); req.end();
               });
               console.log(`[event-tag] ${msg.senderId.slice(0,4)}**** "${params.title.slice(0,40)}" → ${uids.size} attendees, created=${evResult?.created?.length || 0} failed=${evResult?.failed?.length || 0}`);
+              // Send actionable feedback when the calendar creation fails.
+              // Most common cause: user hasn't connected their Google Calendar yet.
+              if (evResult?.failed?.length > 0) {
+                const senderFailed = evResult.failed.find(f => f.userId === msg.senderId);
+                if (senderFailed) {
+                  const isNotConnected = (senderFailed.error || '').includes('not_connected');
+                  const setupUrl = process.env.BOT_PUBLIC_URL ? `${process.env.BOT_PUBLIC_URL}/setup` : null;
+                  const hint = isNotConnected
+                    ? (setupUrl ? `To add it to your calendar, connect Google Calendar first: ${setupUrl}` : `To add it to your calendar, connect Google Calendar first — ask me for the setup link.`)
+                    : `Couldn't add the event to your calendar: ${senderFailed.error}`;
+                  await signalAdapter.sendMessage(msg.chatId, hint).catch(() => {});
+                }
+              }
             } catch (e) { console.warn(`[event-tag] failed: ${e.message}`); }
           }
         } catch (e) { console.warn(`[event-tag] handler error: ${e.message}`); }
@@ -3040,6 +3155,7 @@ async function _dispatchSignalMessage(msg, chatId, text, state) {
     } finally {
       clearInterval(signalTypingInterval);
       state.busy = false;
+      state.busySince = null;
       state.startedAt = null;
       state.progress = freshProgress();
       state.activeTask = null;

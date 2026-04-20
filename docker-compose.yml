@@ -17,6 +17,11 @@ services:
       # signal-api sidecar webhook forwarder, and any future internal services.
       # MUST be set to a long random value in .env — if unset, all authenticated
       # routes fail with HTTP 503 (we refuse to fail open).
+      # Dedicated Anthropic API key for Bianca. When set, Claude Code CLI uses
+      # this instead of the mounted ~/.claude.json OAuth session, giving Bianca
+      # its own rate limit budget separate from the owner's personal usage.
+      # Get one at https://console.anthropic.com — set ANTHROPIC_API_KEY in .env
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
       - INTERNAL_API_TOKEN=${INTERNAL_API_TOKEN:-}
       # Bot-level 2FA PIN. When set, every channel starts LOCKED — the user must
       # send `!unlock <PIN>` before the bot responds. Protects against compromised
