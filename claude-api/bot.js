@@ -903,6 +903,15 @@ async function startBot() {
     console.log('[security] !unlock PIN gate is disabled (BOT_UNLOCK_PIN not set).');
   }
 
+  // Kill any claude CLI processes orphaned from the previous container run.
+  // Safe to do unconditionally: loadAllChannelStates() (below) clears stale
+  // sessionIds so the queue never tries --resume on a dead session.
+  try {
+    const { execSync } = require('child_process');
+    execSync('pkill -f "^claude " 2>/dev/null; true', { stdio: 'ignore' });
+    console.log('[startup] Killed orphaned claude CLI processes (if any)');
+  } catch {}
+
   // Restore persisted channel states from previous container lifecycle
   _savedChannelStates = loadAllChannelStates();
   // After a rebuild, clear all session IDs so conversations start fresh.

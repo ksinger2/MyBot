@@ -1,8 +1,51 @@
 const schedule = require('node-schedule');
 const { loadSchedules, updateSchedule } = require('./schedules-storage');
+const { getInternalToken } = require('./internal-token');
 
 // Track active jobs so we can cancel them
 const activeJobs = new Map(); // scheduleId -> node-schedule Job
+
+// Resolve [WEATHER:] and [CALENDAR:] tags in scheduled task output before sending.
+// These tags only get resolved inside _dispatchSignalMessage(); scheduled tasks
+// bypass that path, so we handle them here directly.
+async function resolveTagsInText(text) {
+  if (!text) return text;
+  let result = text;
+
+  // Resolve [WEATHER: location="..." fromDate="..." toDate="..."]
+  const weatherRe = /\[WEATHER:\s*location="([^"]+)"(?:\s+fromDate="([^"]+)")?(?:\s+toDate="([^"]+)")?\]/gi;
+  let wMatch;
+  while ((wMatch = weatherRe.exec(text)) !== null) {
+    try {
+      const { getForecast } = require('./plugins/weather');
+      const forecast = await getForecast(wMatch[1], wMatch[2], wMatch[3]);
+      if (forecast) result = result.replace(wMatch[0], forecast);
+      else result = result.replace(wMatch[0], '');
+    } catch { result = result.replace(wMatch[0], ''); }
+  }
+
+  // Resolve [CALENDAR: fromDate="..." toDate="..."]
+  const calRe = /\[CALENDAR:\s*fromDate="([^"]+)"\s+toDate="([^"]+)"\]/gi;
+  let cMatch;
+  while ((cMatch = calRe.exec(text)) !== null) {
+    try {
+      const token = getInternalToken();
+      const res = await fetch(`http://localhost:3000/calendar/events?from=${cMatch[1]}&to=${cMatch[2]}`, {
+        headers: { Authorization: `Bearer ${token}` },
+        signal: AbortSignal.timeout(8000),
+      });
+      if (res.ok) {
+        const data = await res.json();
+        const lines = (data.events || []).map(e => `• ${e.summary || e.title} — ${e.start}`).join('\n');
+        result = result.replace(cMatch[0], lines || '(no events)');
+      } else {
+        result = result.replace(cMatch[0], '');
+      }
+    } catch { result = result.replace(cMatch[0], ''); }
+  }
+
+  return result.trim();
+}
 
 /**
  * Start all saved schedules on bot startup.
@@ -110,6 +153,7 @@ function registerJob(sched) {
             cwd: '/app',
             maxTurns: 10,
             profileContext,
+            ownerDmMode: true,
           });
 
           if (!result.text) {
@@ -117,8 +161,11 @@ function registerJob(sched) {
             return;
           }
 
+          // Resolve any [WEATHER:] or [CALENDAR:] tags before sending
+          const resolvedText = await resolveTagsInText(result.text);
+
           if (signalAdapter && signalAdapter.ready) {
-            await signalAdapter.sendLongMessage(sched.userId, result.text);
+            await signalAdapter.sendLongMessage(sched.userId, resolvedText);
             console.log(`[dm-task] Job #${sched.id} sent to Signal DM`);
           } else {
             console.warn(`[dm-task] Job #${sched.id} — Signal adapter not ready, skipping`);
@@ -161,6 +208,7 @@ function registerJob(sched) {
             identity: state.identity,
             cwd: sched.cwd || state.cwd,
             channelState: state,
+            ownerDmMode: true,
           }, null);
 
           if (result.sessionId) {

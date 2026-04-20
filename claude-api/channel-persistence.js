@@ -130,6 +130,21 @@ function loadAllChannelStates() {
     try { writeStore(store); } catch {}
     console.log(`[channel-persistence] Cleared ${cleared} stale activeTask(s) on load`);
   }
+
+  // Always clear sessionIds on startup — container restarts invalidate CLI sessions.
+  // Without this, the queue retries --resume <dead-session> and gets "No conversation found".
+  let clearedSessions = 0;
+  for (const [, s] of Object.entries(store)) {
+    if (s && s.sessionId) {
+      s.sessionId = null;
+      clearedSessions++;
+    }
+  }
+  if (clearedSessions > 0) {
+    try { writeStore(store); } catch {}
+    console.log(`[channel-persistence] Cleared ${clearedSessions} stale sessionId(s) on startup`);
+  }
+
   return store;
 }
 

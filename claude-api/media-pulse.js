@@ -43,25 +43,67 @@ function buildPromptWithSeen(basePrompt, seen) {
 }
 
 async function runMediaPulseJob(sched) {
-  const { askClaude, signalAdapter } = require('./bot');
+  const { signalAdapter } = require('./bot');
   const isSignal = typeof sched.userId === 'string' && sched.userId.startsWith('+');
 
-  const seen = loadSeen();
-  const prompt = buildPromptWithSeen(sched.message, seen);
-
-  console.log(`[media-pulse] Running job #${sched.id} (${seen.size} seen in dedup list)`);
-
-  const result = await askClaude(prompt, {
-    cwd: '/app',
-    maxTurns: 10,
-  });
-
-  if (!result.text) {
-    console.log(`[media-pulse] Job #${sched.id} returned no text`);
+  const apiKey = process.env.SERPAPI_KEY;
+  if (!apiKey) {
+    console.warn(`[media-pulse] SERPAPI_KEY not set, skipping job #${sched.id}`);
     return;
   }
 
-  const text = result.text.trim();
+  const seen = loadSeen();
+  console.log(`[media-pulse] Running job #${sched.id} via SerpAPI (${seen.size} seen in dedup list)`);
+
+  // Extract a search query from the schedule message (use first 100 chars as query)
+  const query = sched.message.replace(/\[.*?\]/g, '').trim().substring(0, 100);
+  let allResults = [];
+  try {
+    const url = `https://serpapi.com/search.json?engine=google&q=${encodeURIComponent(query)}&tbm=nws&num=10&tbs=qdr:d&api_key=${apiKey}`;
+    const res = await fetch(url, { signal: AbortSignal.timeout(12000) });
+    if (res.ok) {
+      const data = await res.json();
+      allResults = data.news_results || [];
+    }
+  } catch (err) {
+    console.warn(`[media-pulse] SerpAPI fetch failed: ${err.message}`);
+    return;
+  }
+
+  // Filter out already-seen stories
+  const newResults = allResults.filter(item => {
+    if (!item.title) return false;
+    const plain = item.title.substring(0, 80);
+    return ![...seen].some(s => s && plain.toLowerCase().includes(s.toLowerCase().substring(0, 30)));
+  });
+
+  if (newResults.length === 0) {
+    console.log(`[media-pulse] Job #${sched.id} — no new stories, skipping`);
+    return;
+  }
+
+  // Format with Haiku SDK
+  const Anthropic = require('@anthropic-ai/sdk');
+  const client = new Anthropic();
+  const storiesText = newResults.slice(0, 12).map(r =>
+    `- ${r.title} | ${r.source?.name || 'Unknown'} | ${r.link} | ${r.date || ''}`
+  ).join('\n');
+
+  const seenList = seen.size > 0
+    ? `\n\nDO NOT repeat these already-sent stories:\n${[...seen].slice(-60).map(h => `- ${h}`).join('\n')}`
+    : '';
+
+  const formatPrompt = `${sched.message}\n\nFRESH NEWS TO FORMAT (from today):\n${storiesText}${seenList}
+
+Format as bullet points. If using markdown links, only hyperlink the source name. No raw URLs visible. Keep it concise.
+If nothing notable, output: "Nothing new since last check."`;
+
+  const resp = await client.messages.create({
+    model: 'claude-haiku-4-5-20251001',
+    max_tokens: 1000,
+    messages: [{ role: 'user', content: formatPrompt }],
+  });
+  const text = (resp.content[0]?.text || '').trim();
   if (text.includes('Nothing new since last check')) {
     console.log('[media-pulse] No new stories this cycle, not sending');
     return;

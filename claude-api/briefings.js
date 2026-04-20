@@ -2,6 +2,7 @@ const schedule = require('node-schedule');
 const https = require('https');
 const http = require('http');
 const path = require('path');
+const fs = require('fs');
 const { geocode: weatherGeocode } = require('./plugins/weather');
 const config = require('./briefing-config');
 const { loadActiveTasks, addTasks, formatTaskList } = require('./tasks-storage');
@@ -354,23 +355,30 @@ async function sendBriefing() {
   const prompt = buildPrompt(stockData, weatherData, calendarText, jobsData, config, tasksText);
 
   // Resolve identity and personality
-  const { askClaude } = require('./bot');
   const identity = config.identity || DEFAULT_IDENTITY;
   const personalityName = config.personality || DEFAULT_PERSONALITY;
   const personalityFile = path.join(PERSONALITIES_DIR, `${personalityName}.md`);
 
   try {
-    const result = await askClaude(prompt, {
-      personalityFile,
-      identity,
-      cwd: '/app',
-      maxTurns: 15,
-    });
+    const Anthropic = require('@anthropic-ai/sdk');
+    const client = new Anthropic();
+    let personalityContent = '';
+    try { personalityContent = fs.readFileSync(personalityFile, 'utf-8'); } catch {}
+    const system = [`Your name is ${identity.name}. You are ${identity.description}.`, personalityContent]
+      .filter(Boolean).join('\n\n');
 
-    if (result.text) {
-      const cleanText = stripBotTags(result.text);
+    const resp = await client.messages.create({
+      model: 'claude-haiku-4-5-20251001',
+      max_tokens: 2048,
+      system,
+      messages: [{ role: 'user', content: prompt }],
+    });
+    const text = resp.content[0]?.text || '';
+
+    if (text) {
+      const cleanText = stripBotTags(text);
       await sendToChannel(null, cleanText);
-      console.log(`Briefing sent to ${recipient}${result.cost ? ` ($${result.cost.toFixed(4)})` : ''}`);
+      console.log(`Briefing sent to ${recipient} (Haiku SDK, no CLI spawn)`);
     } else {
       await sendToChannel(null, '(Morning briefing came back empty — Claude might be having a slow morning too)');
     }
@@ -448,23 +456,30 @@ async function sendWeeklyPreview() {
   const tasksText = formatTaskList(activeTasks);
   const prompt = buildWeeklyPreviewPrompt(tasksText);
 
-  const { askClaude } = require('./bot');
   const identity = config.identity || DEFAULT_IDENTITY;
   const personalityName = config.personality || DEFAULT_PERSONALITY;
   const personalityFile = path.join(PERSONALITIES_DIR, `${personalityName}.md`);
 
   try {
-    const result = await askClaude(prompt, {
-      personalityFile,
-      identity,
-      cwd: '/app',
-      maxTurns: 15,
-    });
+    const Anthropic = require('@anthropic-ai/sdk');
+    const client = new Anthropic();
+    let personalityContent = '';
+    try { personalityContent = fs.readFileSync(personalityFile, 'utf-8'); } catch {}
+    const system = [`Your name is ${identity.name}. You are ${identity.description}.`, personalityContent]
+      .filter(Boolean).join('\n\n');
 
-    if (result.text) {
-      const cleanText = stripBotTags(result.text);
+    const resp = await client.messages.create({
+      model: 'claude-haiku-4-5-20251001',
+      max_tokens: 2048,
+      system,
+      messages: [{ role: 'user', content: prompt }],
+    });
+    const text = resp.content[0]?.text || '';
+
+    if (text) {
+      const cleanText = stripBotTags(text);
       await sendToChannel(null, cleanText);
-      console.log(`Weekly preview sent to ${recipient}${result.cost ? ` ($${result.cost.toFixed(4)})` : ''}`);
+      console.log(`Weekly preview sent to ${recipient} (Haiku SDK, no CLI spawn)`);
     } else {
       await sendToChannel(null, '(Weekly preview came back empty)');
     }

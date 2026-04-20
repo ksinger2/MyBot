@@ -82,82 +82,103 @@ const SOURCES = [
   'nytimes.com',
 ];
 
-function buildPrompt(seenHeadlines) {
-  const seenList = seenHeadlines.size > 0
-    ? `\n\nDO NOT include any of these already-seen stories (match by headline keywords):\n${[...seenHeadlines].slice(-100).map(h => `- ${h}`).join('\n')}`
-    : '';
 
-  const sourcesHint = SOURCES.length
-    ? `\nPriority sources to check: ${SOURCES.join(', ')}`
-    : '';
-
-  return `You are an AI industry news scanner. Your ONLY data source is the WebSearch tool — you MUST NOT use training data or prior knowledge for news items.
-
-STEP 1 (MANDATORY — do this FIRST, before writing anything):
-Run WebSearch for EACH of these queries. You MUST call WebSearch at least 5 times with different queries:
-${TOPICS.slice(0, 8).map(t => `- WebSearch("${t} ${new Date().toISOString().slice(0, 10)}")`).join('\n')}
-
-STEP 2: From the search results, extract stories published in the last 24 hours ONLY. Ignore anything older.
-
-RECENCY: Order NEWEST FIRST. Prioritize last 3 hours, then last 6, then last 24. Nothing older.
-${sourcesHint}
-
-FORMAT RULES (CRITICAL — follow exactly):
-- Output ONLY a header and bullet points. NO intro, NO outro, NO commentary.
-- Header: **🤖 AI Pulse** (then the current time in Pacific Time, e.g. "**🤖 AI Pulse** — 3:00 PM PT")
-- Each bullet: hyperlink ONLY the first word (company or source name), rest of sentence is plain text, time-ago tag at end
-- Format: • [CompanyName](url) does thing — brief detail (Xh ago)
-- The URL is hidden — only the company/source name is clickable. DO NOT show the raw URL anywhere.
-- Example: • [Meta](https://example.com) releases Llama 4 Scout — beats GPT-4o on reasoning (1h ago)
-- Example: • [OpenAI](https://example.com) acquires Rockset for $800M to boost enterprise search (3h ago)
-- ONLY include NEW stories not in the seen list below
-- If there are zero new stories, output ONLY: "**🤖 AI Pulse** — Nothing new since last check."
-- NO deep links, NO long URLs visible, NO essay, NO explanation
-- Max 12 bullets. Min 0 (if nothing new).
-${seenList}`;
+async function fetchTopicNews(topic, apiKey) {
+  const url = `https://serpapi.com/search.json?engine=google&q=${encodeURIComponent(topic)}&tbm=nws&num=5&tbs=qdr:d&api_key=${apiKey}`;
+  const res = await fetch(url, { signal: AbortSignal.timeout(12000) });
+  if (!res.ok) throw new Error(`SerpAPI HTTP ${res.status} for "${topic}"`);
+  const data = await res.json();
+  return data.news_results || [];
 }
 
 async function sendAINews() {
-  console.log('[ai-news] Running AI news pulse...');
+  console.log('[ai-news] Running AI news pulse (SerpAPI + Haiku)...');
 
-  const { askClaude, signalAdapter } = require('./bot');
+  const { signalAdapter } = require('./bot');
   const recipient = AI_NEWS_CONFIG.recipient;
   if (!recipient || !signalAdapter || !signalAdapter.ready) {
     console.warn('[ai-news] No Signal recipient or adapter not ready, skipping');
     return;
   }
 
+  const apiKey = process.env.SERPAPI_KEY;
+  if (!apiKey) {
+    console.warn('[ai-news] SERPAPI_KEY not set, skipping news pulse');
+    return;
+  }
+
   const seen = loadSeen();
-  const prompt = buildPrompt(seen);
+
+  // Fetch news for first 8 topics in parallel (rate-limit friendly)
+  const topicsToFetch = TOPICS.slice(0, 8);
+  const allResults = [];
+  const fetchResults = await Promise.allSettled(
+    topicsToFetch.map(t => fetchTopicNews(t, apiKey))
+  );
+  for (const r of fetchResults) {
+    if (r.status === 'fulfilled') allResults.push(...r.value);
+  }
+
+  // Deduplicate by title and filter out already-seen stories
+  const uniqueResults = [];
+  const titlesSeen = new Set();
+  for (const item of allResults) {
+    if (!item.title || !item.link) continue;
+    const key = item.title.replace(/[^a-zA-Z0-9]/g, '').toLowerCase().substring(0, 60);
+    if (titlesSeen.has(key)) continue;
+    titlesSeen.add(key);
+    const plain = item.title.substring(0, 80);
+    if ([...seen].some(s => s && plain.toLowerCase().includes(s.toLowerCase().substring(0, 30)))) continue;
+    uniqueResults.push(item);
+  }
+
+  if (uniqueResults.length === 0) {
+    console.log('[ai-news] No new stories this cycle, not sending');
+    return;
+  }
+
+  // Format with Haiku SDK
+  const Anthropic = require('@anthropic-ai/sdk');
+  const client = new Anthropic();
+  const now = new Date();
+  const timeStr = now.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit', hour12: true, timeZone: 'America/Los_Angeles' });
+  const storiesText = uniqueResults.slice(0, 15).map(r =>
+    `- ${r.title} | ${r.source?.name || 'Unknown'} | ${r.link} | ${r.date || ''}`
+  ).join('\n');
+
+  const formatPrompt = `Format these AI/tech news stories as Signal-friendly bullets. Output ONLY:
+Header: **🤖 AI Pulse** — ${timeStr} PT
+Then bullets (max 12): • [SourceName](url) does thing — brief detail (Xh ago)
+Only the source name is hyperlinked. No raw URLs visible. No intro or outro.
+If nothing notable, output: "**🤖 AI Pulse** — Nothing new since last check."
+
+Stories:
+${storiesText}`;
 
   try {
-    const result = await askClaude(prompt, {
-      cwd: '/app',
-      maxTurns: 15, // needs multiple WebSearch calls for different topics
+    const resp = await client.messages.create({
+      model: 'claude-haiku-4-5-20251001',
+      max_tokens: 1000,
+      messages: [{ role: 'user', content: formatPrompt }],
     });
+    const text = (resp.content[0]?.text || '').trim();
 
-    if (!result.text) {
-      console.log('[ai-news] Empty result, skipping send');
+    if (!text || text.includes('Nothing new since last check')) {
+      console.log('[ai-news] No new stories after formatting, not sending');
       return;
     }
 
-    const text = result.text.trim();
-    if (text.includes('Nothing new since last check')) {
-      console.log('[ai-news] No new stories this cycle, not sending');
-      return;
-    }
-
-    const bulletLines = text.split('\n').filter(l => l.trim().startsWith('•') || l.trim().startsWith('-'));
-    for (const line of bulletLines) {
-      const plain = line.replace(/\[([^\]]+)\]\([^)]+\)/g, '$1').replace(/[•\-\*]/g, '').trim().substring(0, 80);
-      if (plain) seen.add(plain);
+    // Update seen list with new headlines
+    for (const item of uniqueResults) {
+      seen.add(item.title.substring(0, 80));
     }
     saveSeen(seen);
 
     await signalAdapter.sendLongMessage(recipient, text);
-    console.log(`[ai-news] Sent ${bulletLines.length} bullets to ${recipient}`);
+    const bulletCount = text.split('\n').filter(l => l.trim().startsWith('•')).length;
+    console.log(`[ai-news] Sent ${bulletCount} bullets to ${recipient} (SerpAPI + Haiku, no CLI)`);
   } catch (err) {
-    console.error('[ai-news] Failed:', err.message);
+    console.error('[ai-news] Haiku formatting failed:', err.message);
   }
 }
 
