@@ -13,6 +13,7 @@
 - **`!status` command**: Shows busy state, queue depth, elapsed time, cost.
 - **Queue ack**: DM senders see "⏳ Queued (#N)" when Bianca is busy.
 - **Signal-only**: Discord fully removed. Signal via bbernhard/signal-cli-rest-api (MODE=json-rpc + webhook).
+- **Email digest** (`!emaildigest`): Morning email digest via Gmail — categorizes last 24h emails into Important / Needs Reply / Unsubscribe / Ignore using Claude Haiku. Supports mark-read, mark-unread, and one-click unsubscribe (RFC 8058 POST → GET → mailto: fallback). Schedulable daily (e.g. `!emaildigest schedule 8am`). Owner-only. SSRF-protected.
 
 ## Routing Table
 | Who | Route | Auth |
@@ -25,9 +26,12 @@
 ## What's Broken / In Progress
 - **SDK history lost on rebuild**: Per-channel Sonnet history is in-memory only. Rebuild = conversation reset for non-owner users. Acceptable for now; fix by persisting history in channel state.
 - **`!prefs` command**: Let users view/edit stored preference rules (SET_PREF). Not yet implemented.
+- **Email digest — needs re-auth**: Karen must run `!connect` once to re-authorize Google with the new `gmail.modify` + `gmail.send` scopes before `!emaildigest` will work.
 
 ## Next Steps (Prioritized)
-1. **Validate Merrisa's calendar**: Have Merrisa send "put an event for tonight at 8pm" — confirm event goes to her Google Calendar (merrisang13@gmail.com), date is correct, no CLI rate limit hit.
-2. **Persist SDK history in channel state**: Survive rebuilds without conversation reset.
-3. **`!prefs` command**: Show user their stored preference rules.
-4. **WhatsApp adapter**: User wants Bianca on WhatsApp (explicitly NOT iMessage).
+1. **Re-authorize Google for Gmail**: Karen runs `!connect` → completes OAuth flow → `!emaildigest` to test.
+2. **Schedule daily digest**: `!emaildigest schedule 8am` once Gmail is connected.
+3. **Validate Merrisa's calendar**: Have Merrisa send "put an event for tonight at 8pm" — confirm event goes to her Google Calendar (merrisang13@gmail.com), date is correct, no CLI rate limit hit.
+4. **Persist SDK history in channel state**: Survive rebuilds without conversation reset.
+5. **`!prefs` command**: Show user their stored preference rules.
+6. **WhatsApp adapter**: User wants Bianca on WhatsApp (explicitly NOT iMessage).

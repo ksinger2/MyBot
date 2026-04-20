@@ -409,12 +409,9 @@ app.post('/event', requireInternalToken, async (req, res) => {
   const durationMs = (duration_minutes || 120) * 60 * 1000;
   const endTime = endDt || new Date(startTime.getTime() + durationMs);
 
-  // Gather emails of all connected users for the attendees list
-  const attendeeEmails = [];
-  for (const uid of user_ids) {
-    const tok = userTokens.getToken(uid);
-    if (tok?.email) attendeeEmails.push(tok.email);
-  }
+  // Do NOT pre-gather a shared attendees list — adding all user emails as
+  // attendees on every calendar entry sends unwanted cross-invitations.
+  // Each event is created independently on each person's own calendar.
 
   const created = [];
   const failed = [];
@@ -434,7 +431,6 @@ app.post('/event', requireInternalToken, async (req, res) => {
           location: location || undefined,
           start: { dateTime: startTime.toISOString() },
           end: { dateTime: endTime.toISOString() },
-          attendees: attendeeEmails.map(email => ({ email })),
           ...(color_id ? { colorId: String(color_id) } : {}),
           ...(reminder_minutes != null ? {
             reminders: {

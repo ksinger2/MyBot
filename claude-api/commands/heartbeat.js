@@ -15,6 +15,8 @@ module.exports = {
     }
     if (arg === 'off' || arg === 'stop') {
       ctx.stopHeartbeat(message.channel.id);
+      state.heartbeat = null;
+      ctx.saveChannelState(message.channel.id, state);
       await message.reply('Heartbeat stopped.');
       return;
     }
@@ -39,6 +41,9 @@ module.exports = {
         await ctx.sendLongMessage(message, result.text, state.cwd);
       },
     });
+    // Persist heartbeat config so it auto-restores after container rebuilds.
+    state.heartbeat = { intervalMinutes: interval, cwd: state.cwd };
+    ctx.saveChannelState(message.channel.id, state);
     await message.reply(`Heartbeat started — checking every **${interval} minutes**. Reads AGENTS.md for standing orders. Use \`!heartbeat off\` to stop.`);
   }
 };

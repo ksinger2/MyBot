@@ -18,6 +18,8 @@ const SCOPES = [
   'https://www.googleapis.com/auth/calendar.freebusy',
   'https://www.googleapis.com/auth/userinfo.email',
   'https://www.googleapis.com/auth/userinfo.profile',
+  'https://www.googleapis.com/auth/gmail.modify',
+  'https://www.googleapis.com/auth/gmail.send',
 ];
 
 const REDIRECT_URI = process.env.GOOGLE_REDIRECT_URI || `${process.env.BOT_PUBLIC_URL || 'http://localhost:3400'}/auth/google/callback`;
@@ -151,4 +153,26 @@ async function getCalendarClient(discordUserId) {
   return google.calendar({ version: 'v3', auth: client });
 }
 
-module.exports = { getAuthUrl, handleCallback, getCalendarClient, refreshTokenIfNeeded };
+/**
+ * Get an authenticated Gmail API client for a specific user.
+ * Automatically refreshes the token if needed.
+ * @param {string} userId
+ * @returns {Promise<object|null>} googleapis gmail client, or null if user not connected
+ */
+async function getGmailClient(userId) {
+  const valid = await refreshTokenIfNeeded(userId);
+  if (!valid) return null;
+
+  const tokenData = userTokens.getToken(userId);
+  if (!tokenData) return null;
+
+  const client = getOAuth2Client();
+  client.setCredentials({
+    access_token: tokenData.accessToken,
+    refresh_token: tokenData.refreshToken,
+  });
+
+  return google.gmail({ version: 'v1', auth: client });
+}
+
+module.exports = { getAuthUrl, handleCallback, getCalendarClient, getGmailClient, refreshTokenIfNeeded };
