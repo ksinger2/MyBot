@@ -58,6 +58,10 @@ function saveChannelState(channelId, state, { critical = false } = {}) {
     // reads this on startup to send a "I just rebuilt — resend if needed"
     // notification to the channel.
     wantsRestartNotification: state.wantsRestartNotification || null,
+    // Heartbeat config — { intervalMinutes, cwd } or null. Persisted so
+    // periodic autonomous wakes survive container rebuilds and are restored
+    // on startup by bot.js.
+    heartbeat: state.heartbeat || null,
   };
 
   if (critical) {

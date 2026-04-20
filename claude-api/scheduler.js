@@ -77,6 +77,15 @@ function registerJob(sched) {
           }
           return;
         }
+        if (sched.subtype === 'email-digest') {
+          try {
+            const { runEmailDigestJob } = require('./email-digest');
+            await runEmailDigestJob(sched);
+          } catch (err) {
+            console.error(`[email-digest] Job #${sched.id} failed: ${err.message}`);
+          }
+          return;
+        }
         // Hard-stop legacy concert tracker schedules at dispatch
         // even if startup safeguard somehow missed them.
         if (_isLegacyConcertTracker(sched)) {

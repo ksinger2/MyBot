@@ -24,17 +24,14 @@
 | Anyone else — action tag or [NEEDS_AGENT] | CLI (Sonnet, restricted tools) | `ANTHROPIC_API_KEY` |
 
 ## What's Broken / In Progress
-- **"opts is not defined" signal handler error**: Intermittent ReferenceError thrown inside `_dispatchSignalMessage`. Couldn't find the source via static analysis — all known `opts` usages are properly scoped. Added `console.error(err.stack)` to the catch block (bot.js:3152) so the next occurrence will log the exact line in docker logs. Check with: `docker compose logs claude-api 2>&1 | grep "Stack:"`.
-- **Signal group join broken**: Auto-join via API returns 204 but bot stays "pending invite" — signal-cli cannot find its own service ID. Groups must be invited manually.
 - **SDK history lost on rebuild**: Per-channel Sonnet history is in-memory only. Rebuild = conversation reset for non-owner users. Acceptable for now; fix by persisting history in channel state.
 - **`!prefs` command**: Let users view/edit stored preference rules (SET_PREF). Not yet implemented.
 - **Email digest — needs re-auth**: Karen must run `!connect` once to re-authorize Google with the new `gmail.modify` + `gmail.send` scopes before `!emaildigest` will work.
 
 ## Next Steps (Prioritized)
-1. **Fix "opts is not defined"**: Trigger the error, grab the stack trace from docker logs, fix the underlying bug.
-2. **Re-authorize Google for Gmail**: Karen runs `!connect` → completes OAuth flow → `!emaildigest` to test.
-3. **Schedule daily digest**: `!emaildigest schedule 8am` once Gmail is connected.
-4. **Validate Merrisa's calendar**: Have Merrisa send "put an event for tonight at 8pm" — confirm event goes to her Google Calendar (merrisang13@gmail.com), date is correct, no CLI rate limit hit.
-5. **Persist SDK history in channel state**: Survive rebuilds without conversation reset.
-6. **`!prefs` command**: Show user their stored preference rules.
-7. **WhatsApp adapter**: User wants Bianca on WhatsApp (explicitly NOT iMessage).
+1. **Re-authorize Google for Gmail**: Karen runs `!connect` → completes OAuth flow → `!emaildigest` to test.
+2. **Schedule daily digest**: `!emaildigest schedule 8am` once Gmail is connected.
+3. **Validate Merrisa's calendar**: Have Merrisa send "put an event for tonight at 8pm" — confirm event goes to her Google Calendar (merrisang13@gmail.com), date is correct, no CLI rate limit hit.
+4. **Persist SDK history in channel state**: Survive rebuilds without conversation reset.
+5. **`!prefs` command**: Show user their stored preference rules.
+6. **WhatsApp adapter**: User wants Bianca on WhatsApp (explicitly NOT iMessage).
