@@ -61,8 +61,10 @@ async function chatRespond({ channelId, userText, identity, personalityFile, pro
   // bot infrastructure and cannot be processed by the SDK fast-path.
   // Explicit allowlist (not a shape regex) to avoid false-positives on
   // normal text like [NOTE:], [ERROR:], [UPDATE:], etc.
-  const ACTION_TAG_RE = /\[(NEEDS_AGENT|IMAGINE|REMIND|EVENT|EVENT_JOIN|CALENDAR|WEATHER|EIGHTSLEEP|PRODUCT|SET_PREF|LEARNED|UPDATE_NOTES|REBUILD|FLIGHT|CONCERT_PRICES)[:\]]/;
-  if (!text || ACTION_TAG_RE.test(text)) return null;
+  // Only escalate to CLI for true [NEEDS_AGENT] (complex multi-step task).
+  // All other action tags ([EVENT:], [REMIND:], [IMAGINE:], etc.) are handled
+  // by bot.js post-processing via the synthetic result object — no CLI needed.
+  if (!text || /\[NEEDS_AGENT\]/.test(text)) return null;
 
   // Update history, trim to MAX_HISTORY_PAIRS
   history.push({ role: 'user', content: userText });

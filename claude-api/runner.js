@@ -15,9 +15,51 @@
  * runClaudeWithContinuation, or any shared utilities that bot.js
  * also needs (freshProgress, pushOutput, pushRawLog, etc.).
  */
-const { spawn } = require('child_process');
+const { spawn, execSync } = require('child_process');
 const fs = require('fs');
 const path = require('path');
+
+// ── Global CLI process registry ───────────────────────────────────────────────
+// Tracks every active claude child process so we can audit, limit, and kill
+// orphans. Key = auto-incrementing integer. Value = { child, startedAt, channelId }.
+const _activeRunners = new Map();
+let _runnerIdSeq = 0;
+const _MAX_CLI_RUNTIME_MS = 2 * 60 * 60 * 1000; // 2h absolute ceiling
+
+// Kill orphaned processes left over from a previous crash
+function killOrphanedClaude() {
+  try {
+    execSync('pkill -f "^claude " 2>/dev/null; true', { stdio: 'ignore' });
+    console.log('[runner] Cleared any orphaned claude processes on startup');
+  } catch {}
+}
+
+// Kill every currently-tracked runner (e.g. on graceful shutdown)
+function killAllRunners() {
+  for (const [id, info] of _activeRunners.entries()) {
+    try { info.child.kill('SIGTERM'); } catch {}
+    _activeRunners.delete(id);
+  }
+}
+
+function getActiveRunnerCount() { return _activeRunners.size; }
+
+// Periodic audit: log active count and kill any runner exceeding the ceiling
+setInterval(() => {
+  if (_activeRunners.size === 0) return;
+  const now = Date.now();
+  let killed = 0;
+  for (const [id, info] of _activeRunners.entries()) {
+    const ageMs = now - info.startedAt;
+    if (ageMs > _MAX_CLI_RUNTIME_MS) {
+      console.warn(`[runner-audit] Killing ghost runner #${id} ch=${info.channelId} age=${Math.round(ageMs/60000)}min`);
+      try { info.child.kill('SIGTERM'); } catch {}
+      _activeRunners.delete(id);
+      killed++;
+    }
+  }
+  console.log(`[runner-audit] Active CLI spawns: ${_activeRunners.size}${killed ? `, killed ghost(s): ${killed}` : ''}`);
+}, 5 * 60 * 1000).unref();
 
 // F5: Output scrubber — redacts secrets that might leak via prompt injection
 // or accidental echoing. Applied to every streamed text block and final result.
@@ -487,6 +529,10 @@ class Runner {
         stdio: ['ignore', 'pipe', 'pipe'],
       });
 
+      // Register in global process registry for audit + cleanup
+      const _runnerId = ++_runnerIdSeq;
+      _activeRunners.set(_runnerId, { child, startedAt: Date.now(), channelId: channelState?._channelId || 'unknown' });
+
       // Track the process so it can be killed
       if (channelState) {
         channelState.process = child;
@@ -894,6 +940,7 @@ class Runner {
 
       // --- Close handler ---
       child.on('close', (code) => {
+        _activeRunners.delete(_runnerId);
         if (hardTimeout) clearTimeout(hardTimeout);
         clearInterval(stallCheck);
         clearInterval(checkinTimer);
@@ -975,4 +1022,4 @@ class Runner {
   }
 }
 
-module.exports = { Runner };
+module.exports = { Runner, killOrphanedClaude, killAllRunners, getActiveRunnerCount };

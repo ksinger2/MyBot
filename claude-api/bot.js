@@ -29,7 +29,8 @@ let startSocialPlanWizard, processSocialPlanStep;
 try { ({ startSocialPlanWizard, processSocialPlanStep } = require('./wizards/social-plan')); } catch {}
 let spotifyAuth;
 try { spotifyAuth = require('./spotify-auth'); } catch {}
-const { Runner } = require('./runner');
+const { Runner, killOrphanedClaude } = require('./runner');
+killOrphanedClaude(); // kill any orphaned claude processes from a previous crash
 const { sweepOrphanTmpFiles, atomicWriteJsonSync } = require('./atomic-write');
 const { extractImageAttachments } = require('./adapters/base');
 const { loadCommands } = require('./commands');
@@ -307,7 +308,8 @@ class ChannelProxy {
           return '';
         });
         // Strip all system tags before they reach the user (they get processed post-session)
-        cleaned = cleaned.replace(/\[(IMAGINE|LEARNED|NOTE|RESOLVE_NOTE|UPDATE_NOTES|CONCERT_PRICES|FLIGHT_SEARCH|FLIGHT_PRICE|EIGHTSLEEP|FLIGHT|WEATHER|CALENDAR|PRODUCT):\s*[^\]]*\]/gi, '').trim();
+        cleaned = cleaned.replace(/\[(IMAGINE|LEARNED|NOTE|RESOLVE_NOTE|UPDATE_NOTES|CONCERT_PRICES|FLIGHT_SEARCH|FLIGHT_PRICE|EIGHTSLEEP|FLIGHT|WEATHER|CALENDAR|PRODUCT|EVENT|EVENT_JOIN|REMIND|SET_PREF):\s*[^\]]*\]/gi, '').trim();
+        cleaned = cleaned.replace(/\[REBUILD\]/gi, '').trim();
         if (!cleaned) return Promise.resolve();
         return adapter.sendMessage(recipientChatId, cleaned);
       },
@@ -2289,14 +2291,17 @@ async function _dispatchSignalMessage(msg, chatId, text, state) {
         console.error('[instagram] Signal transcript error:', err.message);
       }
 
-      // ── SDK fast-path: non-owner chats (DMs + groups) use Sonnet SDK ─────
-      // Avoids CLI spawn for conversational messages. Falls through to CLI on
-      // action tags, [NEEDS_AGENT], SDK error, or any message with attachments.
-      // Owner DMs and owner groups always use CLI (full tools, OAuth session).
-      if (!senderIsOwner && !isOwnerGroupChat && !msg.attachments?.length) {
+      // ── Routing: non-owner → SDK only (CLI never spawned); owner → CLI ────
+      // Non-owner CLI was blocked to prevent access to Karen's account MCPs.
+      // All non-owner features (calendar, reminders, images, weather, etc.)
+      // work via action tags returned in the SDK response and processed below.
+      let result;
+      if (!senderIsOwner && !isOwnerGroupChat) {
+        // ── Non-owner: SDK fast-path, no CLI fallback ──────────────────────
+        let sdkText = null;
         try {
           const { chatRespond } = require('./chat-responder');
-          const sdkReply = await chatRespond({
+          sdkText = await chatRespond({
             channelId: msg.chatId,
             userText: text,
             identity: state.identity,
@@ -2304,18 +2309,37 @@ async function _dispatchSignalMessage(msg, chatId, text, state) {
             profileContext: claudeOpts.profileContext,
             isGroupChat,
           });
-          if (sdkReply !== null) {
-            await signalProxy.send(sdkReply);
-            return;
-          }
-          console.log(`[sdk-path] [NEEDS_AGENT] from ${msg.senderId?.slice(0,6)}... — escalating to CLI`);
         } catch (e) {
-          console.warn(`[sdk-path] error for ${msg.senderId?.slice(0,6)}..., falling back to CLI: ${e.message}`);
+          console.warn(`[sdk-path] error for ${msg.senderId?.slice(0,6)}...: ${e.message}`);
+          await signalProxy.send("Sorry, I had trouble with that. Try again?");
+          return;
         }
-      }
-      // ── End SDK fast-path ─────────────────────────────────────────────────
 
-      const result = await runClaudeWithContinuation(signalPrompt, claudeOpts, signalProxy);
+        if (sdkText === null) {
+          // [NEEDS_AGENT]: too complex for SDK and CLI is blocked for non-owners.
+          // Dupe the original message to Karen so she can follow up.
+          console.log(`[sdk-path] [NEEDS_AGENT] from ${msg.senderId?.slice(0,6)}... — blocked (non-owner CLI disabled)`);
+          await signalProxy.send("That one's out of my reach here — I've passed it along.");
+          const ownerPhone = process.env.SIGNAL_OWNER;
+          if (ownerPhone && signalAdapter) {
+            const senderShort = msg.senderId?.slice(0, 12) || 'unknown';
+            await signalAdapter.sendMessage(ownerPhone,
+              `\u{1F4CB} Forwarded from ${senderShort}:\n${(text || '').slice(0, 400)}`).catch(() => {});
+          }
+          return;
+        }
+
+        // SDK returned text (may include action tags). Send visible text to user;
+        // tags are stripped by the proxy. Synthesize a result so the action-tag
+        // processing block below can execute [EVENT:], [REMIND:], [IMAGINE:], etc.
+        await signalProxy.send(sdkText);
+        result = { text: sdkText, sessionId: null, cost: null, inputTokens: 0, outputTokens: 0, turns: 1 };
+
+      } else {
+        // ── Owner DMs and ownergroup chats: full CLI with OAuth ────────────
+        result = await runClaudeWithContinuation(signalPrompt, claudeOpts, signalProxy);
+      }
+      // ── End routing ───────────────────────────────────────────────────────
 
       // Auto-learn extraction — strip [LEARNED: ...] tags, store preferences, notify user.
       //
