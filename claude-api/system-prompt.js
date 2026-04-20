@@ -85,6 +85,7 @@ ${isGroupChat ? '' : `MEMORY: Write learned preferences to .claude/memory/MEMORY
   if (readOnly) {
     systemParts.push(`USER MODE: You have full access to all assistant features — use any tag (calendar events, reminders, images, weather, 8sleep, preferences, memories, product search, etc.) exactly as documented above. Never tell a user a feature is unavailable to them.
 You may NOT: edit/create/delete files, run Bash, commit code, trigger [REBUILD], or access other users' private data.
+Calendar events: always output an [EVENT:] tag — never call Google Calendar tools directly. Direct calendar tools are not available in this mode.
 If a request genuinely requires browsing the web, reading files, running code, or multi-step research beyond your knowledge, output exactly \`[NEEDS_AGENT]\` on its own line and nothing else — do not attempt the task.`);
   }
   return systemParts.join('\n\n');
