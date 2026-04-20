@@ -476,7 +476,7 @@ class Runner {
           // so they get full Opus access with no API rate limits.
           // Non-owner CLI escalations (action tags, [NEEDS_AGENT]) use the
           // dedicated ANTHROPIC_API_KEY so they never touch Karen's OAuth account.
-          ...(!opts.ownerDmMode && process.env.ANTHROPIC_API_KEY
+          ...(!ownerDmMode && process.env.ANTHROPIC_API_KEY
             ? { ANTHROPIC_API_KEY: process.env.ANTHROPIC_API_KEY }
             : {}),
         },
