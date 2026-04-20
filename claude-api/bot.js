@@ -29,8 +29,7 @@ let startSocialPlanWizard, processSocialPlanStep;
 try { ({ startSocialPlanWizard, processSocialPlanStep } = require('./wizards/social-plan')); } catch {}
 let spotifyAuth;
 try { spotifyAuth = require('./spotify-auth'); } catch {}
-const { Runner, killOrphanedClaude } = require('./runner');
-killOrphanedClaude(); // kill any orphaned claude processes from a previous crash
+const { Runner } = require('./runner');
 const { sweepOrphanTmpFiles, atomicWriteJsonSync } = require('./atomic-write');
 const { extractImageAttachments } = require('./adapters/base');
 const { loadCommands } = require('./commands');
@@ -1182,12 +1181,19 @@ async function processQueue(state) {
     state.progress = freshProgress();
 
     let result;
+    // Derive ownerDmMode so the queued CLI spawn uses the right HOME and auth.
+    // Without this, Karen's queued messages would use /home/node-nonowner + API key
+    // instead of /home/node + OAuth — causing session-not-found errors and rate limits.
+    const { isOwner: _isOwnerQ } = require('./project-permissions');
+    const { isOwnerGroup: _isOwnerGroupQ } = require('./owner-groups');
+    const _ownerDmModeQ = !!(_isOwnerQ(signalChatId) || _isOwnerGroupQ(signalChatId));
     const queueOpts = {
       sessionId: state.sessionId,
       personalityFile,
       identity: state.identity,
       cwd: state.cwd,
       channelState: state,
+      ownerDmMode: _ownerDmModeQ,
     };
     try {
       result = await runClaudeWithContinuation(combined, queueOpts, null);

@@ -52,12 +52,15 @@ async function processNextItem() {
 
     const personalityFile = getPersonalityFile(item.personality);
 
+    // Scheduled tasks are owner-initiated — use ownerDmMode so they run with
+    // Karen's OAuth (HOME=/home/node) and get full Opus access without rate limits.
     const result = await runClaudeWithContinuation(item.prompt, {
       sessionId: null,
       personalityFile,
       identity: item.identity,
       cwd: item.cwd,
       channelState: transientState,
+      ownerDmMode: true,
     }, null);
 
     const summary = result.text
