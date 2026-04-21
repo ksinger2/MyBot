@@ -19,6 +19,8 @@ Identify and read the most critical source files for the project. Look at:
 - Entry points (main files, index files, app files)
 - Configuration files (package.json, docker-compose.yml, etc.)
 - Core business logic files
+- Signal adapter and transport files
+- Non-owner SDK routing files
 
 ## 4. Project State
 Run these commands to understand current state:
@@ -41,6 +43,8 @@ Launch agents in parallel to review their domains:
 After reading everything, provide:
 1. A brief summary of the project state
 2. What's currently working vs broken
-3. Running services (PM2 processes, dev servers)
-4. The recommended next action to take
-5. Any blockers or questions to resolve first
+3. The current routing split: owner CLI vs non-owner SDK vs blocked escalation
+4. Any obvious drift between `NextSteps.md` and `CLAUDE.md`
+5. Running services (PM2 processes, dev servers)
+6. The recommended next action to take
+7. Any blockers or questions to resolve first

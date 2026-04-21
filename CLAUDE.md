@@ -1,11 +1,12 @@
-# MyBot — Claude Code Discord Bot
+# MyBot — Signal Assistant Runtime
 
 ## Overview
-Discord bot that wraps Claude Code CLI, giving users a chat interface to an autonomous coding agent. Users talk to a configurable personality who can build software, browse the web, generate images, and manage infrastructure — all from Discord.
+Signal-first assistant runtime that routes owner conversations to Claude Code CLI with OAuth-backed tooling and routes non-owner conversational traffic through the Anthropic SDK fast-path. The codebase also handles scheduling, briefings, calendar flows, reminders, media/news digests, and Signal-specific onboarding and routing.
 
 ## Tech Stack
-- Node.js + Discord.js 14
+- Node.js runtime with Signal adapter(s)
 - Claude Code CLI (spawned as child process with `--output-format stream-json`)
+- Anthropic SDK for low-cost non-owner conversational flows and digest formatting
 - OpenAI SDK (image generation via gpt-image-1)
 - Express server for internal API endpoints
 - Docker (single container, `restart: unless-stopped`)
@@ -18,8 +19,10 @@ docker compose up -d --build
 ## Key Files
 | File | Purpose |
 |------|---------|
-| `claude-api/bot.js` | Main bot — Discord commands, Claude CLI wrapper, system prompt, progress tracking |
-| `claude-api/server.js` | Express server — `/ask`, `/imagine`, `/health` endpoints |
+| `claude-api/bot.js` | Main Signal runtime — routing, commands, CLI/SDK split, progress tracking |
+| `claude-api/server.js` | Express server — internal endpoints, setup/OAuth flows, and webhook support |
+| `claude-api/adapters/signal.js` | Signal adapter and sidecar integration |
+| `claude-api/chat-responder.js` | Non-owner Anthropic SDK fast-path |
 | `claude-api/monitor-config.js` | Monitor config CRUD — JSON persistence for polling monitors |
 | `claude-api/pollers.js` | Poller functions — GitHub CI (`gh` CLI) and URL health checks |
 | `claude-api/monitor-runner.js` | Timer-based polling loop — dedup, dispatch, rate limiting |
@@ -28,9 +31,9 @@ docker compose up -d --build
 | `docker-compose.yml` | Container config, env vars, volume mounts |
 
 ## Conventions
-- Brevity first — Discord messages must be short (2-4 sentences simple, 6-8 complex)
+- Brevity first for normal Signal chat; owner/operator mode can be longer when needed
 - Auto-rebuild after code changes — don't tell the user to rebuild, just do it
-- Image file paths MUST appear in text response for Discord attachment
+- Non-owner chats should stay on the SDK fast-path unless they truly need escalation
 - System prompt is assembled in `askClaude()` from: brevity rules + capabilities + identity + personality file
 - Three-layer timeout: stall (10min), check-in (5min), hard cap (90min)
 

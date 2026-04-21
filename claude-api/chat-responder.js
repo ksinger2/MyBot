@@ -14,7 +14,16 @@ const Anthropic = require('@anthropic-ai/sdk');
 const { buildSystemPrompt } = require('./system-prompt');
 
 const _histories = new Map(); // channelId → [{role, content}, ...]
-const MAX_HISTORY_PAIRS = 10;
+const MAX_HISTORY_PAIRS = 6;
+const FASTPATH_MODEL = process.env.NON_OWNER_FASTPATH_MODEL || 'claude-haiku-4-5-20251001';
+const FASTPATH_MAX_TOKENS = parseInt(process.env.NON_OWNER_FASTPATH_MAX_TOKENS, 10) || 250;
+const MAX_PROFILE_CONTEXT_CHARS = parseInt(process.env.NON_OWNER_PROFILE_CONTEXT_MAX_CHARS, 10) || 1400;
+const MAX_USER_TEXT_CHARS = parseInt(process.env.NON_OWNER_FASTPATH_INPUT_MAX_CHARS, 10) || 2500;
+
+function trimText(text, maxChars) {
+  if (!text || typeof text !== 'string') return '';
+  return text.length > maxChars ? `${text.slice(0, maxChars)}\n[truncated]` : text;
+}
 
 async function chatRespond({ channelId, userText, identity, personalityFile, profileContext, isGroupChat = false }) {
   const client = new Anthropic(); // uses ANTHROPIC_API_KEY from env
@@ -37,21 +46,24 @@ async function chatRespond({ channelId, userText, identity, personalityFile, pro
   const dateContext = `Today is ${dateStr}, ${timeStr} PT.`;
 
   // Build messages: inject profile context + date at start of fresh history
+  const trimmedUserText = trimText(userText, MAX_USER_TEXT_CHARS);
+  const trimmedProfileContext = trimText(profileContext, MAX_PROFILE_CONTEXT_CHARS);
+
   let messages;
-  if (history.length === 0 && profileContext) {
+  if (history.length === 0 && trimmedProfileContext) {
     messages = [
-      { role: 'user', content: `${dateContext}\n\n${profileContext}` },
+      { role: 'user', content: `${dateContext}\n\n${trimmedProfileContext}` },
       { role: 'assistant', content: 'Got it.' },
-      { role: 'user', content: userText },
+      { role: 'user', content: trimmedUserText },
     ];
   } else {
     // Always prepend date to the current user message so it's never stale
-    messages = [...history, { role: 'user', content: `${dateContext}\n\n${userText}` }];
+    messages = [...history, { role: 'user', content: `${dateContext}\n\n${trimmedUserText}` }];
   }
 
   const resp = await client.messages.create({
-    model: 'claude-sonnet-4-5',
-    max_tokens: 400,
+    model: FASTPATH_MODEL,
+    max_tokens: FASTPATH_MAX_TOKENS,
     system: systemPrompt,
     messages,
   });
@@ -67,7 +79,7 @@ async function chatRespond({ channelId, userText, identity, personalityFile, pro
   if (!text || /\[NEEDS_AGENT\]/.test(text)) return null;
 
   // Update history, trim to MAX_HISTORY_PAIRS
-  history.push({ role: 'user', content: userText });
+  history.push({ role: 'user', content: trimmedUserText });
   history.push({ role: 'assistant', content: text });
   while (history.length > MAX_HISTORY_PAIRS * 2) history.splice(0, 2);
 

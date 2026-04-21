@@ -1,6 +1,6 @@
 ---
 name: reinit
-description: Re-establish project context by reviewing NextStep.md, code, and Docker state for a new session
+description: Re-establish project context by reviewing NextSteps.md, current Signal routing, and runtime state for a new session
 disable-model-invocation: true
 allowed-tools: Read, Glob, Grep, Bash(docker*), Bash(git*)
 ---
@@ -10,15 +10,17 @@ allowed-tools: Read, Glob, Grep, Bash(docker*), Bash(git*)
 Read the following files and information to re-establish context for this session.
 
 ## 1. Handoff Document
-Read `NextStep.md` in the project root. This contains:
+Read `NextSteps.md` in the project root. This contains:
 - What was built and the current architecture
 - What's working and what's broken
 - Specific next steps to pick up from
 
 ## 2. Key Source Files
 Read these files to understand the current implementation:
-- `claude-api/bot.js` — Discord bot logic and Claude CLI integration
-- `claude-api/server.js` — Express server that starts the bot
+- `claude-api/bot.js` — Signal runtime routing, commands, and CLI/SDK split
+- `claude-api/server.js` — Express server, setup/OAuth flows, and internal endpoints
+- `claude-api/adapters/signal.js` — Signal adapter and sidecar integration
+- `claude-api/chat-responder.js` — non-owner Anthropic SDK fast-path
 - `docker-compose.yml` — Service configuration
 - `claude-api/Dockerfile` — Container build steps
 
@@ -38,5 +40,7 @@ Check the memory directory for any saved context:
 After reading everything, provide:
 1. A brief summary of the project state
 2. What's currently working vs broken
-3. The recommended next action to take
-4. Any blockers or questions to resolve first
+3. The current routing split: owner CLI vs non-owner SDK vs blocked escalation
+4. Any obvious drift between `NextSteps.md` and `CLAUDE.md`
+5. The recommended next action to take
+6. Any blockers or questions to resolve first
