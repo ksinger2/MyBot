@@ -1287,6 +1287,7 @@ async function processQueue(state) {
 // --- Signal adapter integration ---
 
 let signalAdapter = null;
+let _needsAgentRateLimit = null; // senderId → lastForwardTimestamp
 // Cache group member lookups to avoid an HTTP round-trip on every message.
 // Keyed by group chatId, value: { members: [...], name, fetchedAt }.
 const _groupInfoCache = new Map();
@@ -1580,8 +1581,9 @@ function startSignalAdapter() {
         const textLower = text.toLowerCase().replace(/\uFFFC/g, '').trim();
         const hasQuestion = textLower.includes('?');
         const hasTask = /\b(can you|could you|please|remind|schedule|search|find|look up|what|who|when|where|how|tell me|do you|help|show|get|check|track|set|add|list|commands|u have|u know)\b/i.test(textLower);
+        const hasUrl = /https?:\/\/\S+/i.test(textLower);
         const namesMeByName = botName && textLower.includes(botName);
-        if (!hasQuestion && !hasTask && !namesMeByName) {
+        if (!hasQuestion && !hasTask && !namesMeByName && !hasUrl) {
           console.log(`[signal] Group listenToAll — short conversational message, not directed at bot, ignoring`);
           return;
         }
@@ -2282,7 +2284,10 @@ async function _dispatchSignalMessage(msg, chatId, text, state) {
         for (const turl of tiktokUrls) {
           const ttResult = await getTikTokTranscriptWithFallback(turl);
           if (ttResult && ttResult.transcript) {
-            signalPrompt += `\n\n<video-transcript url="${turl}">\n${ttResult.transcript}\n</video-transcript>`;
+            const cap = ttResult.transcript.length > 1500
+              ? ttResult.transcript.slice(0, 1500) + '\n...[truncated]'
+              : ttResult.transcript;
+            signalPrompt += `\n\n<video-transcript url="${turl}">\n${cap}\n</video-transcript>`;
           }
         }
       } catch (err) {
@@ -2296,8 +2301,14 @@ async function _dispatchSignalMessage(msg, chatId, text, state) {
           const igResult = await getInstagramTranscript(igUrl);
           if (igResult) {
             let block = `<video-transcript url="${igUrl}">`;
-            if (igResult.transcript) block += `\n${igResult.transcript}`;
-            else if (igResult.description) block += `\n[No audio transcript. Creator caption: ${igResult.description}]`;
+            if (igResult.transcript) {
+              const cap = igResult.transcript.length > 1500
+                ? igResult.transcript.slice(0, 1500) + '\n...[truncated]'
+                : igResult.transcript;
+              block += `\n${cap}`;
+            } else if (igResult.description) {
+              block += `\n[No audio transcript. Creator caption: ${igResult.description}]`;
+            }
             block += `\n</video-transcript>`;
             signalPrompt += `\n\n${block}`;
           }
@@ -2318,7 +2329,7 @@ async function _dispatchSignalMessage(msg, chatId, text, state) {
           const { chatRespond } = require('./chat-responder');
           sdkText = await chatRespond({
             channelId: msg.chatId,
-            userText: text,
+            userText: signalPrompt,
             identity: state.identity,
             personalityFile,
             profileContext: claudeOpts.profileContext,
@@ -2332,14 +2343,21 @@ async function _dispatchSignalMessage(msg, chatId, text, state) {
 
         if (sdkText === null) {
           // [NEEDS_AGENT]: too complex for SDK and CLI is blocked for non-owners.
-          // Dupe the original message to Karen so she can follow up.
+          // Rate-limit forwarding to owner: max 1 per user per 60s to prevent spam.
+          if (!_needsAgentRateLimit) _needsAgentRateLimit = new Map();
+          const rateLimitKey = msg.senderId || 'unknown';
+          const lastForward = _needsAgentRateLimit.get(rateLimitKey) || 0;
+          const now = Date.now();
           console.log(`[sdk-path] [NEEDS_AGENT] from ${msg.senderId?.slice(0,6)}... — blocked (non-owner CLI disabled)`);
           await signalProxy.send("That one's out of my reach here — I've passed it along.");
-          const ownerPhone = process.env.SIGNAL_OWNER;
-          if (ownerPhone && signalAdapter) {
-            const senderShort = msg.senderId?.slice(0, 12) || 'unknown';
-            await signalAdapter.sendMessage(ownerPhone,
-              `\u{1F4CB} Forwarded from ${senderShort}:\n${(text || '').slice(0, 400)}`).catch(() => {});
+          if (now - lastForward > 60_000) {
+            _needsAgentRateLimit.set(rateLimitKey, now);
+            const ownerPhone = process.env.SIGNAL_OWNER;
+            if (ownerPhone && signalAdapter) {
+              const senderShort = msg.senderId?.slice(0, 12) || 'unknown';
+              await signalAdapter.sendMessage(ownerPhone,
+                `\u{1F4CB} Forwarded from ${senderShort}:\n${(text || '').slice(0, 400)}`).catch(() => {});
+            }
           }
           return;
         }

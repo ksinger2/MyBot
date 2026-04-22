@@ -929,6 +929,23 @@ class SignalAdapter extends MessagePlatform {
     const envelope = raw.envelope || raw;
     if (!envelope) return;
 
+    // Dedup — signal-api may retry on network hiccups, delivering the same
+    // envelope twice. Key on timestamp+source which is unique per message.
+    const dedupKey = `${envelope.timestamp || ''}_${envelope.sourceUuid || envelope.sourceNumber || envelope.source || ''}`;
+    if (dedupKey !== '_') {
+      if (!this._seenTimestamps) this._seenTimestamps = new Map();
+      if (this._seenTimestamps.has(dedupKey)) return;
+      this._seenTimestamps.set(dedupKey, Date.now());
+      // Prune entries older than 60s to avoid unbounded growth
+      if (this._seenTimestamps.size > 500) {
+        const cutoff = Date.now() - 60_000;
+        for (const [k, ts] of this._seenTimestamps) {
+          if (ts < cutoff) this._seenTimestamps.delete(k);
+          else break;
+        }
+      }
+    }
+
     // Auto-accept message requests so contacts can add bot to groups
     const senderUuid = envelope.sourceUuid || envelope.source;
     if (senderUuid && !senderUuid.startsWith('+')) {

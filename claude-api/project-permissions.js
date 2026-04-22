@@ -12,8 +12,12 @@ const fs   = require('fs');
 const path = require('path');
 const { atomicWriteJsonSync } = require('./atomic-write');
 
-// The one and only person who can edit code or change permissions from Signal
-const SIGNAL_OWNER = process.env.SIGNAL_OWNER_NUMBER || '+16315214787';
+// The one and only person who can edit code or change permissions from Signal.
+// MUST be set via env var — no hardcoded fallback to avoid impersonation risk.
+const SIGNAL_OWNER = process.env.SIGNAL_OWNER_NUMBER;
+if (!SIGNAL_OWNER) {
+  console.error('[FATAL] SIGNAL_OWNER_NUMBER is not set — project-permissions will deny all owner checks');
+}
 
 function _permFile(projectPath) {
   return path.join(projectPath, '.claude', 'permissions.json');
