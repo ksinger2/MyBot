@@ -38,24 +38,38 @@
 - `[WEATHER:]` and `[CALENDAR:]` in scheduled task output resolved via `resolveTagsInText()` before `sendLongMessage()`
 - URLs in listenToAll group chats are no longer silently filtered out
 
+### Link & Media Handling
+- TikTok video links: free VTT captions first, Whisper fallback for videos without captions
+- TikTok photo/carousel posts: detected via `/photo/` in resolved URL, Whisper skipped (no audio), metadata (title + description) still passed to Haiku for summarization
+- Instagram Reels: yt-dlp + Whisper transcript extraction
+- All transcripts capped at 1500 chars before injection into prompt
+- Non-owner SDK path receives the same enriched link data as owner CLI path
+
 ### Signal Bot
 - Signal-only (Discord fully removed)
 - Morning briefing, AI Pulse, Media Pulse all run via SerpAPI + Haiku SDK — deterministic, no Claude CLI
 - `!ownergroup` command registers groups for owner-mode CLI access
-- Email digest (`!emaildigest`): categorizes Gmail, supports mark-read + unsubscribe
+- Email digest (`!emaildigest`): code complete, needs Gmail API enabled in Google Cloud Console
 
-### Security Hardening (This Session)
+### Security Hardening
 - `SIGNAL_OWNER_NUMBER` no longer has a hardcoded phone number fallback — fails fast if env var not set
 - `[NEEDS_AGENT]` forwarding rate-limited to 1 per user per 60s to prevent spam flooding
 - Webhook dedup added to Signal adapter (timestamp+source key, 60s window)
 - INTERNAL_API_TOKEN properly scrubbed from env before child process spawns (verified)
 - Calendar privacy: group chats only see "Busy", full details only in DMs (deterministic server-side override)
 
+### Bugs Fixed (This Session)
+- **Duplicate messages**: SDK fast-path sent response twice (once via proxy, once via post-session sendLongMessage) — fixed by marking SDK results as `streamed: true`
+- **URLs filtered in group chats**: listenToAll filter dropped messages with URLs as "short conversational" — added `hasUrl` check
+- **Non-owner link enrichment missing**: SDK path received raw text instead of enriched prompt with transcripts/metadata — now passes `signalPrompt`
+- **TikTok photo/carousel errors**: yt-dlp + Whisper failed on photo posts, spamming errors — now detects `/photo/` URLs and skips transcript, uses metadata only
+
 ## Known Limitations
 - **Signal group join broken**: Auto-join returns 204 but bot stays "pending invite" — signal-cli can't find its own service ID. Groups must be invited manually.
 - **SDK history lost on rebuild**: Non-owner per-channel SDK history is in-memory only — resets on container restart.
 - **Weekly preview**: No real-time web search (Haiku SDK can't use WebSearch tools) — uses training knowledge for "week ahead" context.
 - **`!prefs` command**: View/edit stored preference rules (SET_PREF) — not yet implemented.
+- **Gmail API not enabled**: Email digest code is complete but Gmail API must be enabled in Google Cloud Console (project 86891241462) before `!emaildigest` works.
 
 ## Token Savings Opportunities (Not Yet Implemented)
 - **Heartbeat pre-check** (~2.88M tokens/month): Add regex pre-scan before invoking Claude; 80% of heartbeats return NO_ACTION_NEEDED
@@ -64,12 +78,11 @@
 - **Profile context sent once per session** (~50-100K tokens/month): Don't re-inject on every SDK history reset
 
 ## Next Steps (Prioritized)
-1. **Validate Bianca DM rate limits**: Send a few normal non-owner messages and confirm Anthropic 429s stop.
-2. **Re-authorize Google for Gmail**: Karen runs `!connect` → completes OAuth → `!emaildigest` to test.
+1. **Enable Gmail API + re-auth**: Enable at Google Cloud Console → Karen runs `!connect` → test `!emaildigest`.
+2. **Validate Bianca in group chats**: Have Merrisa send TikTok links, create events, test all non-owner features post-fix.
 3. **Validate morning briefing**: Confirm weather + calendar show actual data (no raw tags), no `[runner]` log entry on next fire.
 4. **Validate AI Pulse**: Confirm SerpAPI fetch works and news arrives without CLI spawn in logs.
-5. **Validate Merrisa's calendar**: Have Merrisa create an event — confirm it goes to her Google Calendar, not Karen's, no rate limit hit.
-6. **Implement heartbeat pre-check**: Biggest token savings (~2.88M/month) — regex scan AGENTS.md for actionable keywords before invoking Claude.
-7. **Persist SDK history**: Survive rebuilds without non-owner conversation reset.
-8. **`!prefs` command**: Show user their stored preference rules.
-9. **WhatsApp adapter**: Bianca on WhatsApp (explicitly NOT iMessage).
+5. **Implement heartbeat pre-check**: Biggest token savings (~2.88M/month) — regex scan AGENTS.md for actionable keywords before invoking Claude.
+6. **Persist SDK history**: Survive rebuilds without non-owner conversation reset.
+7. **`!prefs` command**: Show user their stored preference rules.
+8. **WhatsApp adapter**: Bianca on WhatsApp (explicitly NOT iMessage).

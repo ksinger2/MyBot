@@ -2366,7 +2366,7 @@ async function _dispatchSignalMessage(msg, chatId, text, state) {
         // tags are stripped by the proxy. Synthesize a result so the action-tag
         // processing block below can execute [EVENT:], [REMIND:], [IMAGINE:], etc.
         await signalProxy.send(sdkText);
-        result = { text: sdkText, sessionId: null, cost: null, inputTokens: 0, outputTokens: 0, turns: 1 };
+        result = { text: sdkText, sessionId: null, cost: null, inputTokens: 0, outputTokens: 0, turns: 1, streamed: true };
 
       } else {
         // ── Owner DMs and ownergroup chats: full CLI with OAuth ────────────

@@ -202,16 +202,21 @@ async function getTikTokTranscriptWithFallback(url) {
   const result = await getTikTokTranscript(url);
   if (result && result.transcript) return result;
 
-  // No captions — try Whisper fallback if OpenAI key is set
+  // No captions — try Whisper fallback if OpenAI key is set.
+  // Skip for photo/carousel posts (no audio to transcribe).
   if (process.env.OPENAI_API_KEY) {
-    console.log('[tiktok] No captions found, falling back to Whisper for', url);
     let canonicalUrl = url;
     if (/tiktok\.com\/t\/|vm\.tiktok\.com/.test(url)) {
       canonicalUrl = await resolveRedirect(url);
     }
-    const transcript = await transcribeWithWhisper(canonicalUrl);
-    if (transcript) {
-      return { transcript, title: result?.title || '', description: result?.description || '' };
+    if (/\/photo\//.test(canonicalUrl)) {
+      console.log('[tiktok] Photo/carousel post — skipping Whisper, using metadata only for', url);
+    } else {
+      console.log('[tiktok] No captions found, falling back to Whisper for', url);
+      const transcript = await transcribeWithWhisper(canonicalUrl);
+      if (transcript) {
+        return { transcript, title: result?.title || '', description: result?.description || '' };
+      }
     }
   }
 
