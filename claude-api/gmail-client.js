@@ -173,8 +173,8 @@ function _shortUrl(u) {
 
 function _buildRawEmail(to, subject) {
   const msg = [
-    `To: ${to}`,
-    `Subject: ${subject}`,
+    `To: ${to.replace(/[\r\n]/g, '')}`,
+    `Subject: ${subject.replace(/[\r\n]/g, '')}`,
     'Content-Type: text/plain; charset=utf-8',
     '',
     'Unsubscribe',
@@ -224,4 +224,45 @@ function _httpGet(targetUrl) {
   });
 }
 
-module.exports = { fetchRecentEmailMetadata, markRead, markUnread, unsubscribe, getGmailClient };
+/**
+ * Create a draft email in the user's Gmail Drafts folder.
+ * DETERMINISTIC SAFETY RULE: This function calls gmail.users.drafts.create(),
+ * NEVER gmail.users.messages.send(). The user must manually review and send
+ * from Gmail. There is no sendEmail/sendMessage export in this module.
+ *
+ * @param {object} gmail - Authenticated Gmail client
+ * @param {string} to - Recipient email address
+ * @param {string} subject - Email subject
+ * @param {string} body - Plain text email body
+ * @param {string} [threadId] - Optional threadId to attach draft as reply
+ * @returns {{ draftId: string, threadId: string }}
+ */
+async function createDraft(gmail, to, subject, body, threadId) {
+  if (!to || !subject) throw new Error('Draft requires "to" and "subject"');
+  // Header injection prevention: strip newlines from header fields
+  const safeTo = to.replace(/[\r\n]/g, '');
+  const safeSubject = subject.replace(/[\r\n]/g, '');
+
+  const lines = [
+    `To: ${safeTo}`,
+    `Subject: ${safeSubject}`,
+    'Content-Type: text/plain; charset=utf-8',
+    '',
+    body || '',
+  ];
+  const raw = Buffer.from(lines.join('\r\n')).toString('base64url');
+
+  const res = await gmail.users.drafts.create({
+    userId: 'me',
+    requestBody: {
+      message: { raw, ...(threadId ? { threadId } : {}) },
+    },
+  });
+
+  return {
+    draftId: res.data.id,
+    threadId: res.data.message?.threadId || threadId || null,
+  };
+}
+
+module.exports = { fetchRecentEmailMetadata, markRead, markUnread, unsubscribe, createDraft, getGmailClient };

@@ -2057,6 +2057,7 @@ async function _dispatchSignalMessage(msg, chatId, text, state) {
         const _emailMarkReadRe = /\bmark\b.{0,20}\b(read|as read)\b|\b(mark read|markread)\b/i;
         const _emailUnsubRe = /\bunsub(scribe)?\b|\bstop.{0,10}(email|newsletter|mailing)/i;
         const _emailMarkAllReadRe = /\bmark\b.{0,10}\ball\b.{0,10}\bread\b|\bmark\s+(everything|all|them)\s+(as\s+)?read\b/i;
+        const _emailDraftRe = /\b(draft|write|compose|reply to|respond to)\b.{0,20}\b(email|mail)\b|\b(email|mail)\b.{0,15}\b(draft|response|reply)\b|\b(draft|reply to|respond to)\b.{0,20}\b(email|mail|inbox)\b/i;
 
         let _emailHandled = false;
 
@@ -2178,10 +2179,55 @@ async function _dispatchSignalMessage(msg, chatId, text, state) {
           _emailHandled = true;
         }
 
+        // ── Email draft handler: uses Haiku to compose, Gmail API to save draft ──
+        // DETERMINISTIC: Only calls gmail.users.drafts.create(), NEVER .send().
+        if (!_emailHandled && _emailDraftRe.test(text)) {
+          try {
+            const { getGmailClient: _getGmail } = require('./gmail-client');
+            const gmail = await _getGmail(msg.senderId);
+            if (!gmail) {
+              await signalProxy.send("I'm not connected to your Gmail yet. Run `!connect` to authorize.");
+            } else {
+              const Anthropic = require('@anthropic-ai/sdk');
+              const _draftClient = new Anthropic();
+              const draftResp = await _draftClient.messages.create({
+                model: 'claude-haiku-4-5-20251001',
+                max_tokens: 1024,
+                system: `You are an email drafting assistant. Given the user's request, produce a JSON object with: {"to": "email@example.com", "subject": "...", "body": "..."}. If the user hasn't specified a recipient, set "to" to "". Keep the tone professional but warm. Respond ONLY with valid JSON, no other text.`,
+                messages: [{ role: 'user', content: text }],
+              });
+              let draftJson;
+              try {
+                let draftText = (draftResp.content?.[0]?.text || '').trim();
+                draftText = draftText.replace(/^```(?:json)?\s*\n?/i, '').replace(/\n?```\s*$/i, '').trim();
+                draftJson = JSON.parse(draftText);
+              } catch {
+                await signalProxy.send("I couldn't parse the draft. Try being more specific about who to email and what to say.");
+                _emailHandled = true;
+              }
+              if (draftJson && !_emailHandled) {
+                if (!draftJson.to) {
+                  await signalProxy.send(`📝 Here's a draft — who should I address it to?\n\nSubject: ${draftJson.subject || '(no subject)'}\n\n${draftJson.body || ''}`);
+                } else {
+                  const { createDraft } = require('./gmail-client');
+                  const { draftId } = await createDraft(gmail, draftJson.to, draftJson.subject, draftJson.body);
+                  await signalProxy.send(`📝 Draft saved to your Gmail!\n\nTo: ${draftJson.to}\nSubject: ${draftJson.subject}\n\n${(draftJson.body || '').slice(0, 300)}${(draftJson.body || '').length > 300 ? '...' : ''}\n\n✏️ Open Gmail to review and send.`);
+                }
+                _emailHandled = true;
+              }
+            }
+          } catch (err) {
+            console.error('[email-draft] error:', err.message);
+            await signalProxy.send("Had trouble drafting that email — try again?");
+            _emailHandled = true;
+          }
+        }
+
         if (_emailHandled) return;
       }
 
       // ── Owner conversational fast-path: simple questions use SDK, not CLI ──
+      let _ownerFastPathResult = null;
       // Questions like "when does my morning briefing run?" or "what's the weather?"
       // don't need Opus + tools. Route to Sonnet SDK to save ~$0.30+ per question.
       // Only applies to owner DMs (non-owners already use SDK fast-path).
@@ -2195,7 +2241,8 @@ async function _dispatchSignalMessage(msg, chatId, text, state) {
           || /\b(update|change|modify)\b.*\b(code|package|dependency|config|setting|file)\b/i.test(_lower)
           || /\b(delete|remove)\b.*\b(file|branch|package|endpoint)\b/i.test(_lower)
           || /^!/.test(_lower)
-          || /\b(project|repo|codebase|branch|PR|deploy|docker|server|database|endpoint)\b/i.test(_lower)
+          || /\b(codebase|branch|PR|deploy)\b/i.test(_lower)
+          || /\b(fix|restart|check|update|modify|inspect|ssh|connect to|log into)\b.{0,30}\b(server|docker|database|repo)\b/i.test(_lower)
           || text.length > 500;
         if (!_needsCli) {
           try {
@@ -2211,14 +2258,11 @@ async function _dispatchSignalMessage(msg, chatId, text, state) {
             });
             if (sdkText && !/\[NEEDS_AGENT\]/.test(sdkText)) {
               await signalProxy.send(sdkText);
-              // Process any action tags in the response
-              const result = { text: sdkText, sessionId: null, cost: null, inputTokens: 0, outputTokens: 0, turns: 1, streamed: true };
-              // Jump to action tag processing (set result so it flows through)
-              state.busy = false;
-              return;
+              _ownerFastPathResult = { text: sdkText, sessionId: null, cost: null, inputTokens: 0, outputTokens: 0, turns: 1, streamed: true };
+              console.log(`[owner-fastpath] Simple question handled via SDK`);
+            } else {
+              console.log(`[owner-fastpath] SDK returned NEEDS_AGENT or null, falling through to CLI`);
             }
-            // NEEDS_AGENT or null — fall through to CLI
-            console.log(`[owner-fastpath] SDK returned NEEDS_AGENT, falling through to CLI`);
           } catch (err) {
             console.warn(`[owner-fastpath] SDK error, falling through to CLI: ${err.message}`);
           }
@@ -2546,6 +2590,9 @@ async function _dispatchSignalMessage(msg, chatId, text, state) {
         await signalProxy.send(sdkText);
         result = { text: sdkText, sessionId: null, cost: null, inputTokens: 0, outputTokens: 0, turns: 1, streamed: true };
 
+      } else if (_ownerFastPathResult) {
+        // Owner fast-path handled it via SDK — use that result for action-tag processing
+        result = _ownerFastPathResult;
       } else {
         // ── Owner DMs and ownergroup chats: full CLI with OAuth ────────────
         result = await runClaudeWithContinuation(signalPrompt, claudeOpts, signalProxy);

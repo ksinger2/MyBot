@@ -115,23 +115,27 @@ async function extractCarouselText(html) {
   const apiKey = process.env.OPENAI_API_KEY;
   if (!apiKey) return null;
 
-  // Extract image URLs from TikTok's embedded JSON
-  const imageUrlBlocks = [...html.matchAll(/"imageURL"\s*:\s*\{[^}]+\}/g)];
-  if (imageUrlBlocks.length === 0) return null;
-
+  // Extract image URLs from TikTok's embedded JSON.
+  // Strategy: find "urlList" arrays near "imageURL" keys and JSON.parse each URL
+  // to properly decode unicode escapes (\u002F, \u003A, etc.)
   const imageUrls = [];
-  for (const block of imageUrlBlocks) {
-    const urlListMatch = block[0].match(/"urlList"\s*:\s*\["([^"]+)"/);
-    if (urlListMatch) {
-      const decoded = urlListMatch[1].replace(/\\u002F/g, '/');
-      imageUrls.push(decoded);
-    }
+  const urlListRe = /"urlList"\s*:\s*\["((?:[^"\\]|\\.)*)"/g;
+  let urlMatch;
+  while ((urlMatch = urlListRe.exec(html)) !== null) {
+    try {
+      const decoded = JSON.parse('"' + urlMatch[1] + '"');
+      if (/^https?:\/\//.test(decoded) && /image|photo|img|muscdn|tiktokcdn/i.test(decoded)) {
+        imageUrls.push(decoded);
+      }
+    } catch {}
   }
-  if (imageUrls.length === 0) return null;
+  // Deduplicate (TikTok embeds each image URL in multiple contexts)
+  const uniqueUrls = [...new Set(imageUrls)];
+  if (uniqueUrls.length === 0) return null;
 
   // Download slides (cap to avoid excessive API cost)
-  const toFetch = imageUrls.slice(0, MAX_CAROUSEL_SLIDES);
-  console.log(`[tiktok-carousel] Downloading ${toFetch.length}/${imageUrls.length} slide(s) for OCR`);
+  const toFetch = uniqueUrls.slice(0, MAX_CAROUSEL_SLIDES);
+  console.log(`[tiktok-carousel] Downloading ${toFetch.length}/${uniqueUrls.length} slide(s) for OCR`);
 
   const imageContents = [];
   for (const imgUrl of toFetch) {
@@ -181,6 +185,10 @@ async function extractCarouselText(html) {
     });
 
     const json = JSON.parse(resp);
+    if (json.error) {
+      console.warn(`[tiktok-carousel] OpenAI API error: ${json.error.message || JSON.stringify(json.error)}`);
+      return null;
+    }
     const text = json.choices?.[0]?.message?.content;
     if (text) {
       console.log(`[tiktok-carousel] OCR extracted ${text.length} chars from ${imageContents.length} slide(s)`);
