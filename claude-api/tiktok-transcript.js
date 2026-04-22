@@ -84,6 +84,114 @@ function parseVtt(vtt) {
     .trim();
 }
 
+/** Download a URL to a Buffer. */
+function fetchBuffer(url) {
+  return new Promise((resolve, reject) => {
+    function follow(currentUrl, hops) {
+      const parsed = new URL(currentUrl);
+      https.get({ hostname: parsed.hostname, path: parsed.pathname + parsed.search, headers: { 'User-Agent': MOBILE_UA } }, (res) => {
+        if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location && hops > 0) {
+          const next = res.headers.location.startsWith('http') ? res.headers.location : new URL(res.headers.location, currentUrl).href;
+          res.resume();
+          follow(next, hops - 1);
+        } else {
+          const chunks = [];
+          res.on('data', c => chunks.push(c));
+          res.on('end', () => resolve(Buffer.concat(chunks)));
+        }
+      }).on('error', reject);
+    }
+    follow(url, 5);
+  });
+}
+
+/**
+ * Extract text from TikTok photo carousel images via GPT-4o-mini vision.
+ * Scrapes image URLs from the page HTML, downloads up to MAX_SLIDES,
+ * sends them to vision model to read text overlays.
+ */
+const MAX_CAROUSEL_SLIDES = 8;
+async function extractCarouselText(html) {
+  const apiKey = process.env.OPENAI_API_KEY;
+  if (!apiKey) return null;
+
+  // Extract image URLs from TikTok's embedded JSON
+  const imageUrlBlocks = [...html.matchAll(/"imageURL"\s*:\s*\{[^}]+\}/g)];
+  if (imageUrlBlocks.length === 0) return null;
+
+  const imageUrls = [];
+  for (const block of imageUrlBlocks) {
+    const urlListMatch = block[0].match(/"urlList"\s*:\s*\["([^"]+)"/);
+    if (urlListMatch) {
+      const decoded = urlListMatch[1].replace(/\\u002F/g, '/');
+      imageUrls.push(decoded);
+    }
+  }
+  if (imageUrls.length === 0) return null;
+
+  // Download slides (cap to avoid excessive API cost)
+  const toFetch = imageUrls.slice(0, MAX_CAROUSEL_SLIDES);
+  console.log(`[tiktok-carousel] Downloading ${toFetch.length}/${imageUrls.length} slide(s) for OCR`);
+
+  const imageContents = [];
+  for (const imgUrl of toFetch) {
+    try {
+      const buf = await fetchBuffer(imgUrl);
+      if (buf.length > 0) {
+        imageContents.push({ type: 'image_url', image_url: { url: `data:image/jpeg;base64,${buf.toString('base64')}` } });
+      }
+    } catch (err) {
+      console.warn(`[tiktok-carousel] Failed to download slide: ${err.message}`);
+    }
+  }
+  if (imageContents.length === 0) return null;
+
+  // Send to GPT-4o-mini vision for text extraction
+  try {
+    const body = JSON.stringify({
+      model: 'gpt-4o-mini',
+      max_tokens: 1000,
+      messages: [{
+        role: 'user',
+        content: [
+          { type: 'text', text: 'Read ALL text visible on these TikTok carousel slides. Output the text from each slide separated by "---". Only output the text you see, nothing else.' },
+          ...imageContents,
+        ],
+      }],
+    });
+
+    const resp = await new Promise((resolve, reject) => {
+      const req = https.request({
+        hostname: 'api.openai.com',
+        path: '/v1/chat/completions',
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${apiKey}`,
+          'Content-Type': 'application/json',
+          'Content-Length': Buffer.byteLength(body),
+        },
+      }, (res) => {
+        let d = '';
+        res.on('data', c => d += c);
+        res.on('end', () => resolve(d));
+      });
+      req.on('error', reject);
+      req.write(body);
+      req.end();
+    });
+
+    const json = JSON.parse(resp);
+    const text = json.choices?.[0]?.message?.content;
+    if (text) {
+      console.log(`[tiktok-carousel] OCR extracted ${text.length} chars from ${imageContents.length} slide(s)`);
+      return text;
+    }
+  } catch (err) {
+    console.error('[tiktok-carousel] Vision API error:', err.message);
+  }
+  return null;
+}
+
 /**
  * Download TikTok audio and transcribe via OpenAI Whisper.
  * Requires OPENAI_API_KEY with active billing.
@@ -210,7 +318,14 @@ async function getTikTokTranscriptWithFallback(url) {
       canonicalUrl = await resolveRedirect(url);
     }
     if (/\/photo\//.test(canonicalUrl)) {
-      console.log('[tiktok] Photo/carousel post — skipping Whisper, using metadata only for', url);
+      console.log('[tiktok] Photo/carousel post — extracting text from slides for', url);
+      // Re-fetch page HTML (getTikTokTranscript already fetched it but didn't return it)
+      const html = await fetchText(canonicalUrl);
+      const carouselText = await extractCarouselText(html);
+      if (carouselText) {
+        return { transcript: carouselText, title: result?.title || '', description: result?.description || '' };
+      }
+      console.log('[tiktok] Carousel OCR returned no text, falling back to metadata only');
     } else {
       console.log('[tiktok] No captions found, falling back to Whisper for', url);
       const transcript = await transcribeWithWhisper(canonicalUrl);

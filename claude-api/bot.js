@@ -1193,7 +1193,7 @@ async function processQueue(state) {
     // Derive ownerDmMode so the queued CLI spawn uses the right HOME and auth.
     // Without this, Karen's queued messages would use /home/node-nonowner + API key
     // instead of /home/node + OAuth — causing session-not-found errors and rate limits.
-    const { isOwner: _isOwnerQ } = require('./project-permissions');
+    const { isSignalOwner: _isOwnerQ } = require('./project-permissions');
     const { isOwnerGroup: _isOwnerGroupQ } = require('./owner-groups');
     const _ownerDmModeQ = !!(_isOwnerQ(signalChatId) || _isOwnerGroupQ(signalChatId));
     const queueOpts = {
@@ -2047,6 +2047,184 @@ async function _dispatchSignalMessage(msg, chatId, text, state) {
 
       const signalProxy = ChannelProxy.fromSignal(signalAdapter, msg.chatId);
 
+      // ── Email fast-path: intercept email requests and route to cheap digest ──
+      // The CLI path costs ~$0.40+ per email check via Gmail MCP + Opus. The
+      // email-digest module does the same thing via direct Gmail API + Haiku
+      // for ~$0.001. Always use the cheap path.
+      if (!isGroupMessage) {
+        const _lowerText = text.toLowerCase();
+        const _emailCheckRe = /\b(check|read|scan|show|get|fetch|pull|summarize|review|any new|look at|go through|open|clean up|organize|tidy|sort|what('s| is| are| do i have)( in| on)?|how many|do i have|have i got|have any)\b.{0,20}\b(email|inbox|mail|gmail|unread)\b|\b(email|inbox|mail|gmail|unread)\b.{0,20}\b(check|update|summary|digest|status|new|unread|look|today|count|how many|clean|organize|tidy|sort)\b|\b(my\s+)?(unread|new)\s+(email|mail|message)s?\b|\bwhat'?s\s+in\s+my\s+(inbox|gmail|email|mail)\b|\b(help|want).{0,30}(inbox|email|mail|gmail)\b/i;
+        const _emailMarkReadRe = /\bmark\b.{0,20}\b(read|as read)\b|\b(mark read|markread)\b/i;
+        const _emailUnsubRe = /\bunsub(scribe)?\b|\bstop.{0,10}(email|newsletter|mailing)/i;
+        const _emailMarkAllReadRe = /\bmark\b.{0,10}\ball\b.{0,10}\bread\b|\bmark\s+(everything|all|them)\s+(as\s+)?read\b/i;
+
+        let _emailHandled = false;
+
+        if (_emailCheckRe.test(text)) {
+          // Check/fetch emails
+          try {
+            const { generateEmailDigest } = require('./email-digest');
+            console.log(`[email-fastpath] Intercepting email check from ${_redactId(msg.senderId)}`);
+            const digestText = await generateEmailDigest(msg.senderId, 24);
+            await signalProxy.send(digestText);
+          } catch (err) {
+            console.error('[email-fastpath] Error:', err.message);
+            await signalProxy.send("Had trouble checking your email — try `!emaildigest` directly.");
+          }
+          _emailHandled = true;
+
+        } else if (_emailMarkAllReadRe.test(text)) {
+          // Mark all as read
+          try {
+            const { getDigestSession } = require('./email-digest');
+            const { getGmailClient, markRead } = require('./gmail-client');
+            const session = getDigestSession(msg.senderId);
+            if (!session) {
+              await signalProxy.send("No recent digest to act on — let me check your email first.");
+              const { generateEmailDigest } = require('./email-digest');
+              const digestText = await generateEmailDigest(msg.senderId, 24);
+              await signalProxy.send(digestText);
+            } else {
+              const gmail = await getGmailClient(msg.senderId);
+              const unread = session.emails.filter(e => e.isUnread && e.messageId);
+              if (!unread.length) {
+                await signalProxy.send("All emails are already read!");
+              } else {
+                await Promise.all(unread.map(e => markRead(gmail, e.messageId).catch(() => {})));
+                await signalProxy.send(`Marked ${unread.length} email${unread.length === 1 ? '' : 's'} as read.`);
+              }
+            }
+          } catch (err) {
+            console.error('[email-fastpath] markread error:', err.message);
+            await signalProxy.send("Had trouble marking emails — try `!emaildigest markread all`.");
+          }
+          _emailHandled = true;
+
+        } else if (_emailMarkReadRe.test(text)) {
+          // Mark specific email(s) as read — look for a number
+          try {
+            const idMatch = text.match(/#?(\d+)/);
+            const { getDigestSession } = require('./email-digest');
+            const { getGmailClient, markRead } = require('./gmail-client');
+            const session = getDigestSession(msg.senderId);
+            if (!session) {
+              await signalProxy.send("No recent digest to act on. Let me check your email first, then you can tell me which to mark read.");
+              const { generateEmailDigest } = require('./email-digest');
+              await signalProxy.send(await generateEmailDigest(msg.senderId, 24));
+            } else if (idMatch) {
+              const id = parseInt(idMatch[1], 10);
+              const found = session.emails.find(e => e.shortId === id);
+              if (!found) {
+                await signalProxy.send(`Couldn't find email #${id}. Check the numbers from your last digest.`);
+              } else {
+                const gmail = await getGmailClient(msg.senderId);
+                await markRead(gmail, found.messageId);
+                await signalProxy.send(`Marked #${id} (${found.from?.split('<')[0]?.trim() || 'unknown'}) as read.`);
+              }
+            } else {
+              await signalProxy.send("Which email? Say something like \"mark #3 as read\" or \"mark all as read\".");
+            }
+          } catch (err) {
+            console.error('[email-fastpath] markread error:', err.message);
+            await signalProxy.send("Had trouble marking that email — try `!emaildigest markread <id>`.");
+          }
+          _emailHandled = true;
+
+        } else if (_emailUnsubRe.test(text)) {
+          // Unsubscribe
+          try {
+            const idMatch = text.match(/#?(\d+)/);
+            const isAll = /\ball\b|\beverything\b|\bnewsletters?\b/.test(_lowerText) && !idMatch;
+            const { getDigestSession } = require('./email-digest');
+            const { getGmailClient, unsubscribe: gmailUnsub } = require('./gmail-client');
+            const session = getDigestSession(msg.senderId);
+            if (!session) {
+              await signalProxy.send("No recent digest to act on. Let me check your email first, then you can unsubscribe.");
+              const { generateEmailDigest } = require('./email-digest');
+              await signalProxy.send(await generateEmailDigest(msg.senderId, 24));
+            } else {
+              const gmail = await getGmailClient(msg.senderId);
+              let targets = [];
+              if (isAll) {
+                targets = (session.unsubscribeCandidates || []).filter(e => e.messageId);
+              } else if (idMatch) {
+                const id = parseInt(idMatch[1], 10);
+                const found = session.emails.find(e => e.shortId === id);
+                if (found) targets = [found];
+                else { await signalProxy.send(`Couldn't find email #${id}.`); _emailHandled = true; }
+              }
+              if (targets.length > 0 && !_emailHandled) {
+                await signalProxy.send(`Unsubscribing from ${targets.length} sender${targets.length === 1 ? '' : 's'}...`);
+                let ok = 0, failed = 0, noHeader = 0;
+                for (const e of targets) {
+                  const r = await gmailUnsub(gmail, e.messageId).catch(err => ({ method: 'none', success: false }));
+                  if (r.method === 'none') noHeader++;
+                  else if (r.success) ok++;
+                  else failed++;
+                }
+                const parts = [];
+                if (ok) parts.push(`✅ ${ok} unsubscribed`);
+                if (failed) parts.push(`❌ ${failed} failed`);
+                if (noHeader) parts.push(`⚠️ ${noHeader} had no unsubscribe link`);
+                await signalProxy.send(parts.join(', ') + '.');
+              } else if (!_emailHandled) {
+                await signalProxy.send("Which email? Say \"unsubscribe #3\" or \"unsubscribe from all newsletters\".");
+              }
+            }
+          } catch (err) {
+            console.error('[email-fastpath] unsub error:', err.message);
+            await signalProxy.send("Had trouble unsubscribing — try `!emaildigest unsubscribe all`.");
+          }
+          _emailHandled = true;
+        }
+
+        if (_emailHandled) return;
+      }
+
+      // ── Owner conversational fast-path: simple questions use SDK, not CLI ──
+      // Questions like "when does my morning briefing run?" or "what's the weather?"
+      // don't need Opus + tools. Route to Sonnet SDK to save ~$0.30+ per question.
+      // Only applies to owner DMs (non-owners already use SDK fast-path).
+      if (senderIsOwner && !isGroupMessage) {
+        const _lower = text.toLowerCase().trim();
+        // Skip fast-path if message looks like it needs tools/file access
+        const _needsCli = /\b(build|deploy|commit|push|pull|install|rebuild|refactor|debug|implement|set up|configure|analyze)\b/i.test(_lower)
+          || /\b(fix|edit|write|code)\b.*\b(bug|file|code|function|error|issue|feature)\b/i.test(_lower)
+          || /\b(run|execute)\b.*\b(test|build|script|command|migration)\b/i.test(_lower)
+          || /\b(create|add)\b.*\b(file|branch|PR|feature|endpoint|route|component)\b/i.test(_lower)
+          || /\b(update|change|modify)\b.*\b(code|package|dependency|config|setting|file)\b/i.test(_lower)
+          || /\b(delete|remove)\b.*\b(file|branch|package|endpoint)\b/i.test(_lower)
+          || /^!/.test(_lower)
+          || /\b(project|repo|codebase|branch|PR|deploy|docker|server|database|endpoint)\b/i.test(_lower)
+          || text.length > 500;
+        if (!_needsCli) {
+          try {
+            const { chatRespond } = require('./chat-responder');
+            console.log(`[owner-fastpath] Simple question from owner — using SDK instead of CLI`);
+            const sdkText = await chatRespond({
+              channelId: msg.chatId,
+              userText: text,
+              identity: state.identity,
+              personalityFile,
+              profileContext: buildMinimalProfileContext(msg.senderId, { isGroupChat: false }),
+              isGroupChat: false,
+            });
+            if (sdkText && !/\[NEEDS_AGENT\]/.test(sdkText)) {
+              await signalProxy.send(sdkText);
+              // Process any action tags in the response
+              const result = { text: sdkText, sessionId: null, cost: null, inputTokens: 0, outputTokens: 0, turns: 1, streamed: true };
+              // Jump to action tag processing (set result so it flows through)
+              state.busy = false;
+              return;
+            }
+            // NEEDS_AGENT or null — fall through to CLI
+            console.log(`[owner-fastpath] SDK returned NEEDS_AGENT, falling through to CLI`);
+          } catch (err) {
+            console.warn(`[owner-fastpath] SDK error, falling through to CLI: ${err.message}`);
+          }
+        }
+      }
+
       // Build profile context. DMs use minimal profile + heuristic on-demand
       // data injection. Groups use the existing stripped path.
       let combinedProfileContext = buildMinimalProfileContext(msg.senderId, { isGroupChat: isGroupMessage });
@@ -2254,7 +2432,7 @@ async function _dispatchSignalMessage(msg, chatId, text, state) {
         groupAllowedTools: (isGroupChat && !(isOwnerGroupChat && senderIsOwner)) ? 'Read,Grep,Glob,WebSearch,WebFetch,Task,TodoWrite,Agent' : undefined,
         profileContext: (combinedProfileContext || '') + groupOnboardHint + pendingEventContext + groupNotesContext + activeFlightsContext + imageRefinementContext + (isGroupChat ? `\n\nCHAT_ID: ${msg.chatId}\nSENDER_ID: ${msg.senderId}` : ''),
         streamReplies: true,
-        maxTurns: ownerDmMode ? null
+        maxTurns: ownerDmMode ? (parseInt(process.env.OWNER_DM_MAX_TURNS, 10) || 10)
           : (isGroupChat ? 8 : (senderIsOwner ? (parseInt(process.env.SIGNAL_OWNER_MAX_TURNS, 10) || 75) : undefined)),
         ownerDmMode,
         planMode,

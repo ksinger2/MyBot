@@ -291,13 +291,12 @@ class Runner {
     this.personalityFile = personalityFile;
     this.identity = identity;
     this.cwd = cwd;
-    // Owner DM mode intentionally passes maxTurns=null and uses a very high
-    // ceiling so Claude runs to natural completion. Everyone else uses the
-    // historical default.
+    // Owner DM mode uses a moderate ceiling (default 25) to prevent runaway
+    // cost. bot.js passes OWNER_DM_MAX_TURNS (default 10) for most messages.
     this.ownerDmMode = ownerDmMode;
     this.planMode = planMode;
     this.maxTurns = ownerDmMode
-      ? (maxTurns || 1000)
+      ? (maxTurns || 25)
       : (maxTurns || (channelState?.config?.maxTurns) || DEFAULT_MAX_TURNS);
     this.channelState = channelState;
     this.channelProxy = channelProxy;

@@ -98,8 +98,10 @@ Respond ONLY with valid JSON in this exact format (no other text):
   });
 
   try {
-    const text = resp.content?.[0]?.text;
+    let text = resp.content?.[0]?.text;
     if (!text) throw new Error('empty response from Claude');
+    // Strip markdown fences Haiku sometimes wraps JSON in
+    text = text.replace(/^```(?:json)?\s*\n?/i, '').replace(/\n?```\s*$/i, '').trim();
     return JSON.parse(text);
   } catch (err) {
     console.warn(`[email-digest] Claude categorization failed: ${err.message}`);
