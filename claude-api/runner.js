@@ -62,34 +62,160 @@ const { init: initErrorAlerting, sendErrorAlert } = require('./error-alerting');
 const { appendEntry, getJournalContext } = require('./session-journal');
 const { loadMemory } = require('./memory');
 
-// Global concurrency semaphore — caps simultaneous Claude CLI processes so
-// multiple Discord channels + background runners don't pile on the API at once
-// and trigger rate limits. Configurable via MAX_CONCURRENT_CLAUDE env var.
-const MAX_CONCURRENT = parseInt(process.env.MAX_CONCURRENT_CLAUDE, 10) || 1;
-let _activeSlots = 0;
-const _slotQueue = [];
+// ── Process Registry — tracks all active CLI processes for diagnostics,
+// ghost detection, and priority eviction. pid → {channelId, startedAt, isOwner, child}
+const _processRegistry = new Map();
 
-function _acquireSlot() {
-  return new Promise((resolve) => {
+function _registerProcess(pid, { channelId, startedAt, isOwner, child }) {
+  _processRegistry.set(pid, { channelId, startedAt, isOwner, child });
+  console.log(`[registry] registered pid=${pid} channel=${channelId} owner=${isOwner} (${_processRegistry.size} active)`);
+}
+
+function _deregisterProcess(pid) {
+  if (_processRegistry.delete(pid)) {
+    console.log(`[registry] deregistered pid=${pid} (${_processRegistry.size} active)`);
+  }
+}
+
+// ── Priority Semaphore — caps simultaneous Claude CLI processes.
+// Owner gets priority: can evict oldest non-owner if at capacity.
+// Non-owner queues with 30s timeout → SlotTimeoutError.
+const MAX_CONCURRENT = parseInt(process.env.MAX_CONCURRENT_CLAUDE, 10) || 4;
+let _activeSlots = 0;
+const _ownerQueue = [];    // owner waiters get priority on release
+const _nonOwnerQueue = []; // non-owner waiters, FIFO with timeout
+
+class SlotTimeoutError extends Error {
+  constructor(msg) {
+    super(msg || 'All conversation slots are busy — try again in a minute');
+    this.name = 'SlotTimeoutError';
+  }
+}
+
+function _acquireSlot(isOwner = false) {
+  return new Promise((resolve, reject) => {
     if (_activeSlots < MAX_CONCURRENT) {
       _activeSlots++;
-      console.log(`[semaphore] acquired slot (${_activeSlots}/${MAX_CONCURRENT} active)`);
-      resolve();
-    } else {
-      console.log(`[semaphore] at capacity (${_activeSlots}/${MAX_CONCURRENT}), queuing — ${_slotQueue.length + 1} waiting`);
-      _slotQueue.push(resolve);
+      console.log(`[semaphore] acquired slot (${_activeSlots}/${MAX_CONCURRENT} active) owner=${isOwner}`);
+      return resolve();
     }
+
+    if (isOwner) {
+      // Owner at capacity: evict the oldest non-owner process to make room
+      let oldestNonOwner = null;
+      let oldestPid = null;
+      for (const [pid, info] of _processRegistry) {
+        if (info.isOwner) continue;
+        if (!oldestNonOwner || info.startedAt < oldestNonOwner.startedAt) {
+          oldestNonOwner = info;
+          oldestPid = pid;
+        }
+      }
+      if (oldestNonOwner && oldestNonOwner.child) {
+        console.log(`[semaphore] owner evicting non-owner pid=${oldestPid} (started ${Math.round((Date.now() - oldestNonOwner.startedAt) / 1000)}s ago)`);
+        forceKillProcess(oldestNonOwner.child, 3000).then(() => {
+          // Slot will be released by the close handler, then we acquire it
+          // Put owner at front of owner queue to grab it immediately
+        }).catch(() => {});
+        // Queue owner — the evicted process's close handler will release a slot
+        _ownerQueue.push(resolve);
+        return;
+      }
+      // No non-owner to evict — queue the owner (shouldn't happen with 4 slots)
+      console.log(`[semaphore] owner at capacity, no non-owner to evict — queuing`);
+      _ownerQueue.push(resolve);
+      return;
+    }
+
+    // Non-owner at capacity: queue with 30s timeout
+    console.log(`[semaphore] non-owner at capacity (${_activeSlots}/${MAX_CONCURRENT}), queuing with 30s timeout — ${_nonOwnerQueue.length + 1} waiting`);
+    const entry = { resolve, reject, timedOut: false };
+    entry.timer = setTimeout(() => {
+      entry.timedOut = true;
+      // Remove from queue
+      const idx = _nonOwnerQueue.indexOf(entry);
+      if (idx !== -1) _nonOwnerQueue.splice(idx, 1);
+      console.log(`[semaphore] non-owner timed out after 30s (${_nonOwnerQueue.length} still waiting)`);
+      reject(new SlotTimeoutError());
+    }, 30000);
+    _nonOwnerQueue.push(entry);
   });
 }
 
 function _releaseSlot() {
-  if (_slotQueue.length > 0) {
-    const next = _slotQueue.shift();
-    console.log(`[semaphore] slot released → waking queued runner (${_slotQueue.length} still waiting)`);
+  // Priority: wake owner waiters first, then non-owners FIFO
+  if (_ownerQueue.length > 0) {
+    const next = _ownerQueue.shift();
+    console.log(`[semaphore] slot released → waking owner waiter (${_ownerQueue.length} owners, ${_nonOwnerQueue.length} non-owners still waiting)`);
     next(); // _activeSlots stays the same — passing directly to next waiter
+  } else if (_nonOwnerQueue.length > 0) {
+    const entry = _nonOwnerQueue.shift();
+    if (entry.timedOut) {
+      // This entry already rejected — try next
+      _releaseSlot();
+      return;
+    }
+    clearTimeout(entry.timer);
+    console.log(`[semaphore] slot released → waking non-owner waiter (${_nonOwnerQueue.length} still waiting)`);
+    entry.resolve();
   } else {
     _activeSlots = Math.max(0, _activeSlots - 1);
     console.log(`[semaphore] slot released (${_activeSlots}/${MAX_CONCURRENT} active)`);
+  }
+}
+
+// ── Ghost Reaper — kills stale non-owner processes every 60s ──
+function _sweepGhosts() {
+  const now = Date.now();
+  const MAX_NON_OWNER_AGE_MS = 15 * 60 * 1000; // 15 minutes
+  for (const [pid, info] of _processRegistry) {
+    // Kill dead PIDs (process already exited but registry wasn't cleaned up).
+    // Only deregister — don't release the slot here, the close handler does that
+    // via releaseOnce() to prevent double-release.
+    try {
+      process.kill(pid, 0); // test if alive — throws if dead
+    } catch {
+      console.log(`[ghost-reaper] dead pid=${pid} — deregistering (close handler releases slot)`);
+      _deregisterProcess(pid);
+      continue;
+    }
+    // Kill non-owner processes older than 15 minutes
+    if (!info.isOwner && (now - info.startedAt) > MAX_NON_OWNER_AGE_MS) {
+      console.log(`[ghost-reaper] killing stale non-owner pid=${pid} (age=${Math.round((now - info.startedAt) / 60000)}min)`);
+      forceKillProcess(info.child, 3000).catch(() => {});
+      // close handler will deregister + release slot
+    }
+  }
+}
+const _ghostReaperInterval = setInterval(_sweepGhosts, 60000);
+// Don't let the reaper keep the process alive
+if (_ghostReaperInterval.unref) _ghostReaperInterval.unref();
+
+// ── Startup Orphan Cleanup — kills lingering claude processes from previous runs ──
+// Scans /proc directly since pgrep/ps may not be installed in the container.
+function killOrphanClaude() {
+  try {
+    const myPid = process.pid;
+    const procDirs = fs.readdirSync('/proc').filter(d => /^\d+$/.test(d));
+    let killed = 0;
+    for (const dir of procDirs) {
+      const pid = parseInt(dir, 10);
+      if (pid === myPid) continue;
+      try {
+        const cmdline = fs.readFileSync(`/proc/${dir}/cmdline`, 'utf8');
+        // cmdline uses null bytes as separators
+        if (cmdline.includes('claude') && !cmdline.includes('node')) {
+          process.kill(pid, 'SIGTERM');
+          console.log(`[orphan-cleanup] killed orphan claude pid=${pid}`);
+          killed++;
+        }
+      } catch {
+        // Process may have exited between readdir and readFile — ignore
+      }
+    }
+    console.log(`[orphan-cleanup] ${killed > 0 ? `cleaned up ${killed} orphan claude process(es)` : 'no orphan claude processes found'}`);
+  } catch (err) {
+    console.warn(`[orphan-cleanup] error: ${err.message}`);
   }
 }
 
@@ -239,6 +365,10 @@ class Runner {
     // Toggled by the `!mode plan` / `!mode auto` command.
     planMode = false,
     isVoice = false, // Siri voice mode — ultra-compact prompt, no engineering tools
+    // Is this an owner session? Used by the priority semaphore.
+    isOwner = false,
+    // Recent messages context for conversation continuity
+    recentMessages = null,
     // Injected from bot.js so runner doesn't need to import bot.js:
     freshProgressFn = null,
     saveChannelStateFn = null,
@@ -266,6 +396,8 @@ class Runner {
     this.profileContext = profileContext;
     this.streamReplies = streamReplies;
     this.isVoice = isVoice;
+    this.isOwner = isOwner || ownerDmMode; // ownerDmMode implies isOwner
+    this.recentMessages = recentMessages;
     // Use injected functions or local fallbacks
     this._freshProgress = freshProgressFn || freshProgress;
     this._saveChannelState = saveChannelStateFn || (() => {});
@@ -273,7 +405,7 @@ class Runner {
   }
 
   async run() {
-    await _acquireSlot();
+    await _acquireSlot(this.isOwner);
     const _originalResolve_DO_NOT_USE = null; // sentinel — use wrappedResolve/wrappedReject below
     let _slotReleased = false;
     const releaseOnce = () => { if (!_slotReleased) { _slotReleased = true; _releaseSlot(); } };
@@ -377,6 +509,20 @@ class Runner {
             if (preflight) contextParts.push(preflight);
           } catch {}
         }
+        // Inject recent message log for conversation continuity
+        if (this.recentMessages && this.recentMessages.length > 0) {
+          const now = Date.now();
+          const lines = this.recentMessages.map(m => {
+            const ago = Math.round((now - m.timestamp) / 60000);
+            const agoStr = ago < 1 ? 'just now' : ago < 60 ? `${ago}min ago` : `${Math.round(ago / 60)}h ago`;
+            if (m.role === 'user') {
+              return `${m.sender || 'User'} (${agoStr}): ${m.text}`;
+            }
+            return `Bianca (${agoStr}): ${m.text}`;
+          });
+          contextParts.push(`[Recent conversation in this chat:]\n${lines.join('\n')}`);
+        }
+
         if (contextParts.length > 0) {
           effectivePrompt = contextParts.join('\n\n') + `\n\n[Current request]:\n${prompt}`;
         }
@@ -495,6 +641,16 @@ class Runner {
           channelState.progress = this._freshProgress();
         }
         channelState.progress._startTime = channelState.startedAt;
+      }
+
+      // Register in process registry for ghost detection and priority eviction
+      if (child.pid) {
+        _registerProcess(child.pid, {
+          channelId: channelState?._channelId || 'unknown',
+          startedAt: Date.now(),
+          isOwner: this.isOwner,
+          child,
+        });
       }
 
       // Stream-json result accumulators
@@ -883,6 +1039,8 @@ class Runner {
         if (hardTimeout) clearTimeout(hardTimeout);
         clearInterval(stallCheck);
         clearInterval(checkinTimer);
+        // Deregister from process registry
+        if (child.pid) _deregisterProcess(child.pid);
         const turnCount = channelState?.progress?.turnCount || 0;
         const elapsed = channelState?.startedAt ? Math.round((Date.now() - channelState.startedAt) / 1000) : 0;
         console.log(`[close] code=${code} turns=${turnCount} elapsed=${elapsed}s stderr_len=${stderr.length}`);
@@ -961,4 +1119,4 @@ class Runner {
   }
 }
 
-module.exports = { Runner };
+module.exports = { Runner, SlotTimeoutError, killOrphanClaude };

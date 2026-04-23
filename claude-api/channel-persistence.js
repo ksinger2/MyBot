@@ -62,6 +62,8 @@ function saveChannelState(channelId, state, { critical = false } = {}) {
     // periodic autonomous wakes survive container rebuilds and are restored
     // on startup by bot.js.
     heartbeat: state.heartbeat || null,
+    // Recent messages for conversation context persistence (capped at 10)
+    recentMessages: (state.recentMessages || []).slice(-10),
   };
 
   if (critical) {

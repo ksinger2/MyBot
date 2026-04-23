@@ -29,7 +29,7 @@ let startSocialPlanWizard, processSocialPlanStep;
 try { ({ startSocialPlanWizard, processSocialPlanStep } = require('./wizards/social-plan')); } catch {}
 let spotifyAuth;
 try { spotifyAuth = require('./spotify-auth'); } catch {}
-const { Runner } = require('./runner');
+const { Runner, SlotTimeoutError, killOrphanClaude } = require('./runner');
 const { sweepOrphanTmpFiles, atomicWriteJsonSync } = require('./atomic-write');
 const { extractImageAttachments } = require('./adapters/base');
 const { loadCommands } = require('./commands');
@@ -561,6 +561,7 @@ function getChannel(channelId) {
       startedAt: null, // timestamp when Claude started working
       progress: freshProgress(), // structured progress for !btw
       queue: (saved?.pendingQueue || []).map(text => ({ content: text, timestamp: Date.now() })),
+      recentMessages: saved?.recentMessages || [], // recent messages for context persistence (capped at 10)
       groupingTimer: null,   // debounce timer for message grouping
       groupingBuffer: [],    // buffered messages waiting to be combined
       groupingSenderId: null, // sender of the buffered messages
@@ -588,7 +589,7 @@ function listPersonalities() {
     .map(f => f.replace('.md', ''));
 }
 
-function askClaude(prompt, { sessionId = null, personalityFile = null, identity = null, cwd = DEFAULT_WORKSPACE, maxTurns = null, channelState = null, channelProxy = null, discordUserId = null, readOnly = false, groupAllowedTools = undefined, profileContext = null, streamReplies = false, model = 'sonnet', ownerDmMode = false, planMode = false, isVoice = false } = {}) {
+function askClaude(prompt, { sessionId = null, personalityFile = null, identity = null, cwd = DEFAULT_WORKSPACE, maxTurns = null, channelState = null, channelProxy = null, discordUserId = null, readOnly = false, groupAllowedTools = undefined, profileContext = null, streamReplies = false, model = 'sonnet', ownerDmMode = false, planMode = false, isVoice = false, isOwner = false, recentMessages = null } = {}) {
   // Delegate to Runner (extracted in F20/F21).
   // `discordUserId` retained as the param name for backward-compatibility with
   // runner.js — it actually holds the Signal sender id in this codebase.
@@ -596,6 +597,7 @@ function askClaude(prompt, { sessionId = null, personalityFile = null, identity 
     sessionId, personalityFile, identity, cwd, maxTurns,
     channelState, channelProxy, discordUserId, readOnly,
     groupAllowedTools, profileContext, streamReplies, model, ownerDmMode, planMode, isVoice,
+    isOwner, recentMessages,
     // Inject bot.js functions so runner.js doesn't need to import bot.js
     freshProgressFn: freshProgress,
     saveChannelStateFn: saveChannelState,
@@ -885,6 +887,9 @@ let _startBotRan = false;
 async function startBot() {
   if (_startBotRan) return;
   _startBotRan = true;
+
+  // Kill orphan claude CLI processes from previous container runs
+  try { killOrphanClaude(); } catch (err) { console.warn(`[startup] orphan cleanup failed: ${err.message}`); }
 
   // F16: sweep orphaned .tmp files from previous crash before reading stores
   try { sweepOrphanTmpFiles(['/app/data', '/home/node/.claude']); } catch {}
@@ -1947,6 +1952,16 @@ async function _dispatchSignalMessage(msg, chatId, text, state) {
   }, 8000);
 
   try {
+    // Record incoming message to recentMessages for context persistence
+    if (!state.recentMessages) state.recentMessages = [];
+    state.recentMessages.push({
+      role: 'user',
+      text: text.substring(0, 500),
+      sender: msg.senderName || msg.senderId,
+      timestamp: Date.now(),
+    });
+    if (state.recentMessages.length > 10) state.recentMessages = state.recentMessages.slice(-10);
+
     state._isGroupChat = isGroupMessage; // used by commands (e.g. !btw) to suppress in groups
     state.activeTask = {
       prompt: text.substring(0, 500),
@@ -2145,6 +2160,12 @@ async function _dispatchSignalMessage(msg, chatId, text, state) {
       // Toggled via `!mode plan` / `!mode auto`; default is auto.
       const planMode = ownerDmMode && state.codingMode === 'plan';
 
+      // Non-owner DMs are aligned with group chats: same tool whitelist,
+      // same turn cap (8), personality applied. readOnly=false so the Runner
+      // uses the groupAllowedTools whitelist instead of the restrictive readOnly list.
+      const isNonOwnerDm = !senderIsOwner && !isGroupChat;
+      const nonOwnerToolWhitelist = 'Read,WebSearch,WebFetch,Task,TodoWrite';
+
       const claudeOpts = {
         sessionId: isGroupChat ? null : state.sessionId,
         personalityFile: ownerDmMode ? null : personalityFile,
@@ -2153,26 +2174,26 @@ async function _dispatchSignalMessage(msg, chatId, text, state) {
         channelState: state,
         channelProxy: signalProxy,
         discordUserId: msg.senderId,
-        // Groups use a SOCIAL allowlist: web search, reading, calendar (Bash for
-        // curl), sub-agents — but NOT Edit/Write/Grep/Glob (engineering tools).
+        // Groups and non-owner DMs use a SOCIAL allowlist: web search, reading,
+        // sub-agents — but NOT Edit/Write/Grep/Glob (engineering tools).
         // readOnly=false so the Runner doesn't apply the restrictive readOnly list.
         // Instead we pass a custom groupAllowedTools list.
-        readOnly: isGroupChat ? false : (!senderIsOwner && !_isChannelElevated(chatId)),
-        // Group chats: social tools only. NO Bash (prevents file deletion/modification
-        // by non-owner group members). NO Edit/Write/Grep/Glob (engineering tools).
-        // Image generation in groups works via user photo attachments + image registry.
-        groupAllowedTools: isGroupChat ? 'Read,WebSearch,WebFetch,Task,TodoWrite' : undefined,
+        readOnly: false,
+        // Group chats and non-owner DMs: social tools only. NO Bash (prevents
+        // file deletion/modification by non-owner users). NO Edit/Write/Grep/Glob.
+        groupAllowedTools: (isGroupChat || isNonOwnerDm) ? nonOwnerToolWhitelist : undefined,
         profileContext: (combinedProfileContext || '') + groupOnboardHint + pendingEventContext + groupNotesContext + activeFlightsContext + imageRefinementContext + (isGroupChat ? `\n\nCHAT_ID: ${msg.chatId}\nSENDER_ID: ${msg.senderId}` : ''),
         streamReplies: true,
         maxTurns: ownerDmMode ? null
-          : (isGroupChat ? 8 : (senderIsOwner ? (parseInt(process.env.SIGNAL_OWNER_MAX_TURNS, 10) || 75) : undefined)),
+          : ((isGroupChat || isNonOwnerDm) ? 8 : (senderIsOwner ? (parseInt(process.env.SIGNAL_OWNER_MAX_TURNS, 10) || 75) : 8)),
         ownerDmMode,
         planMode,
+        isOwner: senderIsOwner,
+        // Pass recent messages for conversation context persistence
+        recentMessages: state.recentMessages || [],
         // Model selection.
         //   - Owner DM → always Opus 4.7 (full 200k context)
         //   - Groups and non-owner DMs → Sonnet by default
-        //   - (owner's historical !opus / plugin-query heuristics are gone in
-        //      owner DM — everything is Opus 4.7 there)
         model: ownerDmMode ? 'claude-opus-4-7'
           : (isGroupChat ? 'sonnet'
           : (!senderIsOwner ? 'sonnet' : 'sonnet')),
@@ -2219,6 +2240,17 @@ async function _dispatchSignalMessage(msg, chatId, text, state) {
       }
 
       const result = await runClaudeWithContinuation(signalPrompt, claudeOpts, signalProxy);
+
+      // Record outgoing message to recentMessages for context persistence
+      if (result.text) {
+        if (!state.recentMessages) state.recentMessages = [];
+        state.recentMessages.push({
+          role: 'assistant',
+          text: result.text.substring(0, 500),
+          timestamp: Date.now(),
+        });
+        if (state.recentMessages.length > 10) state.recentMessages = state.recentMessages.slice(-10);
+      }
 
       // Auto-learn extraction — strip [LEARNED: ...] tags, store preferences, notify user.
       //
@@ -3034,10 +3066,16 @@ async function _dispatchSignalMessage(msg, chatId, text, state) {
         }
       }
     } catch (err) {
-      console.error(`[signal] Error: ${err.message}`);
-      console.error(`[signal] Stack: ${err.stack}`);
-      await signalAdapter.sendMessage(msg.chatId, `Error: ${err.message.substring(0, 500)}`);
-      sendErrorAlert(err, { source: 'signal handler', channel: chatId });
+      // Change 4: Queue timeout feedback — non-owners waiting >30s get a friendly busy message
+      if (err && err.name === 'SlotTimeoutError') {
+        console.log(`[signal] SlotTimeoutError for ${_redactId(msg.senderId)} in ${_redactId(chatId)}`);
+        await signalAdapter.sendMessage(msg.chatId, "I'm handling a few conversations right now — try again in a minute");
+      } else {
+        console.error(`[signal] Error: ${err.message}`);
+        console.error(`[signal] Stack: ${err.stack}`);
+        await signalAdapter.sendMessage(msg.chatId, `Error: ${err.message.substring(0, 500)}`);
+        sendErrorAlert(err, { source: 'signal handler', channel: chatId });
+      }
     } finally {
       clearInterval(signalTypingInterval);
       state.busy = false;
