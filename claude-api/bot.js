@@ -155,6 +155,26 @@ const MAX_LOOP_ITERATIONS_PER_DAY = parseInt(process.env.MAX_LOOP_ITERATIONS_PER
 // Message grouping debounce — wait this many ms for follow-up messages before
 // dispatching. Set MESSAGE_GROUP_DELAY_MS=0 to disable.
 const MESSAGE_GROUP_DELAY_MS = parseInt(process.env.MESSAGE_GROUP_DELAY_MS, 10) || 800;
+// Session inactivity timeout — clears sessionId after this many ms of no messages.
+// Timer resets on every message and pauses while bot is processing.
+const SESSION_INACTIVITY_MS = parseInt(process.env.SESSION_INACTIVITY_MS, 10) || (15 * 60 * 1000);
+
+function _resetSessionInactivityTimer(state, channelId) {
+  if (state._sessionInactivityTimer) clearTimeout(state._sessionInactivityTimer);
+  if (state.busy) {
+    state._sessionInactivityTimer = null;
+    return;
+  }
+  state._sessionInactivityTimer = setTimeout(() => {
+    if (state.sessionId && !state.busy) {
+      console.log(`[session-expiry] Clearing sessionId for ${channelId} after ${SESSION_INACTIVITY_MS / 60000}min inactivity`);
+      state.sessionId = null;
+      saveChannelState(channelId, state);
+    }
+    state._sessionInactivityTimer = null;
+  }, SESSION_INACTIVITY_MS);
+  if (state._sessionInactivityTimer.unref) state._sessionInactivityTimer.unref();
+}
 // M3: in-memory per-channel iteration counter, keyed by UTC date. Resets on
 // day rollover. Map<channelId, { date: 'YYYY-MM-DD', count: number }>.
 const _loopIterationsToday = new Map();
@@ -566,6 +586,7 @@ function getChannel(channelId) {
       groupingBuffer: [],    // buffered messages waiting to be combined
       groupingSenderId: null, // sender of the buffered messages
       _triggeredByTimestamp: null, // Signal timestamp of the message that started the active task
+      _sessionInactivityTimer: null, // 15-min timer that clears sessionId on expiry
     });
   }
   return channels.get(channelId);
@@ -1144,13 +1165,29 @@ async function processQueue(state) {
     try {
       result = await runClaudeWithContinuation(combined, queueOpts, null);
     } catch (err) {
-      if (state.sessionId) {
+      if (state.sessionId && (err.message?.includes('No conversation found') || err.message?.includes('session'))) {
         console.log('Session resume failed in queue, retrying fresh:', err.message);
         state.sessionId = null;
-        result = await askClaude(combined, queueOpts);
+        queueOpts.sessionId = null;
+        result = await runClaudeWithContinuation(combined, queueOpts, null);
       } else {
         throw err;
       }
+    }
+    // Graceful session resume failure from runner
+    if (result.sessionResumeFailed) {
+      console.log('[session-resume] Queue: graceful retry without session');
+      state.sessionId = null;
+      queueOpts.sessionId = null;
+      result = await runClaudeWithContinuation(combined, queueOpts, null);
+    }
+    // Auth failure during queue processing
+    if (result.authFailed) {
+      const signalChatIdForAuth = replyTarget?._signalChatId || (channelId ? channelId.replace(/^signal:/, '') : null);
+      if (signalChatIdForAuth && signalAdapter) {
+        await signalAdapter.sendMessage(signalChatIdForAuth, '⚠️ Not logged in — Claude CLI needs re-authentication. Run `claude` on the host and use `/login` to refresh the token.').catch(() => {});
+      }
+      return;
     }
 
     if (result.sessionId) {
@@ -1618,8 +1655,10 @@ function startSignalAdapter() {
       if (handled) return;
     }
 
-    // If busy, queue the message — silently in group chats, brief ack in DMs
+    // If busy, queue the message — silently in group chats, brief ack in DMs.
+    // Reset inactivity timer — a queued message still counts as activity.
     if (state.busy) {
+      _resetSessionInactivityTimer(state, chatId);
       const fakeMessage = createSignalMessageProxy(msg, chatId, state);
       state.queue.push({ message: fakeMessage, content: text, _timestamp: msg.timestamp });
       saveChannelState(chatId, state, { critical: true });
@@ -1952,6 +1991,9 @@ async function _dispatchSignalMessage(msg, chatId, text, state) {
   }, 8000);
 
   try {
+    // Reset session inactivity timer — any message resets the 15-min clock
+    _resetSessionInactivityTimer(state, chatId);
+
     // Record incoming message to recentMessages for context persistence
     if (!state.recentMessages) state.recentMessages = [];
     state.recentMessages.push({
@@ -2239,7 +2281,34 @@ async function _dispatchSignalMessage(msg, chatId, text, state) {
         console.error('[instagram] Signal transcript error:', err.message);
       }
 
-      const result = await runClaudeWithContinuation(signalPrompt, claudeOpts, signalProxy);
+      let result;
+      try {
+        result = await runClaudeWithContinuation(signalPrompt, claudeOpts, signalProxy);
+      } catch (err) {
+        // Session resume failed — clear sessionId and retry fresh
+        if (state.sessionId && (err.message?.includes('No conversation found') || err.message?.includes('session'))) {
+          console.log(`[session-resume] Session ${state.sessionId} failed, retrying fresh: ${err.message}`);
+          state.sessionId = null;
+          claudeOpts.sessionId = null;
+          result = await runClaudeWithContinuation(signalPrompt, claudeOpts, signalProxy);
+        } else {
+          throw err;
+        }
+      }
+
+      // Session resume failed gracefully — retry without session
+      if (result.sessionResumeFailed) {
+        console.log(`[session-resume] Graceful retry without session for ${_redactId(chatId)}`);
+        state.sessionId = null;
+        claudeOpts.sessionId = null;
+        result = await runClaudeWithContinuation(signalPrompt, claudeOpts, signalProxy);
+      }
+
+      // Auth failure — surface clearly and stop
+      if (result.authFailed) {
+        await signalAdapter.sendMessage(msg.chatId, '⚠️ Not logged in — Claude CLI needs re-authentication. Run `claude` on the host and use `/login` to refresh the token.');
+        return;
+      }
 
       // Record outgoing message to recentMessages for context persistence
       if (result.text) {
@@ -3091,6 +3160,8 @@ async function _dispatchSignalMessage(msg, chatId, text, state) {
         // processQueue clears in-memory state; re-persist so disk matches.
         saveChannelState(chatId, state, { critical: true });
       }
+      // Start session inactivity timer now that bot is idle
+      _resetSessionInactivityTimer(state, chatId);
     }
 }
 

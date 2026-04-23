@@ -80,7 +80,7 @@ function _deregisterProcess(pid) {
 // ── Priority Semaphore — caps simultaneous Claude CLI processes.
 // Owner gets priority: can evict oldest non-owner if at capacity.
 // Non-owner queues with 30s timeout → SlotTimeoutError.
-const MAX_CONCURRENT = parseInt(process.env.MAX_CONCURRENT_CLAUDE, 10) || 4;
+const MAX_CONCURRENT = parseInt(process.env.MAX_CONCURRENT_CLAUDE, 10) || 2;
 let _activeSlots = 0;
 const _ownerQueue = [];    // owner waiters get priority on release
 const _nonOwnerQueue = []; // non-owner waiters, FIFO with timeout
@@ -191,8 +191,10 @@ const _ghostReaperInterval = setInterval(_sweepGhosts, 60000);
 // Don't let the reaper keep the process alive
 if (_ghostReaperInterval.unref) _ghostReaperInterval.unref();
 
-// ── Startup Orphan Cleanup — kills lingering claude processes from previous runs ──
-// Scans /proc directly since pgrep/ps may not be installed in the container.
+// ── Startup Orphan Cleanup — kills lingering claude processes from previous container runs ──
+// Only kills claude processes whose parent is PID 1 (orphaned by a dead node process)
+// or whose parent no longer exists. Never kills claude processes with a live parent
+// (those belong to Karen's personal CLI sessions or other legitimate callers).
 function killOrphanClaude() {
   try {
     const myPid = process.pid;
@@ -203,10 +205,14 @@ function killOrphanClaude() {
       if (pid === myPid) continue;
       try {
         const cmdline = fs.readFileSync(`/proc/${dir}/cmdline`, 'utf8');
-        // cmdline uses null bytes as separators
-        if (cmdline.includes('claude') && !cmdline.includes('node')) {
+        if (!cmdline.includes('claude') || cmdline.includes('node')) continue;
+        const status = fs.readFileSync(`/proc/${dir}/status`, 'utf8');
+        const ppidMatch = status.match(/^PPid:\s*(\d+)/m);
+        const ppid = ppidMatch ? parseInt(ppidMatch[1], 10) : 0;
+        // Only kill if parent is PID 1 (adopted orphan) or parent is our own process
+        if (ppid === 1 || ppid === myPid) {
           process.kill(pid, 'SIGTERM');
-          console.log(`[orphan-cleanup] killed orphan claude pid=${pid}`);
+          console.log(`[orphan-cleanup] killed orphan claude pid=${pid} ppid=${ppid}`);
           killed++;
         }
       } catch {
@@ -667,6 +673,7 @@ class Runner {
       let lastEventWasAssistant = false;
       let streamedAny = false;
       let hitRateLimit = false;
+      let hitAuthFailure = false;
 
       // --- stdout handler: stream-json event parsing ---
       child.stdout.on('data', (d) => {
@@ -696,6 +703,12 @@ class Runner {
               agentObj.lastDetail = summarizeToolInput(event.message.content[0].name, JSON.stringify(event.message.content[0].input || {}));
             }
 
+            // Detect auth failure from assistant message
+            if (event.type === 'assistant' && event.error === 'authentication_failed') {
+              hitAuthFailure = true;
+              console.error('[auth] CLI authentication failed — OAuth token may be expired');
+            }
+
             // Final result event
             if (event.type === 'result') {
               resultText = event.result || '';
@@ -703,6 +716,11 @@ class Runner {
               resultSessionId = event.session_id || resultSessionId;
               resultCost = event.total_cost_usd != null ? event.total_cost_usd : resultCost;
               resultNumTurns = event.num_turns != null ? event.num_turns : resultNumTurns;
+              // Detect auth failure from result text or flag
+              if (event.is_error && (hitAuthFailure || (resultText && resultText.includes('Not logged in')))) {
+                hitAuthFailure = true;
+                resultSubtype = 'authentication_failed';
+              }
               console.log(`[result] subtype=${resultSubtype} turns=${resultNumTurns} cost=$${resultCost} text_len=${(resultText || '').length} text=${JSON.stringify((resultText || '').substring(0, 300))}`);
               continue;
             }
@@ -1065,6 +1083,18 @@ class Runner {
             return wrappedResolve({ text: '', sessionId: resultSessionId, cost: resultCost, numTurns: resultNumTurns, stopped: true, rateLimited: true });
           }
 
+          // Auth failure: CLI returned "Not logged in" — surface clearly
+          if (resultSubtype === 'authentication_failed' || hitAuthFailure) {
+            console.error('[auth] Resolving with authFailed flag');
+            return wrappedResolve({
+              text: '',
+              sessionId: null,
+              cost: 0,
+              authFailed: true,
+              stopped: true,
+            });
+          }
+
           // error_max_turns: CLI exits 1 with empty text — treat as graceful turn limit,
           // not a crash. This lets runClaudeWithContinuation auto-continue as normal.
           if (resultSubtype === 'error_max_turns') {
@@ -1077,6 +1107,17 @@ class Runner {
               hitTurnLimit: true,
               stopped: false,
               streamed: streamedAny,
+            });
+          }
+          // Session resume failure — session ID no longer valid
+          if (sessionId && (stderr.includes('No conversation found') || stderr.includes('session'))) {
+            console.warn(`[session-resume] Session ${sessionId} not found — signaling retry`);
+            return wrappedResolve({
+              text: '',
+              sessionId: null,
+              cost: 0,
+              sessionResumeFailed: true,
+              stopped: true,
             });
           }
           console.error(`[exit-error] code=${code} stderr:`, stderr.substring(0, 1000));
