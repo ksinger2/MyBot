@@ -6,7 +6,7 @@ module.exports = {
   async run(message, arg, state, ctx) {
     await message.reply(
       `**Available Commands:**\n` +
-      `\`!stop\` \`!clear\` \`!kill\` \`!killall\` \`!restart\` \`!cancel\`\n` +
+      `\`!stop\` \`!clear\` \`!compact\` \`!session\` \`!kill\` \`!killall\` \`!restart\` \`!cancel\`\n` +
       `\`!status\` \`!processes\` \`!btw\` \`!cd\` \`!ls\`\n` +
       `\`!startproject\` \`!audit\` \`!name\` \`!identity\`\n` +
       `\`!personality\` \`!personalities\`\n` +
@@ -17,6 +17,7 @@ module.exports = {
       `\`!monitor\` \`!monitors\`\n` +
       `\`!concerts\` \`!prices\` \`!setalert\` \`!alerts\` \`!removealert\` \`!track\` \`!concerttracker\`\n` +
       `\`!product\` \`!search\`\n` +
+      `\`!bg\` \`!bgtasks\`\n` +
       `\`!briefing\` \`!weekly\` \`!email\` \`!help\` \`!commands\`\n\n` +
       `Use \`!help\` for detailed descriptions.`
     );

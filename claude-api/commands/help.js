@@ -47,6 +47,8 @@ module.exports = {
       `**Control:**\n` +
       `\`!stop\` — Pause Claude (session preserved)\n` +
       `\`!clear\` — Clear conversation context\n` +
+      `\`!compact\` — Reset session, keep recent context\n` +
+      `\`!session\` / \`!sesh\` — Show session stats (turns, cost, age)\n` +
       `\`!kill\` — Hard kill + destroy session\n` +
       `\`!killall\` — Kill everything across all channels\n` +
       `\`!restart\` — Restart bot container\n` +
@@ -61,6 +63,7 @@ module.exports = {
       `**Identity:**\n` +
       `\`!personality <name>\` — Switch personality\n` +
       `\`!personalities\` — List available\n\n` +
+      `**Background:** \`!bg <task>\` · \`!bgtasks\`\n` +
       `**Autonomy:** \`!loop <task>\` · \`!heartbeat <min>\` · \`!orders\`\n` +
       `**Schedule:** \`!schedule\` · \`!schedules\` · \`!unschedule <#>\` · \`!autoschedule\`\n` +
       `**Monitors:** \`!monitor ci|health\` · \`!monitors\`\n` +

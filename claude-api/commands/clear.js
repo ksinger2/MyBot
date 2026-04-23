@@ -14,6 +14,9 @@ module.exports = {
     }
     state.loopActive = false;
     state.sessionId = null;
+    state.sessionStartedAt = null;
+    state.sessionTurns = 0;
+    state.sessionCost = 0;
     state.queue = [];
     state.activeTask = null;
     ctx.saveChannelState(message.channel.id, state, { critical: true });

@@ -85,6 +85,9 @@ services:
       - TICKETMASTER_API_KEY=${TICKETMASTER_API_KEY:-}
       # SerpApi key for Google Flights price tracking (free tier: 250 searches/month)
       - SERPAPI_KEY=${SERPAPI_KEY:-}
+      # SDK runner toggle — set to "true" to use @anthropic-ai/claude-agent-sdk
+      # instead of raw CLI spawn. Opt-in while SDK integration stabilizes.
+      - USE_SDK_RUNNER=${USE_SDK_RUNNER:-false}
     # SSH key and gh config mounts were removed 2026-04-11 after a security
     # review found prompt-injection could exfiltrate them via Claude's Read
     # tool + --dangerously-skip-permissions. `gh` CLI now authenticates via

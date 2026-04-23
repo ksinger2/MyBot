@@ -5,6 +5,11 @@ module.exports = {
   description: 'Stop the current Claude process',
   async run(message, arg, state, ctx) {
     const wasLooping = state.loopActive;
+    if (state._sdkQuery) {
+      state._userStopped = true;
+      try { state._sdkQuery.close(); } catch {}
+      state._sdkQuery = null;
+    }
     if (state.process) {
       state._userStopped = true;
       await ctx.forceKillProcess(state.process);

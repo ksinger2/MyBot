@@ -64,6 +64,9 @@ function saveChannelState(channelId, state, { critical = false } = {}) {
     heartbeat: state.heartbeat || null,
     // Recent messages for conversation context persistence (capped at 10)
     recentMessages: (state.recentMessages || []).slice(-10),
+    sessionStartedAt: state.sessionStartedAt || null,
+    sessionTurns: state.sessionTurns || 0,
+    sessionCost: state.sessionCost || 0,
   };
 
   if (critical) {

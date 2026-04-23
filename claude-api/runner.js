@@ -1160,4 +1160,9 @@ class Runner {
   }
 }
 
-module.exports = { Runner, SlotTimeoutError, killOrphanClaude };
+module.exports = {
+  Runner, SlotTimeoutError, killOrphanClaude,
+  pushOutput, pushRawLog, summarizeToolInput, TOOL_LABELS, AVAILABLE_AGENTS,
+  DEFAULT_WORKSPACE, freshProgress, forceKillProcess,
+  _acquireSlot, _releaseSlot,
+};

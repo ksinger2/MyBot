@@ -30,6 +30,13 @@ try { ({ startSocialPlanWizard, processSocialPlanStep } = require('./wizards/soc
 let spotifyAuth;
 try { spotifyAuth = require('./spotify-auth'); } catch {}
 const { Runner, SlotTimeoutError, killOrphanClaude } = require('./runner');
+const USE_SDK_RUNNER = process.env.USE_SDK_RUNNER === 'true' || process.env.USE_SDK_RUNNER === '1';
+let SDKRunner;
+if (USE_SDK_RUNNER) {
+  try { ({ SDKRunner } = require('./sdk-runner')); } catch (e) {
+    console.warn('[bot] SDK runner failed to load, falling back to CLI runner:', e.message);
+  }
+}
 const { sweepOrphanTmpFiles, atomicWriteJsonSync } = require('./atomic-write');
 const { extractImageAttachments } = require('./adapters/base');
 const { loadCommands } = require('./commands');
@@ -169,6 +176,9 @@ function _resetSessionInactivityTimer(state, channelId) {
     if (state.sessionId && !state.busy) {
       console.log(`[session-expiry] Clearing sessionId for ${channelId} after ${SESSION_INACTIVITY_MS / 60000}min inactivity`);
       state.sessionId = null;
+      state.sessionStartedAt = null;
+      state.sessionTurns = 0;
+      state.sessionCost = 0;
       saveChannelState(channelId, state);
     }
     state._sessionInactivityTimer = null;
@@ -587,6 +597,9 @@ function getChannel(channelId) {
       groupingSenderId: null, // sender of the buffered messages
       _triggeredByTimestamp: null, // Signal timestamp of the message that started the active task
       _sessionInactivityTimer: null, // 15-min timer that clears sessionId on expiry
+      sessionStartedAt: saved?.sessionStartedAt || null,
+      sessionTurns: saved?.sessionTurns || 0,
+      sessionCost: saved?.sessionCost || 0,
     });
   }
   return channels.get(channelId);
@@ -611,19 +624,18 @@ function listPersonalities() {
 }
 
 function askClaude(prompt, { sessionId = null, personalityFile = null, identity = null, cwd = DEFAULT_WORKSPACE, maxTurns = null, channelState = null, channelProxy = null, discordUserId = null, readOnly = false, groupAllowedTools = undefined, profileContext = null, streamReplies = false, model = 'sonnet', ownerDmMode = false, planMode = false, isVoice = false, isOwner = false, recentMessages = null } = {}) {
-  // Delegate to Runner (extracted in F20/F21).
-  // `discordUserId` retained as the param name for backward-compatibility with
-  // runner.js — it actually holds the Signal sender id in this codebase.
-  const runner = new Runner(prompt, {
+  const runnerOpts = {
     sessionId, personalityFile, identity, cwd, maxTurns,
     channelState, channelProxy, discordUserId, readOnly,
     groupAllowedTools, profileContext, streamReplies, model, ownerDmMode, planMode, isVoice,
     isOwner, recentMessages,
-    // Inject bot.js functions so runner.js doesn't need to import bot.js
     freshProgressFn: freshProgress,
     saveChannelStateFn: saveChannelState,
     flushPendingWritesFn: flushPendingWrites,
-  });
+  };
+
+  const RunnerClass = (USE_SDK_RUNNER && SDKRunner) ? SDKRunner : Runner;
+  const runner = new RunnerClass(prompt, runnerOpts);
   return runner.run();
 }
 
@@ -1168,6 +1180,7 @@ async function processQueue(state) {
       if (state.sessionId && (err.message?.includes('No conversation found') || err.message?.includes('session'))) {
         console.log('Session resume failed in queue, retrying fresh:', err.message);
         state.sessionId = null;
+        state.sessionStartedAt = null; state.sessionTurns = 0; state.sessionCost = 0;
         queueOpts.sessionId = null;
         result = await runClaudeWithContinuation(combined, queueOpts, null);
       } else {
@@ -1178,6 +1191,7 @@ async function processQueue(state) {
     if (result.sessionResumeFailed) {
       console.log('[session-resume] Queue: graceful retry without session');
       state.sessionId = null;
+      state.sessionStartedAt = null; state.sessionTurns = 0; state.sessionCost = 0;
       queueOpts.sessionId = null;
       result = await runClaudeWithContinuation(combined, queueOpts, null);
     }
@@ -1192,7 +1206,21 @@ async function processQueue(state) {
 
     if (result.sessionId) {
       state.sessionId = result.sessionId;
+      if (!state.sessionStartedAt) state.sessionStartedAt = Date.now();
       if (channelId) saveChannelState(channelId, state);
+    }
+    state.sessionTurns += (result.numTurns || 0);
+    state.sessionCost += (result.cost || 0);
+
+    // Cost guardrail
+    const qMaxCost = state.config?.maxSessionCost;
+    if (qMaxCost && state.sessionCost >= qMaxCost) {
+      await signalAdapter.sendMessage(signalChatId,
+        `💰 Session cost cap reached ($${state.sessionCost.toFixed(4)} / $${qMaxCost.toFixed(2)}). Session cleared.`
+      ).catch(() => {});
+      state.sessionId = null;
+      state.sessionStartedAt = null; state.sessionTurns = 0; state.sessionCost = 0;
+      if (channelId) saveChannelState(channelId, state, { critical: true });
     }
 
     if (result.stopped) {
@@ -2289,6 +2317,7 @@ async function _dispatchSignalMessage(msg, chatId, text, state) {
         if (state.sessionId && (err.message?.includes('No conversation found') || err.message?.includes('session'))) {
           console.log(`[session-resume] Session ${state.sessionId} failed, retrying fresh: ${err.message}`);
           state.sessionId = null;
+          state.sessionStartedAt = null; state.sessionTurns = 0; state.sessionCost = 0;
           claudeOpts.sessionId = null;
           result = await runClaudeWithContinuation(signalPrompt, claudeOpts, signalProxy);
         } else {
@@ -2300,6 +2329,7 @@ async function _dispatchSignalMessage(msg, chatId, text, state) {
       if (result.sessionResumeFailed) {
         console.log(`[session-resume] Graceful retry without session for ${_redactId(chatId)}`);
         state.sessionId = null;
+        state.sessionStartedAt = null; state.sessionTurns = 0; state.sessionCost = 0;
         claudeOpts.sessionId = null;
         result = await runClaudeWithContinuation(signalPrompt, claudeOpts, signalProxy);
       }
@@ -3065,6 +3095,20 @@ async function _dispatchSignalMessage(msg, chatId, text, state) {
 
       if (result.sessionId) {
         state.sessionId = result.sessionId;
+        if (!state.sessionStartedAt) state.sessionStartedAt = Date.now();
+      }
+      state.sessionTurns += (result.numTurns || 0);
+      state.sessionCost += (result.cost || 0);
+
+      // Cost guardrail — auto-clear session if cost cap exceeded
+      const maxCost = state.config?.maxSessionCost;
+      if (maxCost && state.sessionCost >= maxCost) {
+        await signalAdapter.sendMessage(msg.chatId,
+          `💰 Session cost cap reached ($${state.sessionCost.toFixed(4)} / $${maxCost.toFixed(2)}). Session cleared — next message starts fresh.`
+        ).catch(() => {});
+        state.sessionId = null;
+        state.sessionStartedAt = null; state.sessionTurns = 0; state.sessionCost = 0;
+        saveChannelState(chatId, state, { critical: true });
       }
 
       // Voice response: if the user sent a voice message, speak the response back
