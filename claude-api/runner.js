@@ -80,7 +80,7 @@ function _deregisterProcess(pid) {
 // ── Priority Semaphore — caps simultaneous Claude CLI processes.
 // Owner gets priority: can evict oldest non-owner if at capacity.
 // Non-owner queues with 30s timeout → SlotTimeoutError.
-const MAX_CONCURRENT = parseInt(process.env.MAX_CONCURRENT_CLAUDE, 10) || 2;
+const MAX_CONCURRENT = parseInt(process.env.MAX_CONCURRENT_CLAUDE, 10) || 4;
 let _activeSlots = 0;
 const _ownerQueue = [];    // owner waiters get priority on release
 const _nonOwnerQueue = []; // non-owner waiters, FIFO with timeout
