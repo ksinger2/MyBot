@@ -3014,6 +3014,63 @@ async function _dispatchSignalMessage(msg, chatId, text, state) {
         result.text = (result.text || '').replace(eightSleepRe, '').trim();
       }
 
+      // [BACKGROUND:] tag — Bianca can kick off background tasks mid-conversation.
+      // Format: [BACKGROUND: description | prompt to execute]
+      // The description is shown to the user; the prompt runs as a separate Claude session.
+      const bgRe = /\[BACKGROUND:\s*(.+?)\]/gi;
+      const bgMatches = [...(result.text || '').matchAll(bgRe)];
+      if (bgMatches.length > 0) {
+        if (!state._bgTasks) state._bgTasks = new Map();
+        for (const bgMatch of bgMatches) {
+          const raw = bgMatch[1].trim();
+          const pipeIdx = raw.indexOf('|');
+          const description = pipeIdx > 0 ? raw.substring(0, pipeIdx).trim() : raw.substring(0, 80);
+          const bgPrompt = pipeIdx > 0 ? raw.substring(pipeIdx + 1).trim() : raw;
+
+          const taskId = `bg-${Date.now().toString(36)}`;
+          const bgTask = {
+            id: taskId, description, startedAt: Date.now(),
+            status: 'running', result: null, cost: 0, numTurns: 0,
+          };
+          state._bgTasks.set(taskId, bgTask);
+          console.log(`[bg-task] Started ${taskId}: ${description}`);
+
+          (async () => {
+            try {
+              const bgResult = await askClaude(bgPrompt, {
+                personalityFile: getPersonalityFile(state.personality),
+                identity: state.identity,
+                cwd: state.cwd,
+                maxTurns: state.config?.maxTurns || 30,
+                channelState: null,
+                model: 'sonnet',
+                ownerDmMode: true,
+                isOwner: true,
+              });
+              bgTask.status = bgResult.stopped ? 'stopped' : 'done';
+              bgTask.result = (bgResult.text || '').substring(0, 2000);
+              bgTask.cost = bgResult.cost || 0;
+              bgTask.numTurns = bgResult.numTurns || 0;
+              bgTask.completedAt = Date.now();
+
+              const elapsed = Math.round((bgTask.completedAt - bgTask.startedAt) / 1000);
+              const timeStr = elapsed >= 60 ? `${Math.floor(elapsed / 60)}m ${elapsed % 60}s` : `${elapsed}s`;
+              const summary = bgTask.result.length > 500 ? bgTask.result.substring(0, 497) + '...' : bgTask.result;
+              await signalAdapter.sendLongMessage(msg.chatId,
+                `✅ Background task done: **${description}**\n${timeStr} · ${bgTask.numTurns} turns · $${bgTask.cost.toFixed(4)}\n\n${summary}`
+              );
+            } catch (err) {
+              bgTask.status = 'error';
+              bgTask.result = err.message;
+              bgTask.completedAt = Date.now();
+              console.error(`[bg-task] ${taskId} failed:`, err.message);
+              await signalAdapter.sendMessage(msg.chatId, `❌ Background task failed: ${description}\n${err.message.substring(0, 200)}`).catch(() => {});
+            }
+          })();
+        }
+        result.text = (result.text || '').replace(bgRe, '').trim();
+      }
+
       // Group notes extraction — detect [NOTE:...] tags and store action items
       if (isGroupChat) {
         try {
