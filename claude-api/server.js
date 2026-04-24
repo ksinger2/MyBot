@@ -617,6 +617,8 @@ app.post('/voice', async (req, res) => {
       maxTurns: 3,
       streamReplies: false,
       isVoice: true,
+      isOwner: true,
+      ownerDmMode: true,
     });
 
     // Race against Siri's ~30s timeout
@@ -625,6 +627,16 @@ app.post('/voice', async (req, res) => {
     });
 
     const result = await Promise.race([claudePromise, timeoutPromise]);
+
+    if (result.authFailed) {
+      console.error('[voice] Auth failed — CLI not logged in');
+      const fallback = "Sorry, I'm having trouble connecting right now. Try again in a moment.";
+      // Send to Signal so user knows
+      if (signalAdapter) {
+        signalAdapter.sendMessage(SIGNAL_OWNER, `🎙️ *Via Siri:* ${text}\n\n⚠️ Voice failed — CLI auth error. Run \`claude\` on the host and \`/login\`.`).catch(() => {});
+      }
+      return res.json({ response: fallback });
+    }
 
     // ── Tag processing: execute action tags and inline results ──
     // Claude outputs tags like [EIGHTSLEEP: status left] that are normally

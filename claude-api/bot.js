@@ -2238,7 +2238,7 @@ async function _dispatchSignalMessage(msg, chatId, text, state) {
 
       const claudeOpts = {
         sessionId: isGroupChat ? null : state.sessionId,
-        personalityFile: ownerDmMode ? null : personalityFile,
+        personalityFile,
         identity: state.identity,
         cwd: state.cwd,
         channelState: state,
