@@ -21,9 +21,20 @@ if (!process.env.TOKEN_ENCRYPTION_KEY) {
 }
 
 const app = express();
+app.disable('x-powered-by');
 // L5: cap default JSON body size at 1mb. The per-route /signal/webhook override
 // (5mb) still applies because it's mounted locally on that route.
 app.use(express.json({ limit: '1mb' }));
+app.use((req, res, next) => {
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('X-Frame-Options', 'DENY');
+  res.setHeader('Referrer-Policy', 'no-referrer');
+  res.setHeader('Permissions-Policy', 'camera=(), microphone=(), geolocation=()');
+  if (req.path.startsWith('/setup/') || req.path === '/debug') {
+    res.setHeader('Content-Security-Policy', "default-src 'self'; img-src 'self' data: blob:; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'");
+  }
+  next();
+});
 
 // ── HTML escape helper (used for CSRF token injection in /setup) ─────────────
 function escapeHtml(str) {
@@ -167,6 +178,53 @@ function requireInternalToken(req, res, next) {
   next();
 }
 
+function parseBooleanEnv(name, fallback = false) {
+  const raw = process.env[name];
+  if (raw == null || raw === '') return fallback;
+  return raw === '1' || raw === 'true';
+}
+
+function createRateLimiter({ windowMs, max, keyFn, label }) {
+  const buckets = new Map();
+  const limiter = (req, res, next) => {
+    const key = keyFn(req);
+    const now = Date.now();
+    const bucket = buckets.get(key);
+    if (!bucket || bucket.resetAt <= now) {
+      buckets.set(key, { count: 1, resetAt: now + windowMs });
+      return next();
+    }
+    if (bucket.count >= max) {
+      res.setHeader('Retry-After', String(Math.max(1, Math.ceil((bucket.resetAt - now) / 1000))));
+      return res.status(429).json({ error: `${label || 'rate'} limit exceeded` });
+    }
+    bucket.count += 1;
+    next();
+  };
+  limiter.clear = (key) => buckets.delete(key);
+  setInterval(() => {
+    const now = Date.now();
+    for (const [key, bucket] of buckets) {
+      if (bucket.resetAt <= now) buckets.delete(key);
+    }
+  }, 15 * 60 * 1000).unref();
+  return limiter;
+}
+
+function clientIp(req) {
+  const forwarded = req.headers['x-forwarded-for'];
+  if (typeof forwarded === 'string' && forwarded.trim()) {
+    return forwarded.split(',')[0].trim();
+  }
+  return req.ip || req.socket?.remoteAddress || 'unknown';
+}
+
+function getBearerToken(req) {
+  const auth = req.get('Authorization') || '';
+  const match = auth.match(/^Bearer\s+(.+)$/i);
+  return match ? match[1].trim() : '';
+}
+
 // (escapeHtml is defined above near the CSRF helpers — used by /setup XSS escapes
 // and by the CSRF token injection.)
 
@@ -179,6 +237,7 @@ app.post('/ask', requireInternalToken, (req, res) => {
     '--output-format', 'json',
     '--model', 'sonnet',
     '--dangerously-skip-permissions',
+    '--allowedTools', ['Read', 'Grep', 'Glob', 'LS', 'WebSearch', 'TodoWrite', 'Task'].join(','),
     '--no-session-persistence'
   ];
 
@@ -554,18 +613,39 @@ app.get('/health', (req, res) => {
   }
 });
 
+const VOICE_AUTH_TOKEN = process.env.VOICE_AUTH_TOKEN || '';
+const VOICE_ENABLED = parseBooleanEnv('VOICE_ENABLED', true);
+const OWNER_FULL_ACCESS_ENABLED = parseBooleanEnv('OWNER_FULL_ACCESS', false);
+const voiceRateLimit = createRateLimiter({
+  windowMs: 15 * 60 * 1000,
+  max: parseInt(process.env.VOICE_RATE_LIMIT_MAX, 10) || 20,
+  keyFn: (req) => `voice:${clientIp(req)}`,
+  label: 'voice',
+});
+
+function requireVoiceAccess(req, res, next) {
+  if (!VOICE_ENABLED) return res.status(404).json({ error: 'not found' });
+  if (!VOICE_AUTH_TOKEN) {
+    return res.status(503).json({ error: 'voice auth not configured' });
+  }
+  const supplied = req.get('X-Voice-Token') || getBearerToken(req) || '';
+  if (!safeTokenEqual(supplied, VOICE_AUTH_TOKEN)) {
+    return res.status(401).json({ error: 'unauthorized' });
+  }
+  next();
+}
+
 // ── Voice endpoint — for iOS Shortcut / Siri integration ──
 // "Hey Siri, [trigger phrase]..." → Shortcut POSTs text here → full bot pipeline → Siri speaks response
 // Routes through the same askClaude pipeline as Signal DMs so Bianca has full
 // context: Eight Sleep, calendar, profile, personality, conversation history.
-app.post('/voice', async (req, res) => {
-  console.log(`[voice] HIT — body: ${JSON.stringify(req.body).substring(0, 200)}`);
+app.post('/voice', requireVoiceAccess, voiceRateLimit, async (req, res) => {
   let { text, pin } = req.body;
   if (!text) return res.status(400).json({ error: 'text required' });
 
-  // Auth via PIN (simpler than bearer token for iOS Shortcuts)
+  // Voice requests require a transport token and the bot PIN.
   const expectedPin = process.env.BOT_UNLOCK_PIN;
-  if (!expectedPin || pin !== expectedPin) {
+  if (!expectedPin || !safeTokenEqual(String(pin || ''), expectedPin)) {
     return res.status(401).json({ error: 'invalid pin' });
   }
 
@@ -612,6 +692,7 @@ app.post('/voice', async (req, res) => {
       personalityFile,
       identity: state.identity,
       cwd: state.cwd,
+      readOnly: !OWNER_FULL_ACCESS_ENABLED,
       profileContext,
       model: 'haiku',
       maxTurns: 3,
@@ -871,10 +952,38 @@ app.post('/voice', async (req, res) => {
 });
 
 // ── Debug image upload — drag & drop screenshots for sharing with Claude Code ─
+const DEBUG_UPLOAD_ENABLED = parseBooleanEnv('DEBUG_UPLOAD_ENABLED', false);
 const DEBUG_UPLOAD_DIR = '/tmp/debug-uploads';
+const DEBUG_UPLOAD_MAX_BYTES = parseInt(process.env.DEBUG_UPLOAD_MAX_BYTES, 10) || (5 * 1024 * 1024);
+const DEBUG_UPLOAD_EXTS = new Set(['.png', '.jpg', '.jpeg', '.gif', '.webp']);
+const _debugAccessTokens = new Map();
+const DEBUG_ACCESS_TTL_MS = 10 * 60 * 1000;
 fs.mkdirSync(DEBUG_UPLOAD_DIR, { recursive: true });
 
-app.get('/debug', (req, res) => {
+function requireDebugAccess(req, res, next) {
+  if (!DEBUG_UPLOAD_ENABLED) return res.status(404).send('not found');
+  const suppliedInternal = req.get('X-Internal-Token') || '';
+  if (safeTokenEqual(suppliedInternal, INTERNAL_API_TOKEN)) return next();
+  const debugToken = req.get('X-Debug-Token') || (typeof req.query.t === 'string' ? req.query.t : '');
+  const entry = _debugAccessTokens.get(debugToken);
+  if (entry && entry.expiresAt > Date.now()) return next();
+  return res.status(401).json({ error: 'unauthorized' });
+}
+
+function resolveDebugUpload(name) {
+  const safeName = path.basename(String(name || ''));
+  if (!safeName) return null;
+  const filePath = path.resolve(DEBUG_UPLOAD_DIR, safeName);
+  const baseDir = path.resolve(DEBUG_UPLOAD_DIR) + path.sep;
+  if (!filePath.startsWith(baseDir)) return null;
+  if (!DEBUG_UPLOAD_EXTS.has(path.extname(safeName).toLowerCase())) return null;
+  return filePath;
+}
+
+app.get('/debug', requireInternalToken, (req, res) => {
+  const debugToken = crypto.randomBytes(24).toString('hex');
+  _debugAccessTokens.set(debugToken, { expiresAt: Date.now() + DEBUG_ACCESS_TTL_MS });
+  _capMap(_debugAccessTokens, 500, '_debugAccessTokens');
   res.setHeader('Content-Type', 'text/html');
   res.send(`<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Debug Upload</title>
@@ -902,6 +1011,7 @@ input[type=file]{display:none}
 <input type="file" id="picker" accept="image/*" multiple>
 <div id="files"></div>
 <script>
+const DEBUG_TOKEN=${JSON.stringify(debugToken)};
 const drop=document.getElementById('drop'),picker=document.getElementById('picker'),filesDiv=document.getElementById('files');
 ['dragenter','dragover'].forEach(e=>drop.addEventListener(e,ev=>{ev.preventDefault();drop.classList.add('over')}));
 ['dragleave','drop'].forEach(e=>drop.addEventListener(e,ev=>{ev.preventDefault();drop.classList.remove('over')}));
@@ -910,31 +1020,44 @@ picker.addEventListener('change',e=>{if(e.target.files.length)upload(e.target.fi
 async function upload(files){
   for(const f of files){
     const form=new FormData();form.append('file',f);
-    const r=await fetch('/debug/upload',{method:'POST',body:form});
+    const r=await fetch('/debug/upload',{method:'POST',headers:{'X-Debug-Token':DEBUG_TOKEN},body:form});
     const j=await r.json();
-    if(j.path){
+    if(j.filename){
       const d=document.createElement('div');d.className='file-entry';
-      d.innerHTML='<img src="/debug/file/'+encodeURIComponent(j.filename)+'"><div class="info"><div class="path">'+j.path+'</div><div class="time">'+new Date().toLocaleTimeString()+'</div></div>';
+      d.innerHTML='<img src="/debug/file/'+encodeURIComponent(j.filename)+'?t='+encodeURIComponent(DEBUG_TOKEN)+'"><div class="info"><div class="path">'+j.filename+'</div><div class="time">'+new Date().toLocaleTimeString()+'</div></div>';
       filesDiv.prepend(d);
     }
   }
 }
 // Load existing files on page load
-fetch('/debug/files').then(r=>r.json()).then(files=>{
+fetch('/debug/files',{headers:{'X-Debug-Token':DEBUG_TOKEN}}).then(r=>r.json()).then(files=>{
   files.forEach(f=>{
     const d=document.createElement('div');d.className='file-entry';
-    d.innerHTML='<img src="/debug/file/'+encodeURIComponent(f.name)+'"><div class="info"><div class="path">'+f.path+'</div><div class="time">'+new Date(f.mtime).toLocaleTimeString()+'</div></div>';
+    d.innerHTML='<img src="/debug/file/'+encodeURIComponent(f.name)+'?t='+encodeURIComponent(DEBUG_TOKEN)+'"><div class="info"><div class="path">'+f.name+'</div><div class="time">'+new Date(f.mtime).toLocaleTimeString()+'</div></div>';
     filesDiv.appendChild(d);
   });
 });
 </script></body></html>`);
 });
 
-app.post('/debug/upload', (req, res) => {
+app.post('/debug/upload', requireDebugAccess, (req, res) => {
   // Parse multipart form data manually (no multer dependency)
   const chunks = [];
-  req.on('data', c => chunks.push(c));
+  let received = 0;
+  let rejected = false;
+  req.on('data', c => {
+    if (rejected) return;
+    received += c.length;
+    if (received > DEBUG_UPLOAD_MAX_BYTES) {
+      rejected = true;
+      res.status(413).json({ error: 'file too large' });
+      req.destroy();
+      return;
+    }
+    chunks.push(c);
+  });
   req.on('end', () => {
+    if (rejected) return;
     const buf = Buffer.concat(chunks);
     const contentType = req.headers['content-type'] || '';
     const boundaryMatch = contentType.match(/boundary=(.+)/);
@@ -947,24 +1070,37 @@ app.post('/debug/upload', (req, res) => {
       const headers = part.substring(0, headerEnd);
       const fnMatch = headers.match(/filename="([^"]+)"/);
       if (!fnMatch) continue;
-      const filename = `${Date.now()}_${fnMatch[1].replace(/[^a-zA-Z0-9._-]/g, '_')}`;
+      const originalName = fnMatch[1].replace(/[^a-zA-Z0-9._-]/g, '_');
+      const ext = path.extname(originalName).toLowerCase();
+      if (!DEBUG_UPLOAD_EXTS.has(ext)) {
+        return res.status(400).json({ error: 'unsupported file type' });
+      }
+      const typeMatch = headers.match(/Content-Type:\s*([^\r\n;]+)/i);
+      if (!typeMatch || !/^image\//i.test(typeMatch[1])) {
+        return res.status(400).json({ error: 'image content-type required' });
+      }
+      const filename = `${Date.now()}_${originalName}`;
       const body = part.substring(headerEnd + 4, part.length - 2); // strip trailing \r\n
-      const filePath = path.join(DEBUG_UPLOAD_DIR, filename);
+      if (Buffer.byteLength(body, 'binary') > DEBUG_UPLOAD_MAX_BYTES) {
+        return res.status(413).json({ error: 'file too large' });
+      }
+      const filePath = resolveDebugUpload(filename);
+      if (!filePath) return res.status(400).json({ error: 'invalid filename' });
       fs.writeFileSync(filePath, body, 'binary');
       console.log(`[debug] Uploaded: ${filePath} (${Buffer.byteLength(body, 'binary')} bytes)`);
-      return res.json({ path: filePath, filename });
+      return res.json({ filename });
     }
     res.status(400).json({ error: 'no file found in upload' });
   });
 });
 
-app.get('/debug/files', (req, res) => {
+app.get('/debug/files', requireDebugAccess, (req, res) => {
   try {
     const files = fs.readdirSync(DEBUG_UPLOAD_DIR)
-      .filter(f => /\.(png|jpg|jpeg|gif|webp)$/i.test(f))
+      .filter(f => DEBUG_UPLOAD_EXTS.has(path.extname(f).toLowerCase()))
       .map(f => {
         const stat = fs.statSync(path.join(DEBUG_UPLOAD_DIR, f));
-        return { name: f, path: path.join(DEBUG_UPLOAD_DIR, f), size: stat.size, mtime: stat.mtime };
+        return { name: f, size: stat.size, mtime: stat.mtime };
       })
       .sort((a, b) => b.mtime - a.mtime)
       .slice(0, 20);
@@ -972,8 +1108,9 @@ app.get('/debug/files', (req, res) => {
   } catch { res.json([]); }
 });
 
-app.get('/debug/file/:filename', (req, res) => {
-  const filePath = path.join(DEBUG_UPLOAD_DIR, req.params.filename.replace(/\.\./g, ''));
+app.get('/debug/file/:filename', requireDebugAccess, (req, res) => {
+  const filePath = resolveDebugUpload(req.params.filename);
+  if (!filePath) return res.status(404).send('not found');
   if (!fs.existsSync(filePath)) return res.status(404).send('not found');
   res.sendFile(filePath);
 });

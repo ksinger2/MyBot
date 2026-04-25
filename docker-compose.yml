@@ -22,6 +22,16 @@ services:
       # send `!unlock <PIN>` before the bot responds. Protects against compromised
       # Discord accounts or Signal phone numbers. If unset, the gate is disabled.
       - BOT_UNLOCK_PIN=${BOT_UNLOCK_PIN:-}
+      # Voice endpoint hardening. Voice requests now require BOTH the bot PIN and
+      # a separate transport token (X-Voice-Token or Authorization: Bearer ...).
+      # Leave VOICE_ENABLED=false if you do not use the Siri/Shortcut entrypoint.
+      - VOICE_ENABLED=${VOICE_ENABLED:-true}
+      - VOICE_AUTH_TOKEN=${VOICE_AUTH_TOKEN:-}
+      - VOICE_RATE_LIMIT_MAX=${VOICE_RATE_LIMIT_MAX:-20}
+      # Debug upload UI is disabled by default and should stay off outside
+      # tightly controlled debugging sessions.
+      - DEBUG_UPLOAD_ENABLED=${DEBUG_UPLOAD_ENABLED:-false}
+      - DEBUG_UPLOAD_MAX_BYTES=${DEBUG_UPLOAD_MAX_BYTES:-5242880}
       # Access control — comma-separated IDs/numbers (empty = DENY ALL after the
       # 2026-04-11 fail-closed flip). SIGNAL_OWNER_NUMBER always bypasses the
       # Signal allowlist so the owner can never lock themselves out.
@@ -54,6 +64,9 @@ services:
       - DEFAULT_MAX_TURNS=${DEFAULT_MAX_TURNS:-50}
       - MAX_AUTO_CONTINUES=${MAX_AUTO_CONTINUES:-3}
       - MAX_TIMEOUT_MINUTES=${MAX_TIMEOUT_MINUTES:-90}
+      # Owner DM mode: when true, owner gets full autonomous engineering access
+      # (Edit, Write, Bash, etc.). Set to false to restrict to read-only tools.
+      - OWNER_FULL_ACCESS=${OWNER_FULL_ACCESS:-true}
       # Signal adapter (optional — set SIGNAL_PHONE_NUMBER to enable)
       - ENABLED_PLATFORMS=${ENABLED_PLATFORMS:-signal}
       - SIGNAL_API_URL=${SIGNAL_API_URL:-http://signal-api:8080}
@@ -94,7 +107,7 @@ services:
     # GH_TOKEN (set in .env). See NextStep.md finding H3.
     #
     ports:
-      - "3400:3400"
+      - "127.0.0.1:${CLAUDE_API_PORT:-3400}:3400"
     # CRITICAL: these MUST use HOST_HOME (an absolute host path), NOT ${HOME}.
     # The /rebuild flow spawns a host-side `docker:27-cli` container where
     # HOME=/root, so any ${HOME} interpolation at compose-up time would
@@ -155,8 +168,8 @@ services:
     build: ./concert-scraper
     container_name: mybot-concert-scraper
     restart: unless-stopped
-    ports:
-      - "5001:5000"
+    expose:
+      - "5000"
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:5000/health"]
       interval: 30s

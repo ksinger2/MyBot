@@ -87,6 +87,7 @@ function _redactId(id) {
 // When BOT_UNLOCK_PIN is unset, the gate is disabled (everyone gets full access
 // as before, subject to the existing owner/allowlist checks).
 const BOT_UNLOCK_PIN = process.env.BOT_UNLOCK_PIN || '';
+const OWNER_FULL_ACCESS_ENABLED = process.env.OWNER_FULL_ACCESS === 'true' || process.env.OWNER_FULL_ACCESS === '1';
 const ELEVATED_FILE = path.join('/app/data', 'elevated-channels.json');
 const ELEVATION_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
 
@@ -208,8 +209,8 @@ const STALL_THRESHOLDS = {
 };
 const CHECKIN_INTERVAL = 5 * 60 * 1000; // Progress check-in every 5 minutes
 const DEFAULT_IDENTITY = {
-  name: 'My Bot',
-  description: 'a helpful AI assistant on Signal. You are friendly, concise, and capable.'
+  name: 'Bianca',
+  description: 'an autonomous AI coding agent on Signal. You build software, orchestrate projects across /workspace/, and execute tasks end-to-end — don\'t ask, just do it.'
 };
 
 // Tool labels for !btw progress display
@@ -581,7 +582,7 @@ function getChannel(channelId) {
       _channelId: channelId, // stored for journal lookups
       sessionId: saved?.sessionId || null,
       personality: saved?.personality || DEFAULT_PERSONALITY,
-      identity: saved?.identity ? { ...saved.identity } : { ...DEFAULT_IDENTITY },
+      identity: (saved?.identity && saved.identity.name && saved.identity.name !== 'My Bot') ? { ...saved.identity } : { ...DEFAULT_IDENTITY },
       cwd: saved?.cwd || DEFAULT_WORKSPACE,
       config: saved?.config || {},  // per-channel overrides (maxTurns, maxContinues, maxTimeout)
       listenToAll: saved?.listenToAll || false, // when true, respond to all group messages (not just mentions)
@@ -939,6 +940,7 @@ async function startBot() {
   } else {
     console.log('[security] !unlock PIN gate is disabled (BOT_UNLOCK_PIN not set).');
   }
+  console.log(`[security] Owner full-access mode is ${OWNER_FULL_ACCESS_ENABLED ? 'ENABLED' : 'DISABLED'}${OWNER_FULL_ACCESS_ENABLED ? ' — Claude may use privileged engineering tools in owner DM.' : ' — owner DM stays in restricted agent mode unless OWNER_FULL_ACCESS=true.'}`);
 
   // Restore persisted channel states from previous container lifecycle
   _savedChannelStates = loadAllChannelStates();
@@ -2226,6 +2228,7 @@ async function _dispatchSignalMessage(msg, chatId, text, state) {
       // /home/karen/.claude/plans/no-i-have-another-glimmering-marshmallow.md
       // for the design rationale.
       const ownerDmMode = senderIsOwner && !isGroupChat;
+      const ownerDmFullAccess = ownerDmMode && OWNER_FULL_ACCESS_ENABLED;
       // Plan mode (owner DM only): read-only exploration, no edits/bash/writes.
       // Toggled via `!mode plan` / `!mode auto`; default is auto.
       const planMode = ownerDmMode && state.codingMode === 'plan';
@@ -2248,7 +2251,7 @@ async function _dispatchSignalMessage(msg, chatId, text, state) {
         // sub-agents — but NOT Edit/Write/Grep/Glob (engineering tools).
         // readOnly=false so the Runner doesn't apply the restrictive readOnly list.
         // Instead we pass a custom groupAllowedTools list.
-        readOnly: false,
+        readOnly: ownerDmMode ? !ownerDmFullAccess || planMode : false,
         // Group chats and non-owner DMs: social tools only. NO Bash (prevents
         // file deletion/modification by non-owner users). NO Edit/Write/Grep/Glob.
         groupAllowedTools: (isGroupChat || isNonOwnerDm) ? nonOwnerToolWhitelist : undefined,
