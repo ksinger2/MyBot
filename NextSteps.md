@@ -38,15 +38,16 @@ Branch: `stable-rebuild`
 - **Identity**: Default changed from "My Bot" to "Bianca" with autonomous agent description. Persisted channel states with old "My Bot" identity auto-migrate on load.
 - **Owner DM system prompt**: Rewritten to orient Bianca as an autonomous coding agent — multi-project navigation, end-to-end execution, no permission-asking. Explicit Calendar MCP guidance to prevent schedule Skill confusion.
 - **OWNER_FULL_ACCESS**: Defaults to true so owner DM gets full engineering tools out of the box.
+- **Auth fix for background tasks**: AI news, briefings, media pulse, and scheduled DM tasks all called askClaude without `isOwner: true`, routing through non-owner HOME (/home/node-nonowner) with no OAuth credentials. All now pass `isOwner: true`.
+- **Auth fix for owner group chats**: Runner HOME selection changed from `ownerDmMode` to `(ownerDmMode || this.isOwner)` so owner messages in group chats use /home/node (OAuth), not /home/node-nonowner (empty).
+- **ANTHROPIC_API_KEY**: Added to docker-compose.yml for non-owner CLI sessions. Without it, non-owner group members and DMs had zero auth.
+- **Smoke test**: Retry once on timeout (6min), alert only after 3 consecutive same-test failures. Suppresses transient OpenAI gpt-image-1 spikes.
 - **Security hardening**: Server security headers, rate limiter with periodic cleanup, debug upload auth tokens with double-response guard, /ask endpoint uses --allowedTools + --dangerously-skip-permissions (both needed for non-interactive execution), port binding to localhost only, concert-scraper port changed to expose-only.
 
 ## What Needs Work (Prioritized)
 
-### P0 — OAuth Re-auth (BLOCKER)
-The OAuth token in `~/.claude.json` is expired. Every background task (AI Pulse, Media Pulse, Morning Briefing) and voice/Siri request fails with "Not logged in · Please run /login". To fix:
-1. Run `claude` in a terminal on the host
-2. Run `/login` inside the CLI
-3. Re-auth completes → token refreshed → container picks it up via bind mount
+### P0 — Verify ANTHROPIC_API_KEY
+Non-owner sessions (group chats, non-owner DMs) need `ANTHROPIC_API_KEY` in `.env`. If not set, non-owner members can't talk to Bianca in group chats. Owner sessions use OAuth from ~/.claude.json (currently working).
 
 ### P1 — SDK Runner Stabilization
 The Agent SDK runner (`sdk-runner.js`) is built and wired in behind `USE_SDK_RUNNER=true`. Needs production testing:
