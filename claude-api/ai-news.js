@@ -133,7 +133,8 @@ async function sendAINews() {
   try {
     const result = await askClaude(prompt, {
       cwd: '/app',
-      maxTurns: 15, // needs multiple WebSearch calls for different topics
+      maxTurns: 15,
+      isOwner: true,
     });
 
     if (!result.text) {

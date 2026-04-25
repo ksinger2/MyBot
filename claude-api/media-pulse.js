@@ -54,6 +54,7 @@ async function runMediaPulseJob(sched) {
   const result = await askClaude(prompt, {
     cwd: '/app',
     maxTurns: 10,
+    isOwner: true,
   });
 
   if (!result.text) {

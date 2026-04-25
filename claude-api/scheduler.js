@@ -110,6 +110,7 @@ function registerJob(sched) {
             cwd: '/app',
             maxTurns: 10,
             profileContext,
+            isOwner: true,
           });
 
           if (!result.text) {

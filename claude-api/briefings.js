@@ -365,6 +365,7 @@ async function sendBriefing() {
       identity,
       cwd: '/app',
       maxTurns: 15,
+      isOwner: true,
     });
 
     if (result.text) {
@@ -459,6 +460,7 @@ async function sendWeeklyPreview() {
       identity,
       cwd: '/app',
       maxTurns: 15,
+      isOwner: true,
     });
 
     if (result.text) {

@@ -91,20 +91,24 @@ async function runSmokeTests() {
   }
 
   // Test 2: Image generation (only if OPENAI_API_KEY is set)
+  // gpt-image-1 occasionally spikes past 4min — retry once on timeout before failing.
   if (process.env.OPENAI_API_KEY) {
-    try {
-      const res = await _httpPost('/imagine', { prompt: 'smoke test: solid blue square, 64x64 pixels' }, 60000);
-      if (res.status === 200 && res.body?.path && fs.existsSync(res.body.path)) {
-        results.push({ test: 'imagine', status: 'pass' });
-        passed++;
-        // Clean up test image
-        try { fs.unlinkSync(res.body.path); } catch {}
-      } else {
-        results.push({ test: 'imagine', status: 'fail', detail: `HTTP ${res.status}: ${res.body?.error || 'no path'}` });
-        failed++;
-      }
-    } catch (err) {
+    const attemptImagine = () => _httpPost('/imagine', { prompt: 'smoke test: solid blue square, 64x64 pixels' }, 360000);
+    let res, err;
+    try { res = await attemptImagine(); } catch (e) { err = e; }
+    if (err && /timeout/i.test(err.message)) {
+      err = null;
+      try { res = await attemptImagine(); } catch (e) { err = e; }
+    }
+    if (err) {
       results.push({ test: 'imagine', status: 'fail', detail: err.message });
+      failed++;
+    } else if (res.status === 200 && res.body?.path && fs.existsSync(res.body.path)) {
+      results.push({ test: 'imagine', status: 'pass' });
+      passed++;
+      try { fs.unlinkSync(res.body.path); } catch {}
+    } else {
+      results.push({ test: 'imagine', status: 'fail', detail: `HTTP ${res.status}: ${res.body?.error || 'no path'}` });
       failed++;
     }
   } else {
@@ -179,19 +183,27 @@ async function runAndReport() {
   const summary = await runSmokeTests();
   console.log(`[smoke-test] Results: ${summary.passed} passed, ${summary.failed} failed`);
 
-  // Only send Signal alert if something failed
+  // Only alert when the SAME test fails 3 runs in a row (suppress transient OpenAI timeouts etc.)
   if (summary.failed > 0) {
     try {
-      const { SIGNAL_OWNER } = require('./project-permissions');
-      const { signalAdapter } = require('./bot');
-      if (SIGNAL_OWNER && signalAdapter?.ready) {
-        const failList = summary.results
-          .filter(r => r.status === 'fail')
-          .map(r => `  - ${r.test}: ${r.detail}`)
-          .join('\n');
-        await signalAdapter.sendMessage(SIGNAL_OWNER,
-          `Smoke test FAILED (${summary.failed}/${summary.total}):\n${failList}`
-        );
+      const history = JSON.parse(fs.readFileSync(RESULTS_FILE, 'utf8'));
+      const prev1 = history[history.length - 2];
+      const prev2 = history[history.length - 3];
+      const failedIn = (run) => new Set((run?.results || []).filter(r => r.status === 'fail').map(r => r.test));
+      const prev1Fails = failedIn(prev1);
+      const prev2Fails = failedIn(prev2);
+      const persistentFails = summary.results.filter(r => r.status === 'fail' && prev1Fails.has(r.test) && prev2Fails.has(r.test));
+      if (persistentFails.length > 0) {
+        const { SIGNAL_OWNER } = require('./project-permissions');
+        const { signalAdapter } = require('./bot');
+        if (SIGNAL_OWNER && signalAdapter?.ready) {
+          const failList = persistentFails.map(r => `  - ${r.test}: ${r.detail}`).join('\n');
+          await signalAdapter.sendMessage(SIGNAL_OWNER,
+            `Smoke test FAILED twice in a row:\n${failList}`
+          );
+        }
+      } else {
+        console.log('[smoke-test] Transient failure suppressed (not consecutive)');
       }
     } catch {}
   }

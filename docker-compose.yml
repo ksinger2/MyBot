@@ -38,6 +38,9 @@ services:
       - SIGNAL_OWNER_NUMBER=${SIGNAL_OWNER_NUMBER:-}
       - ALLOWED_USER_IDS=${ALLOWED_USER_IDS:-}
       - ADMIN_USER_IDS=${ADMIN_USER_IDS:-}
+      # Anthropic API key for non-owner CLI sessions (group chats, non-owner DMs,
+      # background tasks). Owner DM uses OAuth via ~/.claude.json instead.
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
       # API keys available to Claude Code when building projects
       - OPENAI_API_KEY=${OPENAI_API_KEY:-}
       - GEMINI_API_KEY=${GEMINI_API_KEY:-}
