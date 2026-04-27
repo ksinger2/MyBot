@@ -3233,6 +3233,7 @@ async function _dispatchSignalMessage(msg, chatId, text, state) {
           for (const imgPath of imagePaths) {
             textToSend = textToSend.replace(imgPath, '').trim();
           }
+          textToSend = require('./response-filter').stripNoResponse(textToSend);
           if (textToSend) await signalAdapter.sendLongMessage(msg.chatId, textToSend);
         } else if (!result.streamed && !result.text && result.hitTurnLimit) {
           await signalAdapter.sendMessage(msg.chatId, 'I ran out of turns before I could respond — try again or simplify your request.');

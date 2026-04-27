@@ -221,7 +221,7 @@ class SDKRunner {
       TERM: process.env.TERM || 'xterm-256color',
       IMAGE_SESSION_KEY: channelState?._channelId || '',
       GH_TOKEN: process.env.GH_TOKEN || '',
-      ...(!ownerDmMode && process.env.ANTHROPIC_API_KEY
+      ...(!ownerDmMode && !this.isOwner && process.env.ANTHROPIC_API_KEY
         ? { ANTHROPIC_API_KEY: process.env.ANTHROPIC_API_KEY }
         : {}),
     };
@@ -407,6 +407,7 @@ class SDKRunner {
               if (streamReplies && channelProxy) {
                 let chunk = scrubSecrets(block.text.trim());
                 chunk = chunk.replace(/\[LEARNED:\s*.+?\]/gi, '').trim();
+                chunk = require('./response-filter').stripNoResponse(chunk);
                 if (chunk.length > 0) {
                   streamedAny = true;
                   if (!channelState._sendQueue) channelState._sendQueue = Promise.resolve();

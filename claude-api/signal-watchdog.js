@@ -9,8 +9,6 @@ let consecutiveFailures = 0;
 let lastRestartAt = 0;
 
 const HEALTH_CHECK_INTERVAL = 60_000;
-const STALE_THRESHOLD = 5 * 60_000;
-const STARTUP_GRACE = 5 * 60_000;
 const RESTART_COOLDOWN = 10 * 60_000;
 const MAX_CONSECUTIVE_FAILURES = 5;
 const CONTAINER_NAME = 'mybot-signal-api-1';
@@ -76,8 +74,6 @@ function startSignalWatchdog(signalAdapter, ownerChatId) {
   const apiUrl = (signalAdapter && signalAdapter.apiUrl) || 'http://signal-api:8080';
 
   watchdogInterval = setInterval(async () => {
-    const now = Date.now();
-    const uptime = now - startedAt;
     const healthy = await checkHealth(apiUrl);
 
     if (healthy) {
@@ -90,16 +86,6 @@ function startSignalWatchdog(signalAdapter, ownerChatId) {
     if (consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
       log('Signal-api HTTP unresponsive — triggering restart');
       restartContainer(signalAdapter, ownerChatId);
-      return;
-    }
-
-    // Only check webhook staleness after startup grace period
-    if (uptime > STARTUP_GRACE && lastWebhookAt > 0) {
-      const staleDuration = now - lastWebhookAt;
-      if (staleDuration > STALE_THRESHOLD) {
-        log(`Webhook stale for ${Math.round(staleDuration / 1000)}s — triggering restart`);
-        restartContainer(signalAdapter, ownerChatId);
-      }
     }
   }, HEALTH_CHECK_INTERVAL);
   if (watchdogInterval.unref) watchdogInterval.unref();
