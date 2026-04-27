@@ -92,13 +92,16 @@ async function _apiRequest(path, { method = 'GET', body, token } = {}) {
 }
 
 async function _login(email, password) {
+  if (!process.env.EIGHTSLEEP_CLIENT_ID || !process.env.EIGHTSLEEP_CLIENT_SECRET) {
+    throw new Error('Eight Sleep credentials not configured (set EIGHTSLEEP_CLIENT_ID and EIGHTSLEEP_CLIENT_SECRET)');
+  }
   // Eight Sleep uses OAuth2 password grant at /v1/tokens
   const res = await fetch(`${AUTH_BASE}/tokens`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', 'User-Agent': 'MyBot/1.0' },
     body: JSON.stringify({
-      client_id: process.env.EIGHTSLEEP_CLIENT_ID || '0894c7f33bb94800a03f1f4df13a4f38',
-      client_secret: process.env.EIGHTSLEEP_CLIENT_SECRET || 'f0954a3ed5763ba3d06834c73731a32f15f168f47d4f164751275def86db0c76',
+      client_id: process.env.EIGHTSLEEP_CLIENT_ID || '',
+      client_secret: process.env.EIGHTSLEEP_CLIENT_SECRET || '',
       grant_type: 'password',
       username: email,
       password: password,

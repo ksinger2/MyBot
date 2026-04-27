@@ -28,12 +28,14 @@ module.exports = {
     // Fire and forget — run the task asynchronously
     (async () => {
       try {
+        const bgChannelState = { _channelId: `bg:${taskId}`, busy: false, process: null };
+        bgTask._channelState = bgChannelState;
         const result = await ctx.askClaude(arg.trim(), {
           personalityFile: ctx.getPersonalityFile(state.personality),
           identity: state.identity,
           cwd: state.cwd,
           maxTurns: state.config?.maxTurns || 30,
-          channelState: null,
+          channelState: bgChannelState,
           readOnly: false,
           model: 'sonnet',
           ownerDmMode: true,

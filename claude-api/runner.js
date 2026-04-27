@@ -721,7 +721,7 @@ class Runner {
                 hitAuthFailure = true;
                 resultSubtype = 'authentication_failed';
               }
-              console.log(`[result] subtype=${resultSubtype} turns=${resultNumTurns} cost=$${resultCost} text_len=${(resultText || '').length} text=${JSON.stringify((resultText || '').substring(0, 300))}`);
+              console.log(`[result] subtype=${resultSubtype} turns=${resultNumTurns} cost=$${resultCost} text_len=${(resultText || '').length}`);
               continue;
             }
 

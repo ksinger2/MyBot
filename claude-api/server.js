@@ -1509,6 +1509,7 @@ app.post('/signal/webhook', express.json({ limit: '5mb' }), (req, res) => {
     }
     if (processed > 0) {
       console.log(`[signal-webhook] processed ${processed} envelope(s)${ignored ? `, ignored ${ignored} non-message frame(s)` : ''}`);
+      try { require('./signal-watchdog').recordWebhookActivity(); } catch {}
     }
     res.status(200).end();
   } catch (err) {
@@ -1530,7 +1531,7 @@ app.get('/auth/spotify/callback', async (req, res) => {
     const returnUrl = _oauthReturnUrls.get(result.userId);
     if (returnUrl) _oauthReturnUrls.delete(result.userId);
     const redirectScript = returnUrl
-      ? `<script>setTimeout(()=>window.location.href='${returnUrl}',1500)</script>`
+      ? `<script>setTimeout(()=>window.location.href=${JSON.stringify(returnUrl)},1500)</script>`
       : '';
     // Respond to the browser IMMEDIATELY so the user doesn't time out and
     // accidentally reload the callback with an already-consumed state.
@@ -2435,7 +2436,7 @@ app.get('/auth/google/callback', async (req, res) => {
     const returnUrl = _oauthReturnUrls.get(result.userId);
     if (returnUrl) _oauthReturnUrls.delete(result.userId);
     const redirectScript = returnUrl
-      ? `<script>setTimeout(()=>window.location.href='${returnUrl}',1500)</script>`
+      ? `<script>setTimeout(()=>window.location.href=${JSON.stringify(returnUrl)},1500)</script>`
       : '';
     res.send(`<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Calendar Connected</title><style>body{font-family:-apple-system,sans-serif;max-width:480px;margin:60px auto;padding:0 20px;text-align:center;}</style></head><body><h1 style="color:#4285f4;">Calendar Connected!</h1><p>${escapeHtml(result.displayName)} (${escapeHtml(result.email)}) is now linked.</p><p style="color:#666;font-size:14px;">${returnUrl ? 'Returning to setup...' : 'You can close this tab.'}</p>${redirectScript}</body></html>`);
   } catch (err) {

@@ -42,6 +42,7 @@ const { extractImageAttachments } = require('./adapters/base');
 const { loadCommands } = require('./commands');
 const { addNote, extractNotes, stripNoteTags, getGroupNotes, startReminderLoop } = require('./group-notes');
 const { registerFlight, restoreFlightJobs, extractFlightTag, stripFlightTags } = require('./flight-tracker');
+const { stopSignalWatchdog } = require('./signal-watchdog');
 
 // F10: Deterministic greeting fast-path — replies without invoking Claude.
 // 100% reliable, $0, ~50ms. The system prompt rule stays as a backstop.
@@ -176,6 +177,10 @@ function _resetSessionInactivityTimer(state, channelId) {
   state._sessionInactivityTimer = setTimeout(() => {
     if (state.sessionId && !state.busy) {
       console.log(`[session-expiry] Clearing sessionId for ${channelId} after ${SESSION_INACTIVITY_MS / 60000}min inactivity`);
+      if (state.process) {
+        console.log(`[session-expiry] Killing orphaned process for ${channelId}`);
+        forceKillProcess(state.process, 3000).catch(() => {});
+      }
       state.sessionId = null;
       state.sessionStartedAt = null;
       state.sessionTurns = 0;
@@ -552,9 +557,15 @@ const channels = new Map();
 // Graceful shutdown — kill children, persist state, then exit
 async function gracefulShutdown(signal) {
   console.log(`[shutdown] Received ${signal}, killing children and persisting state...`);
+  try { stopSignalWatchdog(); } catch {}
   const killPromises = [];
   for (const [channelId, state] of channels) {
     if (state.process) killPromises.push(forceKillProcess(state.process, 3000));
+    if (state._bgTasks) {
+      for (const [taskId, task] of state._bgTasks) {
+        if (task._channelState?.process) killPromises.push(forceKillProcess(task._channelState.process, 3000));
+      }
+    }
     if (state.busy && state.activeTask) {
       saveChannelState(channelId, state);
     }
@@ -929,7 +940,7 @@ async function startBot() {
   try { sweepOrphanTmpFiles(['/app/data', '/home/node/.claude']); } catch {}
 
   // F17: boot warnings for hardcoded fallbacks
-  if (!process.env.HOST_HOME) console.warn('[security] WARNING: HOST_HOME not set in .env — falling back to hardcoded default /home/karen. Set HOST_HOME in .env if your home directory differs.');
+  if (!process.env.HOST_HOME) console.warn('[security] WARNING: HOST_HOME not set — rebuild flow may use wrong home directory. Set HOST_HOME in .env.');
   if (!process.env.SIGNAL_OWNER_NUMBER) console.warn('[security] WARNING: SIGNAL_OWNER_NUMBER not set in .env — falling back to hardcoded default. Set SIGNAL_OWNER_NUMBER in .env.');
 
   console.log(`Default personality: ${DEFAULT_PERSONALITY}`);
@@ -1991,6 +2002,10 @@ function startSignalAdapter() {
     // startBot() is idempotent — the fallback timeout in start() is a no-op
     // when this path runs first.
     startBot().catch(err => console.error('[startBot] failed:', err.message));
+
+    // Start watchdog that auto-restarts signal-api if its WebSocket goes stale
+    const { startSignalWatchdog } = require('./signal-watchdog');
+    startSignalWatchdog(signalAdapter, process.env.SIGNAL_OWNER_NUMBER);
   }).catch(err => {
     console.error(`[signal] Failed to start: ${err.message}`);
   });

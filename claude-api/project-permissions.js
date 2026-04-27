@@ -1,7 +1,7 @@
 /**
  * Per-project permission control — Signal only.
  *
- * The owner (+16315214787) always has full access.
+ * The owner (SIGNAL_OWNER_NUMBER) always has full access.
  * Everyone else is read-only unless explicitly granted per-project access.
  * Permission changes can ONLY be made by the owner.
  *
@@ -13,7 +13,11 @@ const path = require('path');
 const { atomicWriteJsonSync } = require('./atomic-write');
 
 // The one and only person who can edit code or change permissions from Signal
-const SIGNAL_OWNER = process.env.SIGNAL_OWNER_NUMBER || '+16315214787';
+const SIGNAL_OWNER = process.env.SIGNAL_OWNER_NUMBER;
+if (!SIGNAL_OWNER) {
+  console.error('[FATAL] SIGNAL_OWNER_NUMBER env var is required but not set');
+  process.exit(1);
+}
 
 function _permFile(projectPath) {
   return path.join(projectPath, '.claude', 'permissions.json');
