@@ -167,23 +167,21 @@ function _releaseSlot() {
 // ── Ghost Reaper — kills stale non-owner processes every 60s ──
 function _sweepGhosts() {
   const now = Date.now();
-  const MAX_NON_OWNER_AGE_MS = 15 * 60 * 1000; // 15 minutes
+  const MAX_NON_OWNER_AGE_MS = 15 * 60 * 1000;
+  const MAX_OWNER_AGE_MS = 2 * 60 * 60 * 1000;
   for (const [pid, info] of _processRegistry) {
-    // Kill dead PIDs (process already exited but registry wasn't cleaned up).
-    // Only deregister — don't release the slot here, the close handler does that
-    // via releaseOnce() to prevent double-release.
     try {
-      process.kill(pid, 0); // test if alive — throws if dead
+      process.kill(pid, 0);
     } catch {
       console.log(`[ghost-reaper] dead pid=${pid} — deregistering (close handler releases slot)`);
       _deregisterProcess(pid);
       continue;
     }
-    // Kill non-owner processes older than 15 minutes
-    if (!info.isOwner && (now - info.startedAt) > MAX_NON_OWNER_AGE_MS) {
-      console.log(`[ghost-reaper] killing stale non-owner pid=${pid} (age=${Math.round((now - info.startedAt) / 60000)}min)`);
+    const age = now - info.startedAt;
+    const maxAge = info.isOwner ? MAX_OWNER_AGE_MS : MAX_NON_OWNER_AGE_MS;
+    if (age > maxAge) {
+      console.log(`[ghost-reaper] killing stale ${info.isOwner ? 'owner' : 'non-owner'} pid=${pid} (age=${Math.round(age / 60000)}min)`);
       forceKillProcess(info.child, 3000).catch(() => {});
-      // close handler will deregister + release slot
     }
   }
 }

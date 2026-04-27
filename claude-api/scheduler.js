@@ -106,11 +106,13 @@ function registerJob(sched) {
           const profileContext = buildProfileContext(sched.userId);
           console.log(`[dm-task] Running job #${sched.id} "${sched.description}" for Signal user`);
 
+          const dmChannelState = { _channelId: `sched:${sched.id}`, busy: false, process: null };
           const result = await askClaude(sched.message, {
             cwd: '/app',
             maxTurns: 10,
             profileContext,
             isOwner: true,
+            channelState: dmChannelState,
           });
 
           if (!result.text) {

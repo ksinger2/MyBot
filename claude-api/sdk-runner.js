@@ -443,6 +443,9 @@ class SDKRunner {
       }
     } finally {
       if (channelState) {
+        try {
+          if (channelState._sdkQuery?.return) await channelState._sdkQuery.return();
+        } catch {}
         channelState._sdkQuery = null;
       }
     }

@@ -595,6 +595,7 @@ app.post('/event/join', requireInternalToken, async (req, res) => {
 });
 
 let _healthCache = { ts: 0, ok: true, claudeVersion: null };
+let _rebuildInProgress = false;
 app.get('/health', (req, res) => {
   const now = Date.now();
   if (now - _healthCache.ts < 30000) {
@@ -1358,7 +1359,14 @@ ${prevSummary ? `- Before the rebuild, the previous session was working on:\n${p
     });
   }
 
-  // 4. Respond before the rebuild starts so Claude can announce success
+  // 4. Dedup guard — reject if a rebuild is already running
+  if (_rebuildInProgress) {
+    return res.status(429).json({ ok: false, error: 'Rebuild already in progress' });
+  }
+  _rebuildInProgress = true;
+  setTimeout(() => { _rebuildInProgress = false; }, 120000);
+
+  // 5. Respond before the rebuild starts so Claude can announce success
   res.json({
     ok: true,
     message: 'Rebuild started — container will be replaced in ~30s',
