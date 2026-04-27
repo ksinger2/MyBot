@@ -1,6 +1,6 @@
 'use strict';
 
-const FEED_TIMEOUT = 10_000;
+const FEED_TIMEOUT = 15_000;
 
 const USER_AGENT = 'Mozilla/5.0 (compatible; MyBot/1.0; RSS reader)';
 

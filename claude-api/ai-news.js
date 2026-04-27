@@ -27,7 +27,7 @@ const RSS_FEEDS = [
   'https://www.wired.com/feed/tag/ai/latest/rss',
   'https://arstechnica.com/tag/artificial-intelligence/feed/',
   'https://www.technologyreview.com/feed/',
-  'https://feeds.reuters.com/reuters/technologyNews',
+  'https://9to5google.com/feed/',
 ];
 
 const WINDOW_MS = 4 * 60 * 60 * 1000; // 4 hours

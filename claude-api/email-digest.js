@@ -68,13 +68,65 @@ async function generateEmailDigest(userId, hoursBack = 24) {
   return _formatDigest(categorized, emails.length, allIndexed);
 }
 
-async function _categorizeEmails(emails) {
-  const client = new Anthropic();
-  const emailList = emails.map((e, i) =>
-    `${i + 1}. From: ${e.from}\n   Subject: ${e.subject}\n   Preview: ${e.snippet?.slice(0, 120) || ''}`
-  ).join('\n\n');
+const IGNORE_PATTERNS = [
+  /noreply|no-reply|donotreply|do-not-reply/i,
+  /notification|alert|digest|newsletter|update.*account/i,
+  /receipt|order.*confirm|shipping|tracking|delivery/i,
+  /verify.*email|verification|2fa|one-time|security code/i,
+  /unsubscribe|manage.*preferences|email.*preferences/i,
+  /calendar.*notification|event.*reminder|invitation/i,
+  /social.*media|facebook|twitter|instagram|linkedin.*notification/i,
+];
 
-  const systemPrompt = `You are an email organizer for Karen, a product manager actively looking for Product Manager jobs.
+const UNSUB_PATTERNS = [
+  /newsletter|digest|weekly|daily.*update|roundup/i,
+  /marketing|promo|deal|sale|offer|discount|coupon/i,
+  /subscription|subscribe|mailing.*list/i,
+];
+
+const IMPORTANT_PATTERNS = [
+  /product.*manager|PM.*role|head.*product|director.*product|UX/i,
+  /job.*offer|job.*opportunity|application.*status|interview|hiring/i,
+  /offer.*letter|compensation|onsite|phone.*screen/i,
+  /urgent|action.*required|deadline|time.*sensitive/i,
+];
+
+function _categorizeEmailsRuleBased(emails) {
+  const cats = { important: [], reply: [], unsubscribe: [], ignore: [] };
+
+  for (const e of emails) {
+    const text = `${e.from} ${e.subject} ${e.snippet || ''}`;
+    const entry = { from: e.from, subject: e.subject, reason: '' };
+
+    if (IMPORTANT_PATTERNS.some(p => p.test(text))) {
+      entry.reason = 'Job/career related';
+      cats.important.push(entry);
+    } else if (UNSUB_PATTERNS.some(p => p.test(text))) {
+      entry.reason = 'Newsletter/marketing';
+      cats.unsubscribe.push(entry);
+    } else if (IGNORE_PATTERNS.some(p => p.test(text))) {
+      entry.reason = 'Automated notification';
+      cats.ignore.push(entry);
+    } else if (e.isUnread && !IGNORE_PATTERNS.some(p => p.test(e.from || ''))) {
+      entry.reason = 'Unread from real sender';
+      cats.reply.push(entry);
+    } else {
+      cats.ignore.push(entry);
+    }
+  }
+
+  return cats;
+}
+
+async function _categorizeEmails(emails) {
+  // Try AI categorization first, fall back to rules if API unavailable
+  try {
+    const client = new Anthropic();
+    const emailList = emails.map((e, i) =>
+      `${i + 1}. From: ${e.from}\n   Subject: ${e.subject}\n   Preview: ${e.snippet?.slice(0, 120) || ''}`
+    ).join('\n\n');
+
+    const systemPrompt = `You are an email organizer for Karen, a product manager actively looking for Product Manager jobs.
 
 Categorize each email into exactly one of these groups:
 - IMPORTANT: Job listings (Product Manager, PM, Head of Product, Director of Product, UX, etc.), messages from real people that matter, time-sensitive info
@@ -90,20 +142,19 @@ Respond ONLY with valid JSON in this exact format (no other text):
   "ignore": [{"from": "...", "subject": "...", "reason": "..."}]
 }`;
 
-  const resp = await client.messages.create({
-    model: 'claude-haiku-4-5-20251001',
-    max_tokens: 4096,
-    system: systemPrompt,
-    messages: [{ role: 'user', content: `Categorize these ${emails.length} emails:\n\n${emailList}` }],
-  });
+    const resp = await client.messages.create({
+      model: 'claude-haiku-4-5-20251001',
+      max_tokens: 4096,
+      system: systemPrompt,
+      messages: [{ role: 'user', content: `Categorize these ${emails.length} emails:\n\n${emailList}` }],
+    });
 
-  try {
     const text = resp.content?.[0]?.text;
     if (!text) throw new Error('empty response from Claude');
     return JSON.parse(text);
   } catch (err) {
-    console.warn(`[email-digest] Claude categorization failed: ${err.message}`);
-    return { important: [], reply: [], unsubscribe: [], ignore: emails.map(e => ({ from: e.from, subject: e.subject, reason: '' })) };
+    console.warn(`[email-digest] AI categorization failed (${err.message}), using rule-based fallback`);
+    return _categorizeEmailsRuleBased(emails);
   }
 }
 

@@ -20,7 +20,7 @@ const INTERNAL_API_TOKEN = getInternalToken();
 const NEWS_FEEDS = [
   'https://techcrunch.com/category/artificial-intelligence/feed/',
   'https://www.theverge.com/rss/ai-artificial-intelligence/index.xml',
-  'https://feeds.reuters.com/reuters/technologyNews',
+  'https://arstechnica.com/tag/artificial-intelligence/feed/',
   'https://www.wired.com/feed/tag/ai/latest/rss',
 ];
 
@@ -50,7 +50,9 @@ async function fetchStocks(stockConfig) {
   if (!stockConfig.enabled || !stockConfig.tickers.length) return null;
 
   try {
-    const yahooFinance = require('yahoo-finance2').default;
+    const mod = await import('yahoo-finance2');
+    const YahooFinance = mod.default;
+    const yahooFinance = new YahooFinance();
     const results = [];
 
     for (const ticker of stockConfig.tickers) {
@@ -292,7 +294,9 @@ function formatMindfulness() {
 }
 
 function _resolveRecipient() {
-  let recipient = config.channelId || SIGNAL_OWNER || null;
+  // Prefer SIGNAL_OWNER for Signal delivery. config.channelId is a legacy
+  // Discord channel ID that doesn't work with the Signal adapter.
+  let recipient = SIGNAL_OWNER || null;
   if (!recipient) return null;
   if (typeof recipient === 'string' && recipient.startsWith('signal:')) {
     recipient = recipient.replace(/^signal:/, '');
