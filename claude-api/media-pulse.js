@@ -1,22 +1,26 @@
 /**
- * Media Pulse typed handler — deduplicates across cycles.
- *
- * Why this exists: before, Media Pulse ran via the generic dm-task path
- * (scheduler.js → askClaude(sched.message)). With a 5-hour window and
- * no memory of what was already sent, each cycle kept re-surfacing the
- * same stories. This module augments the prompt with a seen list and
- * captures new headlines after each run — same pattern as ai-news.js.
- *
+ * Media Pulse — pure RSS scraper, no AI.
+ * Fetches media/entertainment RSS feeds, deduplicates, formats bullet points.
  * Dispatched from scheduler.js when `sched.subtype === 'media-pulse'`.
  */
 
 const fs = require('fs');
 const path = require('path');
 const { atomicWriteJsonSync } = require('./atomic-write');
+const { fetchFeeds, filterRecent, dedup, formatBullets } = require('./rss-fetcher');
 
-// /app/data is a mounted docker volume so the seen list survives rebuilds
 const SEEN_FILE = path.join(__dirname, 'data', 'media-pulse-seen.json');
 const MAX_SEEN = 500;
+
+const RSS_FEEDS = [
+  'https://variety.com/feed/',
+  'https://deadline.com/feed/',
+  'https://www.thewrap.com/feed/',
+  'https://www.hollywoodreporter.com/feed/',
+  'https://techcrunch.com/category/media-entertainment/feed/',
+];
+
+const WINDOW_MS = 6 * 60 * 60 * 1000; // 6 hours
 
 function loadSeen() {
   try {
@@ -36,62 +40,49 @@ function saveSeen(seen) {
   }
 }
 
-function buildPromptWithSeen(basePrompt, seen) {
-  if (seen.size === 0) return basePrompt;
-  const seenList = [...seen].slice(-120).map(h => `- ${h}`).join('\n');
-  return `${basePrompt}\n\nDO NOT include any of these already-sent stories (match by headline keywords, ignore minor wording differences):\n${seenList}`;
-}
-
 async function runMediaPulseJob(sched) {
-  const { askClaude, signalAdapter } = require('./bot');
+  const { signalAdapter } = require('./bot');
   const isSignal = typeof sched.userId === 'string' && sched.userId.startsWith('+');
 
+  console.log(`[media-pulse] Running job #${sched.id} [RSS mode]`);
+
   const seen = loadSeen();
-  const prompt = buildPromptWithSeen(sched.message, seen);
 
-  console.log(`[media-pulse] Running job #${sched.id} (${seen.size} seen in dedup list)`);
+  try {
+    const allItems = await fetchFeeds(RSS_FEEDS);
+    console.log(`[media-pulse] Fetched ${allItems.length} total items from ${RSS_FEEDS.length} feeds`);
 
-  const result = await askClaude(prompt, {
-    cwd: '/app',
-    maxTurns: 10,
-    isOwner: true,
-  });
+    const recent = filterRecent(allItems, WINDOW_MS);
+    const fresh = dedup(recent, seen);
 
-  if (!result.text) {
-    console.log(`[media-pulse] Job #${sched.id} returned no text`);
-    return;
-  }
-
-  const text = result.text.trim();
-  if (text.includes('Nothing new since last check')) {
-    console.log('[media-pulse] No new stories this cycle, not sending');
-    return;
-  }
-
-  // Capture new bullet headlines so next cycle knows not to repeat them
-  const bulletLines = text.split('\n').filter(l => {
-    const t = l.trim();
-    return t.startsWith('•') || t.startsWith('-');
-  });
-  for (const line of bulletLines) {
-    const plain = line
-      .replace(/\[([^\]]+)\]\([^)]+\)/g, '$1')
-      .replace(/[•\-\*]/g, '')
-      .trim()
-      .substring(0, 80);
-    if (plain) seen.add(plain);
-  }
-  saveSeen(seen);
-
-  if (isSignal) {
-    if (signalAdapter && signalAdapter.ready) {
-      await signalAdapter.sendLongMessage(sched.userId, text);
-      console.log(`[media-pulse] Job #${sched.id} sent to Signal DM (${bulletLines.length} bullets)`);
-    } else {
-      console.warn(`[media-pulse] Job #${sched.id} — Signal adapter not ready, skipping`);
+    for (const item of fresh) {
+      seen.add(item._dedupKey);
     }
-  } else {
-    console.warn(`[media-pulse] Job #${sched.id} — non-Signal userId "${sched.userId}" not supported yet`);
+    saveSeen(seen);
+
+    if (fresh.length === 0) {
+      console.log('[media-pulse] No new stories this cycle');
+      return;
+    }
+
+    const text = formatBullets(fresh, {
+      header: 'Media Pulse',
+      emoji: '📺',
+      maxBullets: 12,
+    });
+
+    if (isSignal) {
+      if (signalAdapter && signalAdapter.ready) {
+        await signalAdapter.sendLongMessage(sched.userId, text);
+        console.log(`[media-pulse] Job #${sched.id} sent ${Math.min(fresh.length, 12)} bullets to Signal DM`);
+      } else {
+        console.warn(`[media-pulse] Job #${sched.id} — Signal adapter not ready, skipping`);
+      }
+    } else {
+      console.warn(`[media-pulse] Job #${sched.id} — non-Signal userId "${sched.userId}" not supported yet`);
+    }
+  } catch (err) {
+    console.error(`[media-pulse] Job #${sched.id} failed:`, err.message);
   }
 }
 

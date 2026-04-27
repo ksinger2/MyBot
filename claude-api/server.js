@@ -2665,6 +2665,193 @@ app.post('/calendar/events', requireInternalToken, async (req, res) => {
   }
 });
 
+// ── Email search (deterministic, server-side Gmail API) ──────────────────
+// The MCP Gmail search_threads tool is non-deterministic — Claude picks the
+// search query, and sometimes misses emails the user knows exist. This
+// endpoint does a thorough server-side search with multiple query strategies
+// to ensure reliable results. Claude can call this via curl as a backup
+// when MCP search returns unexpected results.
+app.post('/email/search', requireInternalToken, async (req, res) => {
+  const { query, days = 30, userId } = req.body || {};
+  if (!query) return res.status(400).json({ error: 'query is required' });
+
+  const targetUserId = userId || SIGNAL_OWNER;
+  try {
+    const googleAuth = require('./google-auth');
+    const gmail = await googleAuth.getGmailClient(targetUserId);
+    if (!gmail) {
+      return res.json({ text: 'Gmail not connected. Run `!connect` to authorize.', results: [] });
+    }
+
+    const afterEpoch = Math.floor((Date.now() - days * 24 * 60 * 60 * 1000) / 1000);
+    const queries = [];
+
+    // Build multiple search strategies from the query
+    const q = query.trim();
+    queries.push(`${q} after:${afterEpoch}`);
+    if (!q.startsWith('from:') && !q.startsWith('to:') && !q.startsWith('subject:')) {
+      queries.push(`from:${q} after:${afterEpoch}`);
+      queries.push(`subject:${q} after:${afterEpoch}`);
+    }
+
+    const seenIds = new Set();
+    const allMessages = [];
+
+    for (const searchQuery of queries) {
+      try {
+        const listRes = await gmail.users.messages.list({
+          userId: 'me',
+          q: searchQuery,
+          maxResults: 20,
+        });
+        for (const msg of (listRes.data.messages || [])) {
+          if (!seenIds.has(msg.id)) {
+            seenIds.add(msg.id);
+            allMessages.push(msg);
+          }
+        }
+      } catch (err) {
+        console.warn(`[email/search] query "${searchQuery}" failed: ${err.message}`);
+      }
+    }
+
+    if (allMessages.length === 0) {
+      return res.json({ text: `No emails found for "${q}" in the last ${days} days.`, results: [] });
+    }
+
+    // Fetch metadata for all found messages
+    const results = await Promise.all(
+      allMessages.slice(0, 30).map(async ({ id, threadId }) => {
+        try {
+          const msg = await gmail.users.messages.get({
+            userId: 'me', id,
+            format: 'metadata',
+            metadataHeaders: ['From', 'To', 'Subject', 'Date'],
+          });
+          const headers = msg.data.payload?.headers || [];
+          const h = (name) => headers.find(hdr => hdr.name.toLowerCase() === name.toLowerCase())?.value || '';
+          return {
+            messageId: id, threadId,
+            from: h('From'), to: h('To'),
+            subject: h('Subject'), date: h('Date'),
+            snippet: msg.data.snippet || '',
+            isUnread: (msg.data.labelIds || []).includes('UNREAD'),
+          };
+        } catch { return null; }
+      })
+    );
+
+    const valid = results.filter(Boolean).sort((a, b) => new Date(b.date) - new Date(a.date));
+
+    const lines = valid.map((e, i) => {
+      const fromShort = (e.from.match(/^(.+?)\s*</) || [])[1]?.replace(/["']/g, '') || e.from.split('@')[0];
+      const dateStr = new Date(e.date).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
+      return `${i + 1}. ${fromShort} — "${e.subject}" (${dateStr})${e.isUnread ? ' [UNREAD]' : ''}`;
+    });
+
+    res.json({
+      text: `Found ${valid.length} email(s) for "${q}":\n${lines.join('\n')}`,
+      results: valid,
+    });
+  } catch (err) {
+    console.error('[email/search] error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── Email read thread (deterministic, server-side Gmail API) ─────────────
+// Read a full email thread by threadId. Returns the full conversation.
+app.post('/email/thread', requireInternalToken, async (req, res) => {
+  const { threadId, userId } = req.body || {};
+  if (!threadId) return res.status(400).json({ error: 'threadId is required' });
+
+  const targetUserId = userId || SIGNAL_OWNER;
+  try {
+    const googleAuth = require('./google-auth');
+    const gmail = await googleAuth.getGmailClient(targetUserId);
+    if (!gmail) {
+      return res.json({ text: 'Gmail not connected.', messages: [] });
+    }
+
+    const thread = await gmail.users.threads.get({
+      userId: 'me', id: threadId, format: 'full',
+    });
+
+    const messages = (thread.data.messages || []).map(msg => {
+      const headers = msg.payload?.headers || [];
+      const h = (name) => headers.find(hdr => hdr.name.toLowerCase() === name.toLowerCase())?.value || '';
+
+      // Extract plain text body
+      let body = '';
+      function extractText(part) {
+        if (part.mimeType === 'text/plain' && part.body?.data) {
+          body += Buffer.from(part.body.data, 'base64').toString('utf-8');
+        }
+        if (part.parts) part.parts.forEach(extractText);
+      }
+      if (msg.payload) extractText(msg.payload);
+
+      return {
+        from: h('From'), to: h('To'), date: h('Date'),
+        subject: h('Subject'),
+        body: body.substring(0, 3000),
+      };
+    });
+
+    const lines = messages.map(m => {
+      const fromShort = (m.from.match(/^(.+?)\s*</) || [])[1]?.replace(/["']/g, '') || m.from;
+      const dateStr = new Date(m.date).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric', hour: 'numeric', minute: '2-digit' });
+      return `--- ${fromShort} (${dateStr}) ---\n${m.body.trim()}`;
+    });
+
+    res.json({
+      text: lines.join('\n\n'),
+      messages,
+      messageCount: messages.length,
+    });
+  } catch (err) {
+    console.error('[email/thread] error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── Email draft (deterministic, server-side Gmail API) ───────────────────
+// Create a Gmail draft. More reliable than MCP create_draft.
+app.post('/email/draft', requireInternalToken, async (req, res) => {
+  const { to, subject, body, threadId, userId } = req.body || {};
+  if (!to || !body) return res.status(400).json({ error: 'to and body are required' });
+
+  const targetUserId = userId || SIGNAL_OWNER;
+  try {
+    const googleAuth = require('./google-auth');
+    const gmail = await googleAuth.getGmailClient(targetUserId);
+    if (!gmail) {
+      return res.json({ success: false, error: 'Gmail not connected.' });
+    }
+
+    const raw = Buffer.from(
+      `To: ${to}\r\nSubject: ${subject || '(no subject)'}\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n${body}`
+    ).toString('base64url');
+
+    const draftBody = { message: { raw } };
+    if (threadId) draftBody.message.threadId = threadId;
+
+    const draft = await gmail.users.drafts.create({
+      userId: 'me',
+      requestBody: draftBody,
+    });
+
+    res.json({
+      success: true,
+      draftId: draft.data.id,
+      text: `Draft saved — "${subject || '(no subject)'}" to ${to}`,
+    });
+  } catch (err) {
+    console.error('[email/draft] error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // ── Product search (DDG HTML scrape + search URLs) ────────────────────────
 // Replaces Bianca's prior "I can't pull up Amazon links" refusals with a
 // deterministic, multi-store product search that always returns at least
