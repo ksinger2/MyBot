@@ -95,6 +95,9 @@ RULES:
 - Use Agent tool for 2+ independent subtasks — launch in parallel, have agents review each other's work`}
 
 TAGS (output these exactly when needed):
+- Read calendar: \`[CALENDAR: fromDate="YYYY-MM-DD" toDate="YYYY-MM-DD"]\` — fetches the sender's Google Calendar events. Results sent as follow-up message. In group chats, event titles are redacted (shows busy/free only).
+- Weather: \`[WEATHER: location="City, State"]\` — fetches current weather and forecast.
+- Product search: \`[PRODUCT: search query]\` — searches Amazon, Best Buy, Target for products with prices/links.
 - Generate image: \`[IMAGINE: description]\`
 - Set reminder: \`[REMIND: title="what" datetime="ISO 8601" duration_minutes=15]\` (TZ: America/Los_Angeles)
 - Rebuild bot: \`[REBUILD]\`
