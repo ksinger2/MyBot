@@ -117,9 +117,9 @@ function startQueueRunner() {
   }
 
   // Poll every 30s
-  setInterval(() => processNextItem(), 30000);
+  setInterval(() => processNextItem(), 30000).unref();
   // Also try immediately on startup
-  setTimeout(() => processNextItem(), 5000);
+  setTimeout(() => processNextItem(), 5000).unref();
 }
 
 module.exports = { startQueueRunner, processNextItem };

@@ -1344,10 +1344,12 @@ ${prevSummary ? `- Before the rebuild, the previous session was working on:\n${p
   // Even though flipping this env var requires container access, validating
   // here is cheap defense-in-depth — it blocks accidental misconfiguration
   // and any future path where an attacker can influence env.
-  const HOST_PROJECT_PATH = process.env.HOST_PROJECT_PATH
-    || '/mnt/c/Users/karen/Desktop/Github Projects/MyBot';
+  const HOST_PROJECT_PATH = process.env.HOST_PROJECT_PATH;
+  if (!HOST_PROJECT_PATH) {
+    console.error('[rebuild] HOST_PROJECT_PATH env var is required');
+    return res.status(500).json({ ok: false, error: 'HOST_PROJECT_PATH not configured' });
+  }
   const _pathInvalid =
-    typeof HOST_PROJECT_PATH !== 'string' ||
     !HOST_PROJECT_PATH.startsWith('/') ||
     HOST_PROJECT_PATH.split('/').includes('..') ||
     /[;|&$`<>\n\r]/.test(HOST_PROJECT_PATH);
@@ -2100,6 +2102,10 @@ app.post('/setup/:userId', express.urlencoded({ extended: false }), (req, res) =
   }
 
   const { name, location, timezone, pronouns } = req.body;
+
+  if ((name && name.length > 100) || (location && location.length > 200) || (timezone && timezone.length > 50) || (pronouns && pronouns.length > 30)) {
+    return res.status(400).send('Input too long — please use shorter values.');
+  }
 
   // L7: verify same-origin CSRF token. Each GET issues a fresh token scoped
   // to the userId with a 30min TTL; POST must present the matching token and

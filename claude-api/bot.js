@@ -138,12 +138,6 @@ function _tryUnlock(channelId, suppliedPin) {
   return true;
 }
 
-// Signal-only bot — Signal access control is handled by SIGNAL_ALLOWED_NUMBERS
-// and isSignalOwner() (see project-permissions.js). These stubs are kept for
-// any legacy callers but should not be used.
-function isAllowed() { return false; }
-function isAdmin() { return false; }
-
 const PERSONALITIES_DIR = path.join(__dirname, 'personalities');
 const DEFAULT_PERSONALITY = 'tiffany_pollard';
 const DEFAULT_WORKSPACE = '/workspace';
@@ -161,6 +155,24 @@ const MAX_LOOP_WALLCLOCK_MS = parseInt(process.env.MAX_LOOP_WALLCLOCK_MS, 10) ||
 // M3: per-channel daily iteration cap — a runaway loop that keeps recovering
 // from errors can't burn through more than this many iterations in a UTC day.
 const MAX_LOOP_ITERATIONS_PER_DAY = parseInt(process.env.MAX_LOOP_ITERATIONS_PER_DAY, 10) || 200;
+
+const _rateLimitMap = new Map();
+const RATE_LIMIT_WINDOW_MS = 15 * 60 * 1000;
+const RATE_LIMIT_MAX_SESSIONS = 5;
+
+function _checkRateLimit(userId) {
+  const now = Date.now();
+  const entry = _rateLimitMap.get(userId);
+  if (!entry) {
+    _rateLimitMap.set(userId, { timestamps: [now] });
+    return true;
+  }
+  entry.timestamps = entry.timestamps.filter(t => now - t < RATE_LIMIT_WINDOW_MS);
+  if (entry.timestamps.length >= RATE_LIMIT_MAX_SESSIONS) return false;
+  entry.timestamps.push(now);
+  return true;
+}
+
 // Message grouping debounce — wait this many ms for follow-up messages before
 // dispatching. Set MESSAGE_GROUP_DELAY_MS=0 to disable.
 const MESSAGE_GROUP_DELAY_MS = parseInt(process.env.MESSAGE_GROUP_DELAY_MS, 10) || 800;
@@ -1170,6 +1182,15 @@ async function processQueue(state) {
 
   const personalityFile = getPersonalityFile(state.personality);
 
+  // Detect ownership/group from the signalChatId so queued messages route
+  // through the same OAuth/model path as the original dispatch. Without this,
+  // queued owner messages fall through to the ANTHROPIC_API_KEY path and fail
+  // with "Credit balance too low" because the env key has no credits.
+  const { isSignalOwner } = require('./project-permissions');
+  const isGroupChatQ = !signalChatId.startsWith('+');
+  const senderIsOwnerQ = !isGroupChatQ && isSignalOwner(signalChatId);
+  const ownerDmModeQ = senderIsOwnerQ && !isGroupChatQ;
+
   await signalAdapter.sendTyping(signalChatId).catch(() => {});
   const typingInterval = setInterval(() => {
     signalAdapter.sendTyping(signalChatId).catch(() => {});
@@ -1186,6 +1207,13 @@ async function processQueue(state) {
       identity: state.identity,
       cwd: state.cwd,
       channelState: state,
+      isOwner: senderIsOwnerQ,
+      ownerDmMode: ownerDmModeQ,
+      model: ownerDmModeQ ? 'claude-opus-4-7' : 'sonnet',
+      maxTurns: ownerDmModeQ ? null : 20,
+      streamReplies: true,
+      readOnly: false,
+      groupAllowedTools: isGroupChatQ ? 'Read,WebSearch,WebFetch,Task,TodoWrite' : undefined,
     };
     try {
       result = await runClaudeWithContinuation(combined, queueOpts, null);
@@ -1701,6 +1729,9 @@ function startSignalAdapter() {
     if (state.busy) {
       _resetSessionInactivityTimer(state, chatId);
       const fakeMessage = createSignalMessageProxy(msg, chatId, state);
+      if (state.queue.length >= 10) {
+        state.queue.shift();
+      }
       state.queue.push({ message: fakeMessage, content: text, _timestamp: msg.timestamp });
       saveChannelState(chatId, state, { critical: true });
       if (!isGroupMessage) {
@@ -2056,6 +2087,12 @@ async function _dispatchSignalMessage(msg, chatId, text, state) {
       startedAt: new Date().toISOString(),
       resumeAttempts: 0,
     };
+    if (!senderIsOwner && !_checkRateLimit(msg.senderId)) {
+      clearInterval(signalTypingInterval);
+      await signalAdapter.sendMessage(msg.chatId, 'You\'ve sent a lot of messages recently — please wait a few minutes before trying again.');
+      return;
+    }
+
     state.busy = true;
     saveChannelState(chatId, state, { critical: true });
 

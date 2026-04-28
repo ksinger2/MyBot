@@ -11,7 +11,10 @@
 - **Conversation memory**: Last 20 messages × 1000 chars (was 10 × 500). Better follow-up context across sessions.
 - **Signal watchdog**: Auto-restarts signal-api on health check failure.
 - **Process leak prevention**: Session expiry orphan kill, bg task tracking, graceful shutdown, 2h owner process cap.
-- **Security hardening**: No hardcoded creds, XSS fixes, PII scrubbed from logs, rebuild dedup.
+- **Security hardening**: No hardcoded creds, XSS fixes, PII scrubbed from logs, rebuild dedup, per-user rate limiting, input validation on /setup forms.
+- **Per-user rate limiting**: Non-owner users capped at 5 sessions per 15 minutes. Owner unlimited.
+- **Message queue overflow protection**: Queue capped at 10 per channel, drops oldest when full.
+- **Graceful shutdown**: queue-runner timers use .unref() so Node exits cleanly.
 
 ## What's Broken / Known Issues
 - **Yahoo Finance rate-limiting**: Stocks section in morning briefing returns empty when Yahoo returns 429. Transient — works on retry. Could switch to a different stock data provider.
@@ -25,3 +28,6 @@
 3. **Stock data provider**: Evaluate alternatives to yahoo-finance2 that don't rate-limit Docker IPs (Alpha Vantage free tier, or direct Yahoo Finance v8 API)
 4. **Stale webhook detection**: Re-add the webhook staleness check to signal-watchdog.js (track lastWebhookAt vs a configurable threshold)
 5. **RSS feed monitoring**: Verify feeds return content consistently; some may block or rate-limit over time
+6. **Session resumption persistence**: Session IDs stored in memory only — lost on container restart. Consider persisting to disk.
+7. **CSRF token replay prevention**: Add used-token tracking (low priority — internal network only)
+8. **OAuth redirect validation**: Validate redirect targets against allowlist on OAuth callbacks
