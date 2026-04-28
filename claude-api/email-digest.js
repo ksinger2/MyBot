@@ -48,8 +48,6 @@ async function generateEmailDigest(userId, hoursBack = 24) {
 
   const categorized = await _categorizeEmails(emails);
 
-  // Merge categorized items back with original emails to preserve messageId/isUnread.
-  // Claude returns { from, subject, reason } — we need the full email object for actions.
   const allCategorized = [
     ...(categorized.important || []).map(e => ({ ...e, _cat: 'important' })),
     ...(categorized.reply || []).map(e => ({ ...e, _cat: 'reply' })),
@@ -61,35 +59,50 @@ async function generateEmailDigest(userId, hoursBack = 24) {
     return { ...original, ...e, shortId: i + 1 };
   });
 
-  const unsubCandidates = allIndexed.filter(e => e._cat === 'unsubscribe');
+  saveDigestSession(userId, allIndexed, []);
 
-  saveDigestSession(userId, allIndexed, unsubCandidates);
-
-  return _formatDigest(categorized, emails.length, allIndexed);
+  return _formatDigest(categorized, emails.length);
 }
 
-const IGNORE_PATTERNS = [
+const AUTOMATED_SENDER_PATTERNS = [
   /noreply|no-reply|donotreply|do-not-reply/i,
-  /notification|alert|digest|newsletter|update.*account/i,
+  /notifications?@|alerts?@|updates?@|digest@|mailer-daemon/i,
+  /support@|billing@|receipts?@|orders?@|shipping@|tracking@/i,
+  /calendar-notification|googleusercontent\.com/i,
+];
+
+const AUTOMATED_SUBJECT_PATTERNS = [
   /receipt|order.*confirm|shipping|tracking|delivery/i,
   /verify.*email|verification|2fa|one-time|security code/i,
-  /unsubscribe|manage.*preferences|email.*preferences/i,
-  /calendar.*notification|event.*reminder|invitation/i,
+  /calendar.*notification|event.*reminder/i,
+  /notification|alert|your.*account|password.*reset/i,
   /social.*media|facebook|twitter|instagram|linkedin.*notification/i,
 ];
 
-const UNSUB_PATTERNS = [
+const NEWSLETTER_PATTERNS = [
   /newsletter|digest|weekly|daily.*update|roundup/i,
   /marketing|promo|deal|sale|offer|discount|coupon/i,
-  /subscription|subscribe|mailing.*list/i,
+  /subscription|mailing.*list/i,
 ];
 
-const IMPORTANT_PATTERNS = [
+const JOB_PATTERNS = [
   /product.*manager|PM.*role|head.*product|director.*product|UX/i,
   /job.*offer|job.*opportunity|application.*status|interview|hiring/i,
   /offer.*letter|compensation|onsite|phone.*screen/i,
-  /urgent|action.*required|deadline|time.*sensitive/i,
+  /recruiter|talent.*acquisition|we.*reviewed.*your/i,
 ];
+
+function _isAutomatedSender(from) {
+  return AUTOMATED_SENDER_PATTERNS.some(p => p.test(from || ''));
+}
+
+function _isRealPerson(email) {
+  if (_isAutomatedSender(email.from)) return false;
+  if (email.unsubscribeHeader) return false;
+  if (AUTOMATED_SUBJECT_PATTERNS.some(p => p.test(email.subject || ''))) return false;
+  if (NEWSLETTER_PATTERNS.some(p => p.test(`${email.from} ${email.subject}`))) return false;
+  return true;
+}
 
 function _categorizeEmailsRuleBased(emails) {
   const cats = { important: [], reply: [], unsubscribe: [], ignore: [] };
@@ -97,18 +110,24 @@ function _categorizeEmailsRuleBased(emails) {
   for (const e of emails) {
     const text = `${e.from} ${e.subject} ${e.snippet || ''}`;
     const entry = { from: e.from, subject: e.subject, reason: '' };
+    const labels = e.labels || [];
 
-    if (IMPORTANT_PATTERNS.some(p => p.test(text))) {
-      entry.reason = 'Job/career related';
+    const isStarred = labels.includes('STARRED');
+    const isImportant = labels.includes('IMPORTANT');
+    const isJobRelated = JOB_PATTERNS.some(p => p.test(text));
+    const isPersonal = _isRealPerson(e);
+
+    if (isJobRelated) {
+      entry.reason = 'Job/career';
       cats.important.push(entry);
-    } else if (UNSUB_PATTERNS.some(p => p.test(text))) {
-      entry.reason = 'Newsletter/marketing';
-      cats.unsubscribe.push(entry);
-    } else if (IGNORE_PATTERNS.some(p => p.test(text))) {
-      entry.reason = 'Automated notification';
-      cats.ignore.push(entry);
-    } else if (e.isUnread && !IGNORE_PATTERNS.some(p => p.test(e.from || ''))) {
-      entry.reason = 'Unread from real sender';
+    } else if (isStarred) {
+      entry.reason = 'Starred';
+      cats.important.push(entry);
+    } else if (isImportant && isPersonal) {
+      entry.reason = 'Marked important';
+      cats.important.push(entry);
+    } else if (isPersonal && e.isUnread) {
+      entry.reason = 'Direct message';
       cats.reply.push(entry);
     } else {
       cats.ignore.push(entry);
@@ -126,19 +145,19 @@ async function _categorizeEmails(emails) {
       `${i + 1}. From: ${e.from}\n   Subject: ${e.subject}\n   Preview: ${e.snippet?.slice(0, 120) || ''}`
     ).join('\n\n');
 
-    const systemPrompt = `You are an email organizer for Karen, a product manager actively looking for Product Manager jobs.
+    const systemPrompt = `You are an email triage assistant. Only surface emails that actually matter.
 
-Categorize each email into exactly one of these groups:
-- IMPORTANT: Job listings (Product Manager, PM, Head of Product, Director of Product, UX, etc.), messages from real people that matter, time-sensitive info
-- REPLY: Messages from real humans that ask questions, need a response, or are part of ongoing conversations
-- UNSUBSCRIBE: Newsletters, marketing emails, promotional content, digest emails Karen doesn't need
-- IGNORE: Automated alerts, receipts, shipping notifications, 2FA codes, calendar notifications, social media alerts
+Categorize each email into exactly one group:
+- IMPORTANT: Direct emails from a real person, job/career related (PM, product, UX, recruiter), starred, or marked important. Also urgent/time-sensitive items.
+- REPLY: Unread messages from real humans (not companies/services) that need a response.
+- IGNORE: Everything else — newsletters, marketing, automated notifications, receipts, alerts, social media, mailing lists, any email with an unsubscribe link that isn't from a real person.
 
-Respond ONLY with valid JSON in this exact format (no other text):
+Be aggressive about filtering. Most emails are noise. Only important and reply matter.
+
+Respond ONLY with valid JSON (no other text):
 {
   "important": [{"from": "...", "subject": "...", "reason": "..."}],
   "reply": [{"from": "...", "subject": "...", "reason": "..."}],
-  "unsubscribe": [{"from": "...", "subject": "...", "reason": "..."}],
   "ignore": [{"from": "...", "subject": "...", "reason": "..."}]
 }`;
 
@@ -158,30 +177,33 @@ Respond ONLY with valid JSON in this exact format (no other text):
   }
 }
 
-function _formatDigest(cats, total, allIndexed) {
-  const lines = [`📬 Morning email digest — ${total} email${total === 1 ? '' : 's'}\n`];
+function _formatDigest(cats, total) {
+  const important = cats.important || [];
+  const reply = cats.reply || [];
+  const ignored = (cats.ignore || []).length;
 
-  const section = (emoji, label, items) => {
-    if (!items.length) return;
-    lines.push(`${emoji} ${label} (${items.length})`);
-    for (const e of items) {
-      const shortId = allIndexed.find(x => x.subject === e.subject && x.from === e.from)?.shortId;
-      const idStr = shortId ? `[${shortId}] ` : '';
-      const fromShort = _shortFrom(e.from);
-      lines.push(`• ${idStr}${fromShort}: "${e.subject?.slice(0, 60) || '(no subject)'}"${e.reason ? ` — ${e.reason}` : ''}`);
+  const actionable = important.length + reply.length;
+  if (actionable === 0) {
+    return `📬 **Email** — ${total} emails, nothing actionable. ${ignored} filtered out.`;
+  }
+
+  const lines = [`📬 **Email** — ${actionable} actionable out of ${total}\n`];
+
+  if (important.length) {
+    lines.push(`⭐ **Important** (${important.length})`);
+    for (const e of important.slice(0, 5)) {
+      lines.push(`• ${_shortFrom(e.from)}: ${e.subject?.slice(0, 50) || '(no subject)'}${e.reason ? ` — ${e.reason}` : ''}`);
     }
+    if (important.length > 5) lines.push(`  …and ${important.length - 5} more`);
     lines.push('');
-  };
+  }
 
-  section('⭐', 'IMPORTANT', cats.important || []);
-  section('↩️', 'NEEDS REPLY', cats.reply || []);
-  section('📤', 'UNSUBSCRIBE', cats.unsubscribe || []);
-  section('🙈', 'IGNORE', cats.ignore || []);
-
-  const unsubCount = (cats.unsubscribe || []).length;
-  if (unsubCount > 0) {
-    lines.push(`To unsubscribe from all flagged: \`!emaildigest unsubscribe all\``);
-    lines.push(`To mark all read: \`!emaildigest markread all\``);
+  if (reply.length) {
+    lines.push(`↩️ **Direct messages** (${reply.length})`);
+    for (const e of reply.slice(0, 5)) {
+      lines.push(`• ${_shortFrom(e.from)}: ${e.subject?.slice(0, 50) || '(no subject)'}`);
+    }
+    if (reply.length > 5) lines.push(`  …and ${reply.length - 5} more`);
   }
 
   return lines.join('\n').trim();
