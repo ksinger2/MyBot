@@ -603,7 +603,7 @@ function getChannel(channelId) {
       startedAt: null, // timestamp when Claude started working
       progress: freshProgress(), // structured progress for !btw
       queue: (saved?.pendingQueue || []).map(text => ({ content: text, timestamp: Date.now() })),
-      recentMessages: saved?.recentMessages || [], // recent messages for context persistence (capped at 10)
+      recentMessages: saved?.recentMessages || [], // recent messages for context persistence (capped at 20)
       groupingTimer: null,   // debounce timer for message grouping
       groupingBuffer: [],    // buffered messages waiting to be combined
       groupingSenderId: null, // sender of the buffered messages
@@ -2043,11 +2043,11 @@ async function _dispatchSignalMessage(msg, chatId, text, state) {
     if (!state.recentMessages) state.recentMessages = [];
     state.recentMessages.push({
       role: 'user',
-      text: text.substring(0, 500),
+      text: text.substring(0, 1000),
       sender: msg.senderName || msg.senderId,
       timestamp: Date.now(),
     });
-    if (state.recentMessages.length > 10) state.recentMessages = state.recentMessages.slice(-10);
+    if (state.recentMessages.length > 20) state.recentMessages = state.recentMessages.slice(-20);
 
     state._isGroupChat = isGroupMessage; // used by commands (e.g. !btw) to suppress in groups
     state.activeTask = {
@@ -2273,7 +2273,7 @@ async function _dispatchSignalMessage(msg, chatId, text, state) {
         profileContext: (combinedProfileContext || '') + groupOnboardHint + pendingEventContext + groupNotesContext + activeFlightsContext + imageRefinementContext + (isGroupChat ? `\n\nCHAT_ID: ${msg.chatId}\nSENDER_ID: ${msg.senderId}` : ''),
         streamReplies: true,
         maxTurns: ownerDmMode ? null
-          : ((isGroupChat || isNonOwnerDm) ? 8 : (senderIsOwner ? (parseInt(process.env.SIGNAL_OWNER_MAX_TURNS, 10) || 75) : 8)),
+          : ((isGroupChat || isNonOwnerDm) ? 20 : (senderIsOwner ? (parseInt(process.env.SIGNAL_OWNER_MAX_TURNS, 10) || 75) : 20)),
         ownerDmMode,
         planMode,
         isOwner: senderIsOwner,
@@ -2363,10 +2363,10 @@ async function _dispatchSignalMessage(msg, chatId, text, state) {
         if (!state.recentMessages) state.recentMessages = [];
         state.recentMessages.push({
           role: 'assistant',
-          text: result.text.substring(0, 500),
+          text: result.text.substring(0, 1000),
           timestamp: Date.now(),
         });
-        if (state.recentMessages.length > 10) state.recentMessages = state.recentMessages.slice(-10);
+        if (state.recentMessages.length > 20) state.recentMessages = state.recentMessages.slice(-20);
       }
 
       // Auto-learn extraction — strip [LEARNED: ...] tags, store preferences, notify user.
