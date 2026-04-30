@@ -139,15 +139,16 @@ async function fetchWeather(weatherConfig) {
 
 function fetchCalendar(days = 7) {
   return new Promise((resolve) => {
-    const today = new Date();
-    const toDate = new Date(today);
+    const pacificNow = new Date(new Date().toLocaleString('en-US', { timeZone: 'America/Los_Angeles' }));
+    const fromDate = pacificNow.toISOString().slice(0, 10);
+    const toDate = new Date(pacificNow);
     toDate.setDate(toDate.getDate() + days);
-    const fmt = (d) => d.toISOString().slice(0, 10);
+    const toDateStr = toDate.toISOString().slice(0, 10);
     const body = JSON.stringify({
       userId: SIGNAL_OWNER,
       isGroupChat: false,
-      fromDate: fmt(today),
-      toDate: fmt(toDate),
+      fromDate,
+      toDate: toDateStr,
     });
     const req = http.request({
       hostname: 'localhost', port: 3400, path: '/calendar/events',
@@ -218,30 +219,10 @@ function formatWeatherLine(w) {
 
 function formatCalendarToday(calendarText) {
   if (!calendarText) return null;
-  // Calendar text comes pre-formatted from the internal API.
-  // Extract just today's events if possible.
-  const todayStr = new Date().toLocaleDateString('en-US', { weekday: 'long', month: 'short', day: 'numeric', timeZone: 'America/Los_Angeles' });
-  const lines = calendarText.split('\n');
-  const todayLines = [];
-  let inToday = false;
-  for (const line of lines) {
-    if (line.includes('Today') || line.includes(todayStr)) {
-      inToday = true;
-      continue;
-    }
-    if (inToday && (line.match(/^#{1,3}\s/) || line.match(/^(Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday)/i))) {
-      break;
-    }
-    if (inToday && line.trim()) {
-      todayLines.push(line.trim());
-    }
-  }
-  if (todayLines.length > 0) {
-    return `📅 **Today**: ${todayLines.join(' · ')}`;
-  }
-  // Fallback: just show first few lines
-  const firstFew = lines.filter(l => l.trim()).slice(0, 3).join('\n');
-  return firstFew ? `📅 ${firstFew}` : null;
+  // fetchCalendar(1) already requests exactly today's date range in Pacific time.
+  // Show whatever the API returned — no string parsing needed.
+  const cleaned = calendarText.split('\n').filter(l => l.trim()).join('\n');
+  return cleaned ? `📅 **Today**\n${cleaned}` : null;
 }
 
 function formatPortfolio(stocks) {

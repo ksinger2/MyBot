@@ -1,5 +1,6 @@
 const fs = require('fs');
 const path = require('path');
+const { getSandboxUser } = require('../sandbox');
 
 module.exports = {
   name: '!cd',
@@ -12,7 +13,14 @@ module.exports = {
     } else {
       const target = arg.startsWith('/') ? arg : path.join(state.cwd, arg);
       const resolved = path.resolve(target);
-      if (!resolved.startsWith('/workspace')) {
+      const senderId = message._signalSenderId;
+      const sandbox = senderId ? getSandboxUser(senderId) : null;
+      if (sandbox) {
+        if (!resolved.startsWith(sandbox.cwd)) {
+          await message.reply(`You can only work in \`${sandbox.cwd}/\`.`);
+          return;
+        }
+      } else if (!resolved.startsWith('/workspace')) {
         await message.reply('Cannot navigate outside `/workspace/`.');
         return;
       }

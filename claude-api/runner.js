@@ -371,6 +371,8 @@ class Runner {
     isVoice = false, // Siri voice mode — ultra-compact prompt, no engineering tools
     // Is this an owner session? Used by the priority semaphore.
     isOwner = false,
+    // Per-user sandbox config — { name, cwd, allowedTools, linuxUser, uid }
+    sandboxUser = null,
     // Recent messages context for conversation continuity
     recentMessages = null,
     // Injected from bot.js so runner doesn't need to import bot.js:
@@ -401,6 +403,7 @@ class Runner {
     this.streamReplies = streamReplies;
     this.isVoice = isVoice;
     this.isOwner = isOwner || ownerDmMode; // ownerDmMode implies isOwner
+    this.sandboxUser = sandboxUser;
     this.recentMessages = recentMessages;
     // Use injected functions or local fallbacks
     this._freshProgress = freshProgressFn || freshProgress;
@@ -608,14 +611,15 @@ class Runner {
       // Even if Claude tries `echo $INTERNAL_API_TOKEN` via Bash, it gets ''.
       //
       // Do NOT re-add INTERNAL_API_TOKEN here. It is a security regression.
-      const child = spawn('claude', args, {
+      const spawnOpts = {
         cwd,
         env: {
           // Owner sessions use /home/node (Karen's OAuth + account MCPs).
           // Non-owner sessions use /home/node-nonowner (clean, no ~/.claude.json,
-          // no account MCPs). This prevents Karen's Google Calendar MCP from
-          // being available to non-owner CLI escalations.
-          HOME: (ownerDmMode || this.isOwner) ? '/home/node' : '/home/node-nonowner', CI: 'true',
+          // no account MCPs). Sandbox users get their own isolated home with
+          // a copy of OAuth creds but no MCPs.
+          HOME: this.sandboxUser ? `/home/${this.sandboxUser.linuxUser}`
+            : (ownerDmMode || this.isOwner) ? '/home/node' : '/home/node-nonowner', CI: 'true',
           PATH: process.env.PATH,
           NODE_PATH: process.env.NODE_PATH || '',
           CHROME_PATH: process.env.CHROME_PATH || '',
@@ -629,12 +633,27 @@ class Runner {
           // F6: owner is trusted; gh capability is documented. Risk: prompt-injection
           // could exfiltrate via Bash — mitigated by scrubSecrets (F5).
           GH_TOKEN: process.env.GH_TOKEN || '',
-          ...(!ownerDmMode && !this.isOwner && process.env.ANTHROPIC_API_KEY
-            ? { ANTHROPIC_API_KEY: process.env.ANTHROPIC_API_KEY }
-            : {}),
         },
         stdio: ['ignore', 'pipe', 'pipe'],
-      });
+      };
+      // Sandbox isolation: spawn inside a mount namespace where /workspace
+      // is replaced with an inaccessible tmpfs. The process runs as the
+      // sandbox Linux user via runuser. This is deterministic — the OS
+      // enforces it regardless of what Claude outputs or tries.
+      let child;
+      if (this.sandboxUser && this.sandboxUser.uid) {
+        const sandboxLinuxUser = this.sandboxUser.linuxUser;
+        child = spawn('sudo', [
+          '-E', '/usr/bin/unshare', '--mount', '--',
+          '/bin/sh', '-c',
+          // Inside the mount namespace: hide /workspace, then drop to sandbox user
+          'mount -t tmpfs -o size=4k,mode=000 tmpfs /workspace && exec runuser -u ' + sandboxLinuxUser + ' -- "$@"',
+          'sandbox', // $0 placeholder for sh -c
+          'claude', ...args,
+        ], spawnOpts);
+      } else {
+        child = spawn('claude', args, spawnOpts);
+      }
 
       // Track the process so it can be killed
       if (channelState) {
@@ -880,9 +899,10 @@ class Runner {
                 // redacts any leaked tokens. F4: serialized via _sendQueue.
                 if (streamReplies && channelProxy) {
                   let chunk = scrubSecrets(block.text.trim());
-                  // Strip auto-learn tags from streamed output (the post-result handler
-                  // will extract them from the full result.text for storage)
-                  chunk = chunk.replace(/\[LEARNED:\s*.+?\]/gi, '').trim();
+                  // Strip ALL action tags from streamed output — users should
+                  // never see raw tags. The post-result handler extracts them
+                  // from the full accumulated text for processing.
+                  chunk = chunk.replace(/\[(LEARNED|IMAGINE|CALENDAR|WEATHER|PRODUCT|REMIND|REBUILD|EVENT|EVENT_JOIN|SET_PREF|UPDATE_NOTES|BACKGROUND|CONCERT_PRICES|FLIGHT_SEARCH|FLIGHT_PRICE|EIGHTSLEEP|NEEDS_AGENT)[:|\]][^\]]*\]?/gi, '').trim();
                   if (chunk.length > 0) {
                     streamedAny = true;
                     if (!channelState._sendQueue) channelState._sendQueue = Promise.resolve();

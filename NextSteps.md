@@ -1,33 +1,38 @@
 # MyBot — Next Steps
 
 ## What's Working
-- **Background jobs are AI-free**: AI Pulse (5x/day), Media Pulse (3x/day), Morning Briefing (1x/day), Weekly Preview (1x/week) all use pure RSS feeds and template formatting. Zero Claude sessions consumed. Eliminates 9+ OAuth sessions/day that were causing rate limits.
-- **Morning briefing includes email digest**: Categorized emails (important, needs-reply, unsubscribe) using rule-based classification. Falls back to Haiku when API credits are available.
-- **Deterministic Gmail access**: `email-search-cli.js` uses bot's own Google OAuth tokens with multi-strategy search (by name, email, subject). System prompt directs Claude to use this instead of MCP tools.
-- **Deterministic Calendar access**: `calendar-cli.js` uses bot's own Google OAuth tokens. System prompt directs Claude to use this instead of MCP tools in owner DM.
-- **Group chat calendar/weather/product tags**: `[CALENDAR:]`, `[WEATHER:]`, `[PRODUCT:]` tags now documented in system prompt so Claude knows to use them in group chats and non-owner DMs.
-- **Server-side email endpoints**: `/email/search`, `/email/thread`, `/email/draft` for reliable email operations.
-- **Turn limit**: Group chats and non-owner DMs get 20 turns (was 8). Enough for real conversations with tool calls.
-- **Conversation memory**: Last 20 messages × 1000 chars (was 10 × 500). Better follow-up context across sessions.
-- **Signal watchdog**: Auto-restarts signal-api on health check failure.
-- **Process leak prevention**: Session expiry orphan kill, bg task tracking, graceful shutdown, 2h owner process cap.
-- **Security hardening**: No hardcoded creds, XSS fixes, PII scrubbed from logs, rebuild dedup, per-user rate limiting, input validation on /setup forms.
-- **Per-user rate limiting**: Non-owner users capped at 5 sessions per 15 minutes. Owner unlimited.
-- **Message queue overflow protection**: Queue capped at 10 per channel, drops oldest when full.
-- **Graceful shutdown**: queue-runner timers use .unref() so Node exits cleanly.
+<!-- Updated each session -->
+- **Sandbox isolation**: Daniel (+16318487980) and Merrisa (+12068024303) each have isolated Docker-volume workspaces at `/sandbox/<Name>` with mount-namespace isolation hiding `/workspace` entirely. OS-enforced via `unshare --mount` + `runuser`, not prompt-based.
+- **OAuth credential sharing**: All users (owner, non-owner, sandbox) authenticate via owner's OAuth. ANTHROPIC_API_KEY removed entirely. `.claude.json` (settings) and `.claude/.credentials.json` (OAuth token) are copied to all user homes at startup and provisioning.
+- **Auto-context pre-fetching**: Calendar and weather queries detected server-side via regex, data pre-fetched and injected into prompt as `<calendar-data>`/`<weather-data>` tags. Claude formats what's already there — no tag emission needed.
+- **Briefings**: Template-based (no AI), scheduled at 9 AM Pacific. Stocks, weather, calendar, tasks, RSS news, email digest, mindfulness. Timezone-correct: all date calculations use Pacific time, not UTC.
+- **Signal adapter**: Webhook mode (`SIGNAL_USE_WEBHOOK=true`), JSON-RPC signal-api sidecar.
+- **Tag stripping**: All action tags (`[LEARNED:]`, `[IMAGINE:]`, `[CALENDAR:]`, etc.) stripped during streaming so users never see raw tags.
+- **Crash-loop recovery**: entrypoint.sh detects repeated crashes and restores last-known-good code from backup.
 
-## What's Broken / Known Issues
-- **Yahoo Finance rate-limiting**: Stocks section in morning briefing returns empty when Yahoo returns 429. Transient — works on retry. Could switch to a different stock data provider.
-- **Anthropic API key has no credits**: Email digest AI categorization falls back to rule-based. Not a blocker — rules work fine.
-- **Stale webhook detection**: Was removed from signal-watchdog.js by linter. Only HTTP health check remains. The watchdog detects full signal-api crashes but not silent WebSocket staleness.
-- **Group chat calendar is post-session**: `[CALENDAR:]` tag results are sent as a follow-up message after the Claude session ends. Claude can't synthesize the calendar data (e.g., "you're free Tuesday afternoon") — it just triggers the fetch and the raw data appears separately.
+## What Was Fixed This Session
+- **Briefing timezone bug**: Morning briefing for Thursday was showing Wednesday events. Root cause: `server.js /calendar/events` endpoint used UTC midnight as day boundaries instead of Pacific midnight. Fixed in three places:
+  1. `briefings.js:fetchCalendar` — uses Pacific dates via `toLocaleString('en-US', { timeZone: 'America/Los_Angeles' })`
+  2. `briefings.js:formatCalendarToday` — removed fragile string-parsing; now displays exactly what the API returns since `fetchCalendar(1)` already requests the correct single day
+  3. `server.js:/calendar/events` — `timeMin`/`timeMax` now convert Pacific midnight → UTC via offset calculation
+- **Sandbox "not logged in"**: Sandbox users (Merrisa, Daniel) got "Not logged in" because provisioning only copied `.claude.json` (settings) but not `.claude/.credentials.json` (OAuth token). Fixed in `sandbox.js:provisionUser` and `entrypoint.sh`.
+- **Sandbox "credit balance too low"**: runner.js was injecting `ANTHROPIC_API_KEY` for non-owner sessions, overriding OAuth. Removed all references to `ANTHROPIC_API_KEY` from runner.js, sdk-runner.js, and docker-compose.yml.
+- **Auto-context determinism**: Calendar/weather queries no longer depend on Claude emitting `[CALENDAR:]`/`[WEATHER:]` tags. Data is pre-fetched server-side and injected into the prompt.
+
+## What's Broken / In Progress
+<!-- Active issues, blockers, half-done work -->
+- **signal-api unhealthy**: `signal-api` container shows `unhealthy` status — may need restart or investigation
+- **Picture handling**: User mentioned sending Bianca a picture — needs verification that image attachment handling works correctly
+
+## Architecture Notes
+- **Determinism Rule**: Never rely on prompt language alone to guarantee behavior. All critical behaviors enforced at infrastructure level (mount namespaces, file permissions, server-side tag handling, auto-context injection).
+- **Sandbox spawn chain**: `sudo -E /usr/bin/unshare --mount -- /bin/sh -c 'mount -t tmpfs tmpfs /workspace && exec runuser -u <user> -- claude ...'`
+- **Sudoers**: `node ALL=(root) NOPASSWD:SETENV: /usr/sbin/useradd, /usr/bin/chown, /usr/bin/mkdir, /usr/bin/cp, /usr/bin/unshare`
+- **Docker capability**: `SYS_ADMIN` required for mount namespace isolation
 
 ## Next Steps
-1. **Calendar tag as pre-fetch**: Consider injecting calendar data INTO the prompt (like briefings do) instead of post-session tag processing, so Claude can reason about availability
-2. **Richer group chat context**: Session journal summaries are shallow — consider storing conversation summaries per group for better multi-session continuity
-3. **Stock data provider**: Evaluate alternatives to yahoo-finance2 that don't rate-limit Docker IPs (Alpha Vantage free tier, or direct Yahoo Finance v8 API)
-4. **Stale webhook detection**: Re-add the webhook staleness check to signal-watchdog.js (track lastWebhookAt vs a configurable threshold)
-5. **RSS feed monitoring**: Verify feeds return content consistently; some may block or rate-limit over time
-6. **Session resumption persistence**: Session IDs stored in memory only — lost on container restart. Consider persisting to disk.
-7. **CSRF token replay prevention**: Add used-token tracking (low priority — internal network only)
-8. **OAuth redirect validation**: Validate redirect targets against allowlist on OAuth callbacks
+<!-- Prioritized — what to pick up next -->
+1. Verify Merrisa and Daniel can now chat with Bianca without auth errors
+2. Investigate signal-api unhealthy status
+3. Verify picture/image attachment handling works
+4. Consider adding OAuth token refresh to sandbox provisioning (tokens expire)

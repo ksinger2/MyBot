@@ -2585,9 +2585,9 @@ app.post('/calendar/events', requireInternalToken, async (req, res) => {
       });
     }
 
-    // Default to today through 7 days from today.
-    const now = new Date();
-    const todayStr = now.toISOString().slice(0, 10);
+    // Default to today in Pacific time.
+    const pacificNow = new Date(new Date().toLocaleString('en-US', { timeZone: 'America/Los_Angeles' }));
+    const todayStr = pacificNow.toISOString().slice(0, 10);
     const from = fromDate || todayStr;
     let to = toDate;
     if (!to) {
@@ -2596,13 +2596,20 @@ app.post('/calendar/events', requireInternalToken, async (req, res) => {
       to = d.toISOString().slice(0, 10);
     }
 
-    // timeMin / timeMax want full ISO datetimes in UTC. Expand the local
-    // day range to cover the full days in the user's (presumed) timezone.
-    const timeMin = new Date(from + 'T00:00:00Z').toISOString();
+    // timeMin / timeMax want full ISO datetimes in UTC. The from/to dates
+    // are Pacific dates, so convert Pacific midnight → UTC.
+    function _pacificMidnightUTC(dateStr) {
+      const probe = new Date(`${dateStr}T12:00:00Z`);
+      const pacificStr = probe.toLocaleString('en-US', { timeZone: 'America/Los_Angeles' });
+      const offsetMs = probe.getTime() - new Date(pacificStr).getTime();
+      return new Date(new Date(`${dateStr}T00:00:00Z`).getTime() + offsetMs);
+    }
+    const timeMin = _pacificMidnightUTC(from).toISOString();
     // +1 day on the end so we include the entire `to` day.
-    const endDate = new Date(to + 'T00:00:00Z');
-    endDate.setUTCDate(endDate.getUTCDate() + 1);
-    const timeMax = endDate.toISOString();
+    const endParts = to.split('-').map(Number);
+    const nextDay = new Date(Date.UTC(endParts[0], endParts[1] - 1, endParts[2] + 1));
+    const nextDayStr = nextDay.toISOString().slice(0, 10);
+    const timeMax = _pacificMidnightUTC(nextDayStr).toISOString();
 
     const resp = await calendar.events.list({
       calendarId: 'primary',

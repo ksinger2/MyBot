@@ -1,7 +1,7 @@
 FROM --platform=linux/amd64 node:20-slim
 
 # Install git, gh CLI, and dev tools Claude Code needs
-RUN apt-get update && apt-get install -y git openssh-client curl && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y git openssh-client curl sudo && rm -rf /var/lib/apt/lists/*
 
 # Install dev tools that Claude Code commonly needs (persists across restarts)
 # Includes yt-dlp + ffmpeg for TikTok/Instagram/YouTube transcript extraction
@@ -79,6 +79,13 @@ RUN mkdir -p /home/node/.claude /app/data && chown -R node:node /home/node/.clau
 # Isolated home for non-owner CLI spawns — no ~/.claude.json here, so Karen's
 # account-level MCPs (Google Calendar, etc.) are never exposed to non-owner sessions.
 RUN mkdir -p /home/node-nonowner/.claude && chown -R node:node /home/node-nonowner
+
+# Sandbox: allow the node user to run useradd/chown/mkdir/cp for runtime
+# sandbox user provisioning. Minimal sudoers — only these four commands.
+# Sandbox sudoers: SETENV allows env passthrough for sudo -E (required so
+# Claude CLI inherits HOME, PATH, etc. inside the mount namespace).
+RUN echo 'node ALL=(root) NOPASSWD:SETENV: /usr/sbin/useradd, /usr/bin/chown, /usr/bin/mkdir, /usr/bin/cp, /usr/bin/unshare' > /etc/sudoers.d/sandbox \
+    && chmod 440 /etc/sudoers.d/sandbox
 
 # Run as non-root user (required by Claude CLI)
 USER node

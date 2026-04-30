@@ -2291,29 +2291,38 @@ async function _dispatchSignalMessage(msg, chatId, text, state) {
       const isNonOwnerDm = !senderIsOwner && !isGroupChat;
       const nonOwnerToolWhitelist = 'Read,WebSearch,WebFetch,Task,TodoWrite';
 
+      // Sandbox lookup — non-owner users with a configured sandbox get write
+      // access scoped to their own directory (enforced by Linux file permissions).
+      const { getSandboxUser } = require('./sandbox');
+      const sandboxUser = !senderIsOwner ? getSandboxUser(msg.senderId) : null;
+      if (sandboxUser) {
+        console.log(`[sandbox] ${_redactId(msg.senderId)} matched sandbox: ${sandboxUser.name} (${sandboxUser.cwd})`);
+      }
+
       const claudeOpts = {
         sessionId: isGroupChat ? null : state.sessionId,
         personalityFile,
         identity: state.identity,
-        cwd: state.cwd,
+        cwd: sandboxUser ? sandboxUser.cwd : state.cwd,
         channelState: state,
         channelProxy: signalProxy,
         discordUserId: msg.senderId,
         // Groups and non-owner DMs use a SOCIAL allowlist: web search, reading,
         // sub-agents — but NOT Edit/Write/Grep/Glob (engineering tools).
-        // readOnly=false so the Runner doesn't apply the restrictive readOnly list.
-        // Instead we pass a custom groupAllowedTools list.
+        // Sandbox users override this with their own tool set.
         readOnly: ownerDmMode ? !ownerDmFullAccess || planMode : false,
-        // Group chats and non-owner DMs: social tools only. NO Bash (prevents
-        // file deletion/modification by non-owner users). NO Edit/Write/Grep/Glob.
-        groupAllowedTools: (isGroupChat || isNonOwnerDm) ? nonOwnerToolWhitelist : undefined,
-        profileContext: (combinedProfileContext || '') + groupOnboardHint + pendingEventContext + groupNotesContext + activeFlightsContext + imageRefinementContext + (isGroupChat ? `\n\nCHAT_ID: ${msg.chatId}\nSENDER_ID: ${msg.senderId}` : ''),
+        groupAllowedTools: sandboxUser ? sandboxUser.allowedTools
+          : (isGroupChat || isNonOwnerDm) ? nonOwnerToolWhitelist : undefined,
+        profileContext: (combinedProfileContext || '') + groupOnboardHint + pendingEventContext + groupNotesContext + activeFlightsContext + imageRefinementContext
+          + (isGroupChat ? `\n\nCHAT_ID: ${msg.chatId}\nSENDER_ID: ${msg.senderId}` : '')
+          + (sandboxUser ? `\n\nSANDBOX: You are working in ${sandboxUser.name}'s project directory (${sandboxUser.cwd}). All file operations are restricted to this directory.` : ''),
         streamReplies: true,
         maxTurns: ownerDmMode ? null
           : ((isGroupChat || isNonOwnerDm) ? 20 : (senderIsOwner ? (parseInt(process.env.SIGNAL_OWNER_MAX_TURNS, 10) || 75) : 20)),
         ownerDmMode,
         planMode,
         isOwner: senderIsOwner,
+        sandboxUser,
         // Pass recent messages for conversation context persistence
         recentMessages: state.recentMessages || [],
         // Model selection.
@@ -2362,6 +2371,16 @@ async function _dispatchSignalMessage(msg, chatId, text, state) {
         }
       } catch (err) {
         console.error('[instagram] Signal transcript error:', err.message);
+      }
+
+      // Auto-context: detect calendar/weather intent and pre-fetch data
+      // so Claude has the answer already — no tag emission needed.
+      try {
+        const { enrichWithContext } = require('./auto-context');
+        const autoCtx = await enrichWithContext(text, msg.senderId, isGroupChat);
+        if (autoCtx) signalPrompt = autoCtx + signalPrompt;
+      } catch (err) {
+        console.warn(`[auto-context] enrichment failed: ${err.message}`);
       }
 
       let result;

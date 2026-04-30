@@ -75,6 +75,7 @@ class SDKRunner {
     this.streamReplies = opts.streamReplies || false;
     this.isVoice = opts.isVoice || false;
     this.isOwner = opts.isOwner || opts.ownerDmMode || false;
+    this.sandboxUser = opts.sandboxUser || null;
     this.recentMessages = opts.recentMessages || null;
     this._freshProgress = opts.freshProgressFn || freshProgress;
     this._saveChannelState = opts.saveChannelStateFn || (() => {});
@@ -211,7 +212,8 @@ class SDKRunner {
 
     // Build env — same security hardening as runner.js
     const env = {
-      HOME: ownerDmMode ? '/home/node' : '/home/node-nonowner',
+      HOME: this.sandboxUser ? `/home/${this.sandboxUser.linuxUser}`
+        : ownerDmMode ? '/home/node' : '/home/node-nonowner',
       CI: 'true',
       PATH: process.env.PATH,
       NODE_PATH: process.env.NODE_PATH || '',
@@ -221,9 +223,6 @@ class SDKRunner {
       TERM: process.env.TERM || 'xterm-256color',
       IMAGE_SESSION_KEY: channelState?._channelId || '',
       GH_TOKEN: process.env.GH_TOKEN || '',
-      ...(!ownerDmMode && !this.isOwner && process.env.ANTHROPIC_API_KEY
-        ? { ANTHROPIC_API_KEY: process.env.ANTHROPIC_API_KEY }
-        : {}),
     };
 
     // Build query options

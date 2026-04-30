@@ -51,6 +51,23 @@ cleanup() {
 }
 trap cleanup SIGTERM SIGINT
 
+# Share OAuth credentials with non-owner home so ALL users authenticate
+# via the owner's Claude Code CLI account (no separate API key needed).
+# Both .claude.json (settings) and .claude/.credentials.json (OAuth token) are needed.
+if [ -f /home/node/.claude.json ]; then
+  cp /home/node/.claude.json /home/node-nonowner/.claude.json 2>/dev/null || true
+fi
+if [ -f /home/node/.claude/.credentials.json ]; then
+  mkdir -p /home/node-nonowner/.claude 2>/dev/null || true
+  cp /home/node/.claude/.credentials.json /home/node-nonowner/.claude/.credentials.json 2>/dev/null || true
+fi
+
+# Provision sandbox users (Linux users + workspace dirs) from persisted config.
+# Runs as node, uses sudo for useradd/chown (see Dockerfile sudoers rule).
+if [ -f /app/data/sandbox-users.json ]; then
+  node -e "try { require('./sandbox').provisionAll(); } catch(e) { console.error('[sandbox] Startup provisioning failed:', e.message); }" 2>&1
+fi
+
 # Run the app in background so bash can process SIGTERM via trap
 node server.js &
 NODE_PID=$!

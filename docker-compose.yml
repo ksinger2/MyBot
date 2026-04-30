@@ -8,6 +8,13 @@ services:
         CLAUDE_CODE_VERSION: "latest"
     platform: linux/amd64
     restart: unless-stopped
+    labels:
+      # Watched by the `autoheal` sidecar — when this container's healthcheck
+      # reports `unhealthy` (process alive but /health failing), autoheal
+      # docker-restarts it. `restart: unless-stopped` only covers crashes.
+      - autoheal=true
+    cap_add:
+      - SYS_ADMIN
     group_add:
       - "989"
     environment:
@@ -38,9 +45,9 @@ services:
       - SIGNAL_OWNER_NUMBER=${SIGNAL_OWNER_NUMBER:-}
       - ALLOWED_USER_IDS=${ALLOWED_USER_IDS:-}
       - ADMIN_USER_IDS=${ADMIN_USER_IDS:-}
-      # Anthropic API key for non-owner CLI sessions (group chats, non-owner DMs,
-      # background tasks). Owner DM uses OAuth via ~/.claude.json instead.
-      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+      # ANTHROPIC_API_KEY removed — all users authenticate via owner's OAuth
+      # (~/.claude.json), shared to all homes at container startup. This
+      # ensures a single auth source and avoids "credit balance too low".
       # API keys available to Claude Code when building projects
       - OPENAI_API_KEY=${OPENAI_API_KEY:-}
       - GEMINI_API_KEY=${GEMINI_API_KEY:-}
@@ -123,6 +130,7 @@ services:
       - ${HOST_HOME:-/home/karen}/.claude.json:/home/node/.claude.json
       - ${HOST_HOME:-/home/karen}/.gitconfig:/home/node/.gitconfig:ro
       - /mnt/c/Users/karen/Desktop/Github Projects:/workspace
+      - sandbox-data:/sandbox
       - /var/run/docker.sock:/var/run/docker.sock
       - bot-data:/app/data
     healthcheck:
@@ -142,6 +150,14 @@ services:
     # for the latest stable, update the tag, and `docker compose up -d --build signal-api`.
     image: bbernhard/signal-cli-rest-api:0.98
     restart: unless-stopped
+    labels:
+      - autoheal=true
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://localhost:8080/v1/about || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
     environment:
       # MODE=json-rpc runs signal-cli as a persistent daemon (one JVM, started once).
       # Per-call latency drops from seconds to milliseconds vs MODE=normal.
@@ -173,6 +189,8 @@ services:
     restart: unless-stopped
     expose:
       - "5000"
+    labels:
+      - autoheal=true
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:5000/health"]
       interval: 30s
@@ -180,9 +198,26 @@ services:
       retries: 3
       start_period: 60s
 
+  # Autoheal — watches every container with `autoheal=true` label and
+  # docker-restarts it when its healthcheck reports `unhealthy`. Closes the
+  # gap that `restart: unless-stopped` only fires on actual process crashes,
+  # not on hung-but-alive states (e.g. event loop stuck, deadlocked Signal
+  # daemon). Pinned to a specific tag to avoid silent supply-chain drift.
+  autoheal:
+    image: willfarrell/autoheal:1.2.0
+    restart: unless-stopped
+    environment:
+      - AUTOHEAL_CONTAINER_LABEL=autoheal
+      - AUTOHEAL_INTERVAL=30
+      - AUTOHEAL_START_PERIOD=60
+      - DOCKER_SOCK=/var/run/docker.sock
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+
 volumes:
   signal-data:
   bot-data:
+  sandbox-data:
 
 networks:
   default:
