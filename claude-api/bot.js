@@ -355,7 +355,7 @@ class ChannelProxy {
           return '';
         });
         // Strip all system tags before they reach the user (they get processed post-session)
-        cleaned = cleaned.replace(/\[(IMAGINE|LEARNED|NOTE|RESOLVE_NOTE|UPDATE_NOTES|CONCERT_PRICES|FLIGHT_SEARCH|FLIGHT_PRICE|EIGHTSLEEP|FLIGHT|WEATHER|CALENDAR|PRODUCT):\s*[^\]]*\]/gi, '').trim();
+        cleaned = cleaned.replace(/\[(IMAGINE|LEARNED|NOTE|RESOLVE_NOTE|UPDATE_NOTES|CONCERT_PRICES|FLIGHT_SEARCH|FLIGHT_PRICE|EIGHTSLEEP|FLIGHT|WEATHER|CALENDAR|PRODUCT|EMAIL_UNSUB):\s*[^\]]*\]/gi, '').trim();
         if (!cleaned) return Promise.resolve();
         return adapter.sendMessage(recipientChatId, cleaned);
       },
@@ -2154,6 +2154,12 @@ async function _dispatchSignalMessage(msg, chatId, text, state) {
       // Build profile context. DMs use minimal profile + heuristic on-demand
       // data injection. Groups use the existing stripped path.
       let combinedProfileContext = buildMinimalProfileContext(msg.senderId, { isGroupChat: isGroupMessage });
+      // Inject user preferences (email rules, shopping prefs, event settings) into context
+      try {
+        const { buildPrefContext } = require('./user-pref-context');
+        const prefCtx = buildPrefContext(msg.senderId);
+        if (prefCtx) combinedProfileContext = (combinedProfileContext || '') + '\n\n' + prefCtx;
+      } catch {}
       // Heuristic: inject heavy profile data only when message likely needs it
       if (!isGroupMessage && text) {
         const lowerText = text.toLowerCase();
@@ -2866,6 +2872,65 @@ async function _dispatchSignalMessage(msg, chatId, text, state) {
           }
         } catch (e) { console.warn(`[pref] SET_PREF handler error: ${e.message}`); }
         result.text = (result.text || '').replace(setPrefRe, '').trim();
+      }
+
+      // [EMAIL_UNSUB:] tag — newsletter unsubscribe with deterministic approval gate.
+      // action="suggest": analyze inbox, propose candidates, store in approval gate
+      // action="confirm": execute unsubscribe ONLY if server-side approval exists
+      const emailUnsubRe = /\[EMAIL_UNSUB:\s*(.+?)\]/gi;
+      const emailUnsubMatches = [...(result.text || '').matchAll(emailUnsubRe)];
+      if (emailUnsubMatches.length > 0 && msg?.senderId) {
+        const approvalGate = require('./approval-gate');
+        for (const match of emailUnsubMatches) {
+          const raw = (match[1] || '').trim();
+          const params = {};
+          raw.replace(/(\w+)="([^"]+)"/g, (_, k, v) => { params[k] = v; });
+          raw.replace(/(\w+)=(\d+)/g, (_, k, v) => { params[k] = parseInt(v, 10); });
+
+          if (params.action === 'suggest') {
+            try {
+              const { analyzeNewsletters } = require('./newsletter-analyzer');
+              const candidates = await analyzeNewsletters(msg.senderId, params.days || 30);
+              if (!candidates || candidates.length === 0) {
+                await signalAdapter.sendMessage(msg.chatId, 'No newsletter unsubscribe candidates found in your recent emails.');
+              } else {
+                const actions = candidates.slice(0, 10).map(c => ({
+                  label: `${c.sender} (${c.count} emails, ${Math.round(c.unreadRate * 100)}% unread)`,
+                  meta: { sender: c.sender, domain: c.domain, messageId: c.latestMessageId },
+                }));
+                approvalGate.proposePending(msg.senderId, 'unsub', actions);
+                const lines = actions.map((a, i) => `${i + 1}. ${a.label}`);
+                await signalAdapter.sendMessage(msg.chatId,
+                  `📧 **Unsubscribe candidates:**\n${lines.join('\n')}\n\nReply \`!unsub yes <number>\` to unsubscribe, or \`!unsub yes all\` for all. Expires in 2 hours.`
+                );
+              }
+            } catch (e) { console.warn(`[email-unsub] suggest error: ${e.message}`); }
+          } else if (params.action === 'confirm' && params.sender) {
+            const approval = approvalGate.consumeApproval(msg.senderId, 'unsub', m => m.sender === params.sender);
+            if (!approval) {
+              await signalAdapter.sendMessage(msg.chatId, `❌ No approved unsubscribe for ${params.sender}. Use \`!unsub yes <number>\` first.`);
+            } else {
+              try {
+                const { unsubscribe, getGmailClient } = require('./gmail-client');
+                const gmail = await getGmailClient(msg.senderId);
+                if (!gmail) throw new Error('Gmail not connected');
+                const res = await unsubscribe(gmail, approval.messageId);
+                const status = res.success ? `✅ Unsubscribed from ${params.sender} (${res.method}: ${res.detail})` : `⚠️ Could not unsubscribe from ${params.sender}: ${res.detail}`;
+                await signalAdapter.sendMessage(msg.chatId, status);
+                // Audit log
+                try {
+                  const auditPath = path.join('/app/data', 'unsub-audit.json');
+                  const audit = JSON.parse(fs.readFileSync(auditPath, 'utf8').toString() || '[]');
+                  audit.push({ ts: new Date().toISOString(), userId: msg.senderId, sender: params.sender, ...res });
+                  fs.writeFileSync(auditPath, JSON.stringify(audit, null, 2));
+                } catch {}
+              } catch (e) {
+                await signalAdapter.sendMessage(msg.chatId, `❌ Unsubscribe failed: ${e.message}`);
+              }
+            }
+          }
+        }
+        result.text = (result.text || '').replace(emailUnsubRe, '').trim();
       }
 
       // [EVENT:] tag extraction — create a shared group calendar event.

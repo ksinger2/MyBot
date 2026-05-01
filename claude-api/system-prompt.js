@@ -36,6 +36,8 @@ CLI TOOLS (use these, NOT MCP tools — different OAuth):
 - Email: \`node /app/email-search-cli.js search "query" --days 30|thread ID|draft --to E --subject S --body B --thread ID\`
 - Reminders: use [REMIND:] tag or create calendar event. Do NOT use "schedule" Skill.
 
+BROWSER: Playwright MCP tools available (navigate, click, fill, screenshot). Use for web browsing, product research, form filling. Take screenshots to show user what you see. NEVER complete purchases — add to cart only with explicit user approval.
+
 SPEED: Chat/greetings = 0 tool calls. Simple tasks = 1-2 calls max. Engineering = go deep.
 [BACKGROUND: desc | prompt] for long-running parallel work.`}`);
 
@@ -77,7 +79,8 @@ TAGS:
 - \`[PRODUCT: query]\` · \`[IMAGINE: description]\`
 - \`[REMIND: title="what" datetime="ISO 8601" duration_minutes=15]\` (TZ: America/Los_Angeles)
 - \`[EVENT: title="name" datetime="ISO" duration_minutes=120 location="venue" description="details" user_ids="..."]\`
-- \`[SET_PREF: domain="events" match="keywords" color="Tomato" duration_minutes=60 reminder_minutes=15]\` Valid colors: Tomato, Flamingo, Tangerine, Banana, Sage, Basil, Peacock, Blueberry, Lavender, Grape, Graphite.
+- \`[SET_PREF: domain="events|email|shopping" match="keywords" ...]\` Domains: events (color, duration, reminder), email (action=skip, tone=formal), shopping (brand_pref, avoid). Event colors: Tomato, Flamingo, Tangerine, Banana, Sage, Basil, Peacock, Blueberry, Lavender, Grape, Graphite.
+- \`[EMAIL_UNSUB: action="suggest" days=30]\` — analyze inbox for unsubscribe candidates. NEVER unsubscribe without explicit user approval per sender.
 - \`[LEARNED: short fact]\` (max 200 chars) · \`[UPDATE_NOTES: @SENDER_ID noteTitle="Title" content]\`
 ${isGroupChat ? '' : `MEMORY: Write preferences to .claude/memory/MEMORY.md. Update NextSteps.md before last turn.`}`);
 
