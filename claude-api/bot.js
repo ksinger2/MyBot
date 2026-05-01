@@ -355,7 +355,7 @@ class ChannelProxy {
           return '';
         });
         // Strip all system tags before they reach the user (they get processed post-session)
-        cleaned = cleaned.replace(/\[(IMAGINE|LEARNED|NOTE|RESOLVE_NOTE|UPDATE_NOTES|CONCERT_PRICES|FLIGHT_SEARCH|FLIGHT_PRICE|EIGHTSLEEP|FLIGHT|WEATHER|CALENDAR|PRODUCT|EMAIL_UNSUB):\s*[^\]]*\]/gi, '').trim();
+        cleaned = cleaned.replace(/\[(IMAGINE|LEARNED|NOTE|RESOLVE_NOTE|UPDATE_NOTES|CONCERT_PRICES|FLIGHT_SEARCH|FLIGHT_PRICE|EIGHTSLEEP|FLIGHT|WEATHER|CALENDAR|PRODUCT|EMAIL_UNSUB|CART_ADD):\s*[^\]]*\]/gi, '').trim();
         if (!cleaned) return Promise.resolve();
         return adapter.sendMessage(recipientChatId, cleaned);
       },
@@ -2769,6 +2769,61 @@ async function _dispatchSignalMessage(msg, chatId, text, state) {
           }
         } catch (e) { console.warn(`[product-tag] plugin error: ${e.message}`); }
         result.text = (result.text || '').replace(productRe, '').trim();
+      }
+
+      // [CART_ADD:] tag — deterministic cart gate. Two actions:
+      //   action="propose" items="name1|url1,name2|url2" — store items in approval gate, show numbered list
+      //   action="add" ids="1,2" — add approved items to cart (requires prior propose + user confirmation)
+      // No "purchase" action exists — purchases are impossible by design.
+      const cartAddRe = /\[CART_ADD:\s*(.+?)\]/gi;
+      const cartAddMatches = [...(result.text || '').matchAll(cartAddRe)];
+      if (cartAddMatches.length > 0 && msg?.senderId) {
+        const approvalGate = require('./approval-gate');
+        for (const match of cartAddMatches) {
+          const raw = (match[1] || '').trim();
+          const params = {};
+          raw.replace(/(\w+)="([^"]+)"/g, (_, k, v) => { params[k] = v; });
+
+          if (params.action === 'propose' && params.items) {
+            const items = params.items.split(',').map(s => {
+              const [name, url] = s.split('|').map(p => p.trim());
+              return { label: name || 'Unknown item', meta: { name, url: url || '' } };
+            }).filter(i => i.meta.url);
+            if (items.length === 0) continue;
+            approvalGate.proposePending(msg.senderId, 'cart', items);
+            const lines = items.map((a, i) => `${i + 1}. ${a.label}`);
+            await signalAdapter.sendMessage(msg.chatId,
+              `🛒 **Add to cart?**\n${lines.join('\n')}\n\nTell me which ones (e.g. "add 1" or "add all").`
+            );
+          } else if (params.action === 'add') {
+            const idsRaw = params.ids || params.id || '';
+            const idsToProcess = [];
+            if (idsRaw === 'all') {
+              const pending = approvalGate.getPending(msg.senderId, 'cart');
+              if (pending) idsToProcess.push(...pending.map(p => p.id));
+            } else {
+              idsToProcess.push(...String(idsRaw).split(',').map(s => parseInt(s.trim(), 10)).filter(Boolean));
+            }
+            if (idsToProcess.length === 0) {
+              await signalAdapter.sendMessage(msg.chatId, 'No pending cart items. Browse products first.');
+              continue;
+            }
+            const results = [];
+            for (const id of idsToProcess) {
+              approvalGate.approvePending(msg.senderId, 'cart', id);
+              const approval = approvalGate.consumeApproval(msg.senderId, 'cart', m => {
+                const pending = approvalGate.getPending(msg.senderId, 'cart');
+                const item = pending?.find(p => p.id === id);
+                return item && m.url === item.meta.url;
+              });
+              if (!approval) { results.push(`⚠️ #${id}: not found`); continue; }
+              // Cart addition via Playwright would go here (v2 — requires active browser session)
+              results.push(`🛒 ${approval.name} — queued for cart (browser session required)`);
+            }
+            if (results.length) await signalAdapter.sendMessage(msg.chatId, results.join('\n'));
+          }
+        }
+        result.text = (result.text || '').replace(cartAddRe, '').trim();
       }
 
       // [WEATHER:] tag extraction — Open-Meteo forecast without Bash.

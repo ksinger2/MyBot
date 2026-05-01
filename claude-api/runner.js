@@ -911,7 +911,7 @@ class Runner {
                   // Strip ALL action tags from streamed output — users should
                   // never see raw tags. The post-result handler extracts them
                   // from the full accumulated text for processing.
-                  chunk = chunk.replace(/\[(LEARNED|IMAGINE|CALENDAR|WEATHER|PRODUCT|REMIND|REBUILD|EVENT|EVENT_JOIN|SET_PREF|UPDATE_NOTES|BACKGROUND|CONCERT_PRICES|FLIGHT_SEARCH|FLIGHT_PRICE|EIGHTSLEEP|NEEDS_AGENT|EMAIL_UNSUB)[:|\]][^\]]*\]?/gi, '').trim();
+                  chunk = chunk.replace(/\[(LEARNED|IMAGINE|CALENDAR|WEATHER|PRODUCT|REMIND|REBUILD|EVENT|EVENT_JOIN|SET_PREF|UPDATE_NOTES|BACKGROUND|CONCERT_PRICES|FLIGHT_SEARCH|FLIGHT_PRICE|EIGHTSLEEP|NEEDS_AGENT|EMAIL_UNSUB|CART_ADD)[:|\]][^\]]*\]?/gi, '').trim();
                   if (chunk.length > 0) {
                     streamedAny = true;
                     if (!channelState._sendQueue) channelState._sendQueue = Promise.resolve();

@@ -3,7 +3,7 @@ const assert = require('node:assert/strict');
 
 describe('Tag stripping', () => {
   // The streaming regex from runner.js — kept in sync here for regression testing
-  const STRIP_RE = /\[(LEARNED|IMAGINE|CALENDAR|WEATHER|PRODUCT|REMIND|REBUILD|EVENT|EVENT_JOIN|SET_PREF|UPDATE_NOTES|BACKGROUND|CONCERT_PRICES|FLIGHT_SEARCH|FLIGHT_PRICE|EIGHTSLEEP|NEEDS_AGENT|EMAIL_UNSUB)[:|\]][^\]]*\]?/gi;
+  const STRIP_RE = /\[(LEARNED|IMAGINE|CALENDAR|WEATHER|PRODUCT|REMIND|REBUILD|EVENT|EVENT_JOIN|SET_PREF|UPDATE_NOTES|BACKGROUND|CONCERT_PRICES|FLIGHT_SEARCH|FLIGHT_PRICE|EIGHTSLEEP|NEEDS_AGENT|EMAIL_UNSUB|CART_ADD)[:|\]][^\]]*\]?/gi;
 
   describe('strips action tags from streamed output', () => {
     const tags = [
@@ -20,6 +20,7 @@ describe('Tag stripping', () => {
       '[PRODUCT: wireless headphones]',
       '[EIGHTSLEEP: status]',
       '[EMAIL_UNSUB: action="suggest" days=30]',
+      '[CART_ADD: action="propose" items="Headphones|https://amazon.com/dp/123"]',
     ];
 
     for (const tag of tags) {

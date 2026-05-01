@@ -1,8 +1,8 @@
 {
   "mcpServers": {
     "playwright": {
-      "command": "npx",
-      "args": ["@playwright/mcp", "--headless", "--user-data-dir", "/app/data/browser-profile"]
+      "command": "node",
+      "args": ["/app/playwright-wrapper.js"]
     }
   }
 }
