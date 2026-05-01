@@ -130,6 +130,8 @@ services:
       - ${HOST_HOME:-/home/karen}/.claude.json:/home/node/.claude.json
       - ${HOST_HOME:-/home/karen}/.gitconfig:/home/node/.gitconfig:ro
       - /mnt/c/Users/karen/Desktop/Github Projects:/workspace
+      - /mnt/c/Users/karen/Desktop:/host/Desktop:ro
+      - /mnt/c/Users/karen/Downloads:/host/Downloads:ro
       - sandbox-data:/sandbox
       - /var/run/docker.sock:/var/run/docker.sock
       - bot-data:/app/data
@@ -150,14 +152,15 @@ services:
     # for the latest stable, update the tag, and `docker compose up -d --build signal-api`.
     image: bbernhard/signal-cli-rest-api:0.98
     restart: unless-stopped
-    labels:
-      - autoheal=true
+    # No autoheal label — signal-api's JVM takes 30-60s to start, and autoheal
+    # restarts trigger a stale /etc/group.lock crash loop. restart:unless-stopped
+    # handles actual crashes; the signal-watchdog in claude-api handles liveness.
     healthcheck:
-      test: ["CMD-SHELL", "wget -q -O /dev/null http://localhost:8080/v1/about || exit 1"]
+      test: ["CMD-SHELL", "curl -sf http://localhost:8080/v1/about > /dev/null || exit 1"]
       interval: 30s
       timeout: 10s
       retries: 3
-      start_period: 30s
+      start_period: 60s
     environment:
       # MODE=json-rpc runs signal-cli as a persistent daemon (one JVM, started once).
       # Per-call latency drops from seconds to milliseconds vs MODE=normal.

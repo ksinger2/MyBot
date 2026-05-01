@@ -131,7 +131,16 @@ function provisionAll() {
 function getSandboxUser(senderId) {
   if (!senderId) return null;
   const config = _load();
-  const entry = config[senderId];
+  let entry = config[senderId];
+  // If senderId is a UUID, try resolving to phone via the signal UUID map
+  if (!entry && !senderId.startsWith('+')) {
+    try {
+      const mapPath = path.join('/app/data', 'signal-uuid-phone.json');
+      const map = JSON.parse(fs.readFileSync(mapPath, 'utf8'));
+      const phone = map.byUuid?.[senderId]?.phone;
+      if (phone) entry = config[phone];
+    } catch {}
+  }
   if (!entry) return null;
 
   return {

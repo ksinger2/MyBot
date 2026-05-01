@@ -665,11 +665,27 @@ function askClaude(prompt, { sessionId = null, personalityFile = null, identity 
 
 async function runClaudeWithContinuation(prompt, opts, channelProxy) {
   let result = await askClaude(prompt, opts);
+
+  // Rate-limit retry: if the CLI was killed by Anthropic throttling, wait and
+  // resume the same session instead of dying. Up to 2 retries with 60s backoff.
+  const MAX_RATE_RETRIES = 2;
+  let rateRetries = 0;
+  while (result.rateLimited && rateRetries < MAX_RATE_RETRIES) {
+    rateRetries++;
+    const waitSec = 60 * rateRetries;
+    if (channelProxy) {
+      channelProxy.send(`⏳ Rate limited — waiting ${waitSec}s before retrying (${rateRetries}/${MAX_RATE_RETRIES})...`).catch(() => {});
+    }
+    await new Promise(r => setTimeout(r, waitSec * 1000));
+    result = await askClaude(
+      'Continue where you left off. The previous attempt was interrupted by a rate limit.',
+      { ...opts, sessionId: result.sessionId }
+    );
+  }
+
   let continueCount = 0;
   let totalCost = result.cost || 0;
   let totalTurns = result.numTurns || 0;
-  // Track streamed across all sub-runs — if ANY iteration streamed text, the
-  // caller should NOT re-send the final result text (it's already in the chat).
   let anyStreamed = !!result.streamed;
   const maxContinues = opts.channelState?.config?.maxContinues || MAX_AUTO_CONTINUES;
 
@@ -1391,6 +1407,15 @@ function startSignalAdapter() {
   const { buildProfileContext, getProfile } = require('./user-profiles');
 
   signalAdapter.on('message', async (msg) => {
+    // Resolve UUID→phone early so all downstream code uses a stable phone-based identity.
+    // Newer Signal clients omit sourceNumber, so msg.senderId may be a UUID.
+    if (msg.senderId && !msg.senderId.startsWith('+')) {
+      const resolved = signalAdapter._resolveRecipient(msg.senderId);
+      if (resolved && resolved.startsWith('+')) {
+        msg.senderId = resolved;
+      }
+    }
+
     // Access control — SECURITY (H1): fail-closed. Owner is ALWAYS allowed
     // (even if SIGNAL_ALLOWED_NUMBERS is empty), otherwise must be explicitly
     // listed. Group messages are allowed if the sender is in the allowlist.
@@ -1754,7 +1779,9 @@ function startSignalAdapter() {
           const combined = prev.map(e => e.content).join('\n');
           setImmediate(() => {
             state._triggeredByTimestamp = prev[prev.length - 1].msg?.timestamp;
-            _dispatchSignalMessage(prev[prev.length - 1].msg, prev[prev.length - 1].chatId, combined, state);
+            _dispatchSignalMessage(prev[prev.length - 1].msg, prev[prev.length - 1].chatId, combined, state).catch(err => {
+              console.error('[signal] dispatch error (flush):', err.message);
+            });
           });
         }
       }
@@ -1770,19 +1797,32 @@ function startSignalAdapter() {
         const combined = buf.map(e => e.content).join('\n');
         state._triggeredByTimestamp = buf[buf.length - 1].msg?.timestamp;
         state._isVoiceMessage = isVoiceMessage;
-        _dispatchSignalMessage(buf[buf.length - 1].msg, buf[buf.length - 1].chatId, combined, state);
+        _dispatchSignalMessage(buf[buf.length - 1].msg, buf[buf.length - 1].chatId, combined, state).catch(err => {
+          console.error('[signal] dispatch error (debounce):', err.message);
+        });
       }, MESSAGE_GROUP_DELAY_MS);
       return;
     }
     // Immediate path (ends with punctuation or long message)
     state._triggeredByTimestamp = msg.timestamp;
     state._isVoiceMessage = isVoiceMessage;
-    _dispatchSignalMessage(msg, chatId, text, state);
+    _dispatchSignalMessage(msg, chatId, text, state).catch(err => {
+      console.error('[signal] dispatch error (immediate):', err.message);
+    });
   });
 
   // Handle Signal emoji reactions — treat 👍/👎 as yes/no answers
-  signalAdapter.on('reaction', ({ chatId, senderId, emoji, targetTimestamp, isRemove }) => {
+  signalAdapter.on('reaction', ({ chatId, senderId: rawSenderId, emoji, targetTimestamp, isRemove }) => {
     if (isRemove) return; // ignore reaction removals
+
+    // Resolve UUID→phone for downstream profile/access control lookups
+    let senderId = rawSenderId;
+    if (senderId && !senderId.startsWith('+')) {
+      const resolved = signalAdapter._resolveRecipient(senderId);
+      if (resolved && resolved.startsWith('+')) {
+        senderId = resolved;
+      }
+    }
 
     // Strip skin-tone modifiers (U+1F3FB–1F3FF) so 👍🏼 matches 👍
     const baseEmoji = emoji.replace(/[\u{1F3FB}-\u{1F3FF}]/gu, '').trim();
@@ -1849,7 +1889,9 @@ function startSignalAdapter() {
       raw: null,
     };
     state._triggeredByTimestamp = syntheticMsg.timestamp;
-    _dispatchSignalMessage(syntheticMsg, chatId, syntheticText, state);
+    _dispatchSignalMessage(syntheticMsg, chatId, syntheticText, state).catch(err => {
+      console.error('[signal] dispatch error (reaction):', err.message);
+    });
   });
 
   // Handle "delete for everyone" in Signal — cancel queued/running task if triggered by this message
@@ -2013,7 +2055,9 @@ function startSignalAdapter() {
               mentions: [],
               timestamp: Date.now(),
             };
-            _dispatchSignalMessage(syntheticMsg, SIGNAL_OWNER, taskText, state);
+            _dispatchSignalMessage(syntheticMsg, SIGNAL_OWNER, taskText, state).catch(err => {
+              console.error('[signal] dispatch error (auto-resume):', err.message);
+            });
           } else {
             state.queue.push({ content: taskText, timestamp: Date.now() });
             saveChannelState(chatId, state);
@@ -2045,6 +2089,16 @@ function startSignalAdapter() {
 async function _dispatchSignalMessage(msg, chatId, text, state) {
   const { buildMinimalProfileContext, buildProfileLookup, buildProfileContext, getProfile } = require('./user-profiles');
   const { isSignalOwner } = require('./project-permissions');
+
+  // Resolve UUID→phone for downstream profile/calendar/preference lookups.
+  // This can be called directly (e.g., from !testas) with a UUID senderId.
+  if (msg.senderId && !msg.senderId.startsWith('+') && signalAdapter) {
+    const resolved = signalAdapter._resolveRecipient(msg.senderId);
+    if (resolved && resolved.startsWith('+')) {
+      msg.senderId = resolved;
+    }
+  }
+
   const isGroupMessage = msg.chatId !== msg.senderId;
   const senderIsOwner = isSignalOwner(msg.senderId);
   const personalityFile = getPersonalityFile(state.personality);
@@ -2061,12 +2115,14 @@ async function _dispatchSignalMessage(msg, chatId, text, state) {
   // Real Signal typing indicator (replaces the old "..." literal-message hack).
   // Signal typing dots auto-expire after a few seconds, so refresh on an interval
   // for the duration of Claude's run.
-  await signalAdapter.sendTyping(msg.chatId).catch(() => {});
-  const signalTypingInterval = setInterval(() => {
-    signalAdapter.sendTyping(msg.chatId).catch(() => {});
-  }, 8000);
-
+  // Moved inside try so failures don't leak busy=true / typing interval.
+  let signalTypingInterval;
   try {
+    await signalAdapter.sendTyping(msg.chatId).catch(() => {});
+    signalTypingInterval = setInterval(() => {
+      signalAdapter.sendTyping(msg.chatId).catch(() => {});
+    }, 8000);
+
     // Reset session inactivity timer — any message resets the 15-min clock
     _resetSessionInactivityTimer(state, chatId);
 
@@ -3091,9 +3147,11 @@ async function _dispatchSignalMessage(msg, chatId, text, state) {
       // [BACKGROUND:] tag — Bianca can kick off background tasks mid-conversation.
       // Format: [BACKGROUND: description | prompt to execute]
       // The description is shown to the user; the prompt runs as a separate Claude session.
+      // SECURITY (H2): only the owner in a DM can trigger background tasks.
+      // Same gate as [REBUILD] — non-owners and group chats strip the tag silently.
       const bgRe = /\[BACKGROUND:\s*(.+?)\]/gi;
       const bgMatches = [...(result.text || '').matchAll(bgRe)];
-      if (bgMatches.length > 0) {
+      if (bgMatches.length > 0 && senderIsOwner && !isGroupChat) {
         if (!state._bgTasks) state._bgTasks = new Map();
         for (const bgMatch of bgMatches) {
           const raw = bgMatch[1].trim();
@@ -3142,6 +3200,9 @@ async function _dispatchSignalMessage(msg, chatId, text, state) {
             }
           })();
         }
+        result.text = (result.text || '').replace(bgRe, '').trim();
+      } else if (bgMatches.length > 0) {
+        // Non-owner or group chat: strip tags silently without spawning sessions
         result.text = (result.text || '').replace(bgRe, '').trim();
       }
 
@@ -3377,4 +3438,4 @@ function start() {
   setTimeout(() => { startBot().catch(err => console.error('[startBot] fallback failed:', err.message)); }, 15000);
 }
 
-module.exports = { start, askClaude, runClaudeWithContinuation, getChannelState, getPersonalityFile, sendLongMessage, freshProgress, channels, signalAdapter, _tryUnlock, _isChannelElevated, _addKnownGroupMember };
+module.exports = { start, askClaude, runClaudeWithContinuation, getChannelState, getPersonalityFile, sendLongMessage, freshProgress, channels, signalAdapter, _tryUnlock, _isChannelElevated, _addKnownGroupMember, _dispatchSignalMessage };

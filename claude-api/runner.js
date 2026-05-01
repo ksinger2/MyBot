@@ -641,19 +641,29 @@ class Runner {
       // sandbox Linux user via runuser. This is deterministic — the OS
       // enforces it regardless of what Claude outputs or tries.
       let child;
-      if (this.sandboxUser && this.sandboxUser.uid) {
-        const sandboxLinuxUser = this.sandboxUser.linuxUser;
-        child = spawn('sudo', [
-          '-E', '/usr/bin/unshare', '--mount', '--',
-          '/bin/sh', '-c',
-          // Inside the mount namespace: hide /workspace, then drop to sandbox user
-          'mount -t tmpfs -o size=4k,mode=000 tmpfs /workspace && exec runuser -u ' + sandboxLinuxUser + ' -- "$@"',
-          'sandbox', // $0 placeholder for sh -c
-          'claude', ...args,
-        ], spawnOpts);
-      } else {
-        child = spawn('claude', args, spawnOpts);
+      try {
+        if (this.sandboxUser && this.sandboxUser.uid) {
+          const sandboxLinuxUser = this.sandboxUser.linuxUser;
+          child = spawn('sudo', [
+            '-E', '/usr/bin/unshare', '--mount', '--',
+            '/bin/sh', '-c',
+            // Inside the mount namespace: hide /workspace, then drop to sandbox user
+            'mount -t tmpfs -o size=4k,mode=000 tmpfs /workspace && exec runuser -u ' + sandboxLinuxUser + ' -- "$@"',
+            'sandbox', // $0 placeholder for sh -c
+            'claude', ...args,
+          ], spawnOpts);
+        } else {
+          child = spawn('claude', args, spawnOpts);
+        }
+      } catch (spawnErr) {
+        wrappedReject(spawnErr);
+        return;
       }
+
+      // Handle async spawn failures (e.g., ENOENT when binary not found)
+      child.on('error', (err) => {
+        wrappedReject(err);
+      });
 
       // Track the process so it can be killed
       if (channelState) {

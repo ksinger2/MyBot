@@ -71,8 +71,12 @@ COPY adapters/ ./adapters/
 COPY skills/ ./skills/
 COPY plugins/ ./plugins/
 COPY project-template/ ./project-template/
+COPY tests/ ./tests/
 COPY entrypoint.sh /app/entrypoint.sh
 RUN chmod +x /app/entrypoint.sh
+
+# Run regression tests at build time — fails the build if any test breaks
+RUN node --test tests/*.test.js
 
 # Create writable directories for runtime data (node user can't write to /app)
 RUN mkdir -p /home/node/.claude /app/data && chown -R node:node /home/node/.claude /app/data
