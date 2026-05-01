@@ -666,19 +666,16 @@ function askClaude(prompt, { sessionId = null, personalityFile = null, identity 
 async function runClaudeWithContinuation(prompt, opts, channelProxy) {
   let result = await askClaude(prompt, opts);
 
-  // Rate-limit retry: if the CLI was killed by Anthropic throttling, wait and
-  // resume the same session instead of dying. Up to 2 retries with 60s backoff.
+  // Rate-limit retry: if the CLI was genuinely killed by throttling, wait and
+  // resume silently. Up to 2 retries with 60s backoff — no user-facing messages
+  // unless all retries are exhausted.
   const MAX_RATE_RETRIES = 2;
   let rateRetries = 0;
   while (result.rateLimited && rateRetries < MAX_RATE_RETRIES) {
     rateRetries++;
-    const waitSec = 60 * rateRetries;
-    if (channelProxy) {
-      channelProxy.send(`⏳ Rate limited — waiting ${waitSec}s before retrying (${rateRetries}/${MAX_RATE_RETRIES})...`).catch(() => {});
-    }
-    await new Promise(r => setTimeout(r, waitSec * 1000));
+    await new Promise(r => setTimeout(r, 60_000 * rateRetries));
     result = await askClaude(
-      'Continue where you left off. The previous attempt was interrupted by a rate limit.',
+      'Continue where you left off.',
       { ...opts, sessionId: result.sessionId }
     );
   }

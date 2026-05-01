@@ -1101,15 +1101,9 @@ class Runner {
         }
 
         if (code !== 0) {
-          // Rate limit: only treat as fatal if the CLI died without producing
-          // a result. rate_limit_event is routine — the CLI retries internally
-          // and usually succeeds. Only surface to the user when it actually killed
-          // the session.
+          // Rate limit: only flag if the CLI died without a result. The retry
+          // logic in bot.js will wait and retry — no user-facing message here.
           if (hitRateLimit && !resultText && resultSubtype !== 'success') {
-            console.warn(`[rate-limit] CLI died from rate limiting (no result produced)`);
-            if (channelProxy) {
-              channelProxy.send('⏳ Hit Anthropic rate limit mid-task. Wait a minute and try again.').catch(() => {});
-            }
             return wrappedResolve({ text: '', sessionId: resultSessionId, cost: resultCost, numTurns: resultNumTurns, stopped: true, rateLimited: true });
           }
 
