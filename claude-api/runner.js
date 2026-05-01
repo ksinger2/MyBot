@@ -719,7 +719,6 @@ class Runner {
 
             if (event.type === 'rate_limit_event') {
               hitRateLimit = true;
-              console.warn(`[rate-limit] Hit Anthropic rate limit — will notify user on close`);
             }
 
             const parentId = event.parent_tool_use_id || null;
@@ -1102,9 +1101,12 @@ class Runner {
         }
 
         if (code !== 0) {
-          // Rate limit: CLI was cut off by Anthropic — notify user clearly.
-          if (hitRateLimit) {
-            console.warn(`[rate-limit] Process exited after rate limit event — notifying user`);
+          // Rate limit: only treat as fatal if the CLI died without producing
+          // a result. rate_limit_event is routine — the CLI retries internally
+          // and usually succeeds. Only surface to the user when it actually killed
+          // the session.
+          if (hitRateLimit && !resultText && resultSubtype !== 'success') {
+            console.warn(`[rate-limit] CLI died from rate limiting (no result produced)`);
             if (channelProxy) {
               channelProxy.send('⏳ Hit Anthropic rate limit mid-task. Wait a minute and try again.').catch(() => {});
             }
