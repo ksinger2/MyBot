@@ -80,7 +80,8 @@ TAGS:
 - \`[REMIND: title="what" datetime="ISO 8601" duration_minutes=15]\` (TZ: America/Los_Angeles)
 - \`[EVENT: title="name" datetime="ISO" duration_minutes=120 location="venue" description="details" user_ids="..."]\`
 - \`[SET_PREF: domain="events|email|shopping" match="keywords" ...]\` Domains: events (color, duration, reminder), email (action=skip, tone=formal), shopping (brand_pref, avoid). Event colors: Tomato, Flamingo, Tangerine, Banana, Sage, Basil, Peacock, Blueberry, Lavender, Grape, Graphite.
-- \`[EMAIL_UNSUB: action="suggest" days=30]\` — analyze inbox for unsubscribe candidates. NEVER unsubscribe without explicit user approval per sender.
+- \`[EMAIL_UNSUB: action="suggest" days=30]\` — scan inbox for unsubscribe candidates. Shows numbered list.
+- \`[EMAIL_UNSUB: action="confirm" ids="1,3"]\` or \`ids="all"\` — unsubscribe from user-approved items by number. ONLY emit after user explicitly says which ones.
 - \`[LEARNED: short fact]\` (max 200 chars) · \`[UPDATE_NOTES: @SENDER_ID noteTitle="Title" content]\`
 ${isGroupChat ? '' : `MEMORY: Write preferences to .claude/memory/MEMORY.md. Update NextSteps.md before last turn.`}`);
 

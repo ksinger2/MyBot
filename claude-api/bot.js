@@ -2876,7 +2876,8 @@ async function _dispatchSignalMessage(msg, chatId, text, state) {
 
       // [EMAIL_UNSUB:] tag — newsletter unsubscribe with deterministic approval gate.
       // action="suggest": analyze inbox, propose candidates, store in approval gate
-      // action="confirm": execute unsubscribe ONLY if server-side approval exists
+      // action="confirm" id=N|ids="1,2,3"|ids="all": approve + execute in one step (conversational)
+      // action="confirm" sender="x": execute by sender name (requires prior approval via !unsub yes)
       const emailUnsubRe = /\[EMAIL_UNSUB:\s*(.+?)\]/gi;
       const emailUnsubMatches = [...(result.text || '').matchAll(emailUnsubRe)];
       if (emailUnsubMatches.length > 0 && msg?.senderId) {
@@ -2892,7 +2893,7 @@ async function _dispatchSignalMessage(msg, chatId, text, state) {
               const { analyzeNewsletters } = require('./newsletter-analyzer');
               const candidates = await analyzeNewsletters(msg.senderId, params.days || 30);
               if (!candidates || candidates.length === 0) {
-                await signalAdapter.sendMessage(msg.chatId, 'No newsletter unsubscribe candidates found in your recent emails.');
+                await signalAdapter.sendMessage(msg.chatId, 'No newsletter unsubscribe candidates found.');
               } else {
                 const actions = candidates.slice(0, 10).map(c => ({
                   label: `${c.sender} (${c.count} emails, ${Math.round(c.unreadRate * 100)}% unread)`,
@@ -2901,33 +2902,63 @@ async function _dispatchSignalMessage(msg, chatId, text, state) {
                 approvalGate.proposePending(msg.senderId, 'unsub', actions);
                 const lines = actions.map((a, i) => `${i + 1}. ${a.label}`);
                 await signalAdapter.sendMessage(msg.chatId,
-                  `📧 **Unsubscribe candidates:**\n${lines.join('\n')}\n\nReply \`!unsub yes <number>\` to unsubscribe, or \`!unsub yes all\` for all. Expires in 2 hours.`
+                  `📧 **Unsubscribe candidates:**\n${lines.join('\n')}\n\nTell me which ones to unsubscribe from (e.g. "do 1 and 3" or "all of them").`
                 );
               }
             } catch (e) { console.warn(`[email-unsub] suggest error: ${e.message}`); }
-          } else if (params.action === 'confirm' && params.sender) {
-            const approval = approvalGate.consumeApproval(msg.senderId, 'unsub', m => m.sender === params.sender);
-            if (!approval) {
-              await signalAdapter.sendMessage(msg.chatId, `❌ No approved unsubscribe for ${params.sender}. Use \`!unsub yes <number>\` first.`);
-            } else {
+          } else if (params.action === 'confirm') {
+            // Resolve which IDs to process — supports id=N, ids="1,3,5", ids="all"
+            const idsToProcess = [];
+            if (params.ids === 'all' || params.id === 'all') {
+              const pending = approvalGate.getPending(msg.senderId, 'unsub');
+              if (pending) idsToProcess.push(...pending.map(p => p.id));
+            } else if (params.ids) {
+              idsToProcess.push(...String(params.ids).split(',').map(s => parseInt(s.trim(), 10)).filter(Boolean));
+            } else if (params.id) {
+              idsToProcess.push(typeof params.id === 'number' ? params.id : parseInt(params.id, 10));
+            } else if (params.sender) {
+              // Legacy: direct sender lookup (requires prior !unsub yes)
+              const approval = approvalGate.consumeApproval(msg.senderId, 'unsub', m => m.sender === params.sender);
+              if (approval) idsToProcess.push(-1); // sentinel — handled below
+            }
+
+            if (idsToProcess.length === 0) {
+              await signalAdapter.sendMessage(msg.chatId, 'No pending unsubscribe suggestions found. Ask me to scan your inbox first.');
+              continue;
+            }
+
+            // Approve + execute each ID
+            const { unsubscribe: doUnsub, getGmailClient } = require('./gmail-client');
+            const gmail = await getGmailClient(msg.senderId);
+            if (!gmail) {
+              await signalAdapter.sendMessage(msg.chatId, 'Gmail not connected. Use !connect first.');
+              continue;
+            }
+            const results = [];
+            for (const id of idsToProcess) {
+              // Approve and consume in one step
+              if (id > 0) approvalGate.approvePending(msg.senderId, 'unsub', id);
+              const pending = approvalGate.getPending(msg.senderId, 'unsub');
+              const item = id > 0 ? pending?.find(p => p.id === id) : null;
+              const approval = id > 0
+                ? approvalGate.consumeApproval(msg.senderId, 'unsub', m => item && m.sender === item.meta.sender)
+                : null; // sentinel case already consumed above
+              if (!approval && id > 0) { results.push(`⚠️ #${id}: not found`); continue; }
+              const sender = approval?.sender || params.sender;
+              const messageId = approval?.messageId || null;
+              if (!messageId) { results.push(`⚠️ ${sender}: no message ID`); continue; }
               try {
-                const { unsubscribe, getGmailClient } = require('./gmail-client');
-                const gmail = await getGmailClient(msg.senderId);
-                if (!gmail) throw new Error('Gmail not connected');
-                const res = await unsubscribe(gmail, approval.messageId);
-                const status = res.success ? `✅ Unsubscribed from ${params.sender} (${res.method}: ${res.detail})` : `⚠️ Could not unsubscribe from ${params.sender}: ${res.detail}`;
-                await signalAdapter.sendMessage(msg.chatId, status);
-                // Audit log
+                const res = await doUnsub(gmail, messageId);
+                results.push(res.success ? `✅ ${sender}` : `⚠️ ${sender}: ${res.detail}`);
                 try {
                   const auditPath = path.join('/app/data', 'unsub-audit.json');
-                  const audit = JSON.parse(fs.readFileSync(auditPath, 'utf8').toString() || '[]');
-                  audit.push({ ts: new Date().toISOString(), userId: msg.senderId, sender: params.sender, ...res });
+                  let audit = []; try { audit = JSON.parse(fs.readFileSync(auditPath, 'utf8')); } catch {}
+                  audit.push({ ts: new Date().toISOString(), userId: msg.senderId, sender, ...res });
                   fs.writeFileSync(auditPath, JSON.stringify(audit, null, 2));
                 } catch {}
-              } catch (e) {
-                await signalAdapter.sendMessage(msg.chatId, `❌ Unsubscribe failed: ${e.message}`);
-              }
+              } catch (e) { results.push(`❌ ${sender}: ${e.message}`); }
             }
+            if (results.length) await signalAdapter.sendMessage(msg.chatId, results.join('\n'));
           }
         }
         result.text = (result.text || '').replace(emailUnsubRe, '').trim();
