@@ -346,6 +346,12 @@ class ChannelProxy {
     // after the session ends — they can't be sent inline during streaming.
     const _strippedImagePaths = [];
 
+    // Group privacy state — set externally via proxy.setGroupChat() once
+    // the handler knows it's a group. Enables deterministic PII filtering
+    // on streamed text (not just post-session).
+    let _isGroupChat = false;
+    let _senderPhone = '';
+
     const proxy = new ChannelProxy({
       sendFn: (text) => {
         // Strip any image file paths before sending — they attach separately.
@@ -357,6 +363,18 @@ class ChannelProxy {
         // Strip all system tags before they reach the user (they get processed post-session)
         cleaned = cleaned.replace(/\[(IMAGINE|LEARNED|NOTE|RESOLVE_NOTE|UPDATE_NOTES|CONCERT_PRICES|FLIGHT_SEARCH|FLIGHT_PRICE|EIGHTSLEEP|FLIGHT|WEATHER|CALENDAR|PRODUCT|EMAIL_UNSUB|CART_ADD):\s*[^\]]*\]/gi, '').trim();
         if (!cleaned) return Promise.resolve();
+        // Deterministic group privacy filter — scrub PII from streamed text
+        if (_isGroupChat) {
+          try {
+            const { filterGroupOutput } = require('./group-privacy-filter');
+            const { text: filtered, redactions } = filterGroupOutput(cleaned, { senderPhone: _senderPhone });
+            if (redactions.length > 0) {
+              console.warn(`[group-privacy-stream] Redacted: ${redactions.join(', ')}`);
+            }
+            cleaned = filtered;
+          } catch {}
+          if (!cleaned) return Promise.resolve();
+        }
         return adapter.sendMessage(recipientChatId, cleaned);
       },
       typingFn: () => Promise.resolve(),
@@ -366,6 +384,10 @@ class ChannelProxy {
 
     // Expose collected paths so the signal handler can send them as attachments
     proxy.strippedImagePaths = _strippedImagePaths;
+    proxy.setGroupChat = (isGroup, senderPhone) => {
+      _isGroupChat = !!isGroup;
+      _senderPhone = senderPhone || '';
+    };
     return proxy;
   }
 }
@@ -2150,6 +2172,7 @@ async function _dispatchSignalMessage(msg, chatId, text, state) {
     saveChannelState(chatId, state, { critical: true });
 
       const signalProxy = ChannelProxy.fromSignal(signalAdapter, msg.chatId);
+      signalProxy.setGroupChat(isGroupMessage, msg.senderId);
 
       // Build profile context. DMs use minimal profile + heuristic on-demand
       // data injection. Groups use the existing stripped path.
@@ -3292,6 +3315,20 @@ async function _dispatchSignalMessage(msg, chatId, text, state) {
         result.text = (result.text || '').replace(eightSleepRe, '').trim();
       }
 
+      // [NEEDS_AGENT] tag — non-owner/read-only mode escalation signal.
+      // When Claude determines it can't fulfill a request with read-only tools,
+      // it emits [NEEDS_AGENT]. Instead of silently dropping it, we inform the
+      // user deterministically so they know the limitation is real.
+      const needsAgentRe = /\[NEEDS_AGENT\]/gi;
+      if (needsAgentRe.test(result.text || '') && !senderIsOwner) {
+        const escalationMsg = "That request needs capabilities I don't have in this mode (browsing, code execution, or multi-step research). Ask the owner to handle it, or try rephrasing as a simpler question.";
+        await signalAdapter.sendMessage(msg.chatId, escalationMsg).catch(() => {});
+        console.log(`[needs-agent] Escalation triggered for ${_redactId(msg.senderId)}`);
+        result.text = (result.text || '').replace(needsAgentRe, '').trim();
+      } else {
+        result.text = (result.text || '').replace(needsAgentRe, '').trim();
+      }
+
       // [BACKGROUND:] tag — Bianca can kick off background tasks mid-conversation.
       // Format: [BACKGROUND: description | prompt to execute]
       // The description is shown to the user; the prompt runs as a separate Claude session.
@@ -3414,6 +3451,23 @@ async function _dispatchSignalMessage(msg, chatId, text, state) {
           result.text = stripFlightTags(result.text);
         } catch (e) {
           console.warn(`[flight-tracker] extraction failed: ${e.message}`);
+        }
+      }
+
+      // GROUP PRIVACY FILTER (deterministic safety net): scrub phone numbers
+      // and emails from Claude's response in group chats. The system prompt
+      // tells Claude not to share PII, but that's non-deterministic — this
+      // filter catches anything that slips through.
+      if (isGroupChat && result.text) {
+        try {
+          const { filterGroupOutput } = require('./group-privacy-filter');
+          const { text: filtered, redactions } = filterGroupOutput(result.text, { senderPhone: msg.senderId });
+          if (redactions.length > 0) {
+            console.warn(`[group-privacy] Redacted ${redactions.length} item(s) from response: ${redactions.join(', ')}`);
+            result.text = filtered;
+          }
+        } catch (e) {
+          console.warn(`[group-privacy] filter error: ${e.message}`);
         }
       }
 

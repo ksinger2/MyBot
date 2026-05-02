@@ -6,7 +6,7 @@
 - Signal UUID→phone resolution across entire pipeline (sandbox, profiles, reactions, dispatch)
 - Semaphore slot leak protection (try/catch on spawn, .catch() on all dispatch call sites)
 - [BACKGROUND] and [REBUILD] tag security gates (owner-only)
-- 105 regression tests run at Docker build time (approval gate, tags, UUID, security, semaphore, greeting)
+- 150 regression tests run at Docker build time (approval gate, tags, UUID, security, semaphore, greeting, privacy, intents)
 - Browser automation via Playwright MCP with persistent profile (`/app/data/browser-profile`)
 - Deterministic purchase prevention: Playwright wrapper blocks checkout/payment URLs at JSON-RPC level
 - Newsletter unsubscribe analysis + conversational approval flow (`[EMAIL_UNSUB:]` tag + approval gate)
@@ -16,6 +16,10 @@
 - `!unsub scan/yes/list/clear` command as power-user shortcut
 - `!testas` command for owner to impersonate sandbox users
 - Signal-api healthcheck fixed (wget→curl), autoheal removed from signal-api
+- **Deterministic group privacy filter** — post-processing scrubs phone numbers/emails from group chat output (safety net on top of prompt rules)
+- **Intent detection hints** for IMAGINE, REMIND, EIGHTSLEEP — server-side regex injects `<system-hint>` tags so Claude reliably emits the correct action tag
+- **[NEEDS_AGENT] handler** — non-owner users get a deterministic "can't do that" response instead of silent tag stripping
+- **Streaming privacy filter** — group privacy redaction applies to streamed chunks, not just final text
 
 ## What's Broken / In Progress
 - Amazon cart execution is stubbed — approval gate works but Playwright add-to-cart automation not yet wired (needs active browser session with login)

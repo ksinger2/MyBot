@@ -22,6 +22,16 @@ const CALENDAR_INTENT = /\b(schedul|calendar|plans?|planned|free|busy|avail|appo
 
 const WEATHER_INTENT = /\b(weather|forecast|rain|snow|cold|hot|warm|temperature|degrees|sunny|cloudy|storm|wind|humid|outside|umbrella|jacket|coat|should i wear|what('s| is) it (like|gonna be)|how('s| is) (the weather|it outside)|will it)\b/i;
 
+// ── Action intent detection — injects hints so Claude reliably emits the right tag ──
+// These don't pre-fetch data (you can't pre-generate an image), but they inject
+// a system hint that makes tag emission near-certain instead of hoping Claude remembers.
+
+const IMAGINE_INTENT = /\b(draw|sketch|paint|illustrate|generate|create|make|design)\s+(me\s+)?(a |an |the |some )?(picture|image|photo|illustration|drawing|sketch|art|portrait|poster|meme|diagram|logo|icon|graphic|render|visual|avatar|selfie)\b|\b(draw|sketch|paint|illustrate)\s+(me|us)\b|\b(imagine|visualize|depict|show me)\b.*\b(image|picture|drawing|visual|what .* looks like)\b|\b(picture of|image of|photo of|drawing of|illustration of)\b/i;
+
+const REMIND_INTENT = /\b(remind|reminder|alert)\s+(me|us)\b|\bdon'?t (let me )?forget\b|\bset (a |an )?(reminder|alarm|timer)\b|\bremind .* (at|in|on|tomorrow|tonight|later|morning|evening|afternoon)\b/i;
+
+const EIGHTSLEEP_INTENT = /\b(bed|eight\s*sleep|eightsleep|mattress|pod|side)\b.*\b(on|off|warm|cool|cold|hot|temperature|temp|status|level|set|turn|switch)\b|\b(turn|switch)\s+(on|off|up|down)\s+(my\s+|the\s+)?(bed|mattress|pod|side)\b|\bhow\s+(warm|cool|cold|hot)\s+is\s+(my\s+)?(bed|mattress|side|pod)\b|\bhow('s| is) (my )?(bed|mattress|side|pod)\b|\bmake\s+(my\s+)?(bed|side|pod)\s+(warm|cool|cold|hot|cooler|warmer)\b/i;
+
 // Date range extraction from natural language
 function _extractDateRange(text) {
   const now = new Date();
@@ -189,9 +199,28 @@ async function enrichWithContext(text, senderId, isGroupChat) {
     }
   }
 
+  // ── Action intent hints — nudge Claude to emit the correct tag ──
+  // These are injected as system context so Claude doesn't have to "remember"
+  // the tag syntax from the system prompt. The hint makes tag emission near-certain.
+
+  if (IMAGINE_INTENT.test(text)) {
+    parts.push(`<system-hint type="image-generation">The user wants an image generated. You MUST emit an [IMAGINE: detailed description] tag. Do NOT describe what you would draw — emit the tag so the image is actually created.</system-hint>`);
+    console.log(`[auto-context] IMAGINE intent detected`);
+  }
+
+  if (REMIND_INTENT.test(text)) {
+    parts.push(`<system-hint type="reminder">The user wants a reminder set. You MUST emit a [REMIND: title="what" datetime="ISO 8601" duration_minutes=15] tag with America/Los_Angeles timezone. Parse the time from their message.</system-hint>`);
+    console.log(`[auto-context] REMIND intent detected`);
+  }
+
+  if (EIGHTSLEEP_INTENT.test(text)) {
+    parts.push(`<system-hint type="eightsleep">The user wants to control their Eight Sleep bed. You MUST emit an [EIGHTSLEEP: action side] tag. Actions: status, set <level>, on, off. Sides: left, right, my.</system-hint>`);
+    console.log(`[auto-context] EIGHTSLEEP intent detected`);
+  }
+
   if (parts.length === 0) return '';
 
   return parts.join('\n\n') + '\n\n';
 }
 
-module.exports = { enrichWithContext, CALENDAR_INTENT, WEATHER_INTENT };
+module.exports = { enrichWithContext, CALENDAR_INTENT, WEATHER_INTENT, IMAGINE_INTENT, REMIND_INTENT, EIGHTSLEEP_INTENT };
