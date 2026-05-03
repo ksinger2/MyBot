@@ -660,13 +660,14 @@ app.post('/voice', requireVoiceAccess, voiceRateLimit, async (req, res) => {
   try {
     const { askClaude, getChannelState, getPersonalityFile, signalAdapter } = require('./bot');
     const { SIGNAL_OWNER } = require('./project-permissions');
-    const { buildMinimalProfileContext, buildProfileLookup } = require('./user-profiles');
+    const { buildMinimalProfileContext, buildProfileLookup, getProfile } = require('./user-profiles');
 
     // Use the owner's Signal DM channel state for identity + personality
     const chatId = `signal:${SIGNAL_OWNER}`;
     const state = getChannelState(chatId);
     const personalityFile = getPersonalityFile(state.personality || 'tiffany_pollard');
     let profileContext = buildMinimalProfileContext(SIGNAL_OWNER) || '';
+    const _voiceProfile = getProfile(SIGNAL_OWNER);
 
     // Heuristic: inject heavy profile data when the message needs it
     const lowerText = text.toLowerCase();
@@ -701,6 +702,7 @@ app.post('/voice', requireVoiceAccess, voiceRateLimit, async (req, res) => {
       isVoice: true,
       isOwner: true,
       ownerDmMode: true,
+      userTimezone: _voiceProfile?.timezone || null,
     });
 
     // Race against Siri's ~30s timeout

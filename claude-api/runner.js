@@ -373,6 +373,9 @@ class Runner {
     isOwner = false,
     // Per-user sandbox config — { name, cwd, allowedTools, linuxUser, uid }
     sandboxUser = null,
+    // IANA timezone for the user (e.g. "America/New_York"). Deterministic —
+    // extracted from the user profile server-side, never from prompt.
+    userTimezone = null,
     // Recent messages context for conversation continuity
     recentMessages = null,
     // Injected from bot.js so runner doesn't need to import bot.js:
@@ -404,6 +407,7 @@ class Runner {
     this.isVoice = isVoice;
     this.isOwner = isOwner || ownerDmMode; // ownerDmMode implies isOwner
     this.sandboxUser = sandboxUser;
+    this.userTimezone = userTimezone || 'America/New_York';
     this.recentMessages = recentMessages;
     // Use injected functions or local fallbacks
     this._freshProgress = freshProgressFn || freshProgress;
@@ -441,17 +445,22 @@ class Runner {
 
       // Auto-load project context on new sessions
       let effectivePrompt = prompt;
+
+      // Date/time is ALWAYS injected — even on session resume. Without this,
+      // Claude hallucinates the date from training data or stale session context.
+      let _dateTimePrefix = '';
+      try {
+        const tz = this.userTimezone;
+        const now = new Date();
+        const dateStr = now.toLocaleDateString('en-US', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric', timeZone: tz });
+        const timeStr = now.toLocaleTimeString('en-US', { timeZone: tz, hour: '2-digit', minute: '2-digit' });
+        _dateTimePrefix = `[Current date/time — ${tz}]: ${dateStr}, ${timeStr}`;
+      } catch {}
+
       if (!sessionId) {
         const contextParts = [];
+        if (_dateTimePrefix) contextParts.push(_dateTimePrefix);
 
-        // Inject date/time here (not in system prompt) so the system prompt stays
-        // static and cache-friendly. This is the only place date/time appears.
-        try {
-          const now = new Date();
-          const dateStr = now.toLocaleDateString('en-US', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric', timeZone: 'America/Los_Angeles' });
-          const timeStr = now.toLocaleTimeString('en-US', { timeZone: 'America/Los_Angeles', hour: '2-digit', minute: '2-digit' });
-          contextParts.push(`[Current date/time — America/Los_Angeles]: ${dateStr}, ${timeStr}`);
-        } catch {}
         // Skip CLAUDE.md and NextSteps.md for clearly casual prompts (saves ~750+
         // tokens). Uses a negative heuristic: skip for known-casual patterns,
         // inject for everything else. This avoids false negatives on engineering
@@ -533,6 +542,9 @@ class Runner {
         if (contextParts.length > 0) {
           effectivePrompt = contextParts.join('\n\n') + `\n\n[Current request]:\n${prompt}`;
         }
+      } else if (_dateTimePrefix) {
+        // Session resume — still prepend current date/time so Claude never guesses
+        effectivePrompt = `${_dateTimePrefix}\n\n${prompt}`;
       }
 
       // Build CLI args

@@ -76,6 +76,7 @@ class SDKRunner {
     this.isVoice = opts.isVoice || false;
     this.isOwner = opts.isOwner || opts.ownerDmMode || false;
     this.sandboxUser = opts.sandboxUser || null;
+    this.userTimezone = opts.userTimezone || 'America/New_York';
     this.recentMessages = opts.recentMessages || null;
     this._freshProgress = opts.freshProgressFn || freshProgress;
     this._saveChannelState = opts.saveChannelStateFn || (() => {});
@@ -104,14 +105,20 @@ class SDKRunner {
 
     // Build effective prompt with context injection (same logic as runner.js)
     let effectivePrompt = prompt;
+
+    // Date/time is ALWAYS injected — even on session resume.
+    let _dateTimePrefix = '';
+    try {
+      const tz = this.userTimezone;
+      const now = new Date();
+      const dateStr = now.toLocaleDateString('en-US', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric', timeZone: tz });
+      const timeStr = now.toLocaleTimeString('en-US', { timeZone: tz, hour: '2-digit', minute: '2-digit' });
+      _dateTimePrefix = `[Current date/time — ${tz}]: ${dateStr}, ${timeStr}`;
+    } catch {}
+
     if (!sessionId) {
       const contextParts = [];
-      try {
-        const now = new Date();
-        const dateStr = now.toLocaleDateString('en-US', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric', timeZone: 'America/Los_Angeles' });
-        const timeStr = now.toLocaleTimeString('en-US', { timeZone: 'America/Los_Angeles', hour: '2-digit', minute: '2-digit' });
-        contextParts.push(`[Current date/time — America/Los_Angeles]: ${dateStr}, ${timeStr}`);
-      } catch {}
+      if (_dateTimePrefix) contextParts.push(_dateTimePrefix);
 
       const lowerPrompt = prompt.toLowerCase();
       const isCasual = !lowerPrompt.startsWith('!')
@@ -179,6 +186,8 @@ class SDKRunner {
       if (contextParts.length > 0) {
         effectivePrompt = contextParts.join('\n\n') + `\n\n[Current request]:\n${prompt}`;
       }
+    } else if (_dateTimePrefix) {
+      effectivePrompt = `${_dateTimePrefix}\n\n${prompt}`;
     }
 
     // Build system prompt

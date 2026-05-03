@@ -33,9 +33,9 @@ const REMIND_INTENT = /\b(remind|reminder|alert)\s+(me|us)\b|\bdon'?t (let me )?
 const EIGHTSLEEP_INTENT = /\b(bed|eight\s*sleep|eightsleep|mattress|pod|side)\b.*\b(on|off|warm|cool|cold|hot|temperature|temp|status|level|set|turn|switch)\b|\b(turn|switch)\s+(on|off|up|down)\s+(my\s+|the\s+)?(bed|mattress|pod|side)\b|\bhow\s+(warm|cool|cold|hot)\s+is\s+(my\s+)?(bed|mattress|side|pod)\b|\bhow('s| is) (my )?(bed|mattress|side|pod)\b|\bmake\s+(my\s+)?(bed|side|pod)\s+(warm|cool|cold|hot|cooler|warmer)\b/i;
 
 // Date range extraction from natural language
-function _extractDateRange(text) {
+function _extractDateRange(text, timezone = 'America/New_York') {
   const now = new Date();
-  const today = new Date(now.toLocaleString('en-US', { timeZone: 'America/Los_Angeles' }));
+  const today = new Date(now.toLocaleString('en-US', { timeZone: timezone }));
   const todayStr = _fmt(today);
 
   const lower = text.toLowerCase();
@@ -175,10 +175,12 @@ async function enrichWithContext(text, senderId, isGroupChat) {
   const profile = getProfile(senderId);
   const parts = [];
 
+  const _tz = profile?.timezone || 'America/New_York';
+
   // Calendar auto-fetch
   if (CALENDAR_INTENT.test(text)) {
     if (profile && profile.gcal_connected) {
-      const dateRange = _extractDateRange(text);
+      const dateRange = _extractDateRange(text, _tz);
       const calData = await _fetchCalendar(senderId, dateRange, isGroupChat);
       if (calData && calData.text) {
         parts.push(`<calendar-data source="auto-fetched" range="${dateRange.from} to ${dateRange.to}">\n${calData.text}\n</calendar-data>`);
@@ -209,7 +211,7 @@ async function enrichWithContext(text, senderId, isGroupChat) {
   }
 
   if (REMIND_INTENT.test(text)) {
-    parts.push(`<system-hint type="reminder">The user wants a reminder set. You MUST emit a [REMIND: title="what" datetime="ISO 8601" duration_minutes=15] tag with America/Los_Angeles timezone. Parse the time from their message.</system-hint>`);
+    parts.push(`<system-hint type="reminder">The user wants a reminder set. You MUST emit a [REMIND: title="what" datetime="ISO 8601" duration_minutes=15] tag with ${_tz} timezone. Parse the time from their message.</system-hint>`);
     console.log(`[auto-context] REMIND intent detected`);
   }
 

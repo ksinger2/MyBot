@@ -669,12 +669,12 @@ function listPersonalities() {
     .map(f => f.replace('.md', ''));
 }
 
-function askClaude(prompt, { sessionId = null, personalityFile = null, identity = null, cwd = DEFAULT_WORKSPACE, maxTurns = null, channelState = null, channelProxy = null, discordUserId = null, readOnly = false, groupAllowedTools = undefined, profileContext = null, streamReplies = false, model = 'sonnet', ownerDmMode = false, planMode = false, isVoice = false, isOwner = false, recentMessages = null } = {}) {
+function askClaude(prompt, { sessionId = null, personalityFile = null, identity = null, cwd = DEFAULT_WORKSPACE, maxTurns = null, channelState = null, channelProxy = null, discordUserId = null, readOnly = false, groupAllowedTools = undefined, profileContext = null, streamReplies = false, model = 'sonnet', ownerDmMode = false, planMode = false, isVoice = false, isOwner = false, recentMessages = null, userTimezone = null } = {}) {
   const runnerOpts = {
     sessionId, personalityFile, identity, cwd, maxTurns,
     channelState, channelProxy, discordUserId, readOnly,
     groupAllowedTools, profileContext, streamReplies, model, ownerDmMode, planMode, isVoice,
-    isOwner, recentMessages,
+    isOwner, recentMessages, userTimezone,
     freshProgressFn: freshProgress,
     saveChannelStateFn: saveChannelState,
     flushPendingWritesFn: flushPendingWrites,
@@ -1236,6 +1236,7 @@ async function processQueue(state) {
     state.progress = freshProgress();
 
     let result;
+    const _qProfile = require('./user-profiles').getProfile(signalChatId);
     const queueOpts = {
       sessionId: state.sessionId,
       personalityFile,
@@ -1249,6 +1250,7 @@ async function processQueue(state) {
       streamReplies: true,
       readOnly: false,
       groupAllowedTools: isGroupChatQ ? 'Read,WebSearch,WebFetch,Task,TodoWrite' : undefined,
+      userTimezone: _qProfile?.timezone || null,
     };
     try {
       result = await runClaudeWithContinuation(combined, queueOpts, null);
@@ -1453,8 +1455,13 @@ function startSignalAdapter() {
       if (_rawEnv?.sourceUuid) _addKnownGroupMember(_rawEnv.sourceUuid);
       if (_rawEnv?.sourceNumber) _addKnownGroupMember(_rawEnv.sourceNumber);
     }
+    // Sandbox users (e.g. Merrisa, Daniel) are implicitly allowed to DM —
+    // having a sandbox entry IS the allowlist for outsiders.
+    let _sandboxAllowed = false;
+    try { _sandboxAllowed = !!require('./sandbox').getSandboxUser(msg.senderId); } catch {}
     const senderAllowed = isSignalOwner(msg.senderId) || isGroupMessage
-      || allowedNumbers.has(msg.senderId) || _knownGroupMembers.has(msg.senderId);
+      || allowedNumbers.has(msg.senderId) || _knownGroupMembers.has(msg.senderId)
+      || _sandboxAllowed;
     if (!senderAllowed) {
       console.log(`[signal] blocked DM from non-allowlisted sender ${_redactId(msg.senderId)}`);
       return;
@@ -2381,6 +2388,10 @@ async function _dispatchSignalMessage(msg, chatId, text, state) {
         console.log(`[sandbox] ${_redactId(msg.senderId)} matched sandbox: ${sandboxUser.name} (${sandboxUser.cwd})`);
       }
 
+      // Deterministic timezone: extracted from user profile, never from prompt.
+      const _senderProfile = getProfile(msg.senderId);
+      const _userTimezone = _senderProfile?.timezone || null;
+
       const claudeOpts = {
         sessionId: isGroupChat ? null : state.sessionId,
         personalityFile,
@@ -2405,6 +2416,7 @@ async function _dispatchSignalMessage(msg, chatId, text, state) {
         planMode,
         isOwner: senderIsOwner,
         sandboxUser,
+        userTimezone: _userTimezone,
         // Pass recent messages for conversation context persistence
         recentMessages: state.recentMessages || [],
         // Model selection.
