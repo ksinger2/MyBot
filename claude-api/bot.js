@@ -1216,27 +1216,6 @@ async function resumeChannel(channelId, savedState) {
   const task = savedState.activeTask;
   const state = getChannel(channelId);
 
-  // Build the restart notification message.
-  function buildRestartMessage() {
-    const wantsNotice = savedState.wantsRestartNotification;
-    const queueLen = (savedState.pendingQueue || []).length;
-    const taskSummary = task?.prompt ? task.prompt.substring(0, 100) : null;
-    const summary =
-      taskSummary ||
-      wantsNotice?.summary ||
-      (queueLen > 0 ? `${queueLen} queued message${queueLen === 1 ? '' : 's'}` : null);
-
-    if (wantsNotice?.reason === 'rebuild') {
-      return summary
-        ? `Back online — I just rebuilt myself. Mid-rebuild I was working on: "${summary}". If anything you sent didn't get answered, resend it now.`
-        : `Back online — I just rebuilt myself. If anything you sent didn't get answered, resend it now.`;
-    }
-    return summary
-      ? `I'm back from an unexpected restart. I was working on: "${summary}" — that got interrupted. Resend if you still need it.`
-      : `I'm back from an unexpected restart. Anything you sent in the last few minutes may have been dropped — resend if you still need it.`;
-  }
-
-  // Signal-only: every channelId we persist is prefixed `signal:`.
   if (!channelId.startsWith('signal:')) {
     console.warn(`[auto-resume] Skipping non-signal channelId ${channelId}`);
     return;
@@ -1248,14 +1227,51 @@ async function resumeChannel(channelId, savedState) {
   state.wantsRestartNotification = null;
   saveChannelState(channelId, state, { critical: true });
 
-  if (signalAdapter && signalAdapter.ready) {
-    signalAdapter.sendMessage(signalChatId, buildRestartMessage()).catch(err => {
-      console.warn(`[auto-resume] Could not notify Signal channel ${channelId}: ${err.message}`);
-    });
-    console.log(`[auto-resume] Notified Signal channel ${channelId} of restart`);
-  } else {
-    console.log(`[auto-resume] Signal adapter not ready, skipping notification for ${channelId}`);
+  if (!signalAdapter || !signalAdapter.ready) {
+    console.log(`[auto-resume] Signal adapter not ready, skipping for ${channelId}`);
+    return;
   }
+
+  // If we have an activeTask with a prompt, auto-retry it instead of just notifying
+  if (task?.prompt && task.senderId) {
+    const maxRetries = 2;
+    const attempts = (task.resumeAttempts || 0) + 1;
+    if (attempts > maxRetries) {
+      console.log(`[auto-resume] Max retries (${maxRetries}) reached for ${channelId}, notifying instead`);
+      await signalAdapter.sendMessage(signalChatId,
+        `I restarted and couldn't finish: "${task.prompt.substring(0, 100)}". Resend if you still need it.`
+      ).catch(() => {});
+      return;
+    }
+
+    console.log(`[auto-resume] Auto-retrying task in ${channelId} (attempt ${attempts}/${maxRetries}): ${task.prompt.substring(0, 80)}`);
+    await signalAdapter.sendMessage(signalChatId,
+      `⚡ Restarted mid-task — auto-resuming: "${task.prompt.substring(0, 100)}"`
+    ).catch(() => {});
+
+    const syntheticMsg = {
+      chatId: signalChatId,
+      senderId: task.senderId,
+      senderName: task.senderName || task.senderId,
+      text: task.prompt,
+      attachments: [],
+      mentions: [],
+      timestamp: Date.now(),
+    };
+    _dispatchSignalMessage(syntheticMsg, signalChatId, task.prompt, state).catch(err => {
+      console.error(`[auto-resume] Dispatch failed for ${channelId}:`, err.message);
+    });
+    return;
+  }
+
+  // No task to retry — just notify
+  const queueLen = (savedState.pendingQueue || []).length;
+  const summary = task?.prompt?.substring(0, 100) || (queueLen > 0 ? `${queueLen} queued message(s)` : null);
+  const msg = summary
+    ? `I'm back from a restart. I was working on: "${summary}" — that got interrupted. Resend if you still need it.`
+    : `I'm back from a restart. Anything you sent recently may have been dropped — resend if needed.`;
+  await signalAdapter.sendMessage(signalChatId, msg).catch(() => {});
+  console.log(`[auto-resume] Notified Signal channel ${channelId} of restart`);
 }
 
 // Signal-only: drain any queued messages for this channel state.
@@ -2246,6 +2262,8 @@ async function _dispatchSignalMessage(msg, chatId, text, state) {
     state.activeTask = {
       prompt: text.substring(0, 500),
       channelId: chatId,
+      senderId: msg.senderId,
+      senderName: msg.senderName || msg.senderId,
       startedAt: new Date().toISOString(),
       resumeAttempts: 0,
     };

@@ -9,8 +9,9 @@
 - SessionId flush is now immediate (`critical: true`) — survives stall kills and container restarts
 - `--effort medium` for non-owner chats caps thinking depth; owner DM gets `--effort high`
 - Auto-continue enabled for sandbox group chats (was previously disabled for all groups)
-- Cloudflare env vars ($CLOUDFLARE_API_TOKEN, $CLOUDFLARE_ACCOUNT_ID) wired into container AND CLI child process spawn env + deterministic system prompt hints
-- Cloudflare API token updated to correct format (was `cfk_...` which is invalid; replaced with proper API Token from dashboard)
+- Cloudflare env vars wired into container AND CLI child process spawn env + deterministic system prompt hints
+- Workspace audit (`!audit <minutes>`) — periodic cross-workspace bug finder; spawns parallel Claude sessions per sandbox project, checks builds/tests/security, auto-fixes issues, reports to owner DM
+- Auto-resume after rebuild — interrupted tasks auto-retry via synthetic message dispatch (max 2 attempts, then falls back to notify); activeTask now stores senderId for correct dispatch context
 - Security hardening (from Bianca's session): unlock rate limiting, owner output filter, encrypted group members, enhanced secret scrubbing (JSON patterns), path traversal containment
 - Deterministic date/time injection, user timezone from profile, auto-context date ranges
 - Sandbox users can DM Bianca without being on the Signal allowlist
@@ -18,12 +19,12 @@
 
 ## What's Broken / In Progress
 <!-- Active issues, blockers, half-done work -->
-- Bianca's partial fixes in bot.js (+160 lines) include security hardening, graceful shutdown improvements, and coding mode enhancements — committed but not individually tested
+- Daniel's app migration to daniel.backtoirl.com via Cloudflare Pages — in progress
 - Many files still hardcode America/Los_Angeles (briefings, calendar-cli, rss-fetcher, media-pulse, schedules-storage)
 - system-prompt.js still mentions America/Los_Angeles in the REMIND tag syntax line (low priority)
-- Daniel's app migration to daniel.backtoirl.com via Cloudflare Pages — in progress, Bianca deploying with corrected token
 
 ## Next Steps
 <!-- Prioritized — what to pick up next -->
-- Verify Bianca successfully deploys Daniel's app to daniel.backtoirl.com with the corrected Cloudflare token
+- Verify Daniel's Cloudflare deployment completes successfully
+- Test `!audit now` end-to-end from owner DM
 - Clean up remaining hardcoded America/Los_Angeles references in non-critical paths
