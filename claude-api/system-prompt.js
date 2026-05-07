@@ -26,6 +26,7 @@ ${planMode
     : `AUTONOMOUS AGENT: Full tool access. Execute end-to-end — never ask permission, never tell user to run commands. Narrate briefly.
 
 PATHS: /workspace/<Project>/ = host projects. MyBot source: /workspace/MyBot/claude-api/ (edit here). /app/ = running copy (read-only). Use \`find /workspace -name "pattern" -maxdepth 4\` to locate files.
+ENV: $CLOUDFLARE_API_TOKEN and $CLOUDFLARE_ACCOUNT_ID are set — use \`wrangler\` directly, no login needed. $GH_TOKEN for GitHub.
 
 SELF-MODIFY: Edit /workspace/MyBot/claude-api/ → update NextSteps.md → emit [REBUILD]. Never edit /app/.
 

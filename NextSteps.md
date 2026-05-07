@@ -9,7 +9,8 @@
 - SessionId flush is now immediate (`critical: true`) — survives stall kills and container restarts
 - `--effort medium` for non-owner chats caps thinking depth; owner DM gets `--effort high`
 - Auto-continue enabled for sandbox group chats (was previously disabled for all groups)
-- Cloudflare API token + account ID wired into container env for deployment across workspaces
+- Cloudflare env vars ($CLOUDFLARE_API_TOKEN, $CLOUDFLARE_ACCOUNT_ID) wired into container AND CLI child process spawn env — Bianca can use `wrangler` directly
+- Deterministic env var hints in system prompt + sandbox context — Bianca knows tokens exist without searching
 - Security hardening (from Bianca's session): unlock rate limiting, owner output filter, encrypted group members, enhanced secret scrubbing (JSON patterns), path traversal containment
 - Deterministic date/time injection, user timezone from profile, auto-context date ranges
 - Sandbox users can DM Bianca without being on the Signal allowlist
@@ -23,6 +24,5 @@
 
 ## Next Steps
 <!-- Prioritized — what to pick up next -->
-- Test sandbox group chat end-to-end: send Daniel a message in the linked group, verify session persists across messages, verify `!btw` works
-- Daniel + Karen co-dev: migrate Daniel's localhost work to daniel.backtoirl.com via Cloudflare
+- Daniel + Karen co-dev: migrate Daniel's localhost work to daniel.backtoirl.com via Cloudflare (tokens now available)
 - Clean up remaining hardcoded America/Los_Angeles references in non-critical paths

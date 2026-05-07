@@ -653,6 +653,9 @@ class Runner {
           // F6: owner is trusted; gh capability is documented. Risk: prompt-injection
           // could exfiltrate via Bash — mitigated by scrubSecrets (F5).
           GH_TOKEN: process.env.GH_TOKEN || '',
+          // Cloudflare — available to all sessions for deploying to *.backtoirl.com
+          CLOUDFLARE_API_TOKEN: process.env.CLOUDFLARE_API_TOKEN || '',
+          CLOUDFLARE_ACCOUNT_ID: process.env.CLOUDFLARE_ACCOUNT_ID || '',
         },
         stdio: ['ignore', 'pipe', 'pipe'],
       };
