@@ -1,6 +1,7 @@
 const fs = require('fs');
 const path = require('path');
 const { atomicWriteJsonSync } = require('../atomic-write');
+const { readEncryptedJson, writeEncryptedJson } = require('../encrypted-json');
 
 // Persist UUID→phone mappings across restarts so group members are recognized
 // even after a bot rebuild wipes the in-memory cache.
@@ -15,6 +16,7 @@ const { atomicWriteJsonSync } = require('../atomic-write');
 // and when that happens we only extend byPhone[phone] — we NEVER auto-migrate
 // tokens or profiles tied to the old UUID. That is an owner-initiated action.
 const UUID_CACHE_FILE = '/app/data/signal-uuid-phone.json';
+const UUID_CACHE_DOMAIN = 'mybot-signal-uuid-phone';
 
 function _emptyUuidMap() {
   return { version: 2, byUuid: {}, byPhone: {} };
@@ -22,21 +24,25 @@ function _emptyUuidMap() {
 
 function _loadUuidMap() {
   try {
-    if (!fs.existsSync(UUID_CACHE_FILE)) return _emptyUuidMap();
-    const raw = JSON.parse(fs.readFileSync(UUID_CACHE_FILE, 'utf8'));
+    const raw = readEncryptedJson(UUID_CACHE_FILE, UUID_CACHE_DOMAIN);
     if (raw && raw.version === 2 && raw.byUuid && raw.byPhone) return raw;
     // Migrate v1 { uuid: phone, ... } → v2
-    const now = Date.now();
-    const v2 = _emptyUuidMap();
-    for (const [uuid, phone] of Object.entries(raw || {})) {
-      if (!uuid || typeof phone !== 'string') continue;
-      v2.byUuid[uuid] = { phone, firstSeen: now, lastSeen: now };
-      if (!v2.byPhone[phone]) v2.byPhone[phone] = [];
-      if (!v2.byPhone[phone].includes(uuid)) v2.byPhone[phone].push(uuid);
+    if (raw && typeof raw === 'object' && !raw.version) {
+      const now = Date.now();
+      const v2 = _emptyUuidMap();
+      for (const [uuid, phone] of Object.entries(raw)) {
+        if (!uuid || typeof phone !== 'string') continue;
+        v2.byUuid[uuid] = { phone, firstSeen: now, lastSeen: now };
+        if (!v2.byPhone[phone]) v2.byPhone[phone] = [];
+        if (!v2.byPhone[phone].includes(uuid)) v2.byPhone[phone].push(uuid);
+      }
+      try { writeEncryptedJson(UUID_CACHE_FILE, v2, UUID_CACHE_DOMAIN); } catch {}
+      console.log(`[signal] Migrated UUID map v1 → v2: ${Object.keys(v2.byUuid).length} entries`);
+      return v2;
     }
-    try { atomicWriteJsonSync(UUID_CACHE_FILE, v2); } catch {}
-    console.log(`[signal] Migrated UUID map v1 → v2: ${Object.keys(v2.byUuid).length} entries`);
-    return v2;
+    // Empty or unrecognized — start fresh
+    if (!raw || Object.keys(raw).length === 0) return _emptyUuidMap();
+    return _emptyUuidMap();
   } catch {
     return _emptyUuidMap();
   }
@@ -44,7 +50,7 @@ function _loadUuidMap() {
 
 function _persistUuidMap(uuidMap) {
   try {
-    atomicWriteJsonSync(UUID_CACHE_FILE, uuidMap);
+    writeEncryptedJson(UUID_CACHE_FILE, uuidMap, UUID_CACHE_DOMAIN);
   } catch {}
 }
 

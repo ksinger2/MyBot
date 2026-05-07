@@ -98,7 +98,7 @@ function _fmt(d) {
 
 // ── Data fetchers ───────────────────────────────────────────────────────────
 
-async function _fetchCalendar(userId, dateRange, isGroupChat) {
+async function _fetchCalendar(userId, dateRange, isGroupChat, timezone) {
   const token = getInternalToken();
   if (!token) return null;
 
@@ -108,6 +108,7 @@ async function _fetchCalendar(userId, dateRange, isGroupChat) {
       fromDate: dateRange.from,
       toDate: dateRange.to,
       isGroupChat: !!isGroupChat,
+      timezone: timezone || undefined,
     });
 
     const http = require('http');
@@ -181,7 +182,7 @@ async function enrichWithContext(text, senderId, isGroupChat) {
   if (CALENDAR_INTENT.test(text)) {
     if (profile && profile.gcal_connected) {
       const dateRange = _extractDateRange(text, _tz);
-      const calData = await _fetchCalendar(senderId, dateRange, isGroupChat);
+      const calData = await _fetchCalendar(senderId, dateRange, isGroupChat, _tz);
       if (calData && calData.text) {
         parts.push(`<calendar-data source="auto-fetched" range="${dateRange.from} to ${dateRange.to}">\n${calData.text}\n</calendar-data>`);
         console.log(`[auto-context] Calendar pre-fetched for ${senderId.slice(0, 4)}****: ${dateRange.from}→${dateRange.to}, ${calData.count || 0} events`);

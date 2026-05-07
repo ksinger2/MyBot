@@ -141,14 +141,17 @@ if (!INTERNAL_API_TOKEN) {
   console.log(`[security] INTERNAL_API_TOKEN loaded via closure; process.env state: ${envState}`);
 }
 
-// Constant-time string compare (F12: simplified — length-equal inputs go
-// straight to timingSafeEqual; length mismatch returns false immediately,
-// which is fine because the length itself is not secret for random tokens).
+// Constant-time string compare (F12 / S4: pad both inputs to equal length so
+// timingSafeEqual always runs — prevents timing leak of token length).
 function safeTokenEqual(a, b) {
   if (typeof a !== 'string' || typeof b !== 'string') return false;
   if (a.length === 0 || b.length === 0) return false;
-  if (a.length !== b.length) return false;
-  return crypto.timingSafeEqual(Buffer.from(a), Buffer.from(b));
+  const maxLen = Math.max(a.length, b.length);
+  const bufA = Buffer.alloc(maxLen);
+  const bufB = Buffer.alloc(maxLen);
+  Buffer.from(a).copy(bufA);
+  Buffer.from(b).copy(bufB);
+  return a.length === b.length && crypto.timingSafeEqual(bufA, bufB);
 }
 
 // F14: hard-cap helper for in-memory maps. Evicts oldest entries (FIFO via
@@ -605,7 +608,7 @@ app.get('/health', (req, res) => {
     });
   }
   try {
-    const v = require('child_process').execSync('claude --version', { timeout: 5000 }).toString().trim();
+    const v = require('child_process').execFileSync('claude', ['--version'], { timeout: 5000, encoding: 'utf8' }).trim();
     _healthCache = { ts: now, ok: true, claudeVersion: v };
     res.json({ status: 'ok', claude: v });
   } catch (e) {
@@ -1135,8 +1138,6 @@ app.get('/debug/file/:filename', requireDebugAccess, (req, res) => {
 // We respond to the HTTP request BEFORE the rebuild starts so Claude gets a
 // confirmation it can announce to the user before the container disappears.
 app.post('/rebuild', requireInternalToken, async (req, res) => {
-  const { execSync } = require('child_process');
-
   const APP_DIR = '/workspace/MyBot/claude-api';
   const COMPOSE_FILE = '/workspace/MyBot/docker-compose.yml';
 
@@ -1185,7 +1186,7 @@ app.post('/rebuild', requireInternalToken, async (req, res) => {
   const syntaxErrors = [];
   for (const f of jsFiles) {
     try {
-      execSync(`node -c "${path.join(APP_DIR, f)}"`, { stdio: 'pipe' });
+      require('child_process').execFileSync('node', ['-c', path.join(APP_DIR, f)], { stdio: 'pipe' });
     } catch (err) {
       const stderr = (err.stderr || '').toString().split('\n').slice(0, 3).join(' ');
       syntaxErrors.push(`${f}: ${stderr}`);
@@ -1473,18 +1474,33 @@ function _extractSignalEnvelope(body) {
   return body;
 }
 
-// Signal webhook auth: bbernhard's JSON-RPC forwarder cannot inject custom
-// HTTP headers, so we accept the shared secret as a ?token= query string.
-// Operators MUST configure signal-api with:
+// Signal webhook auth: prefer Authorization header or X-Internal-Token header,
+// but fall back to ?token= query string for bbernhard's signal-cli-rest-api
+// sidecar which cannot inject custom HTTP headers.
+// Operators SHOULD migrate to header-based auth when possible.
 //   RECEIVE_WEBHOOK_URL=http://claude-api:3400/signal/webhook?token=${INTERNAL_API_TOKEN}
 // Without the token gate, envelope.sourceNumber is trivially forgeable and an
 // attacker could impersonate the owner.
 let _signalAuthLastWarnAt = 0;
+let _signalQsDeprecationLogged = false;
 app.post('/signal/webhook', express.json({ limit: '5mb' }), (req, res) => {
   if (!INTERNAL_API_TOKEN) {
     return res.status(503).end();
   }
-  const supplied = typeof req.query.token === 'string' ? req.query.token : '';
+  // S3: check headers first (preferred), then fall back to query string
+  let supplied = '';
+  const authHeader = req.headers['authorization'] || '';
+  if (authHeader.startsWith('Bearer ')) {
+    supplied = authHeader.slice(7);
+  } else if (typeof req.headers['x-internal-token'] === 'string') {
+    supplied = req.headers['x-internal-token'];
+  } else {
+    supplied = typeof req.query.token === 'string' ? req.query.token : '';
+    if (supplied && !_signalQsDeprecationLogged) {
+      _signalQsDeprecationLogged = true;
+      console.warn('[signal-webhook] DEPRECATION: token supplied via query string; prefer Authorization: Bearer or X-Internal-Token header');
+    }
+  }
   if (!safeTokenEqual(supplied, INTERNAL_API_TOKEN)) {
     const now = Date.now();
     if (now - _signalAuthLastWarnAt > 60000) {
@@ -2563,8 +2579,9 @@ app.post('/concerts/prices', requireInternalToken, async (req, res) => {
 // via the authenticated google-auth client, and returns a plain-text
 // summary formatted for chat use.
 app.post('/calendar/events', requireInternalToken, async (req, res) => {
-  const { userId, fromDate, toDate, isGroupChat } = req.body || {};
+  const { userId, fromDate, toDate, isGroupChat, timezone } = req.body || {};
   if (!userId) return res.status(400).json({ error: 'userId is required' });
+  const tz = timezone || 'America/Los_Angeles';
 
   // FAIL-CLOSED privacy gate: event titles + locations are redacted UNLESS
   // the caller explicitly passes the strict boolean `false`. Absence of the
@@ -2587,9 +2604,9 @@ app.post('/calendar/events', requireInternalToken, async (req, res) => {
       });
     }
 
-    // Default to today in Pacific time.
-    const pacificNow = new Date(new Date().toLocaleString('en-US', { timeZone: 'America/Los_Angeles' }));
-    const todayStr = pacificNow.toISOString().slice(0, 10);
+    // Default to today in the user's timezone (falls back to Pacific).
+    const localNow = new Date(new Date().toLocaleString('en-US', { timeZone: tz }));
+    const todayStr = localNow.toISOString().slice(0, 10);
     const from = fromDate || todayStr;
     let to = toDate;
     if (!to) {
@@ -2599,19 +2616,19 @@ app.post('/calendar/events', requireInternalToken, async (req, res) => {
     }
 
     // timeMin / timeMax want full ISO datetimes in UTC. The from/to dates
-    // are Pacific dates, so convert Pacific midnight → UTC.
-    function _pacificMidnightUTC(dateStr) {
+    // are local dates in the user's timezone, so convert local midnight → UTC.
+    function _localMidnightUTC(dateStr) {
       const probe = new Date(`${dateStr}T12:00:00Z`);
-      const pacificStr = probe.toLocaleString('en-US', { timeZone: 'America/Los_Angeles' });
-      const offsetMs = probe.getTime() - new Date(pacificStr).getTime();
+      const localStr = probe.toLocaleString('en-US', { timeZone: tz });
+      const offsetMs = probe.getTime() - new Date(localStr).getTime();
       return new Date(new Date(`${dateStr}T00:00:00Z`).getTime() + offsetMs);
     }
-    const timeMin = _pacificMidnightUTC(from).toISOString();
+    const timeMin = _localMidnightUTC(from).toISOString();
     // +1 day on the end so we include the entire `to` day.
     const endParts = to.split('-').map(Number);
     const nextDay = new Date(Date.UTC(endParts[0], endParts[1] - 1, endParts[2] + 1));
     const nextDayStr = nextDay.toISOString().slice(0, 10);
-    const timeMax = _pacificMidnightUTC(nextDayStr).toISOString();
+    const timeMax = _localMidnightUTC(nextDayStr).toISOString();
 
     const resp = await calendar.events.list({
       calendarId: 'primary',
@@ -2636,7 +2653,7 @@ app.post('/calendar/events', requireInternalToken, async (req, res) => {
       const end = ev.end?.dateTime || ev.end?.date || '';
       const title = ev.summary || '(no title)';
       const location = ev.location ? ` @ ${ev.location}` : '';
-      const startTz = ev.start?.timeZone || 'America/Los_Angeles';
+      const startTz = ev.start?.timeZone || tz;
       let when = start;
       if (ev.start?.dateTime) {
         try {
@@ -2910,6 +2927,14 @@ const PORT = parseInt(process.env.PORT, 10) || 3400;
 app.listen(PORT, () => {
   console.log(`Claude API wrapper listening on port ${PORT}`);
 
+  // Keep Claude CLI OAuth token warm so users don't get "logged out" errors
+  try {
+    const { startTokenRefresh } = require('./token-refresh');
+    startTokenRefresh();
+  } catch (err) {
+    console.error('[token-refresh] Failed to initialize:', err.message);
+  }
+
   // After 30s of healthy running, snapshot code as last-known-good
   setTimeout(() => {
     try {
@@ -2920,13 +2945,33 @@ app.listen(PORT, () => {
     }
   }, 30000);
 
-  // After 45s, run smoke tests to verify critical subsystems
-  setTimeout(() => {
-    const { runAndReport } = require('./smoke-test');
-    runAndReport().catch(err => {
-      console.error('[smoke-test] Startup smoke test failed:', err.message);
+
+  // Start the persistent Cloudflare tunnel for sandbox user subdomains.
+  // The module auto-starts the tunnel on require() — we just need to load it.
+  // Wrapped in try/catch so a missing credentials file doesn't crash the server.
+  try {
+    const sandboxTunnel = require('./sandbox-tunnel');
+
+    app.post('/sandbox-tunnel/register', requireInternalToken, (req, res) => {
+      const { name, port } = req.body;
+      if (!name || !port) return res.status(400).json({ error: 'name and port required' });
+      sandboxTunnel.registerPort(name, port);
+      res.json({ ok: true, url: sandboxTunnel.getTunnelUrl(name) });
     });
-  }, 45000);
+
+    app.post('/sandbox-tunnel/unregister', requireInternalToken, (req, res) => {
+      const { name } = req.body;
+      if (!name) return res.status(400).json({ error: 'name required' });
+      sandboxTunnel.unregisterPort(name);
+      res.json({ ok: true });
+    });
+
+    app.get('/sandbox-tunnel/status', requireInternalToken, (_req, res) => {
+      res.json(sandboxTunnel.getStatus());
+    });
+  } catch (err) {
+    console.error('[sandbox-tunnel] Failed to initialize:', err.message);
+  }
 });
 
 // Write clean-shutdown marker on SIGTERM/SIGINT so the next boot doesn't

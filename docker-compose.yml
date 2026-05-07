@@ -56,6 +56,9 @@ services:
       - ELEVENLABS_API_KEY=${ELEVENLABS_API_KEY:-}
       - REPLICATE_API_TOKEN=${REPLICATE_API_TOKEN:-}
       - STRIPE_SECRET_KEY=${STRIPE_SECRET_KEY:-}
+      # Cloudflare — used by Bianca and sandbox users to deploy to *.backtoirl.com
+      - CLOUDFLARE_API_TOKEN=${CLOUDFLARE_API_TOKEN:-}
+      - CLOUDFLARE_ACCOUNT_ID=${CLOUDFLARE_ACCOUNT_ID:-}
       # AES-256-GCM key (HKDF-derived) for encrypting OAuth tokens at rest in
       # /app/data/user-tokens.json and /app/data/spotify-tokens.json. If unset,
       # tokens are stored in plaintext (dev fallback) and the modules warn.
@@ -129,6 +132,7 @@ services:
       - ${HOST_HOME:-/home/karen}/.claude:/home/node/.claude
       - ${HOST_HOME:-/home/karen}/.claude.json:/home/node/.claude.json
       - ${HOST_HOME:-/home/karen}/.gitconfig:/home/node/.gitconfig:ro
+      - ${HOST_HOME:-/home/karen}/.cloudflared:/home/node/.cloudflared
       - /mnt/c/Users/karen/Desktop/Github Projects:/workspace
       - /mnt/c/Users/karen/Desktop:/host/Desktop:ro
       - /mnt/c/Users/karen/Downloads:/host/Downloads:ro

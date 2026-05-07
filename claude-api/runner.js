@@ -50,7 +50,13 @@ function scrubSecrets(text) {
     .replace(/(?:INTERNAL_API_TOKEN|TOKEN_ENCRYPTION_KEY|BOT_UNLOCK_PIN|OPENAI_API_KEY|GEMINI_API_KEY|GH_TOKEN|SERPAPI_KEY|SPOTIFY_CLIENT_SECRET|GOOGLE_CLIENT_SECRET|ELEVENLABS_API_KEY|REPLICATE_API_TOKEN|STRIPE_SECRET_KEY|VIDEO_GEN_API_KEY|DISCORD_BOT_TOKEN|SIGNAL_OWNER_NUMBER|TICKETMASTER_API_KEY)=\S+/g,
       (m) => m.split('=')[0] + '=[REDACTED]')
     // ── Catch any remaining token-like strings from env dumps ──
-    .replace(/(?:_KEY|_TOKEN|_SECRET|_PASSWORD)=["']?[^\s"']{8,}/gi, (m) => m.split('=')[0] + '=[REDACTED]');
+    .replace(/(?:_KEY|_TOKEN|_SECRET|_PASSWORD)=["']?[^\s"']{8,}/gi, (m) => m.split('=')[0] + '=[REDACTED]')
+    // ── JSON key-value patterns for known secret env var names ──
+    .replace(/"(INTERNAL_API_TOKEN|TOKEN_ENCRYPTION_KEY|BOT_UNLOCK_PIN|OPENAI_API_KEY|GEMINI_API_KEY|GH_TOKEN|SERPAPI_KEY|SPOTIFY_CLIENT_SECRET|GOOGLE_CLIENT_SECRET|ELEVENLABS_API_KEY|REPLICATE_API_TOKEN|STRIPE_SECRET_KEY|VIDEO_GEN_API_KEY|DISCORD_BOT_TOKEN|SIGNAL_OWNER_NUMBER|TICKETMASTER_API_KEY)"\s*:\s*"[^"]+"/g,
+      (m, key) => `"${key}": "[REDACTED]"`)
+    // ── Generic JSON secret keys (only values 8+ chars to avoid false positives) ──
+    .replace(/"(api_key|apiKey|api_secret|apiSecret|secret|secret_key|secretKey|token|access_token|accessToken|refresh_token|refreshToken|password|credential|credentials|private_key|privateKey)"\s*:\s*"([^"]{8,})"/gi,
+      (m, key) => `"${key}": "[REDACTED]"`);
   // Literal match for the actual INTERNAL_API_TOKEN value
   if (_INTERNAL_TOKEN_LITERAL.length >= 16) {
     out = out.replaceAll(_INTERNAL_TOKEN_LITERAL, '[REDACTED]');
@@ -229,9 +235,9 @@ const DEFAULT_WORKSPACE = '/workspace';
 const DEFAULT_MAX_TURNS = parseInt(process.env.DEFAULT_MAX_TURNS, 10) || 50;
 const MAX_TIMEOUT = (parseInt(process.env.MAX_TIMEOUT_MINUTES, 10) || 90) * 60 * 1000;
 const STALL_THRESHOLDS = {
-  thinking: 10 * 60 * 1000, // 10 min — was 5 min but killed legitimate API backoff/thinking
-  bash:     10 * 60 * 1000,
-  default:  10 * 60 * 1000,
+  thinking: 5 * 60 * 1000,  // 5 min — tight but allows legitimate planning
+  bash:     10 * 60 * 1000, // 10 min — long builds/installs are legitimate
+  default:  5 * 60 * 1000,  // 5 min — generous for tool results
 };
 const CHECKIN_INTERVAL = 5 * 60 * 1000;
 
@@ -407,7 +413,7 @@ class Runner {
     this.isVoice = isVoice;
     this.isOwner = isOwner || ownerDmMode; // ownerDmMode implies isOwner
     this.sandboxUser = sandboxUser;
-    this.userTimezone = userTimezone || 'America/New_York';
+    this.userTimezone = userTimezone || 'America/Los_Angeles';
     this.recentMessages = recentMessages;
     // Use injected functions or local fallbacks
     this._freshProgress = freshProgressFn || freshProgress;
@@ -556,6 +562,7 @@ class Runner {
         '--max-turns', String(maxTurns),
         '--dangerously-skip-permissions',
         '--mcp-config', '/app/.mcp.json',
+        '--effort', ownerDmMode ? 'high' : 'medium',
       ];
 
       // Tool restrictions — group chats get a social allowlist, read-only
@@ -598,6 +605,7 @@ class Runner {
         availableAgents: AVAILABLE_AGENTS,
         ownerDmMode,
         planMode,
+        userTimezone: this.userTimezone,
       });
       if (systemPromptText) {
         // Debug: log profile context presence to help diagnose location/calendar
@@ -998,47 +1006,78 @@ class Runner {
       }, MAX_TIMEOUT);
 
       // --- Stall detector ---
-      // Owner DM mode: emit informational liveness pings at 15/45/90 min of
-      // silence, never kill. User has !stop as the manual escape hatch.
-      // Everyone else: original behavior (warn at 80%, kill at 100%).
-      const ownerPingsSent = { m15: false, m45: false, m90: false };
+      // Process-aware: checks if child is alive before deciding to kill.
+      // Owner DM and sandbox sessions: warn-only (user has !stop).
+      // Social group chats with no sandbox: warn then kill after threshold.
+      const warnOnlyMode = ownerDmMode || !!this.sandboxUser;
+      const pingsSent = { m5: false, m15: false, m45: false };
       const stallCheck = setInterval(() => {
         if (!channelState) return;
         const p = channelState.progress;
         const idle = Date.now() - p.lastActivity;
+        const mins = Math.round(idle / 60000);
 
-        if (ownerDmMode) {
+        // Check if child process is actually alive
+        let childAlive = false;
+        try { childAlive = child && !child.killed && child.exitCode === null; } catch {}
+
+        // Reset ping flags when activity resumes
+        if (idle < 3 * 60 * 1000) {
+          pingsSent.m5 = false;
+          pingsSent.m15 = false;
+          pingsSent.m45 = false;
+          p.stallWarned = false;
+        }
+
+        if (warnOnlyMode) {
           if (!channelProxy) return;
-          const mins = Math.round(idle / 60000);
-          if (mins >= 15 && !ownerPingsSent.m15) {
-            ownerPingsSent.m15 = true;
+          if (mins >= 5 && !pingsSent.m5) {
+            pingsSent.m5 = true;
             const toolInfo = p.currentTool ? `(${p.currentTool}${p.toolDetail ? `: ${p.toolDetail.substring(0, 60)}` : ''})` : '(thinking)';
-            channelProxy.send(`🐢 still working — no output in ${mins}m ${toolInfo}. Reply \`!stop\` to abort.`).catch(() => {});
-          } else if (mins >= 45 && !ownerPingsSent.m45) {
-            ownerPingsSent.m45 = true;
-            channelProxy.send(`🐢 still working (${mins}m). Turn count: ${p.turnCount}. Reply \`!stop\` to abort.`).catch(() => {});
-          } else if (mins >= 90 && !ownerPingsSent.m90) {
-            ownerPingsSent.m90 = true;
-            channelProxy.send(`🐢 still working (${mins}m). No timeout in owner DM — reply \`!stop\` to abort.`).catch(() => {});
+            const alive = childAlive ? 'process alive' : '⚠️ process dead';
+            channelProxy.send(`🐢 no output in ${mins}m ${toolInfo} — ${alive}. Reply \`!stop\` to abort.`).catch(() => {});
+          } else if (mins >= 15 && !pingsSent.m15) {
+            pingsSent.m15 = true;
+            channelProxy.send(`🐢 still waiting (${mins}m, turn ${p.turnCount}). ${childAlive ? 'Process alive — likely waiting on API.' : '⚠️ Process appears dead.'} Reply \`!stop\` to abort.`).catch(() => {});
+          } else if (mins >= 45 && !pingsSent.m45) {
+            pingsSent.m45 = true;
+            channelProxy.send(`🐢 ${mins}m silence. Reply \`!stop\` to abort.`).catch(() => {});
           }
-          // Reset ping flags on any activity so we re-ping on next stall
-          if (idle < 5 * 60 * 1000) {
-            ownerPingsSent.m15 = false;
-            ownerPingsSent.m45 = false;
-            ownerPingsSent.m90 = false;
+          // If process is dead in warn-only mode, auto-clean after 2min grace
+          if (!childAlive && idle >= 2 * 60 * 1000) {
+            channelState.process = null;
+            channelState.busy = false;
+            channelState.startedAt = null;
+            channelState.progress = this._freshProgress();
+            const stallErr = new Error(`Claude CLI process died with no output for ${mins}min (turns: ${p.turnCount})`);
+            sendErrorAlert(stallErr, { source: 'askClaude stall detector (dead process)' });
+            wrappedReject(stallErr);
           }
           return;
         }
 
+        // Social group chats: kill on threshold, but only if process is alive
+        // (if dead, clean up immediately)
         let threshold = getStallThreshold(p.currentTool);
         if (p.activeAgents.size > 0) {
           threshold = Math.max(threshold, 30 * 60 * 1000);
         }
 
+        if (!childAlive) {
+          channelState.process = null;
+          channelState.busy = false;
+          channelState.startedAt = null;
+          channelState.progress = this._freshProgress();
+          const stallErr = new Error(`Claude CLI process died (idle ${mins}min, turns: ${p.turnCount})`);
+          sendErrorAlert(stallErr, { source: 'askClaude stall detector (dead process)' });
+          wrappedReject(stallErr);
+          return;
+        }
+
         if (idle >= threshold * 0.8 && !p.stallWarned && channelProxy) {
           p.stallWarned = true;
           const toolInfo = p.currentTool ? `Tool: ${p.currentTool}` : 'Thinking (no tool active)';
-          channelProxy.send(`⚠️ **Stall warning** — no output for ${Math.round(idle / 60000)}min. ${toolInfo}. Will kill in ${Math.round((threshold - idle) / 60000)}min if no activity.`).catch(() => {});
+          channelProxy.send(`⚠️ **Stall warning** — no output for ${mins}min. ${toolInfo}. Will kill in ${Math.round((threshold - idle) / 60000)}min if no activity.`).catch(() => {});
         }
 
         if (idle >= threshold) {
@@ -1049,7 +1088,7 @@ class Runner {
             const thresholdLabel = !p.currentTool ? 'thinking'
               : p.currentTool === 'Bash' ? 'bash' : 'default';
             const diagLines = [
-              `🛑 **Stalled and killed** after ${Math.round(idle / 60000)}min of silence`,
+              `🛑 **Stalled and killed** after ${mins}min of silence`,
               `**Tool at death:** ${p.currentTool || 'none (thinking)'}`,
               `**Turns completed:** ${p.turnCount}`,
               `**Threshold:** ${Math.round(threshold / 60000)}min (${thresholdLabel})`,
@@ -1064,7 +1103,7 @@ class Runner {
           channelState.busy = false;
           channelState.startedAt = null;
           channelState.progress = this._freshProgress();
-          const stallErr = new Error(`Claude CLI stalled — no output for ${Math.round(idle / 60000)}min (threshold: ${Math.round(threshold / 60000)}min, tool: ${p.currentTool || 'none'}, turns: ${p.turnCount})`);
+          const stallErr = new Error(`Claude CLI stalled — no output for ${mins}min (threshold: ${Math.round(threshold / 60000)}min, tool: ${p.currentTool || 'none'}, turns: ${p.turnCount})`);
           sendErrorAlert(stallErr, { source: 'askClaude stall detector' });
           wrappedReject(stallErr);
         }
@@ -1201,4 +1240,5 @@ module.exports = {
   pushOutput, pushRawLog, summarizeToolInput, TOOL_LABELS, AVAILABLE_AGENTS,
   DEFAULT_WORKSPACE, freshProgress, forceKillProcess,
   _acquireSlot, _releaseSlot,
+  scrubSecrets,
 };

@@ -1,5 +1,6 @@
 const fs = require('fs');
 const path = require('path');
+const { readEncryptedJson } = require('../encrypted-json');
 
 module.exports = {
   name: '!testas',
@@ -20,7 +21,7 @@ module.exports = {
 
     let sandboxConfig;
     try {
-      sandboxConfig = JSON.parse(fs.readFileSync('/app/data/sandbox-users.json', 'utf8'));
+      sandboxConfig = readEncryptedJson('/app/data/sandbox-users.json', 'mybot-sandbox-users');
     } catch {
       await reply(message, 'Could not read sandbox config.');
       return;
@@ -45,7 +46,7 @@ module.exports = {
     // Resolve phone → UUID (mimics real Signal behavior where newer clients only send UUID)
     let simulatedSenderId = targetPhone;
     try {
-      const uuidMap = JSON.parse(fs.readFileSync('/app/data/signal-uuid-phone.json', 'utf8'));
+      const uuidMap = readEncryptedJson('/app/data/signal-uuid-phone.json', 'mybot-signal-uuid-phone');
       const uuids = uuidMap.byPhone?.[targetPhone] || [];
       if (uuids.length > 0) simulatedSenderId = uuids[0];
     } catch {}

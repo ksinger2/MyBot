@@ -15,6 +15,7 @@ const { SIGNAL_OWNER } = require('./project-permissions');
 const { getInternalToken } = require('./internal-token');
 const { fetchFeeds, filterRecent } = require('./rss-fetcher');
 const { generateEmailDigest } = require('./email-digest');
+const { getProfile } = require('./user-profiles');
 const INTERNAL_API_TOKEN = getInternalToken();
 
 const NEWS_FEEDS = [
@@ -139,9 +140,10 @@ async function fetchWeather(weatherConfig) {
 
 function fetchCalendar(days = 7) {
   return new Promise((resolve) => {
-    const pacificNow = new Date(new Date().toLocaleString('en-US', { timeZone: 'America/Los_Angeles' }));
-    const fromDate = pacificNow.toISOString().slice(0, 10);
-    const toDate = new Date(pacificNow);
+    const _tz = getProfile(SIGNAL_OWNER)?.timezone || config.timezone || 'America/Los_Angeles';
+    const localNow = new Date(new Date().toLocaleString('en-US', { timeZone: _tz }));
+    const fromDate = localNow.toISOString().slice(0, 10);
+    const toDate = new Date(localNow);
     toDate.setDate(toDate.getDate() + days);
     const toDateStr = toDate.toISOString().slice(0, 10);
     const body = JSON.stringify({
@@ -149,6 +151,7 @@ function fetchCalendar(days = 7) {
       isGroupChat: false,
       fromDate,
       toDate: toDateStr,
+      timezone: _tz,
     });
     const req = http.request({
       hostname: 'localhost', port: 3400, path: '/calendar/events',
@@ -161,21 +164,21 @@ function fetchCalendar(days = 7) {
       res.on('end', () => {
         try {
           const parsed = JSON.parse(data);
-          resolve(parsed?.text || null);
+          resolve({ text: parsed?.text || null, events: parsed?.events || [] });
         } catch {
           console.warn('[briefing] calendar parse failed');
-          resolve(null);
+          resolve({ text: null, events: [] });
         }
       });
     });
     req.on('error', (err) => {
       console.warn(`[briefing] calendar fetch error: ${err.message}`);
-      resolve(null);
+      resolve({ text: null, events: [] });
     });
     req.on('timeout', () => {
       req.destroy();
       console.warn('[briefing] calendar fetch timeout');
-      resolve(null);
+      resolve({ text: null, events: [] });
     });
     req.write(body); req.end();
   });
@@ -217,12 +220,47 @@ function formatWeatherLine(w) {
   return line;
 }
 
-function formatCalendarToday(calendarText) {
-  if (!calendarText) return null;
-  // fetchCalendar(1) already requests exactly today's date range in Pacific time.
-  // Show whatever the API returned — no string parsing needed.
-  const cleaned = calendarText.split('\n').filter(l => l.trim()).join('\n');
-  return cleaned ? `📅 **Today**\n${cleaned}` : null;
+function formatCalendarToday(calendarText, events) {
+  if (!events || events.length === 0) return calendarText ? `📅 **Today**\n${calendarText}` : null;
+
+  const _tz = getProfile(SIGNAL_OWNER)?.timezone || config.timezone || 'America/Los_Angeles';
+  const nowLocal = new Date(new Date().toLocaleString('en-US', { timeZone: _tz }));
+  const todayStr = nowLocal.toISOString().slice(0, 10);
+
+  const seen = new Set();
+  const todayEvents = events.filter(e => {
+    const startStr = e.start || '';
+    // All-day events: start is just a date like "2026-05-03"
+    const isAllDay = startStr.length === 10;
+    // For all-day multi-day events, only show if today falls within range
+    if (isAllDay) {
+      const end = e.end || startStr;
+      if (todayStr < startStr || todayStr >= end) return false;
+    } else {
+      // Timed events: check the date portion in user's timezone
+      const eventDate = new Date(startStr);
+      const eventLocal = new Date(eventDate.toLocaleString('en-US', { timeZone: _tz }));
+      const eventDateStr = eventLocal.toISOString().slice(0, 10);
+      if (eventDateStr !== todayStr) return false;
+    }
+    // Dedup by title + start time
+    const key = `${e.title}|${e.start}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+
+  if (todayEvents.length === 0) return null;
+
+  const lines = todayEvents.map(e => {
+    const isAllDay = (e.start || '').length === 10;
+    if (isAllDay) return `• ${e.title}${e.location ? ' @ ' + e.location : ''}`;
+    const startDate = new Date(e.start);
+    const h = startDate.toLocaleString('en-US', { timeZone: _tz, hour: 'numeric', minute: '2-digit', hour12: true }).toLowerCase().replace(':00', '').replace(' ', '');
+    return `• ${h} ${e.title}${e.location ? ' @ ' + e.location : ''}`;
+  });
+
+  return `📅 **Today**\n${lines.join('\n')}`;
 }
 
 function formatPortfolio(stocks) {
@@ -314,7 +352,7 @@ async function sendBriefing() {
   }
 
   try {
-    const [stockData, weatherData, calendarText, newsItems, emailDigest] = await Promise.all([
+    const [stockData, weatherData, calendarResult, newsItems, emailDigest] = await Promise.all([
       fetchStocks(config.stocks),
       fetchWeather(config.weather),
       fetchCalendar(1),
@@ -330,13 +368,14 @@ async function sendBriefing() {
 
     const sections = [];
 
-    const dayOfWeek = new Date().toLocaleDateString('en-US', { weekday: 'long', timeZone: 'America/Los_Angeles' });
+    const _briefingTz = getProfile(SIGNAL_OWNER)?.timezone || config.timezone || 'America/Los_Angeles';
+    const dayOfWeek = new Date().toLocaleDateString('en-US', { weekday: 'long', timeZone: _briefingTz });
     sections.push(`**Good morning** — Happy ${dayOfWeek}.`);
 
     const weatherLine = formatWeatherLine(weatherData);
     if (weatherLine) sections.push(weatherLine);
 
-    const calendarLine = formatCalendarToday(calendarText);
+    const calendarLine = formatCalendarToday(calendarResult.text, calendarResult.events);
     if (calendarLine) sections.push(calendarLine);
 
     const portfolioLine = formatPortfolio(stockData);
@@ -381,7 +420,7 @@ async function sendWeeklyPreview() {
   }
 
   try {
-    const [calendarText, newsItems] = await Promise.all([
+    const [calendarResult, newsItems] = await Promise.all([
       fetchCalendar(7),
       fetchTopNews(5),
     ]);
@@ -393,8 +432,8 @@ async function sendWeeklyPreview() {
 
     sections.push('**📋 Week Ahead**');
 
-    if (calendarText) {
-      sections.push(`📅 **Schedule**\n${calendarText}`);
+    if (calendarResult.text) {
+      sections.push(`📅 **Schedule**\n${calendarResult.text}`);
     }
 
     if (tasksText) {

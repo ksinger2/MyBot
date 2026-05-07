@@ -24,11 +24,13 @@ module.exports = {
 
     // Import the unlock function from bot.js
     const bot = require('../bot');
-    if (typeof bot._tryUnlock === 'function' && bot._tryUnlock(channelId, pin)) {
-      const reply = ctx._dreply || ((m, t) => m.reply(t));
+    const result = typeof bot._tryUnlock === 'function' ? bot._tryUnlock(channelId, pin) : false;
+    const reply = ctx._dreply || ((m, t) => m.reply(t));
+    if (result === 'locked') {
+      await reply(message, 'Too many failed attempts. This channel is locked out — try again in 15 minutes.');
+    } else if (result === true) {
       await reply(message, '🔓 Elevated — full write access for this channel until next restart.');
     } else {
-      const reply = ctx._dreply || ((m, t) => m.reply(t));
       await reply(message, '🔒 Wrong PIN.');
     }
   },

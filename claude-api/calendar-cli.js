@@ -14,6 +14,18 @@
 
 const SIGNAL_OWNER = process.env.SIGNAL_OWNER_NUMBER;
 
+function _resolveTimezone(args) {
+  const flag = getFlag(args, '--timezone');
+  if (flag) return flag;
+  // Fall back to user profile timezone, then Pacific.
+  try {
+    const { getProfile } = require('./user-profiles');
+    const p = getProfile(SIGNAL_OWNER);
+    if (p?.timezone) return p.timezone;
+  } catch {}
+  return 'America/Los_Angeles';
+}
+
 async function main() {
   const args = process.argv.slice(2);
   const command = args[0];
@@ -94,6 +106,7 @@ async function listEventsRange(calendar, fromISO, toISO) {
   const to = new Date(toISO).toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric' });
   console.log(`Events ${from} → ${to} (${events.length} total):\n`);
 
+  const _tz = _resolveTimezone(process.argv.slice(2));
   let currentDay = '';
   for (const ev of events) {
     const start = ev.start?.dateTime || ev.start?.date;
@@ -105,9 +118,9 @@ async function listEventsRange(calendar, fromISO, toISO) {
     let timeStr = '';
     if (ev.start?.dateTime) {
       const d = new Date(ev.start.dateTime);
-      dayLabel = d.toLocaleDateString('en-US', { weekday: 'long', month: 'short', day: 'numeric', timeZone: 'America/Los_Angeles' });
-      const startTime = d.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit', timeZone: 'America/Los_Angeles' });
-      const endTime = new Date(ev.end.dateTime).toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit', timeZone: 'America/Los_Angeles' });
+      dayLabel = d.toLocaleDateString('en-US', { weekday: 'long', month: 'short', day: 'numeric', timeZone: _tz });
+      const startTime = d.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit', timeZone: _tz });
+      const endTime = new Date(ev.end.dateTime).toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit', timeZone: _tz });
       timeStr = `${startTime}–${endTime}`;
     } else {
       dayLabel = ev.start?.date || '';
@@ -144,10 +157,11 @@ async function createEvent(calendar, args) {
   const startTime = new Date(datetime);
   const endTime = new Date(startTime.getTime() + duration * 60 * 1000);
 
+  const _eventTz = _resolveTimezone(args);
   const event = {
     summary: title,
-    start: { dateTime: startTime.toISOString(), timeZone: 'America/Los_Angeles' },
-    end: { dateTime: endTime.toISOString(), timeZone: 'America/Los_Angeles' },
+    start: { dateTime: startTime.toISOString(), timeZone: _eventTz },
+    end: { dateTime: endTime.toISOString(), timeZone: _eventTz },
   };
   if (location) event.location = location;
   if (description) event.description = description;
@@ -158,7 +172,7 @@ async function createEvent(calendar, args) {
   });
 
   console.log(`Event created: "${title}"`);
-  console.log(`  When: ${startTime.toLocaleString('en-US', { timeZone: 'America/Los_Angeles' })} (${duration}min)`);
+  console.log(`  When: ${startTime.toLocaleString('en-US', { timeZone: _eventTz })} (${duration}min)`);
   if (location) console.log(`  Where: ${location}`);
   console.log(`  ID: ${res.data.id}`);
   console.log(`  Link: ${res.data.htmlLink}`);

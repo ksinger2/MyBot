@@ -8,7 +8,7 @@ if (INTERNAL_API_TOKEN) {
   console.log(`[security] bot.js: INTERNAL_API_TOKEN loaded via closure; process.env state: ${envState}`);
 }
 
-const { spawn, execSync, execFileSync } = require('child_process');
+const { spawn } = require('child_process');
 const fs = require('fs');
 const path = require('path');
 const { handleWizardMessage, cancelWizard, startWizard } = require('./wizard');
@@ -18,15 +18,12 @@ const { addMonitor, removeMonitor, listMonitors, getMonitor, updateMonitor } = r
 const OpenAI = require('openai');
 const { startAllSchedules, registerJob, cancelJob } = require('./scheduler');
 const { saveChannelState, loadAllChannelStates, flushPendingWrites } = require('./channel-persistence');
-const { appendEntry, getJournalContext } = require('./session-journal');
-const { loadMemory } = require('./memory');
-const { startHeartbeat, stopHeartbeat, getHeartbeatStatus, listHeartbeats, loadStandingOrders } = require('./heartbeat');
+const { appendEntry } = require('./session-journal');
+const { startHeartbeat, stopHeartbeat, getHeartbeatStatus, loadStandingOrders } = require('./heartbeat');
 const { getSkill, listSkills } = require('./skills/skill-loader');
-const { detectLinks, buildExtractionPrompt, buildSmartPrompt, enrichLinks } = require('./link-extractor');
-const { startHangoutWizard, processHangoutStep } = require('./wizards/hangout');
-const { startTripPlannerWizard, runResearchPhase } = require('./wizards/trip-planner');
-let startSocialPlanWizard, processSocialPlanStep;
-try { ({ startSocialPlanWizard, processSocialPlanStep } = require('./wizards/social-plan')); } catch {}
+const { detectLinks, buildSmartPrompt, enrichLinks } = require('./link-extractor');
+const { startHangoutWizard } = require('./wizards/hangout');
+const { startTripPlannerWizard } = require('./wizards/trip-planner');
 let spotifyAuth;
 try { spotifyAuth = require('./spotify-auth'); } catch {}
 const { Runner, SlotTimeoutError, killOrphanClaude } = require('./runner');
@@ -124,14 +121,37 @@ function _isChannelElevated(channelId) {
   return true;
 }
 
+// Brute-force protection for PIN unlock (logic in unlock-ratelimit.js)
+const unlockRateLimit = require('./unlock-ratelimit');
+
 function _tryUnlock(channelId, suppliedPin) {
   if (!BOT_UNLOCK_PIN) return true;
   if (typeof suppliedPin !== 'string' || suppliedPin.length === 0) return false;
+
+  // Check brute-force lockout
+  const lockout = unlockRateLimit.checkLockout(channelId);
+  if (lockout) {
+    const remainMin = Math.ceil(lockout.remainMs / 60000);
+    console.warn(`[unlock] Channel ${_redactId(channelId)} locked out (${remainMin}m remaining)`);
+    return 'locked';
+  }
+
   const crypto = require('crypto');
   const a = Buffer.from(BOT_UNLOCK_PIN);
   const b = Buffer.from(suppliedPin);
-  if (a.length !== b.length) return false;
-  if (!crypto.timingSafeEqual(a, b)) return false;
+  const maxLen = Math.max(a.length, b.length);
+  const aPadded = Buffer.alloc(maxLen);
+  const bPadded = Buffer.alloc(maxLen);
+  a.copy(aPadded);
+  b.copy(bPadded);
+  if (!crypto.timingSafeEqual(aPadded, bPadded) || a.length !== b.length) {
+    const { count, max } = unlockRateLimit.recordFailure(channelId);
+    console.warn(`[unlock] Failed PIN attempt for channel ${_redactId(channelId)} (${count}/${max})`);
+    return false;
+  }
+
+  // Success — clear attempts and elevate
+  unlockRateLimit.clearAttempts(channelId);
   _elevatedChannels.set(channelId, Date.now());
   _persistElevated();
   console.log(`[unlock] Channel ${channelId} elevated to full write access (expires in 24h)`);
@@ -168,6 +188,11 @@ function _checkRateLimit(userId) {
     return true;
   }
   entry.timestamps = entry.timestamps.filter(t => now - t < RATE_LIMIT_WINDOW_MS);
+  if (entry.timestamps.length === 0) {
+    _rateLimitMap.delete(userId);
+    _rateLimitMap.set(userId, { timestamps: [now] });
+    return true;
+  }
   if (entry.timestamps.length >= RATE_LIMIT_MAX_SESSIONS) return false;
   entry.timestamps.push(now);
   return true;
@@ -351,6 +376,9 @@ class ChannelProxy {
     // on streamed text (not just post-session).
     let _isGroupChat = false;
     let _senderPhone = '';
+    // Owner DM privacy state — set externally via proxy.setOwnerDm().
+    // Enables deterministic secret/PII scrubbing on streamed text.
+    let _isOwnerDm = false;
 
     const proxy = new ChannelProxy({
       sendFn: (text) => {
@@ -375,6 +403,18 @@ class ChannelProxy {
           } catch {}
           if (!cleaned) return Promise.resolve();
         }
+        // Deterministic owner DM filter — scrub secrets/PII from streamed text
+        if (_isOwnerDm) {
+          try {
+            const { filterOwnerOutput } = require('./owner-output-filter');
+            const { text: filtered, redactions } = filterOwnerOutput(cleaned);
+            if (redactions.length > 0) {
+              console.warn(`[owner-dm-stream] Redacted: ${redactions.join(', ')}`);
+            }
+            cleaned = filtered;
+          } catch {}
+          if (!cleaned) return Promise.resolve();
+        }
         return adapter.sendMessage(recipientChatId, cleaned);
       },
       typingFn: () => Promise.resolve(),
@@ -387,6 +427,9 @@ class ChannelProxy {
     proxy.setGroupChat = (isGroup, senderPhone) => {
       _isGroupChat = !!isGroup;
       _senderPhone = senderPhone || '';
+    };
+    proxy.setOwnerDm = (isOwnerDm) => {
+      _isOwnerDm = !!isOwnerDm;
     };
     return proxy;
   }
@@ -566,16 +609,20 @@ const _startupMarkers = (() => {
 // (e.g., after typing !setup in a group). Persisted to survive rebuilds.
 // Stores BOTH phone numbers AND UUIDs because the same user's senderId can
 // differ between contexts (phone in group, UUID in DM, or vice versa).
+const { readEncryptedJson, writeEncryptedJson } = require('./encrypted-json');
 const KNOWN_GROUP_MEMBERS_FILE = path.join('/app/data', 'known-group-members.json');
+const KNOWN_GROUP_MEMBERS_DOMAIN = 'mybot-known-group-members';
 const _knownGroupMembers = new Set();
 try {
-  const _kgmRaw = JSON.parse(fs.readFileSync(KNOWN_GROUP_MEMBERS_FILE, 'utf8'));
-  if (Array.isArray(_kgmRaw)) _kgmRaw.forEach(n => _knownGroupMembers.add(n));
+  const _kgmRaw = readEncryptedJson(KNOWN_GROUP_MEMBERS_FILE, KNOWN_GROUP_MEMBERS_DOMAIN);
+  // Handle both legacy array format and wrapped { members: [...] } format
+  const _kgmArr = Array.isArray(_kgmRaw) ? _kgmRaw : (_kgmRaw.members || []);
+  _kgmArr.forEach(n => _knownGroupMembers.add(n));
 } catch {}
 function _addKnownGroupMember(identifier) {
   if (!identifier || _knownGroupMembers.has(identifier)) return;
   _knownGroupMembers.add(identifier);
-  try { atomicWriteJsonSync(KNOWN_GROUP_MEMBERS_FILE, [..._knownGroupMembers]); } catch {}
+  try { writeEncryptedJson(KNOWN_GROUP_MEMBERS_FILE, { members: [..._knownGroupMembers] }, KNOWN_GROUP_MEMBERS_DOMAIN); } catch {}
 }
 // Add both phone AND UUID for a group member so DMs match regardless of format
 function _addKnownGroupMemberFull(msg) {
@@ -592,6 +639,19 @@ const channels = new Map();
 async function gracefulShutdown(signal) {
   console.log(`[shutdown] Received ${signal}, killing children and persisting state...`);
   try { stopSignalWatchdog(); } catch {}
+  // B3: Clear grouping timers to prevent dangling timeouts during shutdown
+  for (const [, state] of channels) {
+    if (state.groupingTimer) { clearTimeout(state.groupingTimer); state.groupingTimer = null; }
+    if (state._sessionInactivityTimer) { clearTimeout(state._sessionInactivityTimer); state._sessionInactivityTimer = null; }
+  }
+  // B4: Drain in-flight send queues (3s cap) so pending Discord messages are not lost
+  const queuePromises = [];
+  for (const [, state] of channels) {
+    if (state._sendQueue) queuePromises.push(state._sendQueue);
+  }
+  if (queuePromises.length) {
+    await Promise.race([Promise.allSettled(queuePromises), new Promise(r => setTimeout(r, 3000))]);
+  }
   const killPromises = [];
   for (const [channelId, state] of channels) {
     if (state.process) killPromises.push(forceKillProcess(state.process, 3000));
@@ -708,8 +768,12 @@ async function runClaudeWithContinuation(prompt, opts, channelProxy) {
   let anyStreamed = !!result.streamed;
   const maxContinues = opts.channelState?.config?.maxContinues || MAX_AUTO_CONTINUES;
 
-  // Don't auto-continue in group chats (short tasks, noisy for non-technical users)
-  const isGroupContext = opts.channelState?._isGroupChat;
+  // Don't auto-continue in casual SOCIAL group chats (short tasks, noisy for
+  // non-technical users). Sandbox groups (Daniel, Lee, etc.) ARE doing real
+  // dev work — they need the same auto-continue + NextSteps.md handoff that
+  // owner DM gets, otherwise the bot silently stops at the 20-turn cap with
+  // no checkpoint and the task context is lost on the next message.
+  const isGroupContext = opts.channelState?._isGroupChat && !opts.sandboxUser;
 
   // Owner DM parity mode runs without a turn cap (maxTurns=1000 in runner.js),
   // so hitTurnLimit should never fire. If it does, respect the natural end —
@@ -799,10 +863,17 @@ async function sendLongMessage(message, text, cwd = DEFAULT_WORKSPACE) {
     return;
   }
 
-  // Resolve relative paths against cwd before scanning for image attachments
+  // Resolve relative paths against cwd before scanning for image attachments.
+  // Containment check: reject paths that escape cwd via ../ traversal.
+  const cwdResolved = path.resolve(cwd);
   const resolvedText = text.replace(/(?:^|\s)([\w./][^\s"'`()]*\.(?:png|jpg|jpeg|gif|webp))/gim, (m, p) => {
     const abs = path.isAbsolute(p) ? p : path.join(cwd, p);
-    return m.replace(p, abs);
+    const resolved = path.resolve(abs);
+    if (!resolved.startsWith(cwdResolved + path.sep) && resolved !== cwdResolved) {
+      // Path escapes cwd — leave unchanged, extractImageAttachments will filter it
+      return m;
+    }
+    return m.replace(p, resolved);
   });
   const imagePaths = extractImageAttachments(resolvedText);
 
@@ -1285,10 +1356,10 @@ async function processQueue(state) {
     if (result.sessionId) {
       state.sessionId = result.sessionId;
       if (!state.sessionStartedAt) state.sessionStartedAt = Date.now();
-      if (channelId) saveChannelState(channelId, state);
     }
     state.sessionTurns += (result.numTurns || 0);
     state.sessionCost += (result.cost || 0);
+    if (channelId) saveChannelState(channelId, state, { critical: true });
 
     // Cost guardrail
     const qMaxCost = state.config?.maxSessionCost;
@@ -1370,6 +1441,15 @@ let signalAdapter = null;
 // Keyed by group chatId, value: { members: [...], name, fetchedAt }.
 const _groupInfoCache = new Map();
 const _GROUP_CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes
+
+// B2: Periodically prune stale group info cache entries to prevent unbounded growth.
+// Entries older than 2x TTL are evicted every 10 minutes.
+setInterval(() => {
+  const cutoff = Date.now() - (_GROUP_CACHE_TTL_MS * 2);
+  for (const [key, val] of _groupInfoCache) {
+    if (val.fetchedAt < cutoff) _groupInfoCache.delete(key);
+  }
+}, 10 * 60 * 1000).unref();
 
 function startSignalAdapter() {
   const phoneNumber = process.env.SIGNAL_PHONE_NUMBER;
@@ -2031,8 +2111,8 @@ function startSignalAdapter() {
     if (_startupMarkers.wasRebuild && SIGNAL_OWNER) {
       let rebuildMsg = 'Rebuild complete \u2014 I\u2019m back!';
       try {
-        const { execSync } = require('child_process');
-        const lastCommit = execSync('git log -1 --pretty=format:"%s"', { cwd: '/workspace/MyBot', encoding: 'utf8' }).trim();
+        const { execFileSync } = require('child_process');
+        const lastCommit = execFileSync('git', ['log', '-1', '--pretty=format:%s'], { cwd: '/workspace/MyBot', encoding: 'utf8' }).trim();
         if (lastCommit) rebuildMsg += `\n\nJust shipped: ${lastCommit}`;
       } catch {}
 
@@ -2180,6 +2260,7 @@ async function _dispatchSignalMessage(msg, chatId, text, state) {
 
       const signalProxy = ChannelProxy.fromSignal(signalAdapter, msg.chatId);
       signalProxy.setGroupChat(isGroupMessage, msg.senderId);
+      if (senderIsOwner && !isGroupMessage) signalProxy.setOwnerDm(true);
 
       // Build profile context. DMs use minimal profile + heuristic on-demand
       // data injection. Groups use the existing stripped path.
@@ -2382,8 +2463,13 @@ async function _dispatchSignalMessage(msg, chatId, text, state) {
 
       // Sandbox lookup — non-owner users with a configured sandbox get write
       // access scoped to their own directory (enforced by Linux file permissions).
-      const { getSandboxUser } = require('./sandbox');
-      const sandboxUser = !senderIsOwner ? getSandboxUser(msg.senderId) : null;
+      // Group chats linked to a sandbox (via !sandbox link) give all members
+      // the same tools/cwd for co-development.
+      const { getSandboxUser, getSandboxForChat } = require('./sandbox');
+      let sandboxUser = !senderIsOwner ? getSandboxUser(msg.senderId) : null;
+      if (!sandboxUser && isGroupChat) {
+        sandboxUser = getSandboxForChat(msg.chatId);
+      }
       if (sandboxUser) {
         console.log(`[sandbox] ${_redactId(msg.senderId)} matched sandbox: ${sandboxUser.name} (${sandboxUser.cwd})`);
       }
@@ -2393,7 +2479,7 @@ async function _dispatchSignalMessage(msg, chatId, text, state) {
       const _userTimezone = _senderProfile?.timezone || null;
 
       const claudeOpts = {
-        sessionId: isGroupChat ? null : state.sessionId,
+        sessionId: (isGroupChat && !sandboxUser) ? null : state.sessionId,
         personalityFile,
         identity: state.identity,
         cwd: sandboxUser ? sandboxUser.cwd : state.cwd,
@@ -2408,7 +2494,7 @@ async function _dispatchSignalMessage(msg, chatId, text, state) {
           : (isGroupChat || isNonOwnerDm) ? nonOwnerToolWhitelist : undefined,
         profileContext: (combinedProfileContext || '') + groupOnboardHint + pendingEventContext + groupNotesContext + activeFlightsContext + imageRefinementContext
           + (isGroupChat ? `\n\nCHAT_ID: ${msg.chatId}\nSENDER_ID: ${msg.senderId}` : '')
-          + (sandboxUser ? `\n\nSANDBOX: You are working in ${sandboxUser.name}'s project directory (${sandboxUser.cwd}). All file operations are restricted to this directory.` : ''),
+          + (sandboxUser ? `\n\nSANDBOX: You are working in ${sandboxUser.name}'s project directory (${sandboxUser.cwd}). All file operations are restricted to this directory.\nPUBLIC URL: When you start a dev server, the user can view it at https://${sandboxUser.name.toLowerCase()}.backtoirl.com — register the port by running: curl -s -X POST http://localhost:3400/sandbox-tunnel/register -H "Content-Type: application/json" -H "X-Internal-Token: $INTERNAL_API_TOKEN" -d '{"name":"${sandboxUser.name}","port":PORT}' (replace PORT with the actual port number).` : ''),
         streamReplies: true,
         maxTurns: ownerDmMode ? null
           : ((isGroupChat || isNonOwnerDm) ? 20 : (senderIsOwner ? (parseInt(process.env.SIGNAL_OWNER_MAX_TURNS, 10) || 75) : 20)),
@@ -2750,6 +2836,10 @@ async function _dispatchSignalMessage(msg, chatId, text, state) {
             // "" / "false" / undefined all collapse correctly.
             params.userId = msg.senderId;
             params.isGroupChat = !!isGroupChat;
+            // Inject user's profile timezone so the endpoint uses the correct
+            // "today" and midnight boundaries — not hardcoded Pacific.
+            const _calProfile = getProfile(msg.senderId);
+            if (_calProfile?.timezone) params.timezone = _calProfile.timezone;
             try {
               const body = JSON.stringify(params);
               const calResult = await new Promise((resolve, reject) => {
@@ -3044,7 +3134,7 @@ async function _dispatchSignalMessage(msg, chatId, text, state) {
                   const auditPath = path.join('/app/data', 'unsub-audit.json');
                   let audit = []; try { audit = JSON.parse(fs.readFileSync(auditPath, 'utf8')); } catch {}
                   audit.push({ ts: new Date().toISOString(), userId: msg.senderId, sender, ...res });
-                  fs.writeFileSync(auditPath, JSON.stringify(audit, null, 2));
+                  atomicWriteJsonSync(auditPath, audit);
                 } catch {}
               } catch (e) { results.push(`❌ ${sender}: ${e.message}`); }
             }
@@ -3348,9 +3438,20 @@ async function _dispatchSignalMessage(msg, chatId, text, state) {
       // Same gate as [REBUILD] — non-owners and group chats strip the tag silently.
       const bgRe = /\[BACKGROUND:\s*(.+?)\]/gi;
       const bgMatches = [...(result.text || '').matchAll(bgRe)];
+      const MAX_BG_TASKS = 5;
       if (bgMatches.length > 0 && senderIsOwner && !isGroupChat) {
         if (!state._bgTasks) state._bgTasks = new Map();
+        // Clean up completed tasks older than 1 hour
+        const bgCutoff = Date.now() - 60 * 60 * 1000;
+        for (const [k, t] of state._bgTasks) {
+          if (t.status !== 'running' && t.startedAt < bgCutoff) state._bgTasks.delete(k);
+        }
         for (const bgMatch of bgMatches) {
+          const runningCount = [...state._bgTasks.values()].filter(t => t.status === 'running').length;
+          if (runningCount >= MAX_BG_TASKS) {
+            console.warn(`[bg-task] Skipping — already ${runningCount} running (cap ${MAX_BG_TASKS})`);
+            break;
+          }
           const raw = bgMatch[1].trim();
           const pipeIdx = raw.indexOf('|');
           const description = pipeIdx > 0 ? raw.substring(0, pipeIdx).trim() : raw.substring(0, 80);
@@ -3483,6 +3584,24 @@ async function _dispatchSignalMessage(msg, chatId, text, state) {
         }
       }
 
+      // OWNER DM PRIVACY FILTER (deterministic safety net): scrub secrets,
+      // env dumps, sensitive file paths, and phone numbers from owner DM
+      // responses. Mirrors the group privacy filter but for owner-specific
+      // patterns. Applied to the final result text (streaming is handled
+      // separately in the ChannelProxy sendFn).
+      if (ownerDmMode && result.text) {
+        try {
+          const { filterOwnerOutput } = require('./owner-output-filter');
+          const { text: filtered, redactions } = filterOwnerOutput(result.text);
+          if (redactions.length > 0) {
+            console.warn(`[owner-dm-privacy] Redacted ${redactions.length} item(s) from response: ${redactions.join(', ')}`);
+            result.text = filtered;
+          }
+        } catch (e) {
+          console.warn(`[owner-dm-privacy] filter error: ${e.message}`);
+        }
+      }
+
       // If the group onboard hint was injected this turn, mark the sender
       // as onboarded so the hint doesn't fire again on every message.
       // The user either shared their info (stored via [LEARNED:] above)
@@ -3505,6 +3624,8 @@ async function _dispatchSignalMessage(msg, chatId, text, state) {
       }
       state.sessionTurns += (result.numTurns || 0);
       state.sessionCost += (result.cost || 0);
+      // Flush sessionId immediately so it survives stall kills / container restarts
+      saveChannelState(chatId, state, { critical: true });
 
       // Cost guardrail — auto-clear session if cost cap exceeded
       const maxCost = state.config?.maxSessionCost;

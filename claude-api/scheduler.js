@@ -102,8 +102,9 @@ function registerJob(sched) {
         }
         try {
           const { askClaude, signalAdapter } = require('./bot');
-          const { buildProfileContext } = require('./user-profiles');
+          const { buildProfileContext, getProfile } = require('./user-profiles');
           const profileContext = buildProfileContext(sched.userId);
+          const _schedProfile = getProfile(sched.userId);
           console.log(`[dm-task] Running job #${sched.id} "${sched.description}" for Signal user`);
 
           const dmChannelState = { _channelId: `sched:${sched.id}`, busy: false, process: null };
@@ -113,6 +114,7 @@ function registerJob(sched) {
             profileContext,
             isOwner: true,
             channelState: dmChannelState,
+            userTimezone: _schedProfile?.timezone || sched.timezone || null,
           });
 
           if (!result.text) {

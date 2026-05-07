@@ -10,7 +10,7 @@
  */
 const fs = require('fs');
 
-function buildSystemPrompt({ identity = null, personalityFile = null, readOnly = false, isGroupChat = false, isVoice = false, discordUserId = null, ownerDmMode = false, planMode = false } = {}) {
+function buildSystemPrompt({ identity = null, personalityFile = null, readOnly = false, isGroupChat = false, isVoice = false, discordUserId = null, ownerDmMode = false, planMode = false, userTimezone = null } = {}) {
   const systemParts = [];
 
   // ── Owner DM parity mode — minimal, engineering-first ──
@@ -78,7 +78,7 @@ TAGS:
 - \`[CALENDAR: fromDate="YYYY-MM-DD" toDate="YYYY-MM-DD"]\` — fetch calendar${isGroupChat ? ' (titles redacted in groups)' : ''}. Skip if <calendar-data> present.
 - \`[WEATHER: location="City, State"]\` — skip if <weather-data> present.
 - \`[PRODUCT: query]\` · \`[IMAGINE: description]\` · \`[CART_ADD: action="propose" items="Name|URL,..."]\` then \`[CART_ADD: action="add" ids="1,2"]\` on approval
-- \`[REMIND: title="what" datetime="ISO 8601" duration_minutes=15]\` (TZ: America/Los_Angeles)
+- \`[REMIND: title="what" datetime="ISO 8601" duration_minutes=15]\` (TZ: ${userTimezone || 'America/Los_Angeles'})
 - \`[EVENT: title="name" datetime="ISO" duration_minutes=120 location="venue" description="details" user_ids="..."]\`
 - \`[SET_PREF: domain="events|email|shopping" match="keywords" ...]\` Domains: events (color, duration, reminder), email (action=skip, tone=formal), shopping (brand_pref, avoid). Event colors: Tomato, Flamingo, Tangerine, Banana, Sage, Basil, Peacock, Blueberry, Lavender, Grape, Graphite.
 - \`[EMAIL_UNSUB: action="suggest" days=30]\` — scan inbox for unsubscribe candidates. Shows numbered list.

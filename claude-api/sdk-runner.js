@@ -76,7 +76,7 @@ class SDKRunner {
     this.isVoice = opts.isVoice || false;
     this.isOwner = opts.isOwner || opts.ownerDmMode || false;
     this.sandboxUser = opts.sandboxUser || null;
-    this.userTimezone = opts.userTimezone || 'America/New_York';
+    this.userTimezone = opts.userTimezone || 'America/Los_Angeles';
     this.recentMessages = opts.recentMessages || null;
     this._freshProgress = opts.freshProgressFn || freshProgress;
     this._saveChannelState = opts.saveChannelStateFn || (() => {});
@@ -203,6 +203,7 @@ class SDKRunner {
       availableAgents: AVAILABLE_AGENTS,
       ownerDmMode,
       planMode,
+      userTimezone: this.userTimezone,
     });
 
     // Build tool restrictions

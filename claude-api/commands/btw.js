@@ -4,9 +4,13 @@ module.exports = {
   adminOnly: false,
   description: 'Peek at progress while Claude is working',
   async run(message, arg, state, ctx) {
-    // !btw is an engineering tool — not useful in Signal group chats
+    // !btw is an engineering tool — suppress in social group chats,
+    // but allow in sandbox-linked groups (co-development).
     if (message._signalChatId && state._isGroupChat) {
-      return; // silently ignore in groups
+      try {
+        const { getSandboxForChat } = require('../sandbox');
+        if (!getSandboxForChat(message._signalChatId)) return;
+      } catch { return; }
     }
     if (!state.busy && !state.process) {
       // Check for background tasks registered by Claude Code

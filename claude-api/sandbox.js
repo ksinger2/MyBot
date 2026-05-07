@@ -15,10 +15,11 @@
 
 const fs = require('fs');
 const path = require('path');
-const { execSync } = require('child_process');
-const { atomicWriteJsonSync } = require('./atomic-write');
+const { execFileSync } = require('child_process');
+const { readEncryptedJson, writeEncryptedJson } = require('./encrypted-json');
 
 const SANDBOX_FILE = path.join('/app/data', 'sandbox-users.json');
+const SANDBOX_DOMAIN = 'mybot-sandbox-users';
 const SANDBOX_ROOT = '/sandbox';
 const DEFAULT_TOOLS = 'Edit,Write,Read,Bash,WebSearch,WebFetch,Grep,Glob,Task,TodoWrite';
 
@@ -28,7 +29,7 @@ const _uidCache = new Map();
 function _load() {
   if (_cache) return _cache;
   try {
-    _cache = JSON.parse(fs.readFileSync(SANDBOX_FILE, 'utf8'));
+    _cache = readEncryptedJson(SANDBOX_FILE, SANDBOX_DOMAIN);
   } catch {
     _cache = {};
   }
@@ -37,17 +38,35 @@ function _load() {
 
 function _save(config) {
   _cache = config;
-  atomicWriteJsonSync(SANDBOX_FILE, config);
+  writeEncryptedJson(SANDBOX_FILE, config, SANDBOX_DOMAIN);
 }
 
 function _linuxUserName(name) {
   return 'sandbox-' + name.toLowerCase().replace(/[^a-z0-9]/g, '').slice(0, 20);
 }
 
+/**
+ * Validate that a cwd path is safe: resolves under SANDBOX_ROOT, no shell metacharacters.
+ * Throws if invalid.
+ */
+function _validateCwd(cwd) {
+  if (!cwd || typeof cwd !== 'string') {
+    throw new Error(`[sandbox] Invalid cwd: must be a non-empty string`);
+  }
+  const resolved = path.resolve(cwd);
+  if (!resolved.startsWith(SANDBOX_ROOT + path.sep) && resolved !== SANDBOX_ROOT) {
+    throw new Error(`[sandbox] cwd "${cwd}" resolves outside ${SANDBOX_ROOT}`);
+  }
+  if (/[;&|`$(){}]/.test(cwd)) {
+    throw new Error(`[sandbox] cwd "${cwd}" contains shell metacharacters`);
+  }
+  return resolved;
+}
+
 function _getUid(linuxUser) {
   if (_uidCache.has(linuxUser)) return _uidCache.get(linuxUser);
   try {
-    const uid = parseInt(execSync(`id -u ${linuxUser}`, { encoding: 'utf8' }).trim(), 10);
+    const uid = parseInt(execFileSync('/usr/bin/id', ['-u', linuxUser], { encoding: 'utf8' }).trim(), 10);
     _uidCache.set(linuxUser, uid);
     return uid;
   } catch {
@@ -62,11 +81,14 @@ function _getUid(linuxUser) {
 function provisionUser(entry) {
   const { linuxUser, cwd } = entry;
 
+  // Validate cwd is safe before any shell operations
+  const safeCwd = _validateCwd(cwd);
+
   // Create Linux user if it doesn't exist
   try {
-    execSync(`id ${linuxUser}`, { stdio: 'ignore' });
+    execFileSync('/usr/bin/id', [linuxUser], { stdio: 'ignore' });
   } catch {
-    execSync(`sudo /usr/sbin/useradd --no-create-home --shell /bin/bash --home-dir /home/${linuxUser} ${linuxUser}`, {
+    execFileSync('/usr/bin/sudo', ['/usr/sbin/useradd', '--no-create-home', '--shell', '/bin/bash', '--home-dir', `/home/${linuxUser}`, linuxUser], {
       stdio: 'ignore',
     });
     console.log(`[sandbox] Created Linux user: ${linuxUser}`);
@@ -74,36 +96,38 @@ function provisionUser(entry) {
 
   // Create home directory with .claude subdir
   const homeDir = `/home/${linuxUser}`;
-  execSync(`sudo /usr/bin/mkdir -p ${homeDir}/.claude`, { stdio: 'ignore' });
+  execFileSync('/usr/bin/sudo', ['/usr/bin/mkdir', '-p', `${homeDir}/.claude`], { stdio: 'ignore' });
 
   // Copy owner's OAuth credentials so sandbox user can authenticate.
   // .claude.json = settings, .claude/.credentials.json = actual OAuth token.
   try {
-    execSync(`sudo /usr/bin/cp /home/node/.claude.json ${homeDir}/.claude.json`, { stdio: 'ignore' });
+    execFileSync('/usr/bin/sudo', ['/usr/bin/cp', '/home/node/.claude.json', `${homeDir}/.claude.json`], { stdio: 'ignore' });
   } catch (err) {
     console.warn(`[sandbox] Could not copy .claude.json for ${linuxUser}: ${err.message}`);
   }
   try {
-    execSync(`sudo /usr/bin/cp /home/node/.claude/.credentials.json ${homeDir}/.claude/.credentials.json`, { stdio: 'ignore' });
+    execFileSync('/usr/bin/sudo', ['/usr/bin/cp', '/home/node/.claude/.credentials.json', `${homeDir}/.claude/.credentials.json`], { stdio: 'ignore' });
   } catch (err) {
     console.warn(`[sandbox] Could not copy .credentials.json for ${linuxUser}: ${err.message}`);
   }
 
   // Set ownership of home directory
-  execSync(`sudo /usr/bin/chown -R ${linuxUser}:${linuxUser} ${homeDir}`, { stdio: 'ignore' });
+  execFileSync('/usr/bin/sudo', ['/usr/bin/chown', '-R', `${linuxUser}:${linuxUser}`, homeDir], { stdio: 'ignore' });
 
   // Create workspace directory and set ownership
-  execSync(`sudo /usr/bin/mkdir -p ${cwd}`, { stdio: 'ignore' });
-  execSync(`sudo /usr/bin/chown -R ${linuxUser}:${linuxUser} ${cwd}`, { stdio: 'ignore' });
+  execFileSync('/usr/bin/sudo', ['/usr/bin/mkdir', '-p', safeCwd], { stdio: 'ignore' });
+  execFileSync('/usr/bin/sudo', ['/usr/bin/chown', '-R', `${linuxUser}:${linuxUser}`, safeCwd], { stdio: 'ignore' });
 
   // Ensure /sandbox parent has restrictive permissions (root-owned, 755)
   // so sandbox users can traverse but not write to other users' dirs
   try {
-    execSync(`sudo /usr/bin/chown root:root ${SANDBOX_ROOT}`, { stdio: 'ignore' });
-    execSync(`sudo /usr/bin/chmod 755 ${SANDBOX_ROOT} 2>/dev/null || true`, { stdio: 'ignore', shell: true });
-  } catch {}
+    execFileSync('/usr/bin/sudo', ['/usr/bin/chown', 'root:root', SANDBOX_ROOT], { stdio: 'ignore' });
+  } catch { /* ignore */ }
+  try {
+    execFileSync('/usr/bin/sudo', ['/usr/bin/chmod', '755', SANDBOX_ROOT], { stdio: 'ignore' });
+  } catch { /* ignore */ }
 
-  console.log(`[sandbox] Provisioned ${linuxUser} → ${cwd}`);
+  console.log(`[sandbox] Provisioned ${linuxUser} → ${safeCwd}`);
 }
 
 /**
@@ -135,13 +159,26 @@ function getSandboxUser(senderId) {
   // If senderId is a UUID, try resolving to phone via the signal UUID map
   if (!entry && !senderId.startsWith('+')) {
     try {
-      const mapPath = path.join('/app/data', 'signal-uuid-phone.json');
-      const map = JSON.parse(fs.readFileSync(mapPath, 'utf8'));
+      const map = readEncryptedJson(path.join('/app/data', 'signal-uuid-phone.json'), 'mybot-signal-uuid-phone');
       const phone = map.byUuid?.[senderId]?.phone;
       if (phone) entry = config[phone];
     } catch {}
   }
   if (!entry) return null;
+
+  // Validate cwd from persisted config before returning it
+  try {
+    _validateCwd(entry.cwd);
+  } catch (err) {
+    console.error(`[sandbox] Rejecting sandbox user ${senderId}: ${err.message}`);
+    return null;
+  }
+
+  // Re-validate linuxUser from persisted JSON matches expected pattern
+  if (!entry.linuxUser || !/^sandbox-[a-z0-9]{1,20}$/.test(entry.linuxUser)) {
+    console.error(`[sandbox] Rejecting sandbox user ${senderId}: linuxUser "${entry.linuxUser}" fails validation`);
+    return null;
+  }
 
   return {
     name: entry.name,
@@ -162,7 +199,7 @@ function getSandboxUser(senderId) {
 function addSandboxUser(senderId, name, cwdOverride, allowedTools) {
   const config = _load();
   const linuxUser = _linuxUserName(name);
-  const cwd = cwdOverride || path.join(SANDBOX_ROOT, name);
+  const cwd = _validateCwd(cwdOverride || path.join(SANDBOX_ROOT, name));
 
   const entry = {
     name,
@@ -177,6 +214,43 @@ function addSandboxUser(senderId, name, cwdOverride, allowedTools) {
   _save(config);
   console.log(`[sandbox] Added sandbox: ${senderId} → ${name} (${cwd})`);
   return entry;
+}
+
+/**
+ * Link a group chat to an existing sandbox user's workspace.
+ * All members of the group get that sandbox's tools, cwd, and session persistence.
+ */
+function linkGroupChat(chatId, sandboxSenderId) {
+  const config = _load();
+  const entry = config[sandboxSenderId];
+  if (!entry) throw new Error(`No sandbox user found for ${sandboxSenderId}`);
+  if (!config._groupLinks) config._groupLinks = {};
+  config._groupLinks[chatId] = { sandboxSenderId, linkedAt: Date.now() };
+  _save(config);
+  console.log(`[sandbox] Linked group ${chatId} → sandbox ${entry.name}`);
+  return entry;
+}
+
+function unlinkGroupChat(chatId) {
+  const config = _load();
+  if (!config._groupLinks?.[chatId]) return null;
+  const removed = config._groupLinks[chatId];
+  delete config._groupLinks[chatId];
+  _save(config);
+  console.log(`[sandbox] Unlinked group ${chatId}`);
+  return removed;
+}
+
+/**
+ * Look up sandbox config for a group chat ID.
+ * Returns the linked sandbox user's config or null.
+ */
+function getSandboxForChat(chatId) {
+  if (!chatId) return null;
+  const config = _load();
+  const link = config._groupLinks?.[chatId];
+  if (!link) return null;
+  return getSandboxUser(link.sandboxSenderId);
 }
 
 function removeSandboxUser(senderId) {
@@ -195,8 +269,11 @@ function listSandboxUsers() {
 
 module.exports = {
   getSandboxUser,
+  getSandboxForChat,
   addSandboxUser,
   removeSandboxUser,
+  linkGroupChat,
+  unlinkGroupChat,
   listSandboxUsers,
   provisionAll,
   provisionUser,
