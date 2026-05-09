@@ -667,6 +667,10 @@ class Runner {
       try {
         if (this.sandboxUser && this.sandboxUser.uid) {
           const sandboxLinuxUser = this.sandboxUser.linuxUser;
+          // Refresh sandbox OAuth creds from live /home/node copy before each
+          // spawn — sandbox creds are otherwise frozen at provision time and
+          // 401 once the live token rotates.
+          try { require('./sandbox').refreshCredentials(sandboxLinuxUser); } catch {}
           child = spawn('sudo', [
             '-E', '/usr/bin/unshare', '--mount', '--',
             '/bin/sh', '-c',
@@ -724,6 +728,22 @@ class Runner {
       let streamedAny = false;
       let hitRateLimit = false;
       let hitAuthFailure = false;
+      let sessionIdPersisted = false;
+      // Persist sessionId to disk the moment we see it in the stream so a
+      // stall-kill mid-stream doesn't leave an orphan (sessionId=null +
+      // activeTask=true) that blocks resume on the next message.
+      const persistSessionIdEarly = (sid) => {
+        if (!sid || sessionIdPersisted) return;
+        if (!channelState || !channelState._channelId) return;
+        channelState.sessionId = sid;
+        if (!channelState.sessionStartedAt) channelState.sessionStartedAt = Date.now();
+        try {
+          this._saveChannelState(channelState._channelId, channelState, { critical: true });
+          sessionIdPersisted = true;
+        } catch (err) {
+          console.error('[runner] Failed to persist sessionId early:', err.message);
+        }
+      };
 
       // --- stdout handler: stream-json event parsing ---
       child.stdout.on('data', (d) => {
@@ -771,10 +791,14 @@ class Runner {
                 resultSubtype = 'authentication_failed';
               }
               console.log(`[result] subtype=${resultSubtype} turns=${resultNumTurns} cost=$${resultCost} text_len=${(resultText || '').length}`);
+              persistSessionIdEarly(resultSessionId);
               continue;
             }
 
-            if (event.session_id) resultSessionId = event.session_id;
+            if (event.session_id) {
+              resultSessionId = event.session_id;
+              persistSessionIdEarly(resultSessionId);
+            }
 
             // Non-assistant events
             if (event.type !== 'assistant') {

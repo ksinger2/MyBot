@@ -131,6 +131,36 @@ function provisionUser(entry) {
 }
 
 /**
+ * Refresh a sandbox user's OAuth credentials from the live /home/node copy.
+ * Called immediately before spawning a CLI session as the sandbox user, so
+ * each invocation starts with the freshest token. Without this, sandbox creds
+ * are frozen at provision time and break with 401 once the live token rotates.
+ * Best-effort: failures are logged but do not block the spawn.
+ */
+function refreshCredentials(linuxUser) {
+  if (!linuxUser || typeof linuxUser !== 'string' || !/^[a-z0-9_-]+$/i.test(linuxUser)) return;
+  const src = '/home/node/.claude/.credentials.json';
+  const dst = `/home/${linuxUser}/.claude/.credentials.json`;
+  try {
+    execFileSync('/usr/bin/sudo', ['/usr/bin/cp', src, dst], { stdio: 'ignore' });
+    execFileSync('/usr/bin/sudo', ['/usr/bin/chown', `${linuxUser}:${linuxUser}`, dst], { stdio: 'ignore' });
+    execFileSync('/usr/bin/sudo', ['/usr/bin/chmod', '600', dst], { stdio: 'ignore' });
+  } catch (err) {
+    console.warn(`[sandbox] refreshCredentials failed for ${linuxUser}: ${err.message}`);
+  }
+}
+
+function refreshAllCredentials() {
+  const config = _load();
+  const seen = new Set();
+  for (const entry of Object.values(config)) {
+    if (!entry || !entry.linuxUser || seen.has(entry.linuxUser)) continue;
+    seen.add(entry.linuxUser);
+    refreshCredentials(entry.linuxUser);
+  }
+}
+
+/**
  * Provision all sandbox users from config. Called at startup from entrypoint.
  */
 function provisionAll() {
@@ -277,6 +307,8 @@ module.exports = {
   listSandboxUsers,
   provisionAll,
   provisionUser,
+  refreshCredentials,
+  refreshAllCredentials,
   SANDBOX_ROOT,
   DEFAULT_TOOLS,
 };

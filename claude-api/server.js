@@ -66,6 +66,16 @@ const SETUP_ACCESS_TTL_MS = 30 * 60 * 1000; // 30 minutes
 if (!global.__mybotServerIntervals) {
   global.__mybotServerIntervals = true;
 
+  // Sandbox cred refresh: every 60s, sync /home/node/.claude/.credentials.json
+  // into each sandbox user's home. Token rotates in /home/node/ asynchronously,
+  // and sandbox users keep stale copies otherwise → 401 on next group-chat
+  // spawn. Per-spawn refresh exists too, but this loop closes the race window
+  // for spawns that started just as a rotation completed.
+  setInterval(() => {
+    try { require('./sandbox').refreshAllCredentials(); }
+    catch (err) { console.warn(`[sandbox-cred-refresh] ${err.message}`); }
+  }, 60 * 1000).unref();
+
   // M2: sweep stale /tmp/imagine_* files every hour. Anything older than 2h
   // gets removed. Never crash the process if this fails.
   setInterval(() => {
@@ -597,23 +607,36 @@ app.post('/event/join', requireInternalToken, async (req, res) => {
   }
 });
 
-let _healthCache = { ts: 0, ok: true, claudeVersion: null };
 let _rebuildInProgress = false;
 app.get('/health', (req, res) => {
-  const now = Date.now();
-  if (now - _healthCache.ts < 30000) {
-    return res.status(_healthCache.ok ? 200 : 503).json({
-      status: _healthCache.ok ? 'ok' : 'degraded',
-      claude: _healthCache.claudeVersion || 'unknown',
-    });
-  }
+  // Reuse the oncall-watchdog's cached CLI health result instead of spawning
+  // a separate `claude --version` on every health check request.
+  try {
+    const { getCliHealthCache } = require('./oncall-watchdog');
+    const cached = getCliHealthCache();
+    const STALE_THRESHOLD = 5 * 60 * 1000;
+    if (cached.ts > 0 && (Date.now() - cached.ts) < STALE_THRESHOLD) {
+      return res.status(cached.ok ? 200 : 503).json({
+        status: cached.ok ? 'ok' : 'degraded',
+        claude: cached.version || 'unknown',
+      });
+    }
+  } catch {}
+  // Fallback: watchdog hasn't run yet — do a direct check
   try {
     const v = require('child_process').execFileSync('claude', ['--version'], { timeout: 5000, encoding: 'utf8' }).trim();
-    _healthCache = { ts: now, ok: true, claudeVersion: v };
     res.json({ status: 'ok', claude: v });
   } catch (e) {
-    _healthCache = { ts: now, ok: false, claudeVersion: null };
     res.status(503).json({ status: 'degraded', error: 'Claude CLI not functional', detail: e.message });
+  }
+});
+
+app.get('/health/watchdog', (req, res) => {
+  try {
+    const { getHealthReport } = require('./oncall-watchdog');
+    res.json(getHealthReport());
+  } catch (err) {
+    res.status(500).json({ error: 'Watchdog not available', detail: err.message });
   }
 });
 
@@ -2924,7 +2947,7 @@ app.post('/weather', requireInternalToken, async (req, res) => {
 });
 
 const PORT = parseInt(process.env.PORT, 10) || 3400;
-app.listen(PORT, () => {
+const server = app.listen(PORT, () => {
   console.log(`Claude API wrapper listening on port ${PORT}`);
 
   // Keep Claude CLI OAuth token warm so users don't get "logged out" errors
@@ -2933,6 +2956,14 @@ app.listen(PORT, () => {
     startTokenRefresh();
   } catch (err) {
     console.error('[token-refresh] Failed to initialize:', err.message);
+  }
+
+  // Start on-call watchdog — proactive health checks with auto-remediation
+  try {
+    const { startWatchdog } = require('./oncall-watchdog');
+    startWatchdog();
+  } catch (err) {
+    console.error('[oncall-watchdog] Failed to initialize:', err.message);
   }
 
   // After 30s of healthy running, snapshot code as last-known-good
@@ -2987,3 +3018,5 @@ for (const sig of ['SIGTERM', 'SIGINT']) {
 // Start Discord bot
 const bot = require('./bot');
 bot.start();
+
+module.exports = { server };

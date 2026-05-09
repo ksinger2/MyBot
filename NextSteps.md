@@ -2,29 +2,22 @@
 
 ## What's Working
 <!-- Updated each session -->
-- Token auto-refresh — CLI OAuth token kept warm via 30-min heartbeat (`token-refresh.js`), eliminates "logged out" errors
-- Sandbox group linking — `!sandbox link <phone>` gives a group chat full sandbox tools, session persistence, and shared cwd for co-development
-- `!btw` works in sandbox-linked groups (still suppressed in social groups)
-- Process-aware stall detector — checks if child process is alive; sandbox/owner sessions warn-only (never killed), social groups still get killed on threshold
-- SessionId flush is now immediate (`critical: true`) — survives stall kills and container restarts
-- `--effort medium` for non-owner chats caps thinking depth; owner DM gets `--effort high`
-- Auto-continue enabled for sandbox group chats (was previously disabled for all groups)
-- Cloudflare env vars wired into container AND CLI child process spawn env + deterministic system prompt hints
-- Workspace audit (`!audit <minutes>`) — periodic cross-workspace bug finder; spawns parallel Claude sessions per sandbox project, checks builds/tests/security, auto-fixes issues, reports to owner DM
-- Auto-resume after rebuild — interrupted tasks auto-retry via synthetic message dispatch (max 2 attempts, then falls back to notify); activeTask now stores senderId for correct dispatch context
-- Security hardening (from Bianca's session): unlock rate limiting, owner output filter, encrypted group members, enhanced secret scrubbing (JSON patterns), path traversal containment
-- Deterministic date/time injection, user timezone from profile, auto-context date ranges
-- Sandbox users can DM Bianca without being on the Signal allowlist
-- All container services healthy
+- On-call watchdog (`oncall-watchdog.js`) running every 2min with 6 deterministic health checks:
+  1. CLI auth health (escalates after 3 failures, 30min cooldown)
+  2. Sandbox credential freshness (auto-refreshes if >5min stale)
+  3. Process leak detection (kills orphan claude processes >10, escalates node >20)
+  4. Disk space monitoring (/tmp sweep at 80%, escalate /app/data at 90%)
+  5. Event loop lag (graceful restart after 3 consecutive >30s readings)
+  6. Semaphore leak detection (clears stuck busy channels with dead processes)
+- `/health/watchdog` endpoint returns rolling health report (last 10 cycles)
+- `/health` endpoint now uses watchdog's cached CLI result (no redundant spawns)
+- Sandbox auth hardening: 3-layer defense (per-spawn refresh + 60s periodic + auth-failure retry)
+- All sandbox users (Merrisa, Daniel, Lee) have fresh creds and are ready
 
 ## What's Broken / In Progress
 <!-- Active issues, blockers, half-done work -->
-- Daniel's app migration to daniel.backtoirl.com via Cloudflare Pages — in progress
-- Many files still hardcode America/Los_Angeles (briefings, calendar-cli, rss-fetcher, media-pulse, schedules-storage)
-- system-prompt.js still mentions America/Los_Angeles in the REMIND tag syntax line (low priority)
+- Nothing actively broken. Monitoring for any remaining "Not logged in" errors in group chats.
 
 ## Next Steps
-<!-- Prioritized — what to pick up next -->
-- Verify Daniel's Cloudflare deployment completes successfully
-- Test `!audit now` end-to-end from owner DM
-- Clean up remaining hardcoded America/Los_Angeles references in non-critical paths
+- Smoke test group chats with Merrisa/Daniel to confirm auth hardening works end-to-end
+- Monitor watchdog logs for any degraded checks: `docker compose logs claude-api | grep oncall-watchdog`

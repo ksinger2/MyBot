@@ -2606,10 +2606,21 @@ async function _dispatchSignalMessage(msg, chatId, text, state) {
         result = await runClaudeWithContinuation(signalPrompt, claudeOpts, signalProxy);
       }
 
-      // Auth failure — surface clearly and stop
+      // Auth failure — usually a sandbox cred staleness race (token rotated in
+      // /home/node after this spawn read its frozen sandbox copy). Refresh
+      // every sandbox user's creds and retry once before surfacing the error.
       if (result.authFailed) {
-        await signalAdapter.sendMessage(msg.chatId, '⚠️ Not logged in — Claude CLI needs re-authentication. Run `claude` on the host and use `/login` to refresh the token.');
-        return;
+        try { require('./sandbox').refreshAllCredentials(); } catch {}
+        console.log(`[auth-retry] refreshed sandbox creds, retrying spawn for ${_redactId(chatId)}`);
+        try {
+          result = await runClaudeWithContinuation(signalPrompt, claudeOpts, signalProxy);
+        } catch (err) {
+          console.warn(`[auth-retry] retry threw: ${err.message}`);
+        }
+        if (result && result.authFailed) {
+          await signalAdapter.sendMessage(msg.chatId, '⚠️ Not logged in — Claude CLI needs re-authentication. Run `claude` on the host and use `/login` to refresh the token.');
+          return;
+        }
       }
 
       // Record outgoing message to recentMessages for context persistence

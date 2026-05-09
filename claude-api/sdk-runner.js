@@ -284,6 +284,29 @@ class SDKRunner {
     const subagentText = new Map();
     let lastEventWasAssistant = false;
     let queryHandle = null;
+    let sessionIdPersisted = false;
+    // Persist sessionId to disk the moment we see it. Without this, a stall-kill
+    // mid-stream leaves channel-state.json with sessionId=null + activeTask=true
+    // (orphan), and the next message can't resume the conversation.
+    const persistSessionIdEarly = (sid) => {
+      if (!sid || sessionIdPersisted) return;
+      if (!channelState || !channelState._channelId) return;
+      channelState.sessionId = sid;
+      if (!channelState.sessionStartedAt) channelState.sessionStartedAt = Date.now();
+      try {
+        this._saveChannelState(channelState._channelId, channelState, { critical: true });
+        sessionIdPersisted = true;
+      } catch (err) {
+        console.error('[sdk] Failed to persist sessionId early:', err.message);
+      }
+    };
+
+    // Refresh sandbox OAuth creds from live /home/node copy before each query
+     // — sandbox creds are otherwise frozen at provision time and 401 once the
+    // live token rotates.
+    if (this.sandboxUser?.linuxUser) {
+      try { require('./sandbox').refreshCredentials(this.sandboxUser.linuxUser); } catch {}
+    }
 
     try {
       queryHandle = sdk.query({ prompt: effectivePrompt, options: queryOptions });
@@ -300,10 +323,14 @@ class SDKRunner {
         if (event.type === 'system' && event.subtype === 'init') {
           resultSessionId = event.session_id || resultSessionId;
           console.log(`[sdk] init session=${event.session_id} model=${event.model} tools=${event.tools?.length || 0}`);
+          persistSessionIdEarly(resultSessionId);
           continue;
         }
 
-        if (event.session_id) resultSessionId = event.session_id;
+        if (event.session_id) {
+          resultSessionId = event.session_id;
+          persistSessionIdEarly(resultSessionId);
+        }
 
         // Rate limit
         if (event.type === 'rate_limit_event') {
