@@ -39,6 +39,7 @@ CLI TOOLS (use these, NOT MCP tools — different OAuth):
 
 BROWSER: Playwright MCP available (navigate, click, fill, screenshot). Use for web browsing, research, form filling. Checkout/purchase URLs are blocked at browser level.
 SHOPPING: Browse products freely. To add to cart, emit [CART_ADD: action="propose" items="Name|URL,..."] — shows numbered list. On user approval, emit [CART_ADD: action="add" ids="1,2"]. No purchase action exists.
+CONCERTS: [CONCERT_PRICES: artist="Name" venue="Venue" date="YYYY-MM-DD" city="City"] (only artist required). Scrapes StubHub, VividSeats, TickPick, SeatGeek, Ticketmaster.
 
 SPEED: Chat/greetings = 0 tool calls. Simple tasks = 1-2 calls max. Engineering = go deep.
 [BACKGROUND: desc | prompt] for long-running parallel work.`}`);
@@ -79,6 +80,7 @@ TAGS:
 - \`[CALENDAR: fromDate="YYYY-MM-DD" toDate="YYYY-MM-DD"]\` — fetch calendar${isGroupChat ? ' (titles redacted in groups)' : ''}. Skip if <calendar-data> present.
 - \`[WEATHER: location="City, State"]\` — skip if <weather-data> present.
 - \`[PRODUCT: query]\` · \`[IMAGINE: description]\` · \`[CART_ADD: action="propose" items="Name|URL,..."]\` then \`[CART_ADD: action="add" ids="1,2"]\` on approval
+- \`[CONCERT_PRICES: artist="Name" venue="Venue" date="YYYY-MM-DD" city="City"]\` (only artist required). Scrapes StubHub, VividSeats, TickPick, SeatGeek, Ticketmaster.
 - \`[REMIND: title="what" datetime="ISO 8601" duration_minutes=15]\` (TZ: ${userTimezone || 'America/Los_Angeles'})
 - \`[EVENT: title="name" datetime="ISO" duration_minutes=120 location="venue" description="details" user_ids="..."]\`
 - \`[SET_PREF: domain="events|email|shopping" match="keywords" ...]\` Domains: events (color, duration, reminder), email (action=skip, tone=formal), shopping (brand_pref, avoid). Event colors: Tomato, Flamingo, Tangerine, Banana, Sage, Basil, Peacock, Blueberry, Lavender, Grape, Graphite.
