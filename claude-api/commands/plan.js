@@ -193,15 +193,11 @@ ls -la /tmp/venue_photo.jpg
 \`\`\`
 Then reference the path /tmp/venue_photo.jpg in your response text — it will be sent as an inline image attachment automatically.
 
-### 4. TICKET PRICES — USE THE CONCERT SCRAPER
-First, use the concert-scraper which checks 5 sources in parallel (much faster than manual searches):
-\`\`\`bash
-curl -s -X POST http://localhost:3400/concerts/prices \\
-  -H "Authorization: Bearer $INTERNAL_API_TOKEN" \\
-  -H "Content-Type: application/json" \\
-  -d '{"artist": "<ARTIST_NAME>", "venue": "<VENUE_NAME>", "date": "<YYYY-MM-DD>", "city": "<CITY>"}'
-\`\`\`
-If the scraper returns results, use those. If it's unavailable or returns no data, fall back to WebSearch on StubHub/Ticketmaster/SeatGeek.
+### 4. TICKET PRICES
+To get ticket prices from the concert scraper (checks 5 sources in parallel), emit this tag:
+[CONCERT_PRICES: artist="<ARTIST_NAME>" venue="<VENUE_NAME>" date="<YYYY-MM-DD>" city="<CITY>"]
+
+The system will automatically fetch prices and return results. Also do a WebSearch for "<artist> <venue> tickets" on StubHub/SeatGeek to supplement.
 
 Report:
 - Price range found
@@ -210,15 +206,11 @@ Report:
 - Note any "best value" or "last few" indicators
 
 ### 5. CALENDAR AVAILABILITY
-Check if ALL group members are free on the event date/time.
-For each member with a connected calendar, use:
-\`\`\`bash
-curl -s -X POST http://localhost:3400/calendar/freebusy \\
-  -H "Authorization: Bearer $INTERNAL_API_TOKEN" \\
-  -H "Content-Type: application/json" \\
-  -d '{"user_ids": ${JSON.stringify(memberPhones)}, "start": "<EVENT_START_ISO>", "end": "<EVENT_END_ISO>"}'
-\`\`\`
-Report: ✅ free or ❌ has conflict (and what the conflict is if possible).
+To check each group member's calendar, emit a tag for each person:
+[CALENDAR: action="check" phone="${memberPhones.join('" date="EVENT_DATE"]\n[CALENDAR: action="check" phone="')}" date="EVENT_DATE"]
+
+Also use WebSearch to look up "is <date> a holiday" or any competing major events.
+Report: ✅ free or ❌ has conflict for each member.
 
 ### 6. PARKING & TRANSPORTATION
 WebSearch for parking/transit near the venue:
@@ -260,14 +252,14 @@ USER LOCATION: ${locationContext}
 
 Follow the same workflow as an image-based !plan:
 1. Open/research the link to get event details (name, date, time, venue)
-2. Venue details (address, distance from ${locationContext}, seating type, capacity)
-3. Download a venue interior photo to /tmp/ and reference the path
-4. Get ticket prices via concert scraper first (curl -s -X POST http://localhost:3400/concerts/prices -H "Authorization: Bearer $INTERNAL_API_TOKEN" -H "Content-Type: application/json" -d '{"artist":"<ARTIST>","venue":"<VENUE>","date":"<YYYY-MM-DD>","city":"<CITY>"}'), fall back to WebSearch if unavailable — highlight CHEAPEST
-5. Check all group members' calendars using: curl -s -X POST http://localhost:3400/calendar/freebusy -H "Authorization: Bearer $INTERNAL_API_TOKEN" -H "Content-Type: application/json" -d '{"user_ids": ${JSON.stringify(memberPhones)}, "start": "<START_ISO>", "end": "<END_ISO>"}'
+2. Venue details (address, distance from ${locationContext}, SEATING type — chairs vs GA/standing, capacity)
+3. Download a venue interior photo to /tmp/ via curl and reference the path
+4. Ticket prices: emit [CONCERT_PRICES: artist="<ARTIST>" venue="<VENUE>" date="<YYYY-MM-DD>" city="<CITY>"] AND WebSearch "<artist> <venue> tickets" — highlight CHEAPEST
+5. Calendar: check all group members' availability for the event date
 6. Parking & transport (garages, transit, rideshare estimate from ${locationContext})
 7. Summary + ask: "Want ticket links?" / "Add to calendars?"
 
-Download a venue photo. Be specific on cheapest tickets. Check ALL calendars.`;
+Download a venue photo to /tmp/. Be specific on cheapest tickets. Check ALL calendars.`;
 }
 
 function _buildEventTextPrompt(text, memberContext, memberPhones, locationContext) {
@@ -283,12 +275,12 @@ USER LOCATION: ${locationContext}
 
 Follow the full !plan workflow:
 1. WebSearch to identify the exact event (name, date, time, venue)
-2. Venue details (address, distance from ${locationContext}, seating type, capacity)
-3. Download a venue interior photo to /tmp/ and reference the path
-4. Get ticket prices via concert scraper first (curl -s -X POST http://localhost:3400/concerts/prices -H "Authorization: Bearer $INTERNAL_API_TOKEN" -H "Content-Type: application/json" -d '{"artist":"<ARTIST>","venue":"<VENUE>","date":"<YYYY-MM-DD>","city":"<CITY>"}'), fall back to WebSearch if unavailable — highlight CHEAPEST
-5. Check all group members' calendars using: curl -s -X POST http://localhost:3400/calendar/freebusy -H "Authorization: Bearer $INTERNAL_API_TOKEN" -H "Content-Type: application/json" -d '{"user_ids": ${JSON.stringify(memberPhones)}, "start": "<START_ISO>", "end": "<END_ISO>"}'
+2. Venue details (address, distance from ${locationContext}, SEATING type — chairs vs GA/standing, capacity)
+3. Download a venue interior photo to /tmp/ via curl and reference the path
+4. Ticket prices: emit [CONCERT_PRICES: artist="<ARTIST>" venue="<VENUE>" date="<YYYY-MM-DD>" city="<CITY>"] AND WebSearch "<artist> <venue> tickets" — highlight CHEAPEST
+5. Calendar: check all group members' availability for the event date
 6. Parking & transport (garages, transit, rideshare estimate from ${locationContext})
 7. Summary + ask: "Want ticket links?" / "Add to calendars?"
 
-Download a venue photo. Be specific on cheapest tickets. Check ALL calendars.`;
+Download a venue photo to /tmp/. Be specific on cheapest tickets. Check ALL calendars.`;
 }
