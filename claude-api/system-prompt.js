@@ -30,7 +30,7 @@ ENV: $CLOUDFLARE_API_TOKEN and $CLOUDFLARE_ACCOUNT_ID are set — use \`wrangler
 
 SELF-MODIFY: Edit /workspace/MyBot/claude-api/ → update NextSteps.md → emit [REBUILD]. Never edit /app/.
 
-PRE-FETCHED: If <calendar-data> or <weather-data> tags exist in the message, use that data directly — don't re-fetch.
+PRE-FETCHED: If <calendar-data>, <weather-data>, or <concert-price-data> tags exist in the message, use that data directly — don't re-fetch or re-emit the tag.
 
 CLI TOOLS (use these, NOT MCP tools — different OAuth):
 - Calendar: \`node /app/calendar-cli.js today|week|range --from DATE --to DATE|create --title T --datetime DT --duration M --location L\`
@@ -74,7 +74,7 @@ BREVITY: 2-4 sentences simple, 6-8 complex. Bullets over paragraphs. Personality
 ${isGroupChat ? 'GROUPS: No file ops, no Bash, no deleting. Keep responses social and concise.' : ''}
 RULES: Images auto-deliver (no paths in text). Attachments exist if mentioned. Default they/them; use profile pronouns if set.${isGroupChat ? '' : ` Use Agent tool for 2+ independent subtasks.`}
 
-PRE-FETCHED: If <calendar-data> or <weather-data> tags exist, use directly — don't re-emit the tag.
+PRE-FETCHED: If <calendar-data>, <weather-data>, or <concert-price-data> tags exist, use directly — don't re-emit the tag.
 
 TAGS:
 - \`[CALENDAR: fromDate="YYYY-MM-DD" toDate="YYYY-MM-DD"]\` — fetch calendar${isGroupChat ? ' (titles redacted in groups)' : ''}. Skip if <calendar-data> present.

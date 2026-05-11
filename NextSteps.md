@@ -1,7 +1,7 @@
 # MyBot — Next Steps
 
 ## What's Working
-<!-- Updated each session — 2026-05-10 -->
+<!-- Updated each session — 2026-05-11 -->
 - On-call watchdog (`oncall-watchdog.js`) running every 2min with 6 deterministic health checks:
   1. CLI auth health (escalates after 3 failures, 30min cooldown)
   2. Sandbox credential freshness (auto-refreshes if >5min stale)
@@ -19,12 +19,14 @@
 - Queue runner now passes a proper ChannelProxy to `runClaudeWithContinuation` for progress messages
 - `isCommandLike()` utility replaces raw `text.startsWith('!')` checks (supports `/` prefix too)
 - Google auth token reconciliation now cross-references UUID↔phone map for accurate token lookup
+- Concert price scraper now deterministic: `auto-context.js` detects ticket/price intent, extracts artist names, pre-fetches from scraper, injects `<concert-price-data>` into prompt — no tag emission needed from Claude
 
 ## What's Broken / In Progress
 <!-- Active issues, blockers, half-done work -->
 - Nothing actively broken.
 
 ## Next Steps
+- Test concert price pre-fetch by sending Bianca a ticket price query (e.g. "tickets for [artist]") and checking logs for `[auto-context] Concert price`
 - Verify missed-message recovery fires correctly on next unclean restart (check logs for `[missed-msg]`)
 - Smoke test group chats with Merrisa/Daniel to confirm auth hardening works end-to-end
 - Monitor watchdog logs for any degraded checks: `docker compose logs claude-api | grep oncall-watchdog`

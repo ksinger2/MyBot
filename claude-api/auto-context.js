@@ -32,6 +32,8 @@ const REMIND_INTENT = /\b(remind|reminder|alert)\s+(me|us)\b|\bdon'?t (let me )?
 
 const EIGHTSLEEP_INTENT = /\b(bed|eight\s*sleep|eightsleep|mattress|pod|side)\b.*\b(on|off|warm|cool|cold|hot|temperature|temp|status|level|set|turn|switch)\b|\b(turn|switch)\s+(on|off|up|down)\s+(my\s+|the\s+)?(bed|mattress|pod|side)\b|\bhow\s+(warm|cool|cold|hot)\s+is\s+(my\s+)?(bed|mattress|side|pod)\b|\bhow('s| is) (my )?(bed|mattress|side|pod)\b|\bmake\s+(my\s+)?(bed|side|pod)\s+(warm|cool|cold|hot|cooler|warmer)\b/i;
 
+const CONCERT_PRICE_INTENT = /\b(ticket|tickets|prices?|pricing|how much|cost|cheapest|best deal|best price|stub\s*hub|vivid\s*seats|tick\s*pick|seat\s*geek|ticketmaster|resale|face value|nosebleed|pit|floor seats?|ga tickets?|general admission)\b.*\b(concert|show|tour|festival|gig|perform|event|arena|stadium|venue|live)\b|\b(concert|show|tour|festival|gig|perform|event|arena|stadium|venue|live)\b.*\b(ticket|tickets|prices?|pricing|how much|cost|cheapest|best deal|best price)\b|\b(find|get|check|compare|look up|search|scrape)\b.*\b(ticket|tickets|prices?)\b|\btickets?\s+(for|to)\b|\bprices?\s+(for|to)\b|\bhow much\b.*\btickets?\b|\bticket\s+prices?\b/i;
+
 // Date range extraction from natural language
 function _extractDateRange(text, timezone = 'America/New_York') {
   const now = new Date();
@@ -94,6 +96,90 @@ function _extractDateRange(text, timezone = 'America/New_York') {
 
 function _fmt(d) {
   return d.toISOString().slice(0, 10);
+}
+
+// ── Concert artist extraction ──────────────────────────────────────────────
+// Extracts artist/event names from user messages. Handles:
+//   "tickets for Beyoncé at SoFi"  → ["Beyoncé"]
+//   "how much are Drake tickets?"  → ["Drake"]
+//   "prices for Sabrina Carpenter in NYC" → ["Sabrina Carpenter"]
+//   "find tickets for Beyoncé, Drake, and Billie Eilish" → all three
+//   "check prices: Beyoncé June 15, Drake July 4" → both
+
+const _NOISE_WORDS = new Set([
+  'tickets', 'ticket', 'prices', 'price', 'pricing', 'concert', 'concerts',
+  'show', 'shows', 'tour', 'tours', 'event', 'events', 'find', 'get', 'check',
+  'compare', 'look', 'search', 'scrape', 'how', 'much', 'cost', 'cheapest',
+  'best', 'deal', 'the', 'a', 'an', 'for', 'to', 'at', 'in', 'on', 'and',
+  'me', 'my', 'some', 'any', 'please', 'can', 'you', 'i', 'want', 'need',
+  'up', 'of', 'are', 'is', 'it', 'do', 'what', 'these', 'those', 'this',
+  'that', 'with', 'from', 'or', 'but', 'also', 'too', 'just',
+]);
+
+function _extractArtists(text) {
+  const artists = [];
+  const cleaned = text
+    .replace(/https?:\/\/\S+/g, '')
+    .replace(/[[\](){}]/g, '')
+    .trim();
+
+  // Pattern 1: "tickets/prices for X", "tickets to X"
+  const forPattern = /(?:tickets?|prices?|pricing)\s+(?:for|to)\s+(.+?)(?:\s+(?:at|in|on|near|@)\s+|[,;]|\s*$)/gi;
+  let m;
+  while ((m = forPattern.exec(cleaned)) !== null) {
+    const raw = m[1].trim().replace(/\s+(tickets?|prices?|concert|show|tour)$/i, '');
+    if (raw.length >= 2 && raw.length <= 80) artists.push(raw);
+  }
+
+  // Pattern 2: "X tickets", "X concert", "X show", "X tour"
+  const suffixPattern = /\b([A-Z][A-Za-zÀ-ÖØ-öø-ÿ''.\-]+(?:\s+[A-Z][A-Za-zÀ-ÖØ-öø-ÿ''.\-]+){0,4})\s+(?:tickets?|concert|show|tour)\b/g;
+  while ((m = suffixPattern.exec(cleaned)) !== null) {
+    const raw = m[1].trim();
+    if (raw.length >= 2 && !_NOISE_WORDS.has(raw.toLowerCase())) artists.push(raw);
+  }
+
+  // Pattern 3: comma/newline-separated list after a header phrase
+  const listPattern = /(?:prices?|tickets?|events?|shows?)\s*(?:for|:)\s*(.+)/is;
+  const listMatch = cleaned.match(listPattern);
+  if (listMatch) {
+    const items = listMatch[1].split(/[,;\n]+/).map(s => s.trim());
+    for (const item of items) {
+      const stripped = item
+        .replace(/\b(?:at|in|on|@)\s+.+$/i, '')
+        .replace(/\b\d{1,2}[\/\-]\d{1,2}(?:[\/\-]\d{2,4})?\b/g, '')
+        .replace(/\b(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\s+\d{1,2}(?:st|nd|rd|th)?\b/gi, '')
+        .replace(/\s+/g, ' ')
+        .trim();
+      if (stripped.length >= 2 && stripped.length <= 80 && !_NOISE_WORDS.has(stripped.toLowerCase())) {
+        artists.push(stripped);
+      }
+    }
+  }
+
+  // Split on " and " / " & " conjunctions, then clean up
+  const expanded = [];
+  for (const a of artists) {
+    const parts2 = a.split(/\s+(?:and|&)\s+/i);
+    for (const p of parts2) {
+      const clean = p
+        .replace(/^(the|a|an)\s+/i, '')
+        .replace(/\s+(tickets?|prices?|concert|show|tour|live|events?)$/i, '')
+        .trim();
+      if (clean.length >= 2) {
+        const words = clean.toLowerCase().split(/\s+/);
+        if (!words.every(w => _NOISE_WORDS.has(w))) expanded.push(clean);
+      }
+    }
+  }
+
+  // Deduplicate (case-insensitive)
+  const seen = new Set();
+  return expanded.filter(a => {
+    const key = a.toLowerCase();
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  }).slice(0, 5);
 }
 
 // ── Data fetchers ───────────────────────────────────────────────────────────
@@ -159,6 +245,40 @@ async function _fetchWeather(location) {
   }
 }
 
+async function _fetchConcertPrices(artists, text) {
+  try {
+    const { isAvailable, getPrices } = require('./plugins/concert-tracker');
+    if (!(await isAvailable())) {
+      console.warn('[auto-context] concert scraper not available');
+      return null;
+    }
+
+    // Extract venue/city/date hints from the full message
+    const venueMatch = text.match(/\b(?:at|@)\s+([A-Z][A-Za-z\s'.\-]+(?:Stadium|Arena|Center|Centre|Garden|Theater|Theatre|Hall|Park|Amphitheater|Bowl|Pavilion|Forum|Coliseum))/i);
+    const cityMatch = text.match(/\b(?:in|near)\s+([A-Z][A-Za-z\s]+?)(?:\s*[,;.]|\s+(?:on|for|tickets?|prices?|and)\b|$)/i);
+    const dateRange = _extractDateRange(text);
+    const venue = venueMatch ? venueMatch[1].trim() : '';
+    const city = cityMatch ? cityMatch[1].trim() : '';
+
+    const results = await Promise.all(
+      artists.map(async (artist) => {
+        try {
+          const priceText = await getPrices(artist, venue, dateRange.from !== _fmt(new Date()) ? dateRange.from : '', city);
+          return { artist, text: priceText };
+        } catch (e) {
+          console.warn(`[auto-context] concert price fetch failed for "${artist}": ${e.message}`);
+          return null;
+        }
+      })
+    );
+
+    return results.filter(Boolean);
+  } catch (e) {
+    console.warn(`[auto-context] concert price module error: ${e.message}`);
+    return null;
+  }
+}
+
 // ── Main entry point ────────────────────────────────────────────────────────
 
 /**
@@ -202,6 +322,24 @@ async function enrichWithContext(text, senderId, isGroupChat) {
     }
   }
 
+  // Concert price pre-fetch — call the scraper deterministically
+  if (CONCERT_PRICE_INTENT.test(text)) {
+    const artists = _extractArtists(text);
+    if (artists.length > 0) {
+      console.log(`[auto-context] Concert price intent detected, artists: ${artists.join(', ')}`);
+      const priceResults = await _fetchConcertPrices(artists, text);
+      if (priceResults && priceResults.length > 0) {
+        for (const r of priceResults) {
+          parts.push(`<concert-price-data source="auto-fetched" artist="${r.artist}">\n${r.text}\n</concert-price-data>`);
+        }
+        console.log(`[auto-context] Concert prices pre-fetched for ${priceResults.length} artist(s)`);
+      }
+    } else {
+      parts.push(`<system-hint type="concert-prices">The user is asking about concert/event ticket prices. You MUST emit a [CONCERT_PRICES: artist="Name" venue="Venue" date="YYYY-MM-DD" city="City"] tag for each event. Only artist is required.</system-hint>`);
+      console.log(`[auto-context] Concert price intent detected but no artist extracted — injecting hint`);
+    }
+  }
+
   // ── Action intent hints — nudge Claude to emit the correct tag ──
   // These are injected as system context so Claude doesn't have to "remember"
   // the tag syntax from the system prompt. The hint makes tag emission near-certain.
@@ -226,4 +364,4 @@ async function enrichWithContext(text, senderId, isGroupChat) {
   return parts.join('\n\n') + '\n\n';
 }
 
-module.exports = { enrichWithContext, CALENDAR_INTENT, WEATHER_INTENT, IMAGINE_INTENT, REMIND_INTENT, EIGHTSLEEP_INTENT };
+module.exports = { enrichWithContext, CALENDAR_INTENT, WEATHER_INTENT, IMAGINE_INTENT, REMIND_INTENT, EIGHTSLEEP_INTENT, CONCERT_PRICE_INTENT };
