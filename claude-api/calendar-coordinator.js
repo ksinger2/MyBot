@@ -1,6 +1,16 @@
 const googleAuth = require('./google-auth');
 const userTokens = require('./user-tokens');
 
+// Load UUID map for cross-referencing phone↔UUID token lookups
+function _loadUuidMap() {
+  try {
+    const { readEncryptedJson } = require('./encrypted-json');
+    const map = readEncryptedJson('/app/data/signal-uuid-phone.json', 'mybot-signal-uuid-phone');
+    return (map?.version === 2) ? map : null;
+  } catch { return null; }
+}
+const _uuidMap = _loadUuidMap();
+
 /**
  * Get free/busy availability for multiple Discord users over a date range.
  * @param {string[]} discordUserIds - array of Discord user IDs
@@ -17,7 +27,7 @@ async function getAvailability(discordUserIds, dateRange) {
       continue;
     }
 
-    const tokenData = userTokens.getToken(userId);
+    const tokenData = userTokens.getTokenForSignalUser(userId, _uuidMap);
     try {
       const resp = await calendar.freebusy.query({
         requestBody: {
@@ -134,7 +144,7 @@ async function createGroupEvent(title, description, startTime, endTime, attendee
   // Gather emails of all connected attendees for the attendees list
   const attendeeEmails = [];
   for (const userId of attendeeDiscordIds) {
-    const tokenData = userTokens.getToken(userId);
+    const tokenData = userTokens.getTokenForSignalUser(userId, _uuidMap);
     if (tokenData?.email) {
       attendeeEmails.push(tokenData.email);
     }
@@ -147,7 +157,7 @@ async function createGroupEvent(title, description, startTime, endTime, attendee
       continue;
     }
 
-    const tokenData = userTokens.getToken(userId);
+    const tokenData = userTokens.getTokenForSignalUser(userId, _uuidMap);
 
     try {
       const event = await calendar.events.insert({

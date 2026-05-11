@@ -20,13 +20,19 @@
 - `isCommandLike()` utility replaces raw `text.startsWith('!')` checks (supports `/` prefix too)
 - Google auth token reconciliation now cross-references UUID↔phone map for accurate token lookup
 - Concert price scraper now deterministic: `auto-context.js` detects ticket/price intent, extracts artist names, pre-fetches from scraper, injects `<concert-price-data>` into prompt — no tag emission needed from Claude
+- **OAuth token auto-refresh**: `token-refresh.js` now does real OAuth2 refresh via `https://api.anthropic.com/token` using the refresh_token, syncs from Windows credentials mount — bot never loses auth even overnight
+- **Signal user token cross-referencing**: `getTokenForSignalUser()` in `user-tokens.js` tries phone→UUID and UUID→phone via the UUID map, fixing Merrisa's calendar connection and all Signal user Google integrations
+- **`/calendar/freebusy` endpoint**: New internal API for checking multi-user availability in one call
+- **`!plan` command enhanced**: Accepts event poster images or text, runs 7-step research pipeline (venue, seating, interior photo, ticket prices via concert scraper, calendar check for all group members, parking/transport), stores result server-side for deterministic follow-ups
+- **WSL stability**: `.wslconfig` has `autoMemoryReclaim=gradual`, WSL vhdx compacted (141GB→56GB), Windows credentials mounted read-only into container
 
 ## What's Broken / In Progress
 <!-- Active issues, blockers, half-done work -->
-- Nothing actively broken.
+- `!plan` venue interior photos: downloads work but image attachment delivery to Signal is inconsistent — may need to verify the `/tmp/` path extraction regex catches the downloaded file
+- `!plan` in group chats: bot requires @mention even for `!plan` command — should auto-respond to `!` commands without mention
 
 ## Next Steps
-- Test concert price pre-fetch by sending Bianca a ticket price query (e.g. "tickets for [artist]") and checking logs for `[auto-context] Concert price`
-- Verify missed-message recovery fires correctly on next unclean restart (check logs for `[missed-msg]`)
-- Smoke test group chats with Merrisa/Daniel to confirm auth hardening works end-to-end
+- Test `!plan` with image attachment in group chat — verify venue photo, seating info, and concert scraper integration all fire
+- Verify follow-up messages after `!plan` (e.g. "send me a link") correctly reference the last-planned event via `state._lastPlan`
+- Test OAuth token auto-refresh by waiting for token expiry window and checking logs for `[token-refresh] OAuth token refreshed`
 - Monitor watchdog logs for any degraded checks: `docker compose logs claude-api | grep oncall-watchdog`

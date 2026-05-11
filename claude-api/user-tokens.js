@@ -138,38 +138,61 @@ function listConnectedUsers() {
 }
 
 /**
- * Check if a Discord user has a connected Google account
- * @param {string} discordUserId
+ * Check if a user has a connected Google account (tries alternate IDs via UUID map).
+ * @param {string} discordUserId - phone number or UUID
  * @returns {boolean}
  */
 function isConnected(discordUserId) {
-  return !!readStore()[discordUserId];
+  const store = readStore();
+  if (store[discordUserId]) return true;
+  // Cross-reference via UUID map
+  const map = _loadUuidMap();
+  if (!map) return false;
+  if (discordUserId.startsWith('+')) {
+    const uuids = map.byPhone?.[discordUserId] || [];
+    return uuids.some(uuid => !!store[uuid]);
+  } else {
+    const phone = map.byUuid?.[discordUserId]?.phone;
+    return phone ? !!store[phone] : false;
+  }
+}
+
+// Lazy-load UUID map from disk for cross-referencing phone↔UUID token lookups.
+function _loadUuidMap() {
+  try {
+    const { readEncryptedJson } = require('./encrypted-json');
+    const map = readEncryptedJson('/app/data/signal-uuid-phone.json', 'mybot-signal-uuid-phone');
+    return (map?.version === 2) ? map : null;
+  } catch { return null; }
 }
 
 /**
  * Look up a token by Signal identifier (phone or UUID), trying alternate IDs
- * via the provided UUID map. This fixes the mismatch where tokens may be
- * stored under a UUID but looked up by phone (or vice versa).
+ * via the UUID map. This fixes the mismatch where tokens may be stored under
+ * a UUID but looked up by phone (or vice versa).
  * @param {string} identifier - phone number or UUID
- * @param {{ byUuid?: Object, byPhone?: Object }} [uuidMap] - Signal UUID map for cross-referencing
+ * @param {{ byUuid?: Object, byPhone?: Object }} [uuidMap] - optional pre-loaded UUID map (loads from disk if omitted)
  * @returns {object|null} token data or null if not connected
  */
 function getTokenForSignalUser(identifier, uuidMap) {
   // Try direct lookup first
   const direct = getToken(identifier);
   if (direct) return direct;
-  if (!uuidMap) return null;
+
+  // Load UUID map if not provided
+  const map = uuidMap || _loadUuidMap();
+  if (!map) return null;
 
   if (identifier.startsWith('+')) {
     // identifier is a phone — try associated UUIDs
-    const uuids = uuidMap.byPhone?.[identifier] || [];
+    const uuids = map.byPhone?.[identifier] || [];
     for (const uuid of uuids) {
       const token = getToken(uuid);
       if (token) return token;
     }
   } else {
     // identifier is a UUID — try the mapped phone
-    const entry = uuidMap.byUuid?.[identifier];
+    const entry = map.byUuid?.[identifier];
     if (entry?.phone) {
       const token = getToken(entry.phone);
       if (token) return token;

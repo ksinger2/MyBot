@@ -266,7 +266,7 @@ async function processHangoutStep(state, message) {
 
       for (const userId of allUserIds) {
         if (userTokens.isConnected(userId)) {
-          const token = userTokens.getToken(userId);
+          const token = userTokens.getTokenForSignalUser(userId);
           connected.push(token?.displayName || userId);
         } else {
           notConnected.push(userId);

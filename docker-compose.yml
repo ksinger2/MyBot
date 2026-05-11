@@ -133,6 +133,7 @@ services:
       - ${HOST_HOME:-/home/karen}/.claude.json:/home/node/.claude.json
       - ${HOST_HOME:-/home/karen}/.gitconfig:/home/node/.gitconfig:ro
       - ${HOST_HOME:-/home/karen}/.cloudflared:/home/node/.cloudflared
+      - /mnt/c/Users/karen/.claude/.credentials.json:/host/windows-claude-credentials.json:ro
       - /mnt/c/Users/karen/Desktop/Github Projects:/workspace
       - /mnt/c/Users/karen/Desktop:/host/Desktop:ro
       - /mnt/c/Users/karen/Downloads:/host/Downloads:ro

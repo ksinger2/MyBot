@@ -2477,6 +2477,14 @@ async function _dispatchSignalMessage(msg, chatId, text, state) {
         } catch {}
       }
 
+      // Inject last !plan result so follow-ups ("send me a link", "buy tickets",
+      // "add to calendar") know which event was just researched — deterministic,
+      // not relying on session memory.
+      let lastPlanContext = '';
+      if (state._lastPlan && (Date.now() - state._lastPlan.timestamp < 4 * 60 * 60 * 1000)) {
+        lastPlanContext = `\n\n[MOST RECENT !plan RESULT — if the user asks for ticket links, calendar adds, or follow-up about "that event" or "the show", THIS is the event they mean. Do NOT confuse it with any other event.]\nQuery: ${state._lastPlan.query}\nResult summary:\n${state._lastPlan.text.substring(0, 1500)}`;
+      }
+
       // Inject active group notes so Claude knows what's pending
       let groupNotesContext = '';
       if (isGroupChat) {
@@ -2578,7 +2586,7 @@ async function _dispatchSignalMessage(msg, chatId, text, state) {
         readOnly: ownerDmMode ? !ownerDmFullAccess || planMode : false,
         groupAllowedTools: sandboxUser ? sandboxUser.allowedTools
           : (isGroupChat || isNonOwnerDm) ? nonOwnerToolWhitelist : undefined,
-        profileContext: (combinedProfileContext || '') + groupOnboardHint + pendingEventContext + groupNotesContext + activeFlightsContext + imageRefinementContext
+        profileContext: (combinedProfileContext || '') + groupOnboardHint + pendingEventContext + lastPlanContext + groupNotesContext + activeFlightsContext + imageRefinementContext
           + (isGroupChat ? `\n\nCHAT_ID: ${msg.chatId}\nSENDER_ID: ${msg.senderId}` : '')
           + (sandboxUser ? `\n\nSANDBOX: You are working in ${sandboxUser.name}'s project directory (${sandboxUser.cwd}). All file operations are restricted to this directory.\nPUBLIC URL: When you start a dev server, the user can view it at https://${sandboxUser.name.toLowerCase()}.backtoirl.com — register the port by running: curl -s -X POST http://localhost:3400/sandbox-tunnel/register -H "Content-Type: application/json" -H "X-Internal-Token: $INTERNAL_API_TOKEN" -d '{"name":"${sandboxUser.name}","port":PORT}' (replace PORT with the actual port number).\nENV: $CLOUDFLARE_API_TOKEN and $CLOUDFLARE_ACCOUNT_ID are set — use \`wrangler\` directly for Cloudflare deployments, no login needed.` : ''),
         streamReplies: true,

@@ -467,6 +467,32 @@ if (!global.__mybotPendingEventSweeper) {
   }, 60 * 60 * 1000).unref();
 }
 
+// Check free/busy availability for multiple users over a time range
+app.post('/calendar/freebusy', requireInternalToken, async (req, res) => {
+  const { user_ids, start, end } = req.body;
+  if (!user_ids || !Array.isArray(user_ids) || !start || !end) {
+    return res.status(400).json({ error: 'user_ids (array), start (ISO), and end (ISO) are required' });
+  }
+  try {
+    const { getAvailability } = require('./calendar-coordinator');
+    const results = await getAvailability(user_ids, { start, end });
+    // Annotate with names from profiles
+    const userProfiles = require('./user-profiles');
+    const annotated = results.map(r => {
+      const profile = userProfiles.getProfile(r.userId);
+      return {
+        ...r,
+        name: profile?.name || r.userId,
+        free: !r.error && r.busy.length === 0,
+      };
+    });
+    res.json({ results: annotated });
+  } catch (err) {
+    console.error('[calendar/freebusy] Error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 app.post('/event', requireInternalToken, async (req, res) => {
   const { title, datetime, end_datetime, duration_minutes, location, description, user_ids, chat_id, color_id, color_name, reminder_minutes } = req.body;
   if (!title || !datetime || !user_ids || !Array.isArray(user_ids) || user_ids.length === 0) {
@@ -512,7 +538,7 @@ app.post('/event', requireInternalToken, async (req, res) => {
           } : {}),
         },
       });
-      const tok = userTokens.getToken(userId);
+      const tok = userTokens.getTokenForSignalUser(userId);
       created.push({ userId, email: tok?.email || 'unknown', eventId: event.data.id });
     } catch (err) {
       console.error(`[event] create error for ${userId}:`, err.message);
@@ -569,7 +595,7 @@ app.post('/event/join', requireInternalToken, async (req, res) => {
   const allAttendees = [...new Set([...pending.attendees, user_id])];
   const attendeeEmails = [];
   for (const uid of allAttendees) {
-    const tok = userTokens.getToken(uid);
+    const tok = userTokens.getTokenForSignalUser(uid);
     if (tok?.email) attendeeEmails.push(tok.email);
   }
 
@@ -591,7 +617,7 @@ app.post('/event/join', requireInternalToken, async (req, res) => {
       pending.attendees.push(user_id);
       _savePendingEvents();
     }
-    const tok = userTokens.getToken(user_id);
+    const tok = userTokens.getTokenForSignalUser(user_id);
 
     res.json({
       success: true,
