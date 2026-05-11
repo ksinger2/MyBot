@@ -77,21 +77,57 @@ async function handleCallback(code, state) {
   const email = profile.data.emailAddresses?.[0]?.value || 'unknown';
   const displayName = profile.data.names?.[0]?.displayName || email;
 
-  userTokens.saveToken(discordUserId, {
+  // Normalize: if userId is a UUID, also resolve to phone via UUID map so the
+  // token is findable by phone lookup (profiles are keyed by phone).
+  let tokenKey = discordUserId;
+  let phoneForProfile = discordUserId; // may be phone or UUID
+  try {
+    if (!discordUserId.startsWith('+')) {
+      // UUID — try to resolve to phone
+      const { readEncryptedJson } = require('./encrypted-json');
+      const uuidMap = readEncryptedJson('/app/data/signal-uuid-phone.json', 'mybot-signal-uuid-phone');
+      if (uuidMap?.version === 2 && uuidMap.byUuid?.[discordUserId]?.phone) {
+        phoneForProfile = uuidMap.byUuid[discordUserId].phone;
+        // Save under BOTH keys so either lookup works
+        tokenKey = phoneForProfile;
+      }
+    }
+  } catch {}
+
+  userTokens.saveToken(tokenKey, {
     accessToken: tokens.access_token,
     refreshToken: tokens.refresh_token,
     expiresAt: tokens.expiry_date,
     email,
     displayName,
   });
+  // Also save under original key if different, so existing references still work
+  if (tokenKey !== discordUserId) {
+    userTokens.saveToken(discordUserId, {
+      accessToken: tokens.access_token,
+      refreshToken: tokens.refresh_token,
+      expiresAt: tokens.expiry_date,
+      email,
+      displayName,
+    });
+  }
 
-  // If this is a Signal user (phone number), update their profile too
+  // Update the user's profile with calendar connection status
   try {
     const userProfiles = require('./user-profiles');
-    userProfiles.markCalendarConnected(discordUserId, email);
+    userProfiles.markCalendarConnected(phoneForProfile, email);
   } catch {}
 
   return { userId: discordUserId, email, displayName };
+}
+
+// Lazy-load the UUID map for cross-referencing phone↔UUID token lookups.
+function _getUuidMap() {
+  try {
+    const { readEncryptedJson } = require('./encrypted-json');
+    const map = readEncryptedJson('/app/data/signal-uuid-phone.json', 'mybot-signal-uuid-phone');
+    return (map?.version === 2) ? map : null;
+  } catch { return null; }
 }
 
 /**
@@ -100,7 +136,7 @@ async function handleCallback(code, state) {
  * @returns {Promise<boolean>} true if token is valid (or was refreshed), false if no token
  */
 async function refreshTokenIfNeeded(discordUserId) {
-  const tokenData = userTokens.getToken(discordUserId);
+  const tokenData = userTokens.getTokenForSignalUser(discordUserId, _getUuidMap());
   if (!tokenData) return false;
 
   // Refresh if within 5 minutes of expiry
@@ -141,7 +177,7 @@ async function getCalendarClient(discordUserId) {
   const valid = await refreshTokenIfNeeded(discordUserId);
   if (!valid) return null;
 
-  const tokenData = userTokens.getToken(discordUserId);
+  const tokenData = userTokens.getTokenForSignalUser(discordUserId, _getUuidMap());
   if (!tokenData) return null;
 
   const client = getOAuth2Client();
@@ -163,7 +199,7 @@ async function getGmailClient(userId) {
   const valid = await refreshTokenIfNeeded(userId);
   if (!valid) return null;
 
-  const tokenData = userTokens.getToken(userId);
+  const tokenData = userTokens.getTokenForSignalUser(userId, _getUuidMap());
   if (!tokenData) return null;
 
   const client = getOAuth2Client();

@@ -146,4 +146,37 @@ function isConnected(discordUserId) {
   return !!readStore()[discordUserId];
 }
 
-module.exports = { saveToken, getToken, removeToken, listConnectedUsers, isConnected };
+/**
+ * Look up a token by Signal identifier (phone or UUID), trying alternate IDs
+ * via the provided UUID map. This fixes the mismatch where tokens may be
+ * stored under a UUID but looked up by phone (or vice versa).
+ * @param {string} identifier - phone number or UUID
+ * @param {{ byUuid?: Object, byPhone?: Object }} [uuidMap] - Signal UUID map for cross-referencing
+ * @returns {object|null} token data or null if not connected
+ */
+function getTokenForSignalUser(identifier, uuidMap) {
+  // Try direct lookup first
+  const direct = getToken(identifier);
+  if (direct) return direct;
+  if (!uuidMap) return null;
+
+  if (identifier.startsWith('+')) {
+    // identifier is a phone — try associated UUIDs
+    const uuids = uuidMap.byPhone?.[identifier] || [];
+    for (const uuid of uuids) {
+      const token = getToken(uuid);
+      if (token) return token;
+    }
+  } else {
+    // identifier is a UUID — try the mapped phone
+    const entry = uuidMap.byUuid?.[identifier];
+    if (entry?.phone) {
+      const token = getToken(entry.phone);
+      if (token) return token;
+    }
+  }
+
+  return null;
+}
+
+module.exports = { saveToken, getToken, removeToken, listConnectedUsers, isConnected, getTokenForSignalUser };

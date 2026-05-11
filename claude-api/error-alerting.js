@@ -16,10 +16,12 @@ async function sendErrorAlert(error, { source = 'unknown', channel = null, detai
   const now = Date.now();
 
   try {
-    // Rate limit: same error type max once per 5 minutes
-    const dedupKey = `${source}:${(error.message || '').substring(0, 50)}`;
+    // Rate limit: same error source max once per 15 minutes.
+    // Use source + first 30 static chars to dedup (strip variable numbers).
+    const msgStatic = (error.message || '').replace(/\d+/g, '#').substring(0, 30);
+    const dedupKey = `${source}:${msgStatic}`;
     const lastSent = _recentErrors.get(dedupKey);
-    if (lastSent && (now - lastSent) < 5 * 60 * 1000) return;
+    if (lastSent && (now - lastSent) < 15 * 60 * 1000) return;
     _recentErrors.set(dedupKey, now);
 
     // Clean old entries

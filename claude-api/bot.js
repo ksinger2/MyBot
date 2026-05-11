@@ -39,7 +39,9 @@ const { extractImageAttachments } = require('./adapters/base');
 const { loadCommands } = require('./commands');
 const { addNote, extractNotes, stripNoteTags, getGroupNotes, startReminderLoop } = require('./group-notes');
 const { registerFlight, restoreFlightJobs, extractFlightTag, stripFlightTags } = require('./flight-tracker');
-const { stopSignalWatchdog } = require('./signal-watchdog');
+const { stopSignalWatchdog, getLastWebhookTimestamp } = require('./signal-watchdog');
+const { isCommandLike } = require('./command-utils');
+const { buildReinitPrompt } = require('./reinit-prompt');
 
 // F10: Deterministic greeting fast-path — replies without invoking Claude.
 // 100% reliable, $0, ~50ms. The system prompt rule stays as a backstop.
@@ -746,6 +748,7 @@ function askClaude(prompt, { sessionId = null, personalityFile = null, identity 
 }
 
 async function runClaudeWithContinuation(prompt, opts, channelProxy) {
+  const _cp = channelProxy || { send: () => Promise.resolve() };
   let result = await askClaude(prompt, opts);
 
   // Rate-limit retry: if the CLI was genuinely killed by throttling, wait and
@@ -792,7 +795,7 @@ async function runClaudeWithContinuation(prompt, opts, channelProxy) {
     // Checkpoint & restart: save to NextSteps.md → kill session → fresh start
     if (continueCount % REFRESH_EVERY === 0 && continueCount < maxContinues) {
       if (isOwnerDm) {
-        await channelProxy.send(
+        await _cp.send(
           `*Context refresh (${continueCount}/${maxContinues}) — saving progress and restarting with clean context...*`
         ).catch(() => {});
       }
@@ -814,7 +817,7 @@ async function runClaudeWithContinuation(prompt, opts, channelProxy) {
     } else {
       // Normal continuation within the same session
       if (isOwnerDm) {
-        await channelProxy.send(
+        await _cp.send(
           `*Turn limit reached (${continueCount}/${maxContinues}) — auto-continuing...*`
         ).catch(() => {});
       }
@@ -839,7 +842,7 @@ async function runClaudeWithContinuation(prompt, opts, channelProxy) {
       totalTurns += handoff.numTurns || 0;
       result = { ...handoff, cost: totalCost, numTurns: totalTurns };
     } catch {}
-    await channelProxy.send(
+    await _cp.send(
       `*Reached max auto-continuations (${maxContinues}). Session handed off via NextSteps.md. Send another message to keep going.*`
     ).catch(() => {});
   }
@@ -959,6 +962,7 @@ function buildCommandCtx() {
     getSkill, listSkills,
     // Audit prompt builder
     buildAuditPrompt,
+    buildReinitPrompt,
     // Wizards
     startHangoutWizard, startTripPlannerWizard,
     // Signal
@@ -1142,11 +1146,20 @@ async function startBot() {
     let spotifyTokensMod = null;
     try { spotifyTokensMod = require('./spotify-tokens'); } catch {}
 
+    // Load UUID map from disk so we can cross-reference phone↔UUID when
+    // checking token existence. Tokens may be stored under either identifier.
+    let _reconUuidMap = null;
+    try {
+      const { readEncryptedJson } = require('./encrypted-json');
+      _reconUuidMap = readEncryptedJson('/app/data/signal-uuid-phone.json', 'mybot-signal-uuid-phone');
+      if (!_reconUuidMap || _reconUuidMap.version !== 2) _reconUuidMap = null;
+    } catch {}
+
     const allProfiles = userProfilesMod.getAllProfiles();
     let reconciled = 0;
     for (const [phone, profile] of Object.entries(allProfiles)) {
       const patch = {};
-      if (profile.gcal_connected && !userTokensMod.getToken(phone)) {
+      if (profile.gcal_connected && !userTokensMod.getTokenForSignalUser(phone, _reconUuidMap)) {
         patch.gcal_connected = false;
         patch.gcal_email = null;
       }
@@ -1209,6 +1222,54 @@ async function startBot() {
         console.log(`[auto-resume] Done: ${succeeded} notified, ${failed} failed`);
       });
     }, 5000);
+  }
+
+  // Missed-message recovery: if there's a gap between the last persisted
+  // webhook timestamp and now, proactively check in with recently active chats.
+  // This catches the case where signal-cli crashed and messages were lost.
+  const MIN_GAP_MS = 90_000;
+  const MAX_RECENCY_MS = 60 * 60_000; // only bother for chats active in last hour
+  const lastWebhook = getLastWebhookTimestamp();
+  if (lastWebhook > 0) {
+    const gapMs = Date.now() - lastWebhook;
+    if (gapMs > MIN_GAP_MS) {
+      const gapMin = Math.round(gapMs / 60_000);
+      console.log(`[missed-msg] Detected ${gapMin}min gap since last webhook — checking for missed conversations`);
+      setTimeout(() => {
+        if (!signalAdapter || !signalAdapter.ready) {
+          console.log('[missed-msg] Signal adapter not ready, skipping check-in');
+          return;
+        }
+
+        const actualGapMin = Math.round((Date.now() - lastWebhook) / 60_000);
+        const candidateChannels = Object.entries(_savedChannelStates).filter(([channelId, s]) => {
+          if (!s || !channelId.startsWith('signal:')) return false;
+          // Check live state to avoid double-notifying channels already handled by auto-resume
+          const live = channels.get(channelId);
+          if (live?.busy || live?.activeTask) return false;
+          if (s.activeTask || (s.pendingQueue && s.pendingQueue.length > 0)) return false;
+          const msgs = s.recentMessages || [];
+          if (msgs.length === 0) return false;
+          const lastUserMsg = [...msgs].reverse().find(m => m.role === 'user');
+          if (!lastUserMsg?.timestamp) return false;
+          const msgAge = Date.now() - lastUserMsg.timestamp;
+          return msgAge < MAX_RECENCY_MS;
+        });
+
+        if (candidateChannels.length === 0) {
+          console.log('[missed-msg] No recently active channels to check in with');
+          return;
+        }
+
+        console.log(`[missed-msg] Sending check-in to ${candidateChannels.length} recently active channel(s)`);
+        for (const [channelId] of candidateChannels) {
+          const chatId = channelId.replace(/^signal:/, '');
+          signalAdapter.sendMessage(chatId,
+            `Hey — I was offline for ~${actualGapMin} minute${actualGapMin === 1 ? '' : 's'} and might have missed messages. If you sent me something, go ahead and resend!`
+          ).catch(() => {});
+        }
+      }, 8000); // wait a bit for signal-api to settle
+    }
   }
 }
 
@@ -1318,6 +1379,12 @@ async function processQueue(state) {
     signalAdapter.sendTyping(signalChatId).catch(() => {});
   }, 8000);
 
+  // Build a proper ChannelProxy so runClaudeWithContinuation can send
+  // progress messages (auto-continue notices, context refresh, etc.)
+  const queueProxy = ChannelProxy.fromSignal(signalAdapter, signalChatId);
+  queueProxy.setGroupChat(isGroupChatQ, signalChatId);
+  if (ownerDmModeQ) queueProxy.setOwnerDm(true);
+
   try {
     state.startedAt = Date.now();
     state.progress = freshProgress();
@@ -1330,9 +1397,10 @@ async function processQueue(state) {
       identity: state.identity,
       cwd: state.cwd,
       channelState: state,
+      channelProxy: queueProxy,
       isOwner: senderIsOwnerQ,
       ownerDmMode: ownerDmModeQ,
-      model: ownerDmModeQ ? 'claude-opus-4-7' : 'sonnet',
+      model: ownerDmModeQ ? 'claude-opus-4-6' : 'sonnet',
       maxTurns: ownerDmModeQ ? null : 20,
       streamReplies: true,
       readOnly: false,
@@ -1340,14 +1408,14 @@ async function processQueue(state) {
       userTimezone: _qProfile?.timezone || null,
     };
     try {
-      result = await runClaudeWithContinuation(combined, queueOpts, null);
+      result = await runClaudeWithContinuation(combined, queueOpts, queueProxy);
     } catch (err) {
       if (state.sessionId && (err.message?.includes('No conversation found') || err.message?.includes('session'))) {
         console.log('Session resume failed in queue, retrying fresh:', err.message);
         state.sessionId = null;
         state.sessionStartedAt = null; state.sessionTurns = 0; state.sessionCost = 0;
         queueOpts.sessionId = null;
-        result = await runClaudeWithContinuation(combined, queueOpts, null);
+        result = await runClaudeWithContinuation(combined, queueOpts, queueProxy);
       } else {
         throw err;
       }
@@ -1358,7 +1426,7 @@ async function processQueue(state) {
       state.sessionId = null;
       state.sessionStartedAt = null; state.sessionTurns = 0; state.sessionCost = 0;
       queueOpts.sessionId = null;
-      result = await runClaudeWithContinuation(combined, queueOpts, null);
+      result = await runClaudeWithContinuation(combined, queueOpts, queueProxy);
     }
     // Auth failure during queue processing
     if (result.authFailed) {
@@ -1705,7 +1773,7 @@ function startSignalAdapter() {
     // signal-cli mention objects can identify the mentioned account by EITHER
     // phone number OR UUID — sometimes both, sometimes only one. We match
     // against both forms (the adapter's own number, and its UUID if known).
-    if (isGroupMessage && !text.startsWith('!')) {
+    if (isGroupMessage && !isCommandLike(text)) {
       // Check per-chat listenToAll toggle — if on, skip the mention check
       // NOTE: use the same prefixed key used for all Signal state (signal:${chatId})
       // Also skip if this sender has a pending onboarding wizard — they need to reply
@@ -1786,7 +1854,7 @@ function startSignalAdapter() {
     // placeholder for @mentions in the text body. Without stripping, "hey ￼"
     // fails GREETING_RE and falls through to Claude for a 60s+ rate-limited run.
     const rawSignalText = (msg.text || '').replace(/\uFFFC/g, '').trim();
-    if (rawSignalText.length < 50 && GREETING_RE.test(rawSignalText) && !rawSignalText.startsWith('!')) {
+    if (rawSignalText.length < 50 && GREETING_RE.test(rawSignalText) && !isCommandLike(rawSignalText)) {
       const personality = state.personality || DEFAULT_PERSONALITY;
       const greeting = _pickGreetingResponse(personality);
       await signalAdapter.sendMessage(msg.chatId, greeting);
@@ -1798,7 +1866,7 @@ function startSignalAdapter() {
       const alreadyOnboarded = existing?.setup_complete;
       // Only kick off the wizard once per session, and only if they don't have
       // a complete profile AND there's no wizard already running for them.
-      if (!alreadyOnboarded && !state.wizard && !text.startsWith('!')) {
+      if (!alreadyOnboarded && !state.wizard && !isCommandLike(text)) {
         const { buildOnboardingWizard } = require('./wizards/onboarding');
         const fakeMessage = createSignalMessageProxy(msg, chatId, state);
         try {
@@ -1842,7 +1910,7 @@ function startSignalAdapter() {
       // attachment-note bleed) so the detection is consistent with the
       // command router's own parsing below.
       const cmdPeek = text.replace(/^@\S+\s+/, '').replace(/\n?\[The user attached \d+ file\(s\)[\s\S]*$/, '').trim();
-      if (cmdPeek.startsWith('!')) {
+      if (isCommandLike(cmdPeek)) {
         console.log(`[signal] command "${cmdPeek.split(/\s/)[0]}" arrived during active wizard — silently cancelling wizard`);
         await cancelWizard(state, fakeMessage, { silent: true });
         // Fall through to command router below. Do NOT return here.
@@ -1861,11 +1929,11 @@ function startSignalAdapter() {
       }
     }
 
-    // Handle commands (same !command syntax).
-    // Also handle "@BotName !command" — strip the @mention prefix first.
+    // Handle commands.
+    // Also handle "@BotName !command" / "@BotName /command" — strip the @mention prefix first.
     // Strip the injected [The user attached...] block so it doesn't leak into command args.
     const cmdText = text.replace(/^@\S+\s+/, '').replace(/\n?\[The user attached \d+ file\(s\)[\s\S]*$/, '').trim();
-    if (cmdText.startsWith('!')) {
+    if (isCommandLike(cmdText)) {
       const fakeMessage = createSignalMessageProxy({ ...msg, text: cmdText }, chatId, state);
       const handled = await handleCommand(fakeMessage);
       if (handled) return;
@@ -2526,7 +2594,7 @@ async function _dispatchSignalMessage(msg, chatId, text, state) {
         // Model selection.
         //   - Owner DM → always Opus 4.7 (full 200k context)
         //   - Groups and non-owner DMs → Sonnet by default
-        model: ownerDmMode ? 'claude-opus-4-7'
+        model: ownerDmMode ? 'claude-opus-4-6'
           : (isGroupChat ? 'sonnet'
           : (!senderIsOwner ? 'sonnet' : 'sonnet')),
       };

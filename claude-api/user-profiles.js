@@ -106,8 +106,29 @@ function writeStore(store) {
 /** Get a user's profile by phone number. Returns null if not found. */
 function getProfile(phoneNumber) {
   const store = readStore();
-  if (!(phoneNumber in store)) return null;
-  return _decodeEntry(store[phoneNumber]);
+  let profile = (phoneNumber in store) ? _decodeEntry(store[phoneNumber]) : null;
+  // UUID→phone resolution: if identifier is a UUID with no direct entry, find
+  // the phone-keyed profile that references this UUID via signalUuid.
+  if (!profile && phoneNumber && !phoneNumber.startsWith('+') && phoneNumber.includes('-')) {
+    for (const [key, entry] of Object.entries(store)) {
+      const p = _decodeEntry(entry);
+      if (p && p.signalUuid === phoneNumber) { profile = p; break; }
+    }
+  }
+  // Phone→UUID merge: if phone profile has a signalUuid AND there's a separate
+  // UUID-keyed profile with fields missing from phone (e.g. gcal_connected
+  // stored under UUID during OAuth), merge them so lookups always find the data.
+  if (profile && profile.signalUuid && store[profile.signalUuid]) {
+    const uuidProfile = _decodeEntry(store[profile.signalUuid]);
+    if (uuidProfile) {
+      for (const [k, v] of Object.entries(uuidProfile)) {
+        if (v != null && v !== false && (profile[k] === undefined || profile[k] === null || profile[k] === false)) {
+          profile[k] = v;
+        }
+      }
+    }
+  }
+  return profile;
 }
 
 /** Create or update fields in a user's profile. Encrypts before storing. */

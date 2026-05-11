@@ -19,6 +19,7 @@ module.exports = {
         `**Useful commands:**\n` +
         `\`!stop\` — Stop my current response\n` +
         `\`!clear\` — Start a fresh conversation\n` +
+        `\`/reinit\` — Re-read project context and suggest next steps\n` +
         `\`!profile\` — See what I know about you\n` +
         `\`!remember <fact>\` — Tell me something to remember\n` +
         `\`!forget <keyword>\` — Remove something I learned\n` +
@@ -47,6 +48,7 @@ module.exports = {
       `**Control:**\n` +
       `\`!stop\` — Pause Claude (session preserved)\n` +
       `\`!clear\` — Clear conversation context\n` +
+      `\`/reinit\` — Fresh multi-agent project read-through + next-step recommendations\n` +
       `\`!compact\` — Reset session, keep recent context\n` +
       `\`!session\` / \`!sesh\` — Show session stats (turns, cost, age)\n` +
       `\`!kill\` — Hard kill + destroy session\n` +

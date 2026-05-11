@@ -7,6 +7,7 @@ module.exports = {
     await message.reply(
       `**Available Commands:**\n` +
       `\`!stop\` \`!clear\` \`!compact\` \`!session\` \`!kill\` \`!killall\` \`!restart\` \`!cancel\`\n` +
+      `\`/reinit\`\n` +
       `\`!status\` \`!processes\` \`!btw\` \`!cd\` \`!ls\`\n` +
       `\`!startproject\` \`!audit\` \`!name\` \`!identity\`\n` +
       `\`!personality\` \`!personalities\`\n` +

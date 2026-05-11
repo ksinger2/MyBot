@@ -1,6 +1,10 @@
 'use strict';
 
 const { execFile } = require('child_process');
+const fs = require('fs');
+const { atomicWriteJsonSync } = require('./atomic-write');
+
+const WATCHDOG_STATE_FILE = '/app/data/watchdog-state.json';
 
 let watchdogInterval = null;
 let lastWebhookAt = 0;
@@ -13,8 +17,24 @@ const RESTART_COOLDOWN = 10 * 60_000;
 const MAX_CONSECUTIVE_FAILURES = 5;
 const CONTAINER_NAME = 'mybot-signal-api-1';
 
+function _readState() {
+  try { return JSON.parse(fs.readFileSync(WATCHDOG_STATE_FILE, 'utf-8')); } catch { return {}; }
+}
+
+function _writeState(patch) {
+  try { atomicWriteJsonSync(WATCHDOG_STATE_FILE, { ..._readState(), ...patch }); } catch (e) {
+    console.error('[signal-watchdog] Failed to persist state:', e.message);
+  }
+}
+
 function recordWebhookActivity() {
   lastWebhookAt = Date.now();
+}
+
+function getLastWebhookTimestamp() {
+  if (lastWebhookAt > 0) return lastWebhookAt;
+  const s = _readState();
+  return s.lastWebhookAt || 0;
 }
 
 function log(msg) {
@@ -83,6 +103,9 @@ function startSignalWatchdog(signalAdapter, ownerChatId) {
       log(`Health check failed (${consecutiveFailures}/${MAX_CONSECUTIVE_FAILURES})`);
     }
 
+    // Persist lastWebhookAt every tick so startup can detect gaps
+    if (lastWebhookAt > 0) _writeState({ lastWebhookAt });
+
     if (consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
       log('Signal-api HTTP unresponsive — triggering restart');
       restartContainer(signalAdapter, ownerChatId);
@@ -99,4 +122,4 @@ function stopSignalWatchdog() {
   }
 }
 
-module.exports = { startSignalWatchdog, stopSignalWatchdog, recordWebhookActivity };
+module.exports = { startSignalWatchdog, stopSignalWatchdog, recordWebhookActivity, getLastWebhookTimestamp };

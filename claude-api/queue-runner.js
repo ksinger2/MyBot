@@ -52,13 +52,22 @@ async function processNextItem() {
 
     const personalityFile = getPersonalityFile(item.personality);
 
+    // Build a no-op channel proxy so the stall detector and error handlers
+    // don't crash on null.send(). If we can reach Signal, route messages there.
+    const noopProxy = {
+      send: (text) => send(text),
+      setGroupChat: () => {},
+      setOwnerDm: () => {},
+    };
+
     const result = await runClaudeWithContinuation(item.prompt, {
       sessionId: null,
       personalityFile,
       identity: item.identity,
       cwd: item.cwd,
       channelState: transientState,
-    }, null);
+      channelProxy: noopProxy,
+    }, noopProxy);
 
     const summary = result.text
       ? result.text.substring(0, 200) + (result.text.length > 200 ? '...' : '')
