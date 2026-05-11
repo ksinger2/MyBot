@@ -90,6 +90,18 @@ module.exports = {
     state.busy = true;
     state.startedAt = Date.now();
     state.progress = ctx.freshProgress();
+
+    // Persist activeTask so auto-resume picks up after rebuild
+    state.activeTask = {
+      prompt: hasImage ? `!plan (image: ${imageAttachments[0]?.name || 'photo'}) ${arg || ''}`.trim() : `!plan ${arg}`,
+      channelId: chatId,
+      senderId: senderPhone,
+      senderName: message._senderName || senderPhone,
+      startedAt: new Date().toISOString(),
+      resumeAttempts: 0,
+    };
+    if (chatId) ctx.saveChannelState(`signal:${chatId}`, state, { critical: true });
+
     await ctx._styping(message);
     const planTyping = setInterval(() => { ctx._styping(message).catch(() => {}); }, 8000);
 
@@ -142,7 +154,9 @@ module.exports = {
       clearInterval(planTyping);
       state.busy = false;
       state.startedAt = null;
+      state.activeTask = null;
       state.progress = ctx.freshProgress();
+      if (chatId) ctx.saveChannelState(`signal:${chatId}`, state, { critical: true });
       // Drain any messages that queued while !plan was running
       if (state.queue && state.queue.length > 0) {
         ctx.processQueue(state);

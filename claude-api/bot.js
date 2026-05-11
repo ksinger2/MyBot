@@ -1202,9 +1202,11 @@ async function startBot() {
   const { startMonitorRunner } = require('./monitor-runner');
   startMonitorRunner();
 
-  // Auto-resume interrupted work after a crash (not a clean !restart).
+  // Auto-resume interrupted work after a crash OR rebuild.
   // Signal-only: every channelId is `signal:<chatId>`.
-  if (!wasCleanShutdown && !wasRolledBack) {
+  // Rebuilds are the most common interruption — the bot rebuilds itself mid-task
+  // and should pick up where it left off, not ask users to resend.
+  if (!wasRolledBack) {
     setTimeout(() => {
       const channelsToNotify = Object.entries(_savedChannelStates).filter(([, s]) => {
         if (!s) return false;
