@@ -143,6 +143,10 @@ module.exports = {
       state.busy = false;
       state.startedAt = null;
       state.progress = ctx.freshProgress();
+      // Drain any messages that queued while !plan was running
+      if (state.queue && state.queue.length > 0) {
+        ctx.processQueue(state);
+      }
     }
   }
 };

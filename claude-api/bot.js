@@ -1949,9 +1949,12 @@ function startSignalAdapter() {
       }
       state.queue.push({ message: fakeMessage, content: text, _timestamp: msg.timestamp });
       saveChannelState(chatId, state, { critical: true });
+      const pos = state.queue.length;
       if (!isGroupMessage) {
-        const pos = state.queue.length;
         await signalAdapter.sendMessage(msg.chatId, `Queued (#${pos}) — I'll get to that next.`);
+      } else if (pos === 1) {
+        // First queued message in a group — brief ack so user knows it's noted
+        await signalAdapter.sendMessage(msg.chatId, `Got it — I'll work on that next.`).catch(() => {});
       }
       return;
     }
