@@ -1989,6 +1989,11 @@ function startSignalAdapter() {
         }
       }
       if (!state.groupingBuffer) state.groupingBuffer = [];
+      const isDupe = state.groupingBuffer.some(e => e.msg?.timestamp === msg.timestamp && e.content === text);
+      if (isDupe) {
+        console.log(`[signal] Dedup: dropping duplicate message (ts=${msg.timestamp})`);
+        return;
+      }
       state.groupingBuffer.push({ content: text, msg, chatId });
       state.groupingSenderId = userId;
       if (state.groupingTimer) clearTimeout(state.groupingTimer);
@@ -3826,7 +3831,7 @@ async function _dispatchSignalMessage(msg, chatId, text, state) {
         const imageRegistry = require('./image-registry');
         const registryPaths = imageRegistry.getOutputs(chatId);
         const textPaths = extractImageAttachments(result.text || '');
-        const streamPaths = (channelProxy && channelProxy.strippedImagePaths) || [];
+        const streamPaths = (signalProxy && signalProxy.strippedImagePaths) || [];
         const imagePaths = [...new Set([...registryPaths, ...textPaths, ...streamPaths])]
           .filter(p => fs.existsSync(p));
 
