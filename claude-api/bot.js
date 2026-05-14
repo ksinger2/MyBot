@@ -385,7 +385,7 @@ class ChannelProxy {
     const proxy = new ChannelProxy({
       sendFn: (text) => {
         // Strip any image file paths before sending — they attach separately.
-        let cleaned = (text || '').replace(/\/tmp\/[^\s"'`\n]+\.(?:png|jpg|jpeg|webp)/gi, (match) => {
+        let cleaned = (text || '').replace(/\/tmp\/[^\s"'`\n]+\.(?:png|jpg|jpeg|gif|webp)/gi, (match) => {
           const p = match.trim();
           if (p && !_strippedImagePaths.includes(p)) _strippedImagePaths.push(p);
           return '';
@@ -3812,14 +3812,18 @@ async function _dispatchSignalMessage(msg, chatId, text, state) {
         // streamed (e.g., the run produced only tool output, or streaming was
         // bypassed for some reason), fall back to sending the full text.
         //
-        // Image delivery: use the server-side image registry as PRIMARY source
-        // (deterministic — /imagine registers outputs regardless of Claude's text).
-        // Union with extractImageAttachments as fallback for non-/imagine images
-        // (e.g., images Claude downloads via other tools).
+        // Image delivery: three sources, unioned and deduplicated.
+        // 1. Image registry (deterministic — /imagine registers outputs)
+        // 2. extractImageAttachments on result.text (final turn text)
+        // 3. strippedImagePaths from streaming proxy (paths stripped from
+        //    earlier turns during streaming — catches images Claude mentions
+        //    mid-session but not in the final summary)
         const imageRegistry = require('./image-registry');
         const registryPaths = imageRegistry.getOutputs(chatId);
         const textPaths = extractImageAttachments(result.text || '');
-        const imagePaths = [...new Set([...registryPaths, ...textPaths])];
+        const streamPaths = (channelProxy && channelProxy.strippedImagePaths) || [];
+        const imagePaths = [...new Set([...registryPaths, ...textPaths, ...streamPaths])]
+          .filter(p => fs.existsSync(p));
 
         if (!result.streamed && result.text) {
           // Strip image file paths from the text — they'll be sent as attachments below

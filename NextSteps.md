@@ -35,7 +35,7 @@
 
 ## What's Broken / In Progress
 <!-- Active issues, blockers, half-done work -->
-- `!plan` venue interior photos: downloads work but image attachment delivery to Signal is inconsistent — may need to verify the `/tmp/` path extraction regex catches the downloaded file
+- (none currently tracked)
 
 ## Recently Fixed (2026-05-13)
 - **TikTok/link messages ignored in group chat**: Merrisa's TikTok links were dropped by the listenToAll filter because messages without question marks or task keywords were classified as "short conversational." Added `hasLink` check — any message with a URL now passes the filter.
@@ -44,9 +44,10 @@
 - **Stall detector diagnostic dumps in groups**: Group chat stalls sent raw diagnostic info ("Tool at death", "Turns completed"). Now sends friendly "try again" message instead.
 - **Sandbox port registration broken**: `[REGISTER_PORT: PORT]` tag handler replaces broken `curl` approach that relied on scrubbed `$INTERNAL_API_TOKEN`.
 - **Signal link formatting lost URLs**: Markdown links with long URLs silently dropped the URL. Now always preserves URL on a separate line.
+- **`!plan` venue photos not delivered**: Image paths from earlier turns were lost because `result.text` only contains the final turn, and `channelProxy.strippedImagePaths` (paths stripped during streaming) were never included in the attachment union. Fixed by adding strippedImagePaths as a third source alongside image registry and extractImageAttachments. Also added `.gif` to the streaming proxy regex.
 
 ## Next Steps
 - Verify Merrisa's TikTok links now trigger Bianca's response in the group chat (send a test link)
-- Debug `!plan` venue interior photo delivery — check if Claude's downloaded image path appears in streamed text or only in tool output
+- Test `!plan` with a venue that has downloadable photos — verify the image arrives as a Signal attachment
 - Test `!plan` follow-ups (e.g. "send me a link") correctly reference `state._lastPlan`
 - Monitor progress circuit breaker in owner DM sessions: `docker compose logs claude-api | grep progress-breaker`
