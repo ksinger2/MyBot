@@ -385,9 +385,14 @@ class ChannelProxy {
     const proxy = new ChannelProxy({
       sendFn: (text) => {
         // Strip any image file paths before sending — they attach separately.
-        let cleaned = (text || '').replace(/\/tmp\/[^\s"'`\n]+\.(?:png|jpg|jpeg|gif|webp)/gi, (match) => {
+        let cleaned = (text || '').replace(/(?:\/tmp\/|\/workspace\/)[^\s"'`\n]+\.(?:png|jpg|jpeg|gif|webp)/gi, (match) => {
           const p = match.trim();
-          if (p && !_strippedImagePaths.includes(p)) _strippedImagePaths.push(p);
+          if (p && _strippedImagePaths.length < 10) {
+            const resolved = require('path').resolve(p);
+            if ((resolved.startsWith('/tmp') || resolved.startsWith('/workspace')) && !_strippedImagePaths.includes(resolved)) {
+              _strippedImagePaths.push(resolved);
+            }
+          }
           return '';
         });
         // Strip all system tags before they reach the user (they get processed post-session)
@@ -1625,7 +1630,7 @@ function startSignalAdapter() {
     // having a sandbox entry IS the allowlist for outsiders.
     let _sandboxAllowed = false;
     try { _sandboxAllowed = !!require('./sandbox').getSandboxUser(msg.senderId); } catch {}
-    const senderAllowed = isSignalOwner(msg.senderId) || isGroupMessage
+    const senderAllowed = isSignalOwner(msg.senderId) || isSignalAdmin(msg.senderId) || isGroupMessage
       || allowedNumbers.has(msg.senderId) || _knownGroupMembers.has(msg.senderId)
       || _sandboxAllowed;
     if (!senderAllowed) {

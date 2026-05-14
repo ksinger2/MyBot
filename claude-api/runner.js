@@ -815,6 +815,8 @@ class Runner {
               if (channelState && event.message?.content) {
                 for (const rb of event.message.content) {
                   if (rb.type === 'tool_result') {
+                    channelState.progress.currentTool = null;
+                    channelState.progress.toolDetail = '';
                     console.log(`[tool-result] id=${rb.tool_use_id || '?'} is_error=${!!rb.is_error} content_type=${typeof rb.content}`);
                     try {
                       const ld = require('./loop-detection');
@@ -877,6 +879,7 @@ class Runner {
               channelState.progress.turnCount++;
               channelState.progress.lastActivity = Date.now();
               channelState.progress.lastTurnTime = Date.now();
+              channelState.progress.lastOutputTime = Date.now();
               pushRawLog(channelState.progress, `── Turn ${channelState.progress.turnCount} ──`);
               lastEventWasAssistant = true;
             }
@@ -912,6 +915,7 @@ class Runner {
               channelState.progress.toolDetail = detail;
               channelState.progress.stallWarned = false;
               channelState.progress.lastActivity = Date.now();
+              channelState.progress.lastTurnTime = Date.now();
               const toolPrefix = agentLabel ? `  ↳ [${agentLabel}] ` : '';
               pushRawLog(channelState.progress, `${toolPrefix}⚡ ${name}${detail ? ` (${detail.length > 60 ? detail.substring(0, 57) + '...' : detail})` : ''}`);
 
@@ -950,9 +954,6 @@ class Runner {
               } catch (err) {
                 console.error('[loop-detection] error:', err.message);
               }
-
-              channelState.progress.currentTool = null;
-              channelState.progress.toolDetail = '';
 
             } else if (block.type === 'text' && block.text) {
               // F11: route text to the right bucket — parent vs sub-agent
