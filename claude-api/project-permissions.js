@@ -19,6 +19,15 @@ if (!SIGNAL_OWNER) {
   process.exit(1);
 }
 
+// Admin numbers — trusted users who get owner-like access (no tool restrictions,
+// no turn caps, bypass group chat filters) but cannot change permissions.
+const SIGNAL_ADMIN_NUMBERS = new Set(
+  (process.env.SIGNAL_ADMIN_NUMBERS || '')
+    .split(',')
+    .map(n => n.trim())
+    .filter(Boolean)
+);
+
 function _permFile(projectPath) {
   return path.join(projectPath, '.claude', 'permissions.json');
 }
@@ -39,6 +48,11 @@ function _write(projectPath, data) {
 /** Is this phone number the Signal owner? */
 function isSignalOwner(phoneNumber) {
   return phoneNumber === SIGNAL_OWNER;
+}
+
+/** Is this phone number a Signal admin (trusted user with owner-like access)? */
+function isSignalAdmin(phoneNumber) {
+  return SIGNAL_ADMIN_NUMBERS.has(phoneNumber);
 }
 
 /**
@@ -80,6 +94,7 @@ function listPermissions(projectPath) {
 module.exports = {
   SIGNAL_OWNER,
   isSignalOwner,
+  isSignalAdmin,
   hasProjectPermission,
   grantPermission,
   revokePermission,

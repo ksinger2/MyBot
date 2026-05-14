@@ -43,6 +43,7 @@ services:
       # 2026-04-11 fail-closed flip). SIGNAL_OWNER_NUMBER always bypasses the
       # Signal allowlist so the owner can never lock themselves out.
       - SIGNAL_OWNER_NUMBER=${SIGNAL_OWNER_NUMBER:-}
+      - SIGNAL_ADMIN_NUMBERS=${SIGNAL_ADMIN_NUMBERS:-}
       - ALLOWED_USER_IDS=${ALLOWED_USER_IDS:-}
       - ADMIN_USER_IDS=${ADMIN_USER_IDS:-}
       # ANTHROPIC_API_KEY removed — all users authenticate via owner's OAuth

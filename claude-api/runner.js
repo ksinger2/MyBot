@@ -174,7 +174,7 @@ function _releaseSlot() {
 function _sweepGhosts() {
   const now = Date.now();
   const MAX_NON_OWNER_AGE_MS = 15 * 60 * 1000;
-  const MAX_OWNER_AGE_MS = 2 * 60 * 60 * 1000;
+  const MAX_OWNER_AGE_MS = 75 * 60 * 1000;
   for (const [pid, info] of _processRegistry) {
     try {
       process.kill(pid, 0);
@@ -239,6 +239,11 @@ const STALL_THRESHOLDS = {
   bash:     10 * 60 * 1000, // 10 min — long builds/installs are legitimate
   default:  5 * 60 * 1000,  // 5 min — generous for tool results
 };
+const GROUP_STALL_THRESHOLDS = {
+  thinking: 2 * 60 * 1000,  // 2 min — group chats should respond fast
+  bash:     5 * 60 * 1000,  // 5 min — shorter for social context
+  default:  2 * 60 * 1000,  // 2 min — no reason to wait longer in groups
+};
 const CHECKIN_INTERVAL = 5 * 60 * 1000;
 
 // Tool labels — duplicated here so runner.js is self-contained for logging.
@@ -265,10 +270,11 @@ function summarizeToolInput(name, jsonStr) {
   } catch { return ''; }
 }
 
-function getStallThreshold(currentTool) {
-  if (!currentTool) return STALL_THRESHOLDS.thinking;
-  if (currentTool === 'Bash') return STALL_THRESHOLDS.bash;
-  return STALL_THRESHOLDS.default;
+function getStallThreshold(currentTool, isGroupChat = false) {
+  const thresholds = isGroupChat ? GROUP_STALL_THRESHOLDS : STALL_THRESHOLDS;
+  if (!currentTool) return thresholds.thinking;
+  if (currentTool === 'Bash') return thresholds.bash;
+  return thresholds.default;
 }
 
 /**
@@ -330,7 +336,8 @@ function freshProgress() {
   const loopDetection = require('./loop-detection');
   return {
     currentTool: null, toolDetail: '', toolHistory: [], turnCount: 0,
-    lastActivity: Date.now(), recentOutputs: [],
+    lastActivity: Date.now(), lastOutputTurn: 0, lastOutputTime: Date.now(),
+    lastTurnTime: Date.now(), recentOutputs: [],
     rawLog: [],
     stallWarned: false,
     lastLoopWarning: 0,
@@ -400,7 +407,7 @@ class Runner {
     this.ownerDmMode = ownerDmMode;
     this.planMode = planMode;
     this.maxTurns = ownerDmMode
-      ? (maxTurns || 1000)
+      ? (maxTurns || 200)
       : (maxTurns || (channelState?.config?.maxTurns) || DEFAULT_MAX_TURNS);
     this.channelState = channelState;
     this.channelProxy = channelProxy;
@@ -747,7 +754,9 @@ class Runner {
 
       // --- stdout handler: stream-json event parsing ---
       child.stdout.on('data', (d) => {
-        if (channelState) channelState.progress.lastActivity = Date.now();
+        // Don't reset lastActivity here — raw stdout bytes (thinking, internal
+        // chatter) aren't progress. Only meaningful events (turn advancement,
+        // tool starts, user-visible output) should reset it.
 
         stdoutBuf += d;
         const lines = stdoutBuf.split('\n');
@@ -866,6 +875,8 @@ class Runner {
 
             if (!lastEventWasAssistant) {
               channelState.progress.turnCount++;
+              channelState.progress.lastActivity = Date.now();
+              channelState.progress.lastTurnTime = Date.now();
               pushRawLog(channelState.progress, `── Turn ${channelState.progress.turnCount} ──`);
               lastEventWasAssistant = true;
             }
@@ -900,6 +911,7 @@ class Runner {
               channelState.progress.currentTool = name;
               channelState.progress.toolDetail = detail;
               channelState.progress.stallWarned = false;
+              channelState.progress.lastActivity = Date.now();
               const toolPrefix = agentLabel ? `  ↳ [${agentLabel}] ` : '';
               pushRawLog(channelState.progress, `${toolPrefix}⚡ ${name}${detail ? ` (${detail.length > 60 ? detail.substring(0, 57) + '...' : detail})` : ''}`);
 
@@ -961,6 +973,9 @@ class Runner {
                   chunk = chunk.replace(/\[(LEARNED|IMAGINE|CALENDAR|WEATHER|PRODUCT|REMIND|REBUILD|EVENT|EVENT_JOIN|SET_PREF|UPDATE_NOTES|BACKGROUND|CONCERT_PRICES|FLIGHT_SEARCH|FLIGHT_PRICE|EIGHTSLEEP|NEEDS_AGENT|EMAIL_UNSUB|CART_ADD)[:|\]][^\]]*\]?/gi, '').trim();
                   if (chunk.length > 0) {
                     streamedAny = true;
+                    channelState.progress.lastOutputTurn = channelState.progress.turnCount;
+                    channelState.progress.lastOutputTime = Date.now();
+                    channelState.progress.lastActivity = Date.now();
                     if (!channelState._sendQueue) channelState._sendQueue = Promise.resolve();
                     channelState._sendQueue = channelState._sendQueue
                       .then(() => channelProxy.send(chunk))
@@ -998,7 +1013,7 @@ class Runner {
       child.stderr.on('data', (d) => {
         stderr += d;
         if (channelState) {
-          channelState.progress.lastActivity = Date.now();
+          // stderr is diagnostic noise (warnings, download progress), not progress
           const stderrLines = d.toString().split('\n');
           for (const sl of stderrLines) {
             const trimmed = sl.trim();
@@ -1013,10 +1028,10 @@ class Runner {
       });
 
       // --- Hard cap timeout ---
-      // Owner DM mode disables the hard cap entirely — Claude runs until it
-      // naturally stops or the user sends !stop. For every other path, the
-      // 90-minute guillotine stays on as a safety net.
-      const hardTimeout = ownerDmMode ? null : setTimeout(async () => {
+      // Owner DM gets 60 min ceiling. Previous 120-min cap allowed
+      // runaway sessions to burn $28+ overnight with zero useful output.
+      const ownerTimeout = 60 * 60 * 1000;
+      const hardTimeout = setTimeout(async () => {
         console.log(`[hard-timeout] Claude CLI hit hard timeout after ${MAX_TIMEOUT / 60000} minutes`);
         await forceKillProcess(child, 5000);
         if (channelState) {
@@ -1030,7 +1045,7 @@ class Runner {
         const timeoutErr = new Error(`Claude CLI hit hard timeout after ${MAX_TIMEOUT / 60000} minutes`);
         sendErrorAlert(timeoutErr, { source: 'askClaude hard timeout' });
         wrappedReject(timeoutErr);
-      }, MAX_TIMEOUT);
+      }, ownerDmMode ? ownerTimeout : MAX_TIMEOUT);
 
       // --- Stall detector ---
       // Process-aware: checks if child is alive before deciding to kill.
@@ -1058,6 +1073,37 @@ class Runner {
 
         if (warnOnlyMode) {
           if (!channelProxy) return;
+
+          // Progress circuit breaker — three independent triggers:
+          // 1. 15+ turns with zero user-visible text (tool loop)
+          // 2. 15+ minutes since last user-visible text (API stall / turn-0 hang)
+          // 3. 10+ minutes since last turn advanced (stuck thinking, API wait)
+          // Any single trigger is enough to kill.
+          const silentTurns = p.turnCount - p.lastOutputTurn;
+          const silentMinutes = Math.round((Date.now() - p.lastOutputTime) / 60000);
+          const turnStaleMinutes = Math.round((Date.now() - p.lastTurnTime) / 60000);
+          const turnTriggered = silentTurns >= 15 && p.turnCount >= 5;
+          const timeTriggered = silentMinutes >= 15;
+          const staleTriggered = turnStaleMinutes >= 10;
+          if ((turnTriggered || timeTriggered || staleTriggered) && childAlive) {
+            const reason = turnTriggered
+              ? `${silentTurns} turns with no user output`
+              : staleTriggered
+                ? `${turnStaleMinutes}min with no turn advancement (stuck on turn ${p.turnCount})`
+                : `${silentMinutes}min with no user output (turn ${p.turnCount})`;
+            console.log(`[progress-breaker] Killing owner session — ${reason}`);
+            forceKillProcess(child).catch(() => {});
+            channelProxy.send(`🛑 **Auto-killed** — ${reason}. I was stuck burning tokens. Sorry about that.`).catch(() => {});
+            channelState.process = null;
+            channelState.busy = false;
+            channelState.startedAt = null;
+            channelState.progress = this._freshProgress();
+            const breakerErr = new Error(`Progress circuit breaker: ${reason}`);
+            sendErrorAlert(breakerErr, { source: 'askClaude progress breaker' });
+            wrappedReject(breakerErr);
+            return;
+          }
+
           if (mins >= 5 && !pingsSent.m5) {
             pingsSent.m5 = true;
             const toolInfo = p.currentTool ? `(${p.currentTool}${p.toolDetail ? `: ${p.toolDetail.substring(0, 60)}` : ''})` : '(thinking)';
@@ -1085,7 +1131,8 @@ class Runner {
 
         // Social group chats: kill on threshold, but only if process is alive
         // (if dead, clean up immediately)
-        let threshold = getStallThreshold(p.currentTool);
+        const _isGroupStall = !!groupAllowedTools && !this.sandboxUser;
+        let threshold = getStallThreshold(p.currentTool, _isGroupStall);
         if (p.activeAgents.size > 0) {
           threshold = Math.max(threshold, 30 * 60 * 1000);
         }
@@ -1103,27 +1150,33 @@ class Runner {
 
         if (idle >= threshold * 0.8 && !p.stallWarned && channelProxy) {
           p.stallWarned = true;
-          const toolInfo = p.currentTool ? `Tool: ${p.currentTool}` : 'Thinking (no tool active)';
-          channelProxy.send(`⚠️ **Stall warning** — no output for ${mins}min. ${toolInfo}. Will kill in ${Math.round((threshold - idle) / 60000)}min if no activity.`).catch(() => {});
+          if (!_isGroupStall) {
+            const toolInfo = p.currentTool ? `Tool: ${p.currentTool}` : 'Thinking (no tool active)';
+            channelProxy.send(`⚠️ **Stall warning** — no output for ${mins}min. ${toolInfo}. Will kill in ${Math.round((threshold - idle) / 60000)}min if no activity.`).catch(() => {});
+          }
         }
 
         if (idle >= threshold) {
           forceKillProcess(child).catch(() => {});
-          const lastEntries = p.rawLog.slice(-5).map(e => `[${e.ts}] ${e.text}`).join('\n');
 
           if (channelProxy) {
-            const thresholdLabel = !p.currentTool ? 'thinking'
-              : p.currentTool === 'Bash' ? 'bash' : 'default';
-            const diagLines = [
-              `🛑 **Stalled and killed** after ${mins}min of silence`,
-              `**Tool at death:** ${p.currentTool || 'none (thinking)'}`,
-              `**Turns completed:** ${p.turnCount}`,
-              `**Threshold:** ${Math.round(threshold / 60000)}min (${thresholdLabel})`,
-            ];
-            if (p.rawLog.length > 0) {
-              diagLines.push('', '**Last activity before stall:**', '```', lastEntries, '```');
+            if (_isGroupStall) {
+              channelProxy.send(`Sorry, I got stuck on that one. Try asking again or rephrase it?`).catch(() => {});
+            } else {
+              const lastEntries = p.rawLog.slice(-5).map(e => `[${e.ts}] ${e.text}`).join('\n');
+              const thresholdLabel = !p.currentTool ? 'thinking'
+                : p.currentTool === 'Bash' ? 'bash' : 'default';
+              const diagLines = [
+                `🛑 **Stalled and killed** after ${mins}min of silence`,
+                `**Tool at death:** ${p.currentTool || 'none (thinking)'}`,
+                `**Turns completed:** ${p.turnCount}`,
+                `**Threshold:** ${Math.round(threshold / 60000)}min (${thresholdLabel})`,
+              ];
+              if (p.rawLog.length > 0) {
+                diagLines.push('', '**Last activity before stall:**', '```', lastEntries, '```');
+              }
+              channelProxy.send(diagLines.join('\n')).catch(() => {});
             }
-            channelProxy.send(diagLines.join('\n')).catch(() => {});
           }
 
           channelState.process = null;

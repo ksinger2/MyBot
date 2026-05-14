@@ -437,9 +437,10 @@ class SignalAdapter extends MessagePlatform {
     // Convert [title](url) → "title (url)" for short URLs, or just "title" for long ones.
     // Also add spacing between bullet points for readability.
     if (text) {
-      // Convert markdown links: [title](url) → title for long URLs, title (url) for short
+      // Convert markdown links: [title](url) → "title (url)" or just the bare URL
+      // if title IS the URL. Never strip URLs — users need clickable links.
       text = text.replace(/\[([^\]]+)\]\((https?:\/\/[^)]+)\)/g, (_, title, url) => {
-        return url.length > 60 ? title : `${title} (${url})`;
+        return title === url ? url : `${title}\n${url}`;
       });
       // Add blank line after each bullet point for breathing room
       text = text.replace(/^(- .+)$/gm, '$1\n');

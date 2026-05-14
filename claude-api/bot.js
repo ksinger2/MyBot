@@ -1590,7 +1590,7 @@ function startSignalAdapter() {
 
   // Known group members loaded at module level — see _addKnownGroupMember()
 
-  const { isSignalOwner, hasProjectPermission } = require('./project-permissions');
+  const { isSignalOwner, isSignalAdmin, hasProjectPermission } = require('./project-permissions');
   const { buildProfileContext, getProfile } = require('./user-profiles');
 
   signalAdapter.on('message', async (msg) => {
@@ -1741,6 +1741,8 @@ function startSignalAdapter() {
 
     // Owner flag — only +16315214787 can edit code or change permissions
     const senderIsOwner = isSignalOwner(msg.senderId);
+    // Admin flag — trusted users who bypass filters and get full tool access
+    const senderIsAdmin = isSignalAdmin(msg.senderId);
 
     // Use sender's phone number as chatId for per-conversation state.
     // For 1:1 DMs the chatId IS the sender's phone. For groups the chatId is
@@ -1790,7 +1792,7 @@ function startSignalAdapter() {
         (m.uuid && botUuid && m.uuid === botUuid)
       );
 
-      if (!state.listenToAll && !hasPendingSenderWizard) {
+      if (!state.listenToAll && !hasPendingSenderWizard && !senderIsAdmin) {
         if (!botMentioned) {
           console.log(`[signal] Group message — bot not mentioned, ignoring (${mentionList.length} other mention(s))`);
           return;
@@ -1828,13 +1830,14 @@ function startSignalAdapter() {
       // Even in listenToAll mode: if the message is clearly a short conversational
       // exchange not addressed to the bot (no question, no task, no bot name), skip.
       // Owner always bypasses this filter — they set up listenToAll and should always get responses.
-      if (state.listenToAll && !botMentioned && mentionList.length === 0 && !senderIsOwner) {
+      if (state.listenToAll && !botMentioned && mentionList.length === 0 && !senderIsOwner && !senderIsAdmin) {
         const botName = (state.identity?.name || '').toLowerCase();
         const textLower = text.toLowerCase().replace(/\uFFFC/g, '').trim();
         const hasQuestion = textLower.includes('?');
         const hasTask = /\b(can you|could you|please|remind|schedule|search|find|look up|what|who|when|where|how|tell me|do you|help|show|get|check|track|set|add|list|commands|u have|u know)\b/i.test(textLower);
         const namesMeByName = botName && textLower.includes(botName);
-        if (!hasQuestion && !hasTask && !namesMeByName) {
+        const hasLink = /https?:\/\/\S+/i.test(textLower);
+        if (!hasQuestion && !hasTask && !namesMeByName && !hasLink) {
           console.log(`[signal] Group listenToAll — short conversational message, not directed at bot, ignoring`);
           return;
         }
@@ -2283,7 +2286,7 @@ function startSignalAdapter() {
 
 async function _dispatchSignalMessage(msg, chatId, text, state) {
   const { buildMinimalProfileContext, buildProfileLookup, buildProfileContext, getProfile } = require('./user-profiles');
-  const { isSignalOwner } = require('./project-permissions');
+  const { isSignalOwner, isSignalAdmin } = require('./project-permissions');
 
   // Resolve UUID→phone for downstream profile/calendar/preference lookups.
   // This can be called directly (e.g., from !testas) with a UUID senderId.
@@ -2296,6 +2299,7 @@ async function _dispatchSignalMessage(msg, chatId, text, state) {
 
   const isGroupMessage = msg.chatId !== msg.senderId;
   const senderIsOwner = isSignalOwner(msg.senderId);
+  const senderIsAdmin = isSignalAdmin(msg.senderId);
   const personalityFile = getPersonalityFile(state.personality);
 
   // Detect "still broken" feedback and mark the latest repair as failed
@@ -2593,10 +2597,12 @@ async function _dispatchSignalMessage(msg, chatId, text, state) {
           : (isGroupChat || isNonOwnerDm) ? nonOwnerToolWhitelist : undefined,
         profileContext: (combinedProfileContext || '') + groupOnboardHint + pendingEventContext + lastPlanContext + groupNotesContext + activeFlightsContext + imageRefinementContext
           + (isGroupChat ? `\n\nCHAT_ID: ${msg.chatId}\nSENDER_ID: ${msg.senderId}` : '')
-          + (sandboxUser ? `\n\nSANDBOX: You are working in ${sandboxUser.name}'s project directory (${sandboxUser.cwd}). All file operations are restricted to this directory.\nPUBLIC URL: When you start a dev server, the user can view it at https://${sandboxUser.name.toLowerCase()}.backtoirl.com — register the port by running: curl -s -X POST http://localhost:3400/sandbox-tunnel/register -H "Content-Type: application/json" -H "X-Internal-Token: $INTERNAL_API_TOKEN" -d '{"name":"${sandboxUser.name}","port":PORT}' (replace PORT with the actual port number).\nENV: $CLOUDFLARE_API_TOKEN and $CLOUDFLARE_ACCOUNT_ID are set — use \`wrangler\` directly for Cloudflare deployments, no login needed.` : ''),
+          + (sandboxUser ? `\n\nSANDBOX: You are working in ${sandboxUser.name}'s project directory (${sandboxUser.cwd}). All file operations are restricted to this directory.\nPUBLIC URL: When you start a dev server, emit [REGISTER_PORT: PORT] (replace PORT with the actual port number, e.g. [REGISTER_PORT: 3000]). The site will be live at https://${sandboxUser.name.toLowerCase()}.backtoirl.com. Do NOT use curl to register ports — use the tag.\nCLOUDFLARE: $CLOUDFLARE_API_TOKEN and $CLOUDFLARE_ACCOUNT_ID are set. Use \`wrangler\` for Workers/Pages deployments. NEVER run \`cloudflared login\` or \`cloudflared tunnel login\` — browser auth does not work in this environment. For public URLs, use the [REGISTER_PORT:] tag above.` : ''),
         streamReplies: true,
         maxTurns: ownerDmMode ? null
-          : ((isGroupChat || isNonOwnerDm) ? 20 : (senderIsOwner ? (parseInt(process.env.SIGNAL_OWNER_MAX_TURNS, 10) || 75) : 20)),
+          : (isGroupChat ? 20
+          : (senderIsOwner || senderIsAdmin) ? (parseInt(process.env.SIGNAL_OWNER_MAX_TURNS, 10) || 75)
+          : 20),
         ownerDmMode,
         planMode,
         isOwner: senderIsOwner,
@@ -2873,9 +2879,11 @@ async function _dispatchSignalMessage(msg, chatId, text, state) {
 
       // [CONCERT_PRICES:] tag extraction — get ticket prices without Bash.
       // Format: [CONCERT_PRICES: artist="Name" venue="Venue" date="YYYY-MM-DD" city="City"]
+      // Skip if auto-context already pre-fetched prices (avoids duplicate messages).
+      const _autoContextHadPrices = signalPrompt && signalPrompt.includes('<concert-price-data');
       const concertRe = /\[CONCERT_PRICES:\s*(.+?)\]/gi;
       const concertMatches = [...(result.text || '').matchAll(concertRe)];
-      if (concertMatches.length > 0) {
+      if (concertMatches.length > 0 && !_autoContextHadPrices) {
         const http = require('http');
         for (const match of concertMatches) {
           const raw = match[1].trim();
@@ -3378,6 +3386,30 @@ async function _dispatchSignalMessage(msg, chatId, text, state) {
           }
         } catch (e) { console.warn(`[event-join-tag] handler error: ${e.message}`); }
         result.text = (result.text || '').replace(eventJoinRe, '').trim();
+      }
+
+      // [REGISTER_PORT:] tag — sandbox users register dev server ports for
+      // public URLs (e.g. daniel.backtoirl.com). Replaces the broken curl
+      // approach that relied on $INTERNAL_API_TOKEN (scrubbed by H2).
+      // Deterministic: tag is processed server-side with direct module call.
+      const registerPortRe = /\[REGISTER_PORT:\s*(?:port\s*=\s*)?(\d+)\s*\]/gi;
+      const registerPortMatches = [...(result.text || '').matchAll(registerPortRe)];
+      if (registerPortMatches.length > 0 && sandboxUser) {
+        try {
+          const { registerPort, getTunnelUrl } = require('./sandbox-tunnel');
+          for (const match of registerPortMatches) {
+            const port = parseInt(match[1], 10);
+            if (port > 0 && port <= 65535) {
+              registerPort(sandboxUser.name, port);
+              const url = getTunnelUrl(sandboxUser.name);
+              console.log(`[register-port-tag] ${sandboxUser.name} → port ${port} (${url})`);
+              if (channelProxy) {
+                channelProxy.send(`Your site is live at **${url}** (port ${port})`).catch(() => {});
+              }
+            }
+          }
+        } catch (e) { console.warn(`[register-port-tag] handler error: ${e.message}`); }
+        result.text = (result.text || '').replace(registerPortRe, '').trim();
       }
 
       // [REBUILD] tag extraction — Claude self-rebuild signal.
