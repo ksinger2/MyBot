@@ -672,7 +672,18 @@ class Runner {
       // enforces it regardless of what Claude outputs or tries.
       let child;
       try {
-        if (this.sandboxUser && this.sandboxUser.uid) {
+        if (this.sandboxUser) {
+          // Retry UID lookup in case provisioning completed after initial cache miss
+          let uid = this.sandboxUser.uid;
+          if (!uid) {
+            try { require('./sandbox').provisionUser(this.sandboxUser); } catch {}
+            uid = require('./sandbox')._getUid?.(this.sandboxUser.linuxUser) || this.sandboxUser.uid;
+          }
+          if (!uid) {
+            console.error(`[sandbox] Cannot resolve UID for ${this.sandboxUser.linuxUser} — aborting sandbox spawn`);
+            wrappedReject(new Error(`Sandbox user ${this.sandboxUser.linuxUser} has no UID — provisioning may have failed`));
+            return;
+          }
           const sandboxLinuxUser = this.sandboxUser.linuxUser;
           // Refresh sandbox OAuth creds from live /home/node copy before each
           // spawn — sandbox creds are otherwise frozen at provision time and

@@ -70,6 +70,7 @@ function _getUid(linuxUser) {
     _uidCache.set(linuxUser, uid);
     return uid;
   } catch {
+    // Don't cache null — user may be provisioned later
     return null;
   }
 }
@@ -309,6 +310,7 @@ module.exports = {
   provisionUser,
   refreshCredentials,
   refreshAllCredentials,
+  _getUid,
   SANDBOX_ROOT,
   DEFAULT_TOOLS,
 };
