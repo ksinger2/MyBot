@@ -8,14 +8,20 @@ const WATCHDOG_STATE_FILE = '/app/data/watchdog-state.json';
 
 let watchdogInterval = null;
 let lastWebhookAt = 0;
+let lastDataMessageAt = 0;
 let startedAt = 0;
 let consecutiveFailures = 0;
 let lastRestartAt = 0;
+let lastOwnerAlertAt = 0;
 
 const HEALTH_CHECK_INTERVAL = 60_000;
 const RESTART_COOLDOWN = 10 * 60_000;
 const MAX_CONSECUTIVE_FAILURES = 5;
 const CONTAINER_NAME = 'mybot-signal-api-1';
+// If HTTP is healthy but no webhook envelopes at all in 60 min, WebSocket is likely dead.
+// Uses webhook activity (any envelope including receipts/read notifications), NOT text
+// messages — 30+ minutes of no texts is normal, but no envelopes at all means dead.
+const STALE_WEBSOCKET_MS = 60 * 60_000;
 
 function _readState() {
   try { return JSON.parse(fs.readFileSync(WATCHDOG_STATE_FILE, 'utf-8')); } catch { return {}; }
@@ -29,6 +35,10 @@ function _writeState(patch) {
 
 function recordWebhookActivity() {
   lastWebhookAt = Date.now();
+}
+
+function recordDataMessage() {
+  lastDataMessageAt = Date.now();
 }
 
 function getLastWebhookTimestamp() {
@@ -52,7 +62,7 @@ async function checkHealth(apiUrl) {
   }
 }
 
-function restartContainer(signalAdapter, ownerChatId) {
+function restartContainer(signalAdapter, ownerChatId, reason) {
   const now = Date.now();
   if (now - lastRestartAt < RESTART_COOLDOWN) {
     log('Restart skipped — cooldown active');
@@ -61,7 +71,7 @@ function restartContainer(signalAdapter, ownerChatId) {
   lastRestartAt = now;
   consecutiveFailures = 0;
 
-  log(`Restarting ${CONTAINER_NAME}`);
+  log(`Restarting ${CONTAINER_NAME} — ${reason}`);
   execFile('docker', ['restart', CONTAINER_NAME], (err, stdout, stderr) => {
     if (err) {
       log(`Restart failed: ${err.message}`);
@@ -69,17 +79,10 @@ function restartContainer(signalAdapter, ownerChatId) {
     }
     log('Restart succeeded');
 
-    // Reset webhook tracking so we don't immediately re-trigger
     lastWebhookAt = Date.now();
-
-    if (signalAdapter && ownerChatId) {
-      setTimeout(() => {
-        signalAdapter.sendMessage(
-          ownerChatId,
-          'Signal connection was stale — I restarted the signal bridge. Messages should flow again in ~30s.'
-        ).catch(e => log(`Failed to alert owner: ${e.message}`));
-      }, 35000);
-    }
+    lastDataMessageAt = Date.now();
+    // No owner notification — bridge restarts are not user-actionable.
+    // Check !health or docker logs for bridge status.
   });
 }
 
@@ -88,6 +91,7 @@ function startSignalWatchdog(signalAdapter, ownerChatId) {
 
   startedAt = Date.now();
   lastWebhookAt = Date.now();
+  lastDataMessageAt = Date.now();
   consecutiveFailures = 0;
   log('Started');
 
@@ -103,12 +107,24 @@ function startSignalWatchdog(signalAdapter, ownerChatId) {
       log(`Health check failed (${consecutiveFailures}/${MAX_CONSECUTIVE_FAILURES})`);
     }
 
-    // Persist lastWebhookAt every tick so startup can detect gaps
-    if (lastWebhookAt > 0) _writeState({ lastWebhookAt });
+    if (lastWebhookAt > 0) _writeState({ lastWebhookAt, lastDataMessageAt });
 
     if (consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
-      log('Signal-api HTTP unresponsive — triggering restart');
-      restartContainer(signalAdapter, ownerChatId);
+      restartContainer(signalAdapter, ownerChatId, 'HTTP unresponsive');
+      return;
+    }
+
+    // WebSocket death detection: HTTP is healthy but no webhook envelopes at all
+    // (receipts, read notifications, typing indicators, or text messages).
+    // 30+ minutes of no TEXT messages is totally normal — but no envelopes at all
+    // means the WebSocket is genuinely dead.
+    if (healthy && lastWebhookAt > 0) {
+      const staleness = Date.now() - lastWebhookAt;
+      const uptime = Date.now() - startedAt;
+      if (uptime > 10 * 60_000 && staleness > STALE_WEBSOCKET_MS) {
+        log(`No webhook envelopes in ${Math.round(staleness / 60_000)}min — WebSocket likely dead`);
+        restartContainer(signalAdapter, ownerChatId, 'no webhook envelopes in 60min');
+      }
     }
   }, HEALTH_CHECK_INTERVAL);
   if (watchdogInterval.unref) watchdogInterval.unref();
@@ -122,4 +138,4 @@ function stopSignalWatchdog() {
   }
 }
 
-module.exports = { startSignalWatchdog, stopSignalWatchdog, recordWebhookActivity, getLastWebhookTimestamp };
+module.exports = { startSignalWatchdog, stopSignalWatchdog, recordWebhookActivity, recordDataMessage, getLastWebhookTimestamp };

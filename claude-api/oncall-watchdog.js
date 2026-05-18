@@ -23,21 +23,13 @@ function logWarn(msg) {
   console.warn(`[oncall-watchdog] ${msg}`);
 }
 
-// ── Escalation — Signal DM to owner if adapter available, otherwise console ──
+// ── Escalation — always route through sendErrorAlert for 15-min dedup ──
 async function escalate(title, detail) {
   const msg = `[ONCALL] ${title}\n${detail}`;
   log(`ESCALATING: ${msg}`);
   try {
-    const bot = require('./bot');
-    const adapter = bot.signalAdapter;
-    if (adapter && adapter.sendMessage && process.env.SIGNAL_OWNER_NUMBER) {
-      await adapter.sendMessage(process.env.SIGNAL_OWNER_NUMBER, msg);
-      return;
-    }
-  } catch {}
-  try {
     const { sendErrorAlert } = require('./error-alerting');
-    sendErrorAlert(new Error(msg), { source: 'oncall-watchdog' });
+    sendErrorAlert(new Error(msg), { source: `oncall-${title}` });
   } catch {}
 }
 

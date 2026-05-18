@@ -872,10 +872,18 @@ class Runner {
                         const preview = firstLine.length > 120 ? firstLine.substring(0, 117) + '...' : firstLine;
                         const prefix = agentLabel ? `  ↳ [${agentLabel}] ` : '  ';
                         pushRawLog(channelState.progress, `${prefix}← ${preview}`);
+                        if (agentObj) agentObj.consecutiveErrors = 0;
                       }
                     } else if (rb.is_error) {
                       const prefix = agentLabel ? `  ↳ [${agentLabel}] ` : '  ';
                       pushRawLog(channelState.progress, `${prefix}← ❌ Error`);
+                      if (agentObj) {
+                        agentObj.consecutiveErrors = (agentObj.consecutiveErrors || 0) + 1;
+                        if (agentObj.consecutiveErrors >= 3) {
+                          console.warn(`[agent-failfast] Agent "${agentObj.description}" hit ${agentObj.consecutiveErrors} consecutive errors — triggering fail-fast`);
+                          channelState.progress._agentFailFast = true;
+                        }
+                      }
                     }
                   }
                 }
@@ -911,12 +919,21 @@ class Runner {
                 const loopDetection = require('./loop-detection');
                 const agentDesc = block.input?.description || 'sub-agent';
                 const agentType = block.input?.subagent_type || 'general-purpose';
+                const totalAgents = channelState.progress.activeAgents.size + channelState.progress.completedAgents.length;
+                if (streamedAny && totalAgents >= 2) {
+                  console.warn(`[agent-cap] Post-answer agent spawn #${totalAgents + 1} ("${agentDesc}") — triggering fail-fast`);
+                  channelState.progress._agentFailFast = true;
+                }
+                if (streamedAny && totalAgents === 0) {
+                  console.warn(`[agent-guard] Post-answer agent spawn: "${agentDesc}" — applying tighter thresholds`);
+                }
                 channelState.progress.activeAgents.set(block.id, {
                   description: agentDesc,
                   type: agentType,
                   startedAt: Date.now(),
                   lastTool: null,
                   lastDetail: '',
+                  consecutiveErrors: 0,
                   loopState: loopDetection.createState(),
                 });
                 pushRawLog(channelState.progress, `🤖 Spawned [${agentType}]: ${agentDesc}`);
@@ -1087,16 +1104,23 @@ class Runner {
           if (!channelProxy) return;
 
           // Progress circuit breaker — three independent triggers:
-          // 1. 15+ turns with zero user-visible text (tool loop)
-          // 2. 15+ minutes since last user-visible text (API stall / turn-0 hang)
-          // 3. 10+ minutes since last turn advanced (stuck thinking, API wait)
-          // Any single trigger is enough to kill.
+          // 1. N+ turns with zero user-visible text (tool loop)
+          // 2. N+ minutes since last user-visible text (API stall / turn-0 hang)
+          // 3. N+ minutes since last turn advanced (stuck thinking, API wait)
+          // Thresholds tighten when a sub-agent spawns AFTER the answer was
+          // already delivered — that pattern is almost always a rogue agent
+          // investigating on its own initiative, not user-requested work.
           const silentTurns = p.turnCount - p.lastOutputTurn;
           const silentMinutes = Math.round((Date.now() - p.lastOutputTime) / 60000);
           const turnStaleMinutes = Math.round((Date.now() - p.lastTurnTime) / 60000);
-          const turnTriggered = silentTurns >= 15 && p.turnCount >= 5;
-          const timeTriggered = silentMinutes >= 15;
-          const staleTriggered = turnStaleMinutes >= 10;
+          const postAnswerAgent = streamedAny && p.activeAgents.size > 0;
+          const agentFailFast = p._agentFailFast;
+          const turnThreshold = agentFailFast ? 3 : postAnswerAgent ? 8 : 15;
+          const silentTimeThreshold = agentFailFast ? 2 : postAnswerAgent ? 5 : 15;
+          const staleThreshold = agentFailFast ? 2 : postAnswerAgent ? 5 : 10;
+          const turnTriggered = silentTurns >= turnThreshold && p.turnCount >= 5;
+          const timeTriggered = silentMinutes >= silentTimeThreshold;
+          const staleTriggered = turnStaleMinutes >= staleThreshold;
           if ((turnTriggered || timeTriggered || staleTriggered) && childAlive) {
             const reason = turnTriggered
               ? `${silentTurns} turns with no user output`

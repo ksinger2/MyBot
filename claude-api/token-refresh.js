@@ -1,24 +1,23 @@
-const { execFile } = require('child_process');
+const { execFile, spawn } = require('child_process');
+const { promisify } = require('util');
 const fs = require('fs');
-const https = require('https');
 
-const REFRESH_INTERVAL_MS = 30 * 60 * 1000; // 30 minutes
+const execFileAsync = promisify(execFile);
+
+const REFRESH_INTERVAL_MS = 15 * 60 * 1000; // 15 minutes — aggressive to catch expiry early
+const PROACTIVE_REFRESH_MINUTES = 120; // trigger refresh when < 2hr remaining
+const EXPIRY_WARN_MINUTES = 30; // only alert owner if proactive refresh FAILS
 
 const WINDOWS_CREDS = '/host/windows-claude-credentials.json';
 const ACTIVE_CREDS = '/home/node/.claude/.credentials.json';
 
-// Anthropic OAuth2 endpoints (from /.well-known/oauth-authorization-server)
-const TOKEN_ENDPOINT = 'https://api.anthropic.com/token';
-const CLIENT_ID = 'https://claude.ai/oauth/claude-code-client-metadata';
+let _ownerNotifiedAt = 0;
+let _loginInProgress = false;
+let _lastProactiveRefreshAt = 0;
 
-// Buffer: refresh 10 minutes before expiry
-const EXPIRY_BUFFER_MS = 10 * 60 * 1000;
+function isLoginInProgress() { return _loginInProgress; }
+function setLoginInProgress(v) { _loginInProgress = !!v; }
 
-/**
- * Sync credentials from the Windows host mount (read-only) if they're fresher.
- * Handles the case where the user logs in from Windows and the WSL/Docker copy
- * has a stale token.
- */
 function syncWindowsCredentials() {
   try {
     if (!fs.existsSync(WINDOWS_CREDS)) return false;
@@ -28,13 +27,12 @@ function syncWindowsCredentials() {
     try { activeRaw = fs.readFileSync(ACTIVE_CREDS, 'utf8'); } catch {}
 
     if (winRaw && winRaw !== activeRaw) {
-      // Check if Windows token is actually newer (has later expiry)
       try {
         const winParsed = JSON.parse(winRaw);
         const activeParsed = activeRaw ? JSON.parse(activeRaw) : {};
         const winExpiry = winParsed?.claudeAiOauth?.expiresAt || 0;
         const activeExpiry = activeParsed?.claudeAiOauth?.expiresAt || 0;
-        if (winExpiry <= activeExpiry) return false; // active is already newer
+        if (winExpiry <= activeExpiry) return false;
       } catch {}
 
       fs.writeFileSync(ACTIVE_CREDS, winRaw, { mode: 0o600 });
@@ -47,105 +45,177 @@ function syncWindowsCredentials() {
   return false;
 }
 
-/**
- * Use the OAuth2 refresh_token grant to get a new access token from Anthropic.
- * This is the same flow the Claude CLI uses internally. Public client (no secret).
- */
-function refreshOAuthToken() {
+function getTokenExpiryMinutes() {
+  try {
+    const creds = JSON.parse(fs.readFileSync(ACTIVE_CREDS, 'utf8'));
+    const exp = creds?.claudeAiOauth?.expiresAt;
+    if (!exp) return null;
+    return Math.round((exp - Date.now()) / 60000);
+  } catch { return null; }
+}
+
+function runHeadlessLogin() {
   return new Promise((resolve, reject) => {
-    let creds;
-    try {
-      creds = JSON.parse(fs.readFileSync(ACTIVE_CREDS, 'utf8'));
-    } catch (err) {
-      return reject(new Error(`Cannot read credentials: ${err.message}`));
-    }
+    if (_loginInProgress) return reject(new Error('Login already in progress'));
+    _loginInProgress = true;
+    let url = null;
+    let stderr = '';
 
-    const oauth = creds?.claudeAiOauth;
-    if (!oauth?.refreshToken) {
-      return reject(new Error('No refresh token available'));
-    }
-
-    // Check if token actually needs refreshing
-    if (oauth.expiresAt && Date.now() < oauth.expiresAt - EXPIRY_BUFFER_MS) {
-      const minsLeft = Math.round((oauth.expiresAt - Date.now()) / 60000);
-      return resolve({ skipped: true, minsLeft });
-    }
-
-    const body = new URLSearchParams({
-      grant_type: 'refresh_token',
-      refresh_token: oauth.refreshToken,
-      client_id: CLIENT_ID,
-    }).toString();
-
-    const url = new URL(TOKEN_ENDPOINT);
-    const req = https.request({
-      hostname: url.hostname,
-      path: url.pathname,
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/x-www-form-urlencoded',
-        'Content-Length': Buffer.byteLength(body),
-      },
-      timeout: 15000,
-    }, (res) => {
-      let data = '';
-      res.on('data', (chunk) => { data += chunk; });
-      res.on('end', () => {
-        if (res.statusCode !== 200) {
-          return reject(new Error(`Token refresh failed: HTTP ${res.statusCode} — ${data.substring(0, 200)}`));
-        }
-        try {
-          const tokens = JSON.parse(data);
-          // Update credentials file with new tokens
-          creds.claudeAiOauth = {
-            ...oauth,
-            accessToken: tokens.access_token,
-            // Refresh token may or may not be rotated
-            refreshToken: tokens.refresh_token || oauth.refreshToken,
-            expiresAt: tokens.expires_in
-              ? Date.now() + tokens.expires_in * 1000
-              : oauth.expiresAt,
-          };
-          fs.writeFileSync(ACTIVE_CREDS, JSON.stringify(creds), { mode: 0o600 });
-          const minsLeft = Math.round(((creds.claudeAiOauth.expiresAt || 0) - Date.now()) / 60000);
-          resolve({ refreshed: true, minsLeft });
-        } catch (err) {
-          reject(new Error(`Failed to parse token response: ${err.message}`));
-        }
-      });
+    const proc = spawn('claude', ['auth', 'login', '--claudeai'], {
+      env: { ...process.env, BROWSER: 'echo', DISPLAY: '' },
+      stdio: ['pipe', 'pipe', 'pipe'],
+      timeout: 120000,
     });
 
-    req.on('error', reject);
-    req.on('timeout', () => { req.destroy(); reject(new Error('Token refresh timed out')); });
-    req.write(body);
-    req.end();
+    proc.stdout.on('data', (chunk) => {
+      const text = chunk.toString();
+      const match = text.match(/(https:\/\/claude\.com\/[^\s]+)/);
+      if (match && !url) {
+        url = match[1];
+        resolve({ process: proc, url });
+      }
+    });
+
+    proc.stderr.on('data', (chunk) => {
+      stderr += chunk.toString();
+      const match = stderr.match(/(https:\/\/claude\.com\/[^\s]+)/);
+      if (match && !url) {
+        url = match[1];
+        resolve({ process: proc, url });
+      }
+    });
+
+    proc.on('error', (err) => {
+      _loginInProgress = false;
+      if (!url) reject(err);
+    });
+
+    proc.on('close', (code) => {
+      _loginInProgress = false;
+      if (!url) {
+        reject(new Error(`Login process exited (code ${code}) without producing URL`));
+      }
+    });
+
+    setTimeout(() => {
+      if (!url) {
+        proc.kill();
+        _loginInProgress = false;
+        reject(new Error('Login timed out waiting for URL'));
+      }
+    }, 30000);
   });
 }
 
-async function refreshToken() {
-  // Step 1: Sync from Windows if a fresher token is available
-  syncWindowsCredentials();
-
-  // Step 2: Proactively refresh the OAuth token if it's close to expiry
+async function notifyOwnerAuthExpiring(minsLeft) {
+  if (Date.now() - _ownerNotifiedAt < 60 * 60 * 1000) return;
   try {
-    const result = await refreshOAuthToken();
-    if (result.skipped) {
-      console.log(`[token-refresh] Token still valid (${result.minsLeft}min remaining)`);
-    } else if (result.refreshed) {
-      console.log(`[token-refresh] OAuth token refreshed (new expiry: ${result.minsLeft}min)`);
-    }
-  } catch (err) {
-    console.error(`[token-refresh] OAuth refresh failed: ${err.message}`);
+    const { sendErrorAlert } = require('./error-alerting');
+    const msg = minsLeft <= 0
+      ? 'Claude auth token has expired. Send me !login to re-authenticate from your phone.'
+      : `Claude auth token expires in ${minsLeft}min. Send me !login to re-authenticate from your phone.`;
+    await sendErrorAlert(new Error(msg), { source: 'token-refresh' });
+    _ownerNotifiedAt = Date.now();
+  } catch {}
+}
+
+/**
+ * Proactive token refresh: runs a minimal Claude CLI command that forces the
+ * SDK to hit the auth endpoint. When a token is near expiry, the CLI
+ * automatically exchanges the refresh_token for a new access_token.
+ *
+ * Returns true if refresh succeeded (token extended), false otherwise.
+ */
+async function _proactiveRefresh() {
+  const cooldown = 5 * 60_000;
+  if (Date.now() - _lastProactiveRefreshAt < cooldown) return false;
+  _lastProactiveRefreshAt = Date.now();
+
+  console.log('[token-refresh] Proactive refresh — syncing credentials and testing CLI...');
+  const beforeExpiry = getTokenExpiryMinutes();
+
+  // Step 1: Sync Windows credentials first — this is free and often sufficient
+  syncWindowsCredentials();
+  const afterSync = getTokenExpiryMinutes();
+  if (afterSync !== null && afterSync > (beforeExpiry || 0) + 30) {
+    console.log(`[token-refresh] Windows sync refreshed token! ${beforeExpiry}min → ${afterSync}min remaining`);
+    try { require('./sandbox').refreshAllCredentials(); } catch {}
+    return true;
   }
 
-  // Step 3: Verify CLI still works
-  execFile('claude', ['--version'], { timeout: 15000 }, (err, stdout) => {
-    if (err) {
-      console.error('[token-refresh] CLI verification failed:', err.message);
-      return;
+  // Step 2: Run claude --version (free, no API tokens) to trigger SDK auth exchange
+  try {
+    await execFileAsync('claude', ['--version'], {
+      timeout: 15000,
+      env: { ...process.env, HOME: '/home/node' },
+    });
+  } catch (err) {
+    console.error('[token-refresh] Proactive refresh (--version) failed:', err.message);
+    return false;
+  }
+
+  const afterVersion = getTokenExpiryMinutes();
+  if (afterVersion !== null && afterVersion > (beforeExpiry || 0) + 30) {
+    console.log(`[token-refresh] Token refreshed via --version! ${beforeExpiry}min → ${afterVersion}min remaining`);
+    try { require('./sandbox').refreshAllCredentials(); } catch {}
+    return true;
+  }
+
+  // Step 3: Only burn an API call if --version didn't refresh the token
+  // and we're within 30 minutes of expiry (critical zone)
+  if ((afterVersion || beforeExpiry || 999) <= EXPIRY_WARN_MINUTES) {
+    console.log('[token-refresh] Critical zone — trying full CLI prompt to force refresh...');
+    try {
+      await execFileAsync('claude', ['-p', 'respond with only the word ok', '--max-turns', '1', '--output-format', 'text'], {
+        timeout: 45000,
+        env: { ...process.env, HOME: '/home/node' },
+      });
+    } catch (err) {
+      console.error('[token-refresh] Proactive refresh (prompt) failed:', err.message);
+      return false;
     }
-    console.log('[token-refresh] CLI verified — claude', stdout.trim());
-  });
+
+    const afterPrompt = getTokenExpiryMinutes();
+    if (afterPrompt !== null && afterPrompt > (beforeExpiry || 0) + 30) {
+      console.log(`[token-refresh] Token refreshed via prompt! ${beforeExpiry}min → ${afterPrompt}min remaining`);
+      try { require('./sandbox').refreshAllCredentials(); } catch {}
+      return true;
+    }
+  }
+
+  console.log(`[token-refresh] CLI ran but token not extended (${beforeExpiry}min → ${getTokenExpiryMinutes()}min)`);
+  return false;
+}
+
+async function refreshToken() {
+  const synced = syncWindowsCredentials();
+  if (synced) {
+    try { require('./sandbox').refreshAllCredentials(); } catch {}
+  }
+
+  const minsLeft = getTokenExpiryMinutes();
+  if (minsLeft === null) {
+    console.warn('[token-refresh] Cannot read token expiry');
+    return;
+  }
+
+  if (minsLeft > PROACTIVE_REFRESH_MINUTES) {
+    console.log(`[token-refresh] Token valid (${minsLeft}min remaining)`);
+    return;
+  }
+
+  // Token is within the proactive refresh window — try to extend it
+  console.warn(`[token-refresh] Token low (${minsLeft}min remaining) — attempting proactive refresh`);
+  const refreshed = await _proactiveRefresh();
+
+  if (refreshed) return;
+
+  // Proactive refresh didn't work — if really low, alert owner
+  const minsAfter = getTokenExpiryMinutes() || minsLeft;
+  if (minsAfter <= EXPIRY_WARN_MINUTES) {
+    console.error(`[token-refresh] Proactive refresh failed, token critical (${minsAfter}min)`);
+    await notifyOwnerAuthExpiring(minsAfter);
+  }
 }
 
 function startTokenRefresh() {
@@ -155,4 +225,11 @@ function startTokenRefresh() {
   console.log(`[token-refresh] Heartbeat started — every ${REFRESH_INTERVAL_MS / 60000}min`);
 }
 
-module.exports = { startTokenRefresh };
+module.exports = {
+  startTokenRefresh,
+  runHeadlessLogin,
+  isLoginInProgress,
+  setLoginInProgress,
+  getTokenExpiryMinutes,
+  syncWindowsCredentials,
+};
