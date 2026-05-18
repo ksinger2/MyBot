@@ -200,6 +200,12 @@ function _checkRateLimit(userId) {
   return true;
 }
 
+// Content-based dedup — catches Signal re-deliveries with different timestamps
+// but identical content (e.g. with/without U+FFFC prefix). Keyed on
+// chatId:senderId:normalizedContent, expires after 2s.
+const _contentDedup = new Map();
+const CONTENT_DEDUP_WINDOW_MS = 2000;
+
 // Message grouping debounce — wait this many ms for follow-up messages before
 // dispatching. Set MESSAGE_GROUP_DELAY_MS=0 to disable.
 const MESSAGE_GROUP_DELAY_MS = parseInt(process.env.MESSAGE_GROUP_DELAY_MS, 10) || 800;
@@ -1231,10 +1237,10 @@ async function startBot() {
     }, 5000);
   }
 
-  // Missed-message recovery: if there's a gap between the last persisted
+  // Missed-message recovery: if there's a LONG gap between the last persisted
   // webhook timestamp and now, proactively check in with recently active chats.
-  // This catches the case where signal-cli crashed and messages were lost.
-  const MIN_GAP_MS = 90_000;
+  // Only for real outages (60min+), not routine restarts.
+  const MIN_GAP_MS = 60 * 60_000; // 60min — short restarts don't need a check-in
   const MAX_RECENCY_MS = 60 * 60_000; // only bother for chats active in last hour
   const lastWebhook = getLastWebhookTimestamp();
   if (lastWebhook > 0) {
@@ -1435,12 +1441,13 @@ async function processQueue(state) {
       queueOpts.sessionId = null;
       result = await runClaudeWithContinuation(combined, queueOpts, queueProxy);
     }
-    // Auth failure during queue processing
+    // Auth failure during queue processing — friendly message to user, diagnostic to owner
     if (result.authFailed) {
       const signalChatIdForAuth = replyTarget?._signalChatId || (channelId ? channelId.replace(/^signal:/, '') : null);
       if (signalChatIdForAuth && signalAdapter) {
-        await signalAdapter.sendMessage(signalChatIdForAuth, '⚠️ Not logged in — Claude CLI needs re-authentication. Run `claude` on the host and use `/login` to refresh the token.').catch(() => {});
+        await signalAdapter.sendMessage(signalChatIdForAuth, "I'm taking a quick break — try again in a few minutes!").catch(() => {});
       }
+      sendErrorAlert(new Error('Auth failed in queue — token may be expired. Send !login to re-authenticate.'), { source: 'auth-queue' });
       return;
     }
 
@@ -1744,6 +1751,21 @@ function startSignalAdapter() {
     }
     if (!text) return; // truly empty (no text, no attachments)
 
+    // Content-based dedup — catches Signal re-deliveries with different timestamps
+    // but identical normalized content (e.g. with/without U+FFFC prefix).
+    const _dedupKey = `${msg.chatId}:${msg.senderId}:${text.substring(0, 200)}`;
+    const _dedupNow = Date.now();
+    if (_contentDedup.has(_dedupKey) && (_dedupNow - _contentDedup.get(_dedupKey)) < CONTENT_DEDUP_WINDOW_MS) {
+      console.log(`[signal] Content dedup: dropping duplicate (same sender+content within ${CONTENT_DEDUP_WINDOW_MS}ms)`);
+      return;
+    }
+    _contentDedup.set(_dedupKey, _dedupNow);
+    if (_contentDedup.size > 500) {
+      for (const [k, v] of _contentDedup) {
+        if (_dedupNow - v > 10000) _contentDedup.delete(k);
+      }
+    }
+
     // Owner flag — only +16315214787 can edit code or change permissions
     const senderIsOwner = isSignalOwner(msg.senderId);
     // Admin flag — trusted users who bypass filters and get full tool access
@@ -1858,11 +1880,40 @@ function startSignalAdapter() {
       if (saveSignalUuid) saveSignalUuid(msg.senderId, incomingUuid);
     }
 
-    // F10: Deterministic greeting fast-path — $0, ~50ms, 100% reliable.
-    // Fires BEFORE onboarding, busy-check, link detection, or Claude invocation.
-    // Strip U+FFFC (object replacement character) — Signal inserts this as a
-    // placeholder for @mentions in the text body. Without stripping, "hey ￼"
-    // fails GREETING_RE and falls through to Claude for a 60s+ rate-limited run.
+    // Intercept login auth code BEFORE greeting fast-path (greeting would eat "hello" during login).
+    // Only captures strings that look like OAuth codes (alphanumeric + URL-safe chars, 4-128 chars).
+    if (senderIsOwner && !isGroupMessage && state._pendingLoginProcess) {
+      const code = (msg.text || '').trim();
+      if (/^[A-Za-z0-9_#.~+/-]{16,128}$/.test(code)) {
+        const { setLoginInProgress } = require('./token-refresh');
+        const { promisify } = require('util');
+        const execFileAsync = promisify(require('child_process').execFile);
+        try {
+          state._pendingLoginProcess.stdin.write(code + '\n');
+          state._pendingLoginProcess.stdin.end();
+          clearTimeout(state._pendingLoginTimeout);
+          await signalAdapter.sendMessage(msg.chatId, 'Submitting auth code...');
+          await new Promise(resolve => setTimeout(resolve, 3000));
+          const { stdout } = await execFileAsync('claude', ['auth', 'status'], { encoding: 'utf8', timeout: 10000 });
+          const status = JSON.parse(stdout);
+          if (status.loggedIn) {
+            try { require('./sandbox').refreshAllCredentials(); } catch {}
+            await signalAdapter.sendMessage(msg.chatId, `Logged in as ${status.email} (${status.subscriptionType})`);
+          } else {
+            await signalAdapter.sendMessage(msg.chatId, 'Auth code accepted but login check failed. Try !login again.');
+          }
+        } catch (err) {
+          await signalAdapter.sendMessage(msg.chatId, `Login error: ${err.message}`).catch(() => {});
+        } finally {
+          if (state._pendingLoginProcess) { try { state._pendingLoginProcess.kill(); } catch {} }
+          state._pendingLoginProcess = null;
+          state._pendingLoginTimeout = null;
+          setLoginInProgress(false);
+        }
+        return;
+      }
+    }
+
     const rawSignalText = (msg.text || '').replace(/\uFFFC/g, '').trim();
     if (rawSignalText.length < 50 && GREETING_RE.test(rawSignalText) && !isCommandLike(rawSignalText)) {
       const personality = state.personality || DEFAULT_PERSONALITY;
@@ -2628,54 +2679,87 @@ async function _dispatchSignalMessage(msg, chatId, text, state) {
           : (!senderIsOwner ? 'sonnet' : 'sonnet')),
       };
 
-      // Auto-detect social/location links — pre-fetch metadata and build action prompt.
-      // Mirrors the Discord handler at bot.js:~3250 — without this, TikTok/Instagram/etc.
-      // links go straight to Claude which gets blocked by their bot walls.
+      // Pre-fetch link metadata, video transcripts, and auto-context in parallel.
+      // Previously ran sequentially (~25s for a TikTok link). Now all fetches
+      // overlap, so total wall time = max(individual fetches) instead of sum.
       let signalPrompt = text;
       const detectedLinks = detectLinks(text);
+
+      const enrichmentTasks = [];
+
+      // Task 1: Link metadata
       if (detectedLinks.length > 0) {
-        const enriched = await enrichLinks(detectedLinks);
-        signalPrompt = buildSmartPrompt(enriched) + text;
+        enrichmentTasks.push(
+          enrichLinks(detectedLinks)
+            .then(enriched => ({ type: 'links', data: enriched }))
+            .catch(err => { console.error('[link-enrich] error:', err.message); return null; })
+        );
       }
-      // TikTok transcript injection — fetch captions and append as context
+
+      // Task 2: TikTok transcripts
       try {
         const { extractTikTokUrls, getTikTokTranscriptWithFallback } = require('./tiktok-transcript');
         const tiktokUrls = extractTikTokUrls(text);
         for (const turl of tiktokUrls) {
-          const ttResult = await getTikTokTranscriptWithFallback(turl);
-          if (ttResult && ttResult.transcript) {
-            signalPrompt += `\n\n<video-transcript url="${turl}">\n${ttResult.transcript}\n</video-transcript>`;
-          }
+          enrichmentTasks.push(
+            getTikTokTranscriptWithFallback(turl)
+              .then(r => r?.transcript ? { type: 'transcript', url: turl, text: r.transcript } : null)
+              .catch(err => { console.error('[tiktok] transcript error:', err.message); return null; })
+          );
         }
-      } catch (err) {
-        console.error('[tiktok] Signal transcript error:', err.message);
-      }
-      // Instagram Reels transcript injection
+      } catch {}
+
+      // Task 3: Instagram Reel transcripts
       try {
         const { extractInstagramReelUrls, getInstagramTranscript } = require('./instagram-transcript');
         const igUrls = extractInstagramReelUrls(text);
         for (const igUrl of igUrls) {
-          const igResult = await getInstagramTranscript(igUrl);
-          if (igResult) {
-            let block = `<video-transcript url="${igUrl}">`;
-            if (igResult.transcript) block += `\n${igResult.transcript}`;
-            else if (igResult.description) block += `\n[No audio transcript. Creator caption: ${igResult.description}]`;
-            block += `\n</video-transcript>`;
-            signalPrompt += `\n\n${block}`;
+          enrichmentTasks.push(
+            getInstagramTranscript(igUrl)
+              .then(r => {
+                if (!r) return null;
+                let block = `<video-transcript url="${igUrl}">`;
+                if (r.transcript) block += `\n${r.transcript}`;
+                else if (r.description) block += `\n[No audio transcript. Creator caption: ${r.description}]`;
+                block += `\n</video-transcript>`;
+                return { type: 'block', text: block };
+              })
+              .catch(err => { console.error('[instagram] transcript error:', err.message); return null; })
+          );
+        }
+      } catch {}
+
+      // Task 4: Auto-context (calendar/weather/concert prices)
+      enrichmentTasks.push(
+        (async () => {
+          try {
+            const { enrichWithContext } = require('./auto-context');
+            const autoCtx = await enrichWithContext(text, msg.senderId, isGroupChat);
+            return autoCtx ? { type: 'autoCtx', text: autoCtx } : null;
+          } catch (err) {
+            console.warn(`[auto-context] enrichment failed: ${err.message}`);
+            return null;
+          }
+        })()
+      );
+
+      // Run all enrichments in parallel — wall time = max(individual) not sum
+      if (enrichmentTasks.length > 0) {
+        const results = await Promise.all(enrichmentTasks);
+        let prefix = '';
+        for (const r of results) {
+          if (!r) continue;
+          if (r.type === 'links') {
+            signalPrompt = buildSmartPrompt(r.data) + signalPrompt;
+          } else if (r.type === 'transcript') {
+            signalPrompt += `\n\n<video-transcript url="${r.url}">\n${r.text}\n</video-transcript>`;
+          } else if (r.type === 'block') {
+            signalPrompt += `\n\n${r.text}`;
+          } else if (r.type === 'autoCtx') {
+            prefix = r.text;
           }
         }
-      } catch (err) {
-        console.error('[instagram] Signal transcript error:', err.message);
-      }
-
-      // Auto-context: detect calendar/weather intent and pre-fetch data
-      // so Claude has the answer already — no tag emission needed.
-      try {
-        const { enrichWithContext } = require('./auto-context');
-        const autoCtx = await enrichWithContext(text, msg.senderId, isGroupChat);
-        if (autoCtx) signalPrompt = autoCtx + signalPrompt;
-      } catch (err) {
-        console.warn(`[auto-context] enrichment failed: ${err.message}`);
+        if (prefix) signalPrompt = prefix + signalPrompt;
       }
 
       let result;
@@ -2703,19 +2787,20 @@ async function _dispatchSignalMessage(msg, chatId, text, state) {
         result = await runClaudeWithContinuation(signalPrompt, claudeOpts, signalProxy);
       }
 
-      // Auth failure — usually a sandbox cred staleness race (token rotated in
-      // /home/node after this spawn read its frozen sandbox copy). Refresh
-      // every sandbox user's creds and retry once before surfacing the error.
+      // Auth failure — refresh sandbox creds and retry once. If still failing,
+      // show a friendly message to the user and alert the owner.
       if (result.authFailed) {
         try { require('./sandbox').refreshAllCredentials(); } catch {}
-        console.log(`[auth-retry] refreshed sandbox creds, retrying spawn for ${_redactId(chatId)}`);
+        try { require('./token-refresh').syncWindowsCredentials(); } catch {}
+        console.log(`[auth-retry] refreshed creds, retrying spawn for ${_redactId(chatId)}`);
         try {
           result = await runClaudeWithContinuation(signalPrompt, claudeOpts, signalProxy);
         } catch (err) {
           console.warn(`[auth-retry] retry threw: ${err.message}`);
         }
         if (result && result.authFailed) {
-          await signalAdapter.sendMessage(msg.chatId, '⚠️ Not logged in — Claude CLI needs re-authentication. Run `claude` on the host and use `/login` to refresh the token.');
+          await signalAdapter.sendMessage(msg.chatId, "I'm taking a quick break — try again in a few minutes!").catch(() => {});
+          sendErrorAlert(new Error('Auth failed after retry — token expired. Send !login to re-authenticate.'), { source: 'auth-signal' });
           return;
         }
       }

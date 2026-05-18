@@ -42,6 +42,8 @@
 - **Oncall watchdog dedup**: All escalations now route through `sendErrorAlert` for 15-min dedup. Previously, `escalate()` sent direct Signal DMs bypassing dedup — process leak and disk alerts could spam every 2 minutes.
 - **Token refresh efficiency**: Tiered approach — (1) sync Windows credentials (free), (2) `claude --version` to trigger SDK auth exchange (free), (3) full CLI prompt only in critical zone (<30min remaining). Previously burned API tokens every 15min on failed refresh attempts.
 - **Claude CLI pinned**: `CLAUDE_CODE_VERSION: "2.1.143"` in docker-compose.yml (was "latest" — any rebuild could pull breaking changes).
+- **Content-based message dedup**: New early dedup layer catches Signal re-deliveries with different timestamps but identical normalized content (e.g. with/without U+FFFC prefix). Keyed on `chatId:senderId:normalizedContent` with 2s window. Runs before command handler — fixes duplicate `!listen on` responses.
+- **Parallel link enrichment**: Link metadata, TikTok transcripts, Instagram transcripts, and auto-context now fetch in parallel via `Promise.all`. Response time for link messages drops from ~25s (sequential) to ~10s (max of individual fetches).
 
 ## What's Broken / In Progress
 <!-- Active issues, blockers, half-done work -->

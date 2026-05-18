@@ -185,6 +185,7 @@ class SignalAdapter extends MessagePlatform {
     this._selfUuid = null; // bot's own ACI/PNI — populated by _loadSelfInfo() so
                            // group mention detection can match @-mentions that
                            // identify the bot by UUID rather than phone number
+    this._seenMessages = new Map(); // sender+timestamp → Date.now(), evicted after 60s
 
     // When SIGNAL_USE_WEBHOOK=true, signal-api runs in MODE=json-rpc and pushes
     // incoming messages to /signal/webhook in claude-api. Polling /v1/receive/
@@ -935,6 +936,22 @@ class SignalAdapter extends MessagePlatform {
     // signal-cli-rest-api returns envelope objects
     const envelope = raw.envelope || raw;
     if (!envelope) return;
+
+    // Dedup: signal-api can deliver the same envelope more than once (webhook
+    // retry, polling overlap, etc.). Key on sender+timestamp — unique per msg.
+    const ts = envelope.dataMessage?.timestamp || envelope.timestamp;
+    const src = envelope.sourceUuid || envelope.sourceNumber || envelope.source || '';
+    if (ts && src) {
+      const dedupKey = `${src}:${ts}`;
+      if (this._seenMessages.has(dedupKey)) return;
+      this._seenMessages.set(dedupKey, Date.now());
+      if (this._seenMessages.size > 200) {
+        const cutoff = Date.now() - 60000;
+        for (const [k, v] of this._seenMessages) {
+          if (v < cutoff) this._seenMessages.delete(k);
+        }
+      }
+    }
 
     // Auto-accept message requests so contacts can add bot to groups
     const senderUuid = envelope.sourceUuid || envelope.source;

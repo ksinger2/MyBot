@@ -118,7 +118,29 @@ const STALE_TASK_TTL_MS = 60 * 60 * 1000; // 1 hour
 function loadAllChannelStates() {
   const store = readStore();
   let cleared = 0;
+  let dirty = false;
+
+  // One-time migration: reset all listenToAll to false (default = mentions-only)
+  const migrations = store._migrations || {};
+  if (!migrations.listenToAllReset) {
+    let resetCount = 0;
+    for (const [id, s] of Object.entries(store)) {
+      if (id.startsWith('_')) continue;
+      if (s && s.listenToAll) {
+        s.listenToAll = false;
+        resetCount++;
+      }
+    }
+    migrations.listenToAllReset = Date.now();
+    store._migrations = migrations;
+    dirty = true;
+    if (resetCount > 0) {
+      console.log(`[channel-persistence] Migration: reset listenToAll to false in ${resetCount} channel(s)`);
+    }
+  }
+
   for (const [id, s] of Object.entries(store)) {
+    if (id.startsWith('_')) continue;
     if (s && s.activeTask && s.activeTask.startedAt) {
       const age = Date.now() - new Date(s.activeTask.startedAt).getTime();
       if (!Number.isFinite(age) || age > STALE_TASK_TTL_MS) {
@@ -126,14 +148,14 @@ function loadAllChannelStates() {
         cleared++;
       }
     } else if (s && s.activeTask && !s.activeTask.startedAt) {
-      // No timestamp at all — treat as stale
       s.activeTask = null;
       cleared++;
     }
   }
-  if (cleared > 0) {
+  if (cleared > 0) dirty = true;
+  if (dirty) {
     try { writeStore(store); } catch {}
-    console.log(`[channel-persistence] Cleared ${cleared} stale activeTask(s) on load`);
+    if (cleared > 0) console.log(`[channel-persistence] Cleared ${cleared} stale activeTask(s) on load`);
   }
   return store;
 }

@@ -1587,6 +1587,15 @@ app.post('/signal/webhook', express.json({ limit: '5mb' }), (req, res) => {
     if (processed > 0) {
       console.log(`[signal-webhook] processed ${processed} envelope(s)${ignored ? `, ignored ${ignored} non-message frame(s)` : ''}`);
       try { require('./signal-watchdog').recordWebhookActivity(); } catch {}
+      // Track dataMessages separately for WebSocket death detection —
+      // receipts still flow even when the text WebSocket is broken.
+      const hasDataMessage = items.some(item => {
+        const env = _extractSignalEnvelope(item);
+        return env && (env.dataMessage || env.syncMessage?.sentMessage);
+      });
+      if (hasDataMessage) {
+        try { require('./signal-watchdog').recordDataMessage(); } catch {}
+      }
     }
     res.status(200).end();
   } catch (err) {
