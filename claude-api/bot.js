@@ -742,12 +742,12 @@ function listPersonalities() {
     .map(f => f.replace('.md', ''));
 }
 
-function askClaude(prompt, { sessionId = null, personalityFile = null, identity = null, cwd = DEFAULT_WORKSPACE, maxTurns = null, channelState = null, channelProxy = null, discordUserId = null, readOnly = false, groupAllowedTools = undefined, profileContext = null, streamReplies = false, model = 'sonnet', ownerDmMode = false, planMode = false, isVoice = false, isOwner = false, recentMessages = null, userTimezone = null } = {}) {
+function askClaude(prompt, { sessionId = null, personalityFile = null, identity = null, cwd = DEFAULT_WORKSPACE, maxTurns = null, channelState = null, channelProxy = null, discordUserId = null, readOnly = false, groupAllowedTools = undefined, profileContext = null, streamReplies = false, model = 'sonnet', ownerDmMode = false, planMode = false, isVoice = false, isOwner = false, sandboxUser = null, recentMessages = null, userTimezone = null } = {}) {
   const runnerOpts = {
     sessionId, personalityFile, identity, cwd, maxTurns,
     channelState, channelProxy, discordUserId, readOnly,
     groupAllowedTools, profileContext, streamReplies, model, ownerDmMode, planMode, isVoice,
-    isOwner, recentMessages, userTimezone,
+    isOwner, sandboxUser, recentMessages, userTimezone,
     freshProgressFn: freshProgress,
     saveChannelStateFn: saveChannelState,
     flushPendingWritesFn: flushPendingWrites,

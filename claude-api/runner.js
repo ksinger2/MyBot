@@ -692,14 +692,18 @@ class Runner {
           // spawn — sandbox creds are otherwise frozen at provision time and
           // 401 once the live token rotates.
           try { require('./sandbox').refreshCredentials(sandboxLinuxUser); } catch {}
+          // Use /tmp as the spawn cwd — the sandbox dir is 700 owned by the
+          // sandbox user, so Node.js chdir (which runs before exec) would fail
+          // with EACCES. cd into the sandbox dir inside the unshare command
+          // after mounts are set up (root can enter 700 dirs).
+          const sandboxSpawnOpts = { ...spawnOpts, cwd: '/tmp' };
           child = spawn('sudo', [
             '-E', '/usr/bin/unshare', '--mount', '--',
             '/bin/sh', '-c',
-            // Inside the mount namespace: hide /workspace and /host (owner's Desktop/Downloads), then drop to sandbox user
-            'mount -t tmpfs -o size=4k,mode=000 tmpfs /workspace && mount -t tmpfs -o size=4k,mode=000 tmpfs /host && exec runuser -u ' + sandboxLinuxUser + ' -- "$@"',
+            'mount -t tmpfs -o size=4k,mode=000 tmpfs /workspace && mount -t tmpfs -o size=4k,mode=000 tmpfs /host && cd ' + cwd + ' && exec runuser -u ' + sandboxLinuxUser + ' -- "$@"',
             'sandbox', // $0 placeholder for sh -c
             'claude', ...args,
-          ], spawnOpts);
+          ], sandboxSpawnOpts);
         } else {
           child = spawn('claude', args, spawnOpts);
         }

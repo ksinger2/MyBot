@@ -65,6 +65,7 @@
 - **Token credential write atomicity**: `token-refresh.js` now writes to `.tmp.${process.pid}` then `fs.renameSync` instead of direct `writeFileSync` — prevents half-written credentials on crash.
 - **XSS in setup page**: `server.js` CSRF token injection changed from `escapeHtml()` (insufficient for JS context) to `JSON.stringify()`.
 - **Sandbox provisionAll error**: `_groupLinks` internal entry was iterated as a sandbox user, causing "Failed to provision undefined" error. Fixed by filtering entries to those with `linuxUser` property.
+- **Sandbox spawn EACCES**: `sandboxUser` was never passed through `askClaude()` to the Runner — the destructured parameter list was missing it, so sandbox sessions spawned `claude` directly (not via `sudo/unshare/runuser`), hitting EACCES on the 700 sandbox dir. Fixed by adding `sandboxUser` to `askClaude()` parameter list. Also fixed the spawn cwd: sandbox dirs are 700 so Node's pre-exec chdir fails — now spawns with `cwd: '/tmp'` and `cd`s into the sandbox dir inside the unshare command where root can traverse it.
 
 ## What's Broken / In Progress
 <!-- Active issues, blockers, half-done work -->
