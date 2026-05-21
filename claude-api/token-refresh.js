@@ -35,7 +35,9 @@ function syncWindowsCredentials() {
         if (winExpiry <= activeExpiry) return false;
       } catch {}
 
-      fs.writeFileSync(ACTIVE_CREDS, winRaw, { mode: 0o600 });
+      const tmpPath = ACTIVE_CREDS + '.tmp.' + process.pid;
+      fs.writeFileSync(tmpPath, winRaw, { mode: 0o600 });
+      fs.renameSync(tmpPath, ACTIVE_CREDS);
       console.log('[token-refresh] Synced fresh credentials from Windows host');
       return true;
     }
@@ -109,12 +111,21 @@ function runHeadlessLogin() {
 
 async function notifyOwnerAuthExpiring(minsLeft) {
   if (Date.now() - _ownerNotifiedAt < 60 * 60 * 1000) return;
+  // Suppress notifications while token has plenty of time — tiered refresh
+  // usually recovers silently. Alert at <=10min so owner has one last cycle.
+  if (minsLeft > 10) {
+    console.warn(`[token-refresh] Token low (${minsLeft}min) — suppressing notification, refresh may still recover`);
+    return;
+  }
   try {
     const { sendErrorAlert } = require('./error-alerting');
     const msg = minsLeft <= 0
-      ? 'Claude auth token has expired. Send me !login to re-authenticate from your phone.'
-      : `Claude auth token expires in ${minsLeft}min. Send me !login to re-authenticate from your phone.`;
-    await sendErrorAlert(new Error(msg), { source: 'token-refresh' });
+      ? 'Auth token expired — send !login to re-authenticate'
+      : `Auth token expires in ${minsLeft}min — send !login if refresh doesn't recover`;
+    await sendErrorAlert(
+      new Error(msg),
+      { source: 'token-refresh' }
+    );
     _ownerNotifiedAt = Date.now();
   } catch {}
 }

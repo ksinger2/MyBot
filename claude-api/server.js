@@ -1486,7 +1486,7 @@ ${prevSummary ? `- Before the rebuild, the previous session was working on:\n${p
         // project name from the working directory (`/work` → `work`), which
         // would create a second set of `work-claude-api-1` / `work-signal-api-1`
         // containers instead of replacing the existing `mybot-*` ones.
-        'sleep 3 && docker compose -p mybot -f docker-compose.yml --profile signal up -d --build',
+        'sleep 3 && docker compose -p mybot -f docker-compose.yml --profile signal up -d --build && docker image prune -f && docker builder prune -f --filter until=48h',
       ];
       const child = spawn('docker', dockerArgs, {
         detached: true,
@@ -2054,8 +2054,8 @@ app.get('/setup/:userId', (req, res) => {
 
   </div>
 <script>
-const CSRF='${escapeHtml(csrfToken)}';
-const UID='${encodeURIComponent(userId)}';
+const CSRF=${JSON.stringify(csrfToken)};
+const UID=${JSON.stringify(encodeURIComponent(userId))};
 let _tagCat='Custom';
 
 function showTagInput(cat,ph){

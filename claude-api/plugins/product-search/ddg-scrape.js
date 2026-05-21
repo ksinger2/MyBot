@@ -23,6 +23,27 @@ const STORE_URL_PATTERNS = {
   target:  /^https?:\/\/(www\.)?target\.com\/p\/[^?\s"]+/i,
 };
 
+// Canonicalize store URLs to their shortest permanent form.
+// Scraper URLs include title slugs that break when products are renamed/delisted.
+// Amazon: /Whatever-Title/dp/B07ZQ3LGF5/ref=sr... → /dp/B07ZQ3LGF5
+// Walmart: /ip/Product-Name/123456789?sp_cid=... → /ip/123456789
+// Target: /p/Product-Name/-/A-12345678#lnk=... → /p/-/A-12345678
+function _canonicalizeUrl(url, store) {
+  try {
+    if (store === 'amazon') {
+      const m = url.match(/\/dp\/([A-Z0-9]{10})/i);
+      if (m) return `https://www.amazon.com/dp/${m[1]}`;
+    } else if (store === 'walmart') {
+      const m = url.match(/\/ip\/(?:[^/]+\/)?(\d{5,15})/);
+      if (m) return `https://www.walmart.com/ip/${m[1]}`;
+    } else if (store === 'target') {
+      const m = url.match(/(A-\d{6,12})/);
+      if (m) return `https://www.target.com/p/-/${m[1]}`;
+    }
+  } catch {}
+  return url;
+}
+
 function _cleanText(html) {
   return (html || '')
     .replace(/<[^>]+>/g, '')
@@ -89,7 +110,7 @@ function _parseBraveHtml(html, store) {
     const snippetMatch = block.match(/class="content[^"]*"[^>]*>([\s\S]{5,400}?)<\/div>/i);
     const snippet = snippetMatch ? _cleanText(snippetMatch[1]).slice(0, 180) : '';
 
-    results.push({ store, title, url, snippet });
+    results.push({ store, title, url: _canonicalizeUrl(url, store), snippet });
   }
 
   // Dedupe by URL within this store
@@ -154,7 +175,7 @@ function _parseDdgHtml(html, store) {
     const snippetMatch = rawBlock.match(/class="result__snippet"[^>]*>([\s\S]{1,500}?)<\/a>/i)
       || rawBlock.match(/class="result__snippet"[^>]*>([\s\S]{1,500}?)<\/div>/i);
     const snippet = snippetMatch ? _cleanText(snippetMatch[1]).slice(0, 180) : '';
-    if (title) results.push({ store, title, url, snippet });
+    if (title) results.push({ store, title, url: _canonicalizeUrl(url, store), snippet });
   }
   return results;
 }
@@ -230,4 +251,4 @@ async function scrapeProducts(query, opts = {}) {
   return interleaved;
 }
 
-module.exports = { scrapeProducts };
+module.exports = { scrapeProducts, _canonicalizeUrl };

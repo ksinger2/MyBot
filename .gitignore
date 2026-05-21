@@ -26,3 +26,9 @@ Thumbs.db
 *.swp
 .env
 .env.*
+
+# Windows reserved device names (created by accident in WSL)
+NUL
+
+# Playwright persistent browser profiles
+browser-profile/

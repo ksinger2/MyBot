@@ -1308,6 +1308,16 @@ async function resumeChannel(channelId, savedState) {
 
   // If we have an activeTask with a prompt, auto-retry it instead of just notifying
   if (task?.prompt && task.senderId) {
+    // Don't auto-resume reaction-triggered tasks — the synthetic context
+    // ("[Reaction: 👍 ...]") is stale after a stall and confuses Claude
+    if (task.prompt.startsWith('[Reaction:')) {
+      console.log(`[auto-resume] Skipping reaction-triggered task in ${channelId}`);
+      await signalAdapter.sendMessage(signalChatId,
+        `I restarted while handling a reaction — send your request again if needed.`
+      ).catch(() => {});
+      return;
+    }
+
     const maxRetries = 2;
     const attempts = (task.resumeAttempts || 0) + 1;
     if (attempts > maxRetries) {
@@ -1387,6 +1397,10 @@ async function processQueue(state) {
   const senderIsOwnerQ = !isGroupChatQ && isSignalOwner(signalChatId);
   const ownerDmModeQ = senderIsOwnerQ && !isGroupChatQ;
 
+  // Resolve sandbox for group chats so queued messages use the right tools/cwd
+  const { getSandboxForChat } = require('./sandbox');
+  const qSandbox = isGroupChatQ ? getSandboxForChat(signalChatId) : null;
+
   await signalAdapter.sendTyping(signalChatId).catch(() => {});
   const typingInterval = setInterval(() => {
     signalAdapter.sendTyping(signalChatId).catch(() => {});
@@ -1398,6 +1412,8 @@ async function processQueue(state) {
   queueProxy.setGroupChat(isGroupChatQ, signalChatId);
   if (ownerDmModeQ) queueProxy.setOwnerDm(true);
 
+  const nonOwnerToolWhitelistQ = 'Read,WebSearch,WebFetch,Task,TodoWrite,ToolSearch,mcp__chrome-devtools__navigate_page,mcp__chrome-devtools__take_snapshot,mcp__chrome-devtools__take_screenshot,mcp__chrome-devtools__close_page,mcp__chrome-devtools__list_pages';
+
   try {
     state.startedAt = Date.now();
     state.progress = freshProgress();
@@ -1408,16 +1424,18 @@ async function processQueue(state) {
       sessionId: state.sessionId,
       personalityFile,
       identity: state.identity,
-      cwd: state.cwd,
+      cwd: qSandbox ? qSandbox.cwd : state.cwd,
       channelState: state,
       channelProxy: queueProxy,
       isOwner: senderIsOwnerQ,
       ownerDmMode: ownerDmModeQ,
       model: ownerDmModeQ ? 'claude-opus-4-6' : 'sonnet',
-      maxTurns: ownerDmModeQ ? null : 20,
+      maxTurns: ownerDmModeQ ? null : (isGroupChatQ && !qSandbox ? 8 : 20),
       streamReplies: true,
       readOnly: false,
-      groupAllowedTools: isGroupChatQ ? 'Read,WebSearch,WebFetch,Task,TodoWrite' : undefined,
+      groupAllowedTools: qSandbox ? qSandbox.allowedTools
+        : isGroupChatQ ? nonOwnerToolWhitelistQ : undefined,
+      sandboxUser: qSandbox || undefined,
       userTimezone: _qProfile?.timezone || null,
     };
     try {
@@ -1514,8 +1532,12 @@ async function processQueue(state) {
     }
   } catch (err) {
     console.error('Error processing queued message:', err.message);
-    const errorMsg = err.message.length > 500 ? err.message.substring(0, 500) + '...' : err.message;
-    await signalAdapter.sendMessage(signalChatId, `Error: ${errorMsg}`).catch(() => {});
+    if (isGroupChatQ) {
+      await signalAdapter.sendMessage(signalChatId, "Sorry, something went wrong. Try again?").catch(() => {});
+    } else {
+      const errorMsg = err.message.length > 500 ? err.message.substring(0, 500) + '...' : err.message;
+      await signalAdapter.sendMessage(signalChatId, `Error: ${errorMsg}`).catch(() => {});
+    }
     sendErrorAlert(err, { source: 'queue handler', channel: channelId });
   } finally {
     clearInterval(typingInterval);
@@ -1996,8 +2018,115 @@ function startSignalAdapter() {
     const cmdText = text.replace(/^@\S+\s+/, '').replace(/\n?\[The user attached \d+ file\(s\)[\s\S]*$/, '').trim();
     if (isCommandLike(cmdText)) {
       const fakeMessage = createSignalMessageProxy({ ...msg, text: cmdText }, chatId, state);
+
+      // Record user command in recentMessages so follow-up Claude sessions
+      // have context about what the command did (prevents context loss on
+      // questions like "how much are those?" after a !product search)
+      if (!state.recentMessages) state.recentMessages = [];
+      state.recentMessages.push({
+        role: 'user',
+        text: cmdText.substring(0, 1000),
+        sender: msg.senderName || msg.senderId,
+        timestamp: Date.now(),
+      });
+      if (state.recentMessages.length > 20) state.recentMessages = state.recentMessages.slice(-20);
+
+      // Wrap reply/send to capture command output for context
+      const origReply = fakeMessage.reply;
+      const origSend = fakeMessage.channel.send;
+      let cmdReplyText = '';
+      const _capture = (content) => {
+        const t = typeof content === 'string' ? content : content.content || '';
+        if (t) cmdReplyText += (cmdReplyText ? '\n' : '') + t;
+      };
+      fakeMessage.reply = (content) => { _capture(content); return origReply(content); };
+      fakeMessage.channel.send = (content) => { _capture(content); return origSend(content); };
+
       const handled = await handleCommand(fakeMessage);
-      if (handled) return;
+
+      if (handled) {
+        if (cmdReplyText) {
+          state.recentMessages.push({
+            role: 'assistant',
+            text: cmdReplyText.substring(0, 1000),
+            timestamp: Date.now(),
+          });
+          if (state.recentMessages.length > 20) state.recentMessages = state.recentMessages.slice(-20);
+        }
+        return;
+      }
+    }
+
+    // Cart approval fast-path — process "1", "add 1", "add all" directly
+    // when the user has pending cart items. Deterministic: no Claude spawn,
+    // approval-gate checked server-side. Same pattern as the greeting fast-path.
+    // Attempts actual Amazon add-to-cart via Playwright if browser is available.
+    {
+      const _ag = require('./approval-gate');
+      const _cp = _ag.getPending(msg.senderId, 'cart');
+      if (_cp && _cp.length > 0) {
+        const cartSel = text.match(/^(?:add\s+)?(\d+(?:\s*[,&]\s*\d+)*|all)\s*$/i);
+        if (cartSel) {
+          const sel = cartSel[1].toLowerCase();
+          const selected = [];
+          if (sel === 'all') {
+            selected.push(..._cp);
+          } else {
+            const ids = sel.split(/[,&]/).map(s => parseInt(s.trim(), 10)).filter(Boolean);
+            for (const id of ids) {
+              const item = _cp.find(p => p.id === id);
+              if (item) selected.push(item);
+            }
+          }
+
+          await signalAdapter.sendTyping(msg.chatId).catch(() => {});
+          const results = [];
+          const amazonCart = require('./amazon-cart');
+          for (const item of selected) {
+            _ag.approvePending(msg.senderId, 'cart', item.id);
+            const url = item.meta?.url;
+            if (url && url.includes('amazon.com') && !amazonCart.isBusy()) {
+              try {
+                const r = await amazonCart.addToCart(url);
+                if (r.success) {
+                  results.push(`✅ ${item.label} — added to Amazon cart${r.cartCount ? ` (${r.cartCount} items total)` : ''}`);
+                  if (r.screenshotPath) {
+                    await signalAdapter.sendMessage(msg.chatId, '', [r.screenshotPath]).catch(() => {});
+                  }
+                } else {
+                  results.push(`⚠️ ${item.label} — ${r.error}`);
+                  if (r.screenshotPath) {
+                    await signalAdapter.sendMessage(msg.chatId, '', [r.screenshotPath]).catch(() => {});
+                  }
+                }
+              } catch (err) {
+                console.error(`[cart-fastpath] Playwright failed for ${item.label}:`, err.message);
+                results.push(`🛒 ${item.label} — couldn't add automatically (${err.message})`);
+              }
+            } else {
+              results.push(`🛒 ${item.label} — ${url || 'no URL'}`);
+            }
+          }
+
+          if (!selected.length) {
+            const badIds = sel.split(/[,&]/).map(s => s.trim());
+            results.push(`⚠️ #${badIds.join(', #')}: not in the list`);
+          }
+
+          if (results.length) {
+            await signalAdapter.sendMessage(msg.chatId, results.join('\n'));
+            if (!state.recentMessages) state.recentMessages = [];
+            state.recentMessages.push(
+              { role: 'user', text: text, sender: msg.senderName || msg.senderId, timestamp: Date.now() },
+              { role: 'assistant', text: results.join('\n').substring(0, 1000), timestamp: Date.now() },
+            );
+            if (state.recentMessages.length > 20) state.recentMessages = state.recentMessages.slice(-20);
+          }
+          _ag.clearPending(msg.senderId, 'cart');
+          console.log(`[cart-fastpath] ${msg.senderId}: selected "${sel}" → ${results.length} item(s)`);
+          return;
+        }
+      }
     }
 
     // If busy, queue the message — silently in group chats, brief ack in DMs.
@@ -2071,7 +2200,7 @@ function startSignalAdapter() {
   });
 
   // Handle Signal emoji reactions — treat 👍/👎 as yes/no answers
-  signalAdapter.on('reaction', ({ chatId, senderId: rawSenderId, emoji, targetTimestamp, isRemove }) => {
+  signalAdapter.on('reaction', async ({ chatId, senderId: rawSenderId, emoji, targetTimestamp, isRemove }) => {
     if (isRemove) return; // ignore reaction removals
 
     // Resolve UUID→phone for downstream profile/access control lookups
@@ -2134,6 +2263,30 @@ function startSignalAdapter() {
       syntheticText = origText
         ? `[Reaction: 👎 rejection]\n\nIn reference to your previous message:\n"${origText}"\n\nI don't approve / thumbs down. Cancel or do not proceed with whatever that message proposed.`
         : 'no';
+    }
+
+    // Cart approval fast-path for reactions: 👍 on a cart prompt approves
+    // all pending items directly — no Claude spawn, no stall risk.
+    // The "🛒" prefix in origText is infrastructure-generated (bot.js line 3179),
+    // so this check is deterministic.
+    if (answer === 'yes' && origText.includes('🛒')) {
+      const _ag = require('./approval-gate');
+      const _cp = _ag.getPending(senderId, 'cart');
+      if (_cp && _cp.length > 0) {
+        for (const item of _cp) _ag.approvePending(senderId, 'cart', item.id);
+        const lines = _cp.map(i => `🛒 ${i.label} — queued for cart (browser session required)`);
+        await signalAdapter.sendMessage(chatId, lines.join('\n'));
+        const _st = getChannel(`signal:${chatId}`);
+        if (!_st.recentMessages) _st.recentMessages = [];
+        _st.recentMessages.push(
+          { role: 'user', text: '👍 (approved cart items)', sender: senderId, timestamp: Date.now() },
+          { role: 'assistant', text: lines.join('\n').substring(0, 1000), timestamp: Date.now() },
+        );
+        if (_st.recentMessages.length > 20) _st.recentMessages = _st.recentMessages.slice(-20);
+        _ag.clearPending(senderId, 'cart');
+        console.log(`[cart-fastpath] Reaction 👍 → approved ${_cp.length} cart item(s)`);
+        return;
+      }
     }
 
     console.log(`[signal] Reaction ${emoji} from ${senderId} in ${chatId} → dispatching "${answer}" (ctx=${origText ? origText.length + 'ch' : 'none'})`);
@@ -2623,7 +2776,7 @@ async function _dispatchSignalMessage(msg, chatId, text, state) {
       // same turn cap (8), personality applied. readOnly=false so the Runner
       // uses the groupAllowedTools whitelist instead of the restrictive readOnly list.
       const isNonOwnerDm = !senderIsOwner && !isGroupChat;
-      const nonOwnerToolWhitelist = 'Read,WebSearch,WebFetch,Task,TodoWrite';
+      const nonOwnerToolWhitelist = 'Read,WebSearch,WebFetch,Task,TodoWrite,ToolSearch,mcp__chrome-devtools__navigate_page,mcp__chrome-devtools__take_snapshot,mcp__chrome-devtools__take_screenshot,mcp__chrome-devtools__close_page,mcp__chrome-devtools__list_pages';
 
       // Sandbox lookup — non-owner users with a configured sandbox get write
       // access scoped to their own directory (enforced by Linux file permissions).
@@ -2636,6 +2789,8 @@ async function _dispatchSignalMessage(msg, chatId, text, state) {
       }
       if (sandboxUser) {
         console.log(`[sandbox] ${_redactId(msg.senderId)} matched sandbox: ${sandboxUser.name} (${sandboxUser.cwd})`);
+      } else if (isGroupChat && !senderIsOwner) {
+        console.log(`[sandbox] ${_redactId(msg.senderId)} in group ${_redactId(msg.chatId)}: no sandbox match (direct=${!!getSandboxUser(msg.senderId)}, chatLink=${!!getSandboxForChat(msg.chatId)})`);
       }
 
       // Deterministic timezone: extracted from user profile, never from prompt.
@@ -2661,7 +2816,8 @@ async function _dispatchSignalMessage(msg, chatId, text, state) {
           + (sandboxUser ? `\n\nSANDBOX: You are working in ${sandboxUser.name}'s project directory (${sandboxUser.cwd}). All file operations are restricted to this directory.\nPUBLIC URL: When you start a dev server, emit [REGISTER_PORT: PORT] (replace PORT with the actual port number, e.g. [REGISTER_PORT: 3000]). The site will be live at https://${sandboxUser.name.toLowerCase()}.backtoirl.com. Do NOT use curl to register ports — use the tag.\nCLOUDFLARE: $CLOUDFLARE_API_TOKEN and $CLOUDFLARE_ACCOUNT_ID are set. Use \`wrangler\` for Workers/Pages deployments. NEVER run \`cloudflared login\` or \`cloudflared tunnel login\` — browser auth does not work in this environment. For public URLs, use the [REGISTER_PORT:] tag above.` : ''),
         streamReplies: true,
         maxTurns: ownerDmMode ? null
-          : (isGroupChat ? 20
+          : (isGroupChat && !sandboxUser ? 8
+          : isGroupChat && sandboxUser ? 20
           : (senderIsOwner || senderIsAdmin) ? (parseInt(process.env.SIGNAL_OWNER_MAX_TURNS, 10) || 75)
           : 20),
         ownerDmMode,
@@ -3955,7 +4111,11 @@ async function _dispatchSignalMessage(msg, chatId, text, state) {
       } else {
         console.error(`[signal] Error: ${err.message}`);
         console.error(`[signal] Stack: ${err.stack}`);
-        await signalAdapter.sendMessage(msg.chatId, `Error: ${err.message.substring(0, 500)}`);
+        if (isGroupMessage) {
+          await signalAdapter.sendMessage(msg.chatId, "Sorry, something went wrong. Try again?").catch(() => {});
+        } else {
+          await signalAdapter.sendMessage(msg.chatId, `Error: ${err.message.substring(0, 500)}`).catch(() => {});
+        }
         sendErrorAlert(err, { source: 'signal handler', channel: chatId });
       }
     } finally {

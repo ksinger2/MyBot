@@ -245,6 +245,7 @@ const GROUP_STALL_THRESHOLDS = {
   default:  2 * 60 * 1000,  // 2 min — no reason to wait longer in groups
 };
 const CHECKIN_INTERVAL = 5 * 60 * 1000;
+const GROUP_CHECKIN_INTERVAL = 90 * 1000; // 90s — groups need faster feedback
 
 // Tool labels — duplicated here so runner.js is self-contained for logging.
 const TOOL_LABELS = {
@@ -659,8 +660,10 @@ class Runner {
           IMAGE_SESSION_KEY: channelState?._channelId || '',
           // F6: owner is trusted; gh capability is documented. Risk: prompt-injection
           // could exfiltrate via Bash — mitigated by scrubSecrets (F5).
-          GH_TOKEN: process.env.GH_TOKEN || '',
-          // Cloudflare — available to all sessions for deploying to *.backtoirl.com
+          // Sandbox users do NOT get infra credentials — they can deploy via
+          // Cloudflare (their sandbox has wrangler access) but not the owner's
+          // GitHub or full Cloudflare account.
+          GH_TOKEN: this.sandboxUser ? '' : (process.env.GH_TOKEN || ''),
           CLOUDFLARE_API_TOKEN: process.env.CLOUDFLARE_API_TOKEN || '',
           CLOUDFLARE_ACCOUNT_ID: process.env.CLOUDFLARE_ACCOUNT_ID || '',
         },
@@ -692,8 +695,8 @@ class Runner {
           child = spawn('sudo', [
             '-E', '/usr/bin/unshare', '--mount', '--',
             '/bin/sh', '-c',
-            // Inside the mount namespace: hide /workspace, then drop to sandbox user
-            'mount -t tmpfs -o size=4k,mode=000 tmpfs /workspace && exec runuser -u ' + sandboxLinuxUser + ' -- "$@"',
+            // Inside the mount namespace: hide /workspace and /host (owner's Desktop/Downloads), then drop to sandbox user
+            'mount -t tmpfs -o size=4k,mode=000 tmpfs /workspace && mount -t tmpfs -o size=4k,mode=000 tmpfs /host && exec runuser -u ' + sandboxLinuxUser + ' -- "$@"',
             'sandbox', // $0 placeholder for sh -c
             'claude', ...args,
           ], spawnOpts);
@@ -782,6 +785,10 @@ class Runner {
 
             if (event.type === 'rate_limit_event') {
               hitRateLimit = true;
+              if (channelState) {
+                channelState.progress.lastActivity = Date.now();
+                channelState.progress.lastOutputTime = Date.now();
+              }
             }
 
             const parentId = event.parent_tool_use_id || null;
@@ -994,7 +1001,7 @@ class Runner {
                 // Streaming: push each text block live (parent only — sub-agent
                 // text is excluded by the parentId routing above). F5: scrubSecrets
                 // redacts any leaked tokens. F4: serialized via _sendQueue.
-                if (streamReplies && channelProxy) {
+                if (streamReplies && channelProxy && !hitAuthFailure) {
                   let chunk = scrubSecrets(block.text.trim());
                   // Strip ALL action tags from streamed output — users should
                   // never see raw tags. The post-result handler extracts them
@@ -1167,8 +1174,13 @@ class Runner {
 
         // Social group chats: kill on threshold, but only if process is alive
         // (if dead, clean up immediately)
-        const _isGroupStall = !!groupAllowedTools && !this.sandboxUser;
+        const _isGroupStall = !!groupAllowedTools;
         let threshold = getStallThreshold(p.currentTool, _isGroupStall);
+        // Startup grace: first API response can be slow (auth refresh, rate
+        // limit queue, cold start). Give 3min before killing at turn 0.
+        // Rate-limited sessions get 10min — the API wait can be long.
+        if (p.turnCount === 0) threshold = Math.max(threshold, 3 * 60 * 1000);
+        if (hitRateLimit) threshold = Math.max(threshold, 10 * 60 * 1000);
         if (p.activeAgents.size > 0) {
           threshold = Math.max(threshold, 30 * 60 * 1000);
         }
@@ -1219,6 +1231,7 @@ class Runner {
           channelState.busy = false;
           channelState.startedAt = null;
           channelState.progress = this._freshProgress();
+          if (p.turnCount === 0) channelState.sessionId = null;
           const stallErr = new Error(`Claude CLI stalled — no output for ${mins}min (threshold: ${Math.round(threshold / 60000)}min, tool: ${p.currentTool || 'none'}, turns: ${p.turnCount})`);
           sendErrorAlert(stallErr, { source: 'askClaude stall detector' });
           wrappedReject(stallErr);
@@ -1230,7 +1243,8 @@ class Runner {
       const checkinTimer = setInterval(() => {
         if (!channelProxy || !channelState || !channelState.startedAt) return;
         const now = Date.now();
-        if (now - lastCheckin < CHECKIN_INTERVAL) return;
+        const checkinInterval = groupAllowedTools ? GROUP_CHECKIN_INTERVAL : CHECKIN_INTERVAL;
+        if (now - lastCheckin < checkinInterval) return;
         lastCheckin = now;
 
         const elapsed = Math.round((now - channelState.startedAt) / 1000);

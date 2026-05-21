@@ -217,7 +217,38 @@ function sweepTmp() {
   } catch {}
 }
 
-// ── Check 5: Event Loop Lag ──
+// ── Check 5: Docker Cleanup ──
+let _lastDockerPruneAt = 0;
+const DOCKER_PRUNE_INTERVAL = 6 * 60 * 60 * 1000; // every 6 hours
+function checkDockerCleanup() {
+  const result = { check: 'docker_cleanup', ok: true, pruned: false };
+  if (Date.now() - _lastDockerPruneAt < DOCKER_PRUNE_INTERVAL) return result;
+  if (!fs.existsSync('/var/run/docker.sock')) {
+    _lastDockerPruneAt = Date.now() - DOCKER_PRUNE_INTERVAL + 60 * 60 * 1000;
+    result.error = 'docker socket not available';
+    return result;
+  }
+  try {
+    const imgOut = execFileSync('docker', ['image', 'prune', '-f'], { encoding: 'utf8', timeout: 30000 });
+    const sizeMatch = imgOut.match(/reclaimed\s+space:\s+(.+)/i);
+    const buildOut = execFileSync('docker', ['builder', 'prune', '-f', '--filter', 'until=48h'], { encoding: 'utf8', timeout: 30000 });
+    const buildMatch = buildOut.match(/reclaimed\s+space:\s+(.+)/i);
+    const imgReclaimed = sizeMatch ? sizeMatch[1].trim() : '0B';
+    const buildReclaimed = buildMatch ? buildMatch[1].trim() : '0B';
+    if (imgReclaimed !== '0B' || buildReclaimed !== '0B') {
+      log(`Docker pruned — images: ${imgReclaimed}, build cache: ${buildReclaimed}`);
+      result.pruned = true;
+    }
+    _lastDockerPruneAt = Date.now();
+  } catch (err) {
+    // Back off 1 hour on failure instead of retrying every watchdog cycle
+    _lastDockerPruneAt = Date.now() - DOCKER_PRUNE_INTERVAL + 60 * 60 * 1000;
+    result.error = err.message;
+  }
+  return result;
+}
+
+// ── Check 6: Event Loop Lag ──
 function checkEventLoopLag() {
   return new Promise((resolve) => {
     const start = Date.now();
@@ -314,6 +345,7 @@ async function runAllChecks() {
       ['sandbox_creds', checkSandboxCreds],
       ['process_leaks', checkProcessLeaks],
       ['disk_space', checkDiskSpace],
+      ['docker_cleanup', checkDockerCleanup],
       ['event_loop_lag', checkEventLoopLag],
       ['semaphore_leaks', checkSemaphoreLeaks],
     ];

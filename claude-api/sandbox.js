@@ -6,11 +6,12 @@
  * 1. Each sandbox user gets a dedicated Linux user (uid/gid)
  * 2. Their workspace lives on an ext4 Docker volume at /sandbox/<name>
  *    — chowned to their Linux user, so permissions are enforced by the OS
- * 3. Claude CLI spawns inside a mount namespace where /workspace is replaced
+ * 3. Each sandbox dir is 700; /sandbox parent is 711 (traverse only, no listing)
+ * 4. Claude CLI spawns inside a mount namespace where /workspace is replaced
  *    with an empty, inaccessible tmpfs — sandbox users literally cannot see
  *    the owner's projects. See runner.js _spawnSandboxed().
- * 4. /sandbox parent dir is root:root 755 — sandbox users can traverse it
- *    but only write to their own subdirectory.
+ * 5. /sandbox parent dir is root:root 711 — sandbox users can traverse it
+ *    but cannot list other sandboxes or write outside their own subdirectory.
  */
 
 const fs = require('fs');
@@ -21,7 +22,7 @@ const { readEncryptedJson, writeEncryptedJson } = require('./encrypted-json');
 const SANDBOX_FILE = path.join('/app/data', 'sandbox-users.json');
 const SANDBOX_DOMAIN = 'mybot-sandbox-users';
 const SANDBOX_ROOT = '/sandbox';
-const DEFAULT_TOOLS = 'Edit,Write,Read,Bash,WebSearch,WebFetch,Grep,Glob,Task,TodoWrite';
+const DEFAULT_TOOLS = 'Edit,Write,Read,Bash,WebSearch,WebFetch,Grep,Glob,Task,TodoWrite,ToolSearch,mcp__chrome-devtools__navigate_page,mcp__chrome-devtools__take_snapshot,mcp__chrome-devtools__take_screenshot,mcp__chrome-devtools__close_page,mcp__chrome-devtools__list_pages';
 
 let _cache = null;
 const _uidCache = new Map();
@@ -119,13 +120,16 @@ function provisionUser(entry) {
   execFileSync('/usr/bin/sudo', ['/usr/bin/mkdir', '-p', safeCwd], { stdio: 'ignore' });
   execFileSync('/usr/bin/sudo', ['/usr/bin/chown', '-R', `${linuxUser}:${linuxUser}`, safeCwd], { stdio: 'ignore' });
 
-  // Ensure /sandbox parent has restrictive permissions (root-owned, 755)
-  // so sandbox users can traverse but not write to other users' dirs
+  // Each sandbox dir is 700 so other sandbox users can't read files
+  try {
+    execFileSync('/usr/bin/sudo', ['/usr/bin/chmod', '700', safeCwd], { stdio: 'ignore' });
+  } catch { /* ignore */ }
+  // /sandbox parent is 711 (traverse only, no listing of other sandboxes)
   try {
     execFileSync('/usr/bin/sudo', ['/usr/bin/chown', 'root:root', SANDBOX_ROOT], { stdio: 'ignore' });
   } catch { /* ignore */ }
   try {
-    execFileSync('/usr/bin/sudo', ['/usr/bin/chmod', '755', SANDBOX_ROOT], { stdio: 'ignore' });
+    execFileSync('/usr/bin/sudo', ['/usr/bin/chmod', '711', SANDBOX_ROOT], { stdio: 'ignore' });
   } catch { /* ignore */ }
 
   console.log(`[sandbox] Provisioned ${linuxUser} → ${safeCwd}`);
@@ -169,8 +173,23 @@ function provisionAll() {
   const entries = Object.values(config);
   if (entries.length === 0) return;
 
-  console.log(`[sandbox] Provisioning ${entries.length} sandbox user(s)...`);
-  for (const entry of entries) {
+  const OLD_DEFAULT = 'Edit,Write,Read,Bash,WebSearch,WebFetch,Grep,Glob,Task,TodoWrite';
+  let migrated = false;
+  for (const [key, entry] of Object.entries(config)) {
+    if (key.startsWith('_') || !entry) continue;
+    if (entry.allowedTools === OLD_DEFAULT) {
+      entry.allowedTools = DEFAULT_TOOLS;
+      migrated = true;
+      console.log(`[sandbox] Migrated tools for ${entry.name} to include Chrome MCP`);
+    }
+  }
+  if (migrated) _save(config);
+
+  const userEntries = Object.entries(config)
+    .filter(([k, v]) => !k.startsWith('_') && v && v.linuxUser)
+    .map(([, v]) => v);
+  console.log(`[sandbox] Provisioning ${userEntries.length} sandbox user(s)...`);
+  for (const entry of userEntries) {
     try {
       provisionUser(entry);
     } catch (err) {

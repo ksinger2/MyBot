@@ -16,15 +16,43 @@
 // H2 (auth hardening): closure-backed token, not process.env
 const INTERNAL_TOKEN = require('../internal-token').getInternalToken();
 
+// Strip conversational filler from natural language product requests,
+// extract the store preference if mentioned, and return a clean search query.
+function cleanProductQuery(raw) {
+  let q = raw;
+  // Extract store preference ("to my amazon cart", "on walmart", "from target")
+  const storeMatch = q.match(/\b(?:to|from|on|at)\s+(?:my\s+)?(amazon|walmart|target)\b/i);
+  const preferredStore = storeMatch ? storeMatch[1].toLowerCase() : null;
+
+  // Strip leading intent verbs, including "i want (you) to <verb>" wrappers.
+  // Only at start of query to avoid stripping brand names like "Best Buy".
+  q = q.replace(/^(?:i\s+want\s+(?:(?:you\s+)?to\s+)?)?(?:add|find|get|search|look\s+for|order|put|buy)\b\s*/i, '');
+  // Strip "to/from/on my [store] cart" phrases
+  q = q.replace(/\b(?:to|from|on|at)\s+(?:my\s+)?(?:amazon|walmart|target)\s*(?:cart|wishlist|list)?\b/gi, '');
+  // Strip adjective+deal phrases only when followed by "deal/price/value" (preserves "Good Earth", "Best Buy")
+  q = q.replace(/\b(?:a\s+)?(?:nice|good|great|best|cheap|affordable)\s+(?:and\s+(?:nice|good|great|best|cheap|affordable)\s+)?(?:deal|price|value)\s*(?:on|for)?\b/gi, '');
+  // Strip "a nice and good ... product" pattern (the whole filler phrase)
+  q = q.replace(/\ba\s+(?:nice|good|great)\s+(?:and\s+(?:nice|good|great)\s+)?(?:deal\s+)?product\b/gi, '');
+  q = q.replace(/\bthat\s+is\s+(?:a\s+)?/gi, '');
+  q = q.replace(/\b(?:,\s*)?and\s+is\b/gi, '');
+  q = q.replace(/\bproduct\b/gi, '');
+  // Strip standalone filler pronouns (never part of a product name)
+  q = q.replace(/\b(me|my|u|you|i)\b/gi, '');
+
+  q = q.replace(/\s+/g, ' ').replace(/^[\s,]+|[\s,]+$/g, '').trim();
+  return { query: q || raw, preferredStore };
+}
+
 module.exports = {
   name: '!product',
   aliases: ['!search', '!products', '!shop', '!link', '!buy'],
   adminOnly: false,
   description: 'Search for products across Amazon, Walmart, and Target',
+  cleanProductQuery,
   async run(message, arg, state, ctx) {
-    const query = (arg || '').trim();
+    const rawQuery = (arg || '').trim();
 
-    if (!query) {
+    if (!rawQuery) {
       await message.reply(
         'Usage: `!product <what you\'re looking for>`\n' +
         'Examples:\n' +
@@ -35,6 +63,10 @@ module.exports = {
       return;
     }
 
+    const { query, preferredStore } = cleanProductQuery(rawQuery);
+    const searchBody = { query };
+    if (preferredStore) searchBody.stores = [preferredStore];
+
     ctx._dtyping(message.channel);
 
     try {
@@ -44,7 +76,7 @@ module.exports = {
           'Content-Type': 'application/json',
           'X-Internal-Token': INTERNAL_TOKEN,
         },
-        body: JSON.stringify({ query }),
+        body: JSON.stringify(searchBody),
         signal: AbortSignal.timeout(20000),
       });
 

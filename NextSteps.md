@@ -1,7 +1,7 @@
 # MyBot — Next Steps
 
 ## What's Working
-<!-- Updated each session — 2026-05-17 -->
+<!-- Updated each session — 2026-05-20 -->
 - On-call watchdog (`oncall-watchdog.js`) running every 2min with 6 deterministic health checks:
   1. CLI auth health (escalates after 3 failures, 30min cooldown)
   2. Sandbox credential freshness (auto-refreshes if >5min stale)
@@ -42,8 +42,29 @@
 - **Oncall watchdog dedup**: All escalations now route through `sendErrorAlert` for 15-min dedup. Previously, `escalate()` sent direct Signal DMs bypassing dedup — process leak and disk alerts could spam every 2 minutes.
 - **Token refresh efficiency**: Tiered approach — (1) sync Windows credentials (free), (2) `claude --version` to trigger SDK auth exchange (free), (3) full CLI prompt only in critical zone (<30min remaining). Previously burned API tokens every 15min on failed refresh attempts.
 - **Claude CLI pinned**: `CLAUDE_CODE_VERSION: "2.1.143"` in docker-compose.yml (was "latest" — any rebuild could pull breaking changes).
+- **Command context continuity**: Commands (`!product`, `!help`, etc.) now record both the user's command and the bot's reply in `recentMessages`. Follow-up questions ("how much are those?") have full context about what the command found. Implemented via reply/send proxy wrapper in bot.js.
+- **Product query cleaning**: `cleanProductQuery()` strips conversational filler from natural language product requests, extracts store preference (Amazon/Walmart/Target), and preserves brand names. "add a nice and good deal product to my amazon cart that is a planter, 8 ft long" → query: "planter 8 ft long", store: amazon.
+- **Cart approval fast-path (deterministic)**: "1", "add 1", "add all" now processed directly via `approvalGate` without spawning Claude — same pattern as the greeting fast-path. 👍 reactions on cart prompts (identified by 🛒 prefix, which is infrastructure-generated) also auto-approve directly. Pending items cleared after processing to prevent duplicate execution. Previously, both paths spawned a full Claude CLI session that had to figure out it should emit `[CART_ADD: action="add" ids="1"]` — which stalled at turn 0 twice in a row.
 - **Content-based message dedup**: New early dedup layer catches Signal re-deliveries with different timestamps but identical normalized content (e.g. with/without U+FFFC prefix). Keyed on `chatId:senderId:normalizedContent` with 2s window. Runs before command handler — fixes duplicate `!listen on` responses.
 - **Parallel link enrichment**: Link metadata, TikTok transcripts, Instagram transcripts, and auto-context now fetch in parallel via `Promise.all`. Response time for link messages drops from ~25s (sequential) to ~10s (max of individual fetches).
+
+## Recently Fixed (2026-05-20)
+- **Chrome MCP tools in group chat whitelist**: `nonOwnerToolWhitelist` now includes `ToolSearch` + 5 Chrome MCP tools (`navigate_page`, `take_snapshot`, `take_screenshot`, `close_page`, `list_pages`). When WebFetch is blocked by a site, the bot can now fall back to Chrome browser automation instead of trying 10+ workaround approaches over 11 minutes. Fixed in both the main dispatch path (bot.js:2771) and queue handler (bot.js:1430).
+- **Sandbox tools include Chrome MCP**: `DEFAULT_TOOLS` in sandbox.js now includes Chrome MCP tools. Existing sandbox users (Daniel, Lee, Merrisa) auto-migrated on startup via `provisionAll()`. Sandbox-linked group chats in the queue handler now resolve sandbox config (tools, cwd) correctly — previously always used the flat nonOwnerToolWhitelist.
+- **Group chat speed — 3 fixes**:
+  1. Max turns cut from 20 → 8 for non-sandbox group chats (sandbox groups keep 20 for coding tasks). Stops the bot from doing 15 rounds of "let me try another approach" for a simple web lookup.
+  2. SPEED rule added to group system prompt: "1-2 tool calls max for lookups, give the answer you have, use Chrome MCP if WebFetch fails."
+  3. Check-in interval cut from 5min → 90s for groups. Owner DMs keep 5min.
+- **Stall detector included sandbox group users**: `_isGroupStall` at runner.js:1174 had `&& !this.sandboxUser`, so sandbox users in groups got raw diagnostic dumps instead of friendly "try again" messages. Fixed by removing the sandbox exclusion.
+- **Rate limit → 0-turn stall kill**: API rate limits at session startup caused the stall detector to kill sessions before they started. Fixed by resetting stall timers on `rate_limit_event` and extending threshold to 10min when rate-limited.
+- **Auth error text streamed to groups**: `"Failed to authenticate. API Error: 401..."` was streamed as regular text before the auth handler could suppress it. Fixed by guarding the streaming path with `!hitAuthFailure`.
+- **Session ID mismatch on retry**: After a 0-turn stall kill, the stale session ID was reused → "No conversation found". Fixed by clearing `sessionId` when `turnCount === 0`.
+- **Playwright URL blocking completely broken**: `playwright-wrapper.js` intercepted stdout (responses FROM Playwright) looking for `tools/call` request patterns — never matched. Complete rewrite to intercept stdin (requests TO Playwright) and properly block `playwright_navigate` to checkout URLs and `playwright_evaluate_script` containing checkout URLs.
+- **Sandbox cross-read prevention**: `/sandbox` parent changed from 755 to 711 (traverse only, no listing). Each sandbox dir set to 700. `/host` hidden inside sandbox mount namespace via tmpfs overlay.
+- **GH_TOKEN stripped from sandbox env**: Sandbox processes no longer inherit the owner's GitHub token.
+- **Token credential write atomicity**: `token-refresh.js` now writes to `.tmp.${process.pid}` then `fs.renameSync` instead of direct `writeFileSync` — prevents half-written credentials on crash.
+- **XSS in setup page**: `server.js` CSRF token injection changed from `escapeHtml()` (insufficient for JS context) to `JSON.stringify()`.
+- **Sandbox provisionAll error**: `_groupLinks` internal entry was iterated as a sandbox user, causing "Failed to provision undefined" error. Fixed by filtering entries to those with `linuxUser` property.
 
 ## What's Broken / In Progress
 <!-- Active issues, blockers, half-done work -->
@@ -51,36 +72,9 @@
 - **Sandbox tunnel instability**: Cloudflared QUIC connections frequently timeout and reconnect (non-blocking but noisy logs).
 - **No unified notification bus**: 7 independent systems can send unsolicited messages to owner (signal-watchdog, token-refresh, oncall-watchdog, error-alerting, bot.js startup, briefings, monitor-runner). No quiet hours, no consolidation. P1 improvement: build a `NotificationManager` with severity levels, dedup, and quiet hours.
 
-## Recently Fixed (2026-05-17)
-- **Rogue agent spawns burning tokens**: Bianca answered conversational questions then autonomously spawned sub-agents ("Investigate signal bridge spam") that got stuck for 10+ minutes. Root cause: system prompt said "Use Agent tool for 2+ independent subtasks" with no guardrails. Fixed with 4-layer defense: (1) system prompt bars self-initiated agents, (2) post-answer agent thresholds (5min kill), (3) consecutive-error fail-fast (3 errors → 2min kill), (4) post-answer spawn cap (3rd agent → immediate fail-fast).
-- **Signal bridge restart spam (17 notifications in 24h)**: Watchdog checked `lastDataMessageAt` (text messages only) — 30min gaps with no texts are normal, especially overnight. Triggered false "WebSocket dead" restarts every 30-40 minutes. Fixed: checks `lastWebhookAt` (any envelope — receipts, read notifications) instead, threshold raised to 60min, owner notifications removed entirely (restarts are not user-actionable).
-- **Oncall watchdog escalation spam**: `escalate()` sent direct Signal DMs with NO rate limit. Process leak and disk space alerts could fire every 2 minutes indefinitely. Fixed: all escalations route through `sendErrorAlert` for 15-min dedup.
-- **Token refresh wasting API tokens**: Proactive refresh ran `claude -p "respond with only the word ok"` (full API call) every 15 minutes when token was low. Even when refresh failed repeatedly, it kept burning tokens. Fixed: tiered approach tries Windows credential sync and `claude --version` (both free) before falling back to expensive CLI prompt only in critical zone (<30min).
-- **Claude CLI version unpinned**: `CLAUDE_CODE_VERSION: "latest"` meant any `docker compose up --build` could pull a breaking CLI version. Pinned to 2.1.143.
-
-## Recently Fixed (2026-05-16)
-- **Signal WebSocket death (ROOT CAUSE of "bot not working")**: signal-api's WebSocket to Signal servers accumulated 453 drops over 2 weeks, stopped receiving text messages while HTTP health checks still passed 200. Fixed by full container recreation (`docker compose --profile signal stop/rm/up`). Enhanced watchdog now detects this via `lastDataMessageAt` tracking — restarts container if HTTP healthy but no text messages in 30min.
-- **`listenToAll` enabled in all group chats**: One-time migration in `channel-persistence.js` resets all groups to `listenToAll: false` on startup. Groups now correctly default to OFF (respond only to @mentions and !commands).
-- **Auth errors shown to group chat users**: Both auth failure handlers in bot.js now show "I'm taking a quick break — try again in a few minutes!" instead of technical auth errors. Owner gets a private alert via `sendErrorAlert()`.
-- **Remote login from phone (!login command)**: New `commands/login.js` enables owner to re-authenticate Claude CLI remotely via Signal DM. Spawns `claude auth login --claudeai` headlessly, sends auth URL, accepts code back.
-- **Login code interception below greeting handler**: Auth code messages were being consumed by the greeting fast-path. Moved login intercept above greeting handler in bot.js.
-- **OAuth HTTP refresh broken**: CLIENT_ID was metadata URL, not actual client ID. Removed broken HTTP refresh entirely; bot now uses Windows credential sync + headless login.
-- **Stale WebSocket not detected by watchdog**: Enhanced signal-watchdog.js with `recordDataMessage()` separate from `recordWebhookActivity()`. Detects when receipts flow but actual text messages don't.
-
-## Recently Fixed (2026-05-14)
-- **TikTok/link messages ignored in group chat**: Merrisa's TikTok links were dropped by the listenToAll filter because messages without question marks or task keywords were classified as "short conversational." Added `hasLink` check — any message with a URL now passes the filter.
-- **Admin role bypass**: Admins (SIGNAL_ADMIN_NUMBERS) now bypass both group mention filters and conversational-skip logic, same as owner. Also added to `senderAllowed` check so admins can DM the bot.
-- **Runaway owner sessions**: No hard timeout on owner DM sessions allowed stuck sessions to burn tokens indefinitely. Added 60min ceiling + progress circuit breaker (kills after 15 silent turns, 15min no output, or 10min no turn advancement).
-- **Stall detector diagnostic dumps in groups**: Group chat stalls sent raw diagnostic info ("Tool at death", "Turns completed"). Now sends friendly "try again" message instead.
-- **Stall detector `currentTool` always null**: `currentTool` was cleared immediately in the `tool_use` handler, so the stall detector always used the `thinking` threshold (5min) instead of the `bash` threshold (10min). Moved clear to `tool_result` handler so the correct threshold applies while tools run.
-- **Sandbox port registration broken**: `[REGISTER_PORT: PORT]` tag handler replaces broken `curl` approach that relied on scrubbed `$INTERNAL_API_TOKEN`.
-- **Signal link formatting lost URLs**: Markdown links with long URLs silently dropped the URL. Now always preserves URL on a separate line.
-- **`!plan` venue photos not delivered**: Image paths from earlier turns were lost because `result.text` only contains the final turn, and `strippedImagePaths` (paths stripped during streaming) were never included in the attachment union. Fixed by adding strippedImagePaths as a third source. Streaming proxy also broadened to catch `/workspace/` paths and `.gif` files.
-- **`channelProxy is not defined` crash**: Wrong variable name in image delivery code (`channelProxy` → `signalProxy`) caused every Signal session to error after completion.
-- **Doubled URLs from webhook re-delivery**: Signal webhook sometimes delivers the same message twice within the 800ms grouping window. The grouping buffer now deduplicates by timestamp + content.
-- **Path traversal in strippedImagePaths**: Streaming proxy collected raw paths without `path.resolve()` or directory prefix check. A crafted path like `/tmp/../../etc/...` could bypass containment. Now applies the same resolve + prefix allowlist as `extractImageAttachments`, capped at 10 entries.
-- **Sandbox spawn silently falls through**: `_getUid()` cached null UIDs permanently. If the Linux user didn't exist at first lookup (provisioning race, container rebuild), all subsequent sandbox sessions ran as `node` instead of the sandbox user — couldn't write to sandbox dir, stalled for 85min. Fixed: don't cache null, retry provisioning at spawn time, reject with clear error.
-- **Circuit breaker false kills on `!plan` / long builds**: `lastOutputTime` only tracked user-visible text, so 15+ minutes of pure tool use (no streamed text) would trigger a kill. `lastTurnTime` didn't reset on tool starts, so a single 12-minute npm install would trigger the 10-min stale check. Fixed: both timers now reset on turn advancement and tool starts.
+- **Amazon cart execution via Playwright**: `amazon-cart.js` module provides deterministic cart operations — `checkLoginStatus()`, `addToCart(url)`, `getCartContents()`. Uses Playwright's Node.js API with persistent browser profile at `/app/data/browser-profile`. Stealth settings (custom user agent, webdriver flag removal, AutomationControlled disabled) prevent Amazon's bot detection. Cart fast-path now attempts actual Playwright add-to-cart before falling back to "queued for cart" placeholder.
+- **`!amazon` command**: Owner-only Amazon account management — `!amazon status` (check login), `!amazon cart` (view cart), `!amazon login` (interactive login flow). Screenshots sent as Signal attachments.
+- **Playwright browser fix**: Dockerfile now installs Chromium using the MCP's bundled Playwright version (not the system's) to prevent version mismatch. `PLAYWRIGHT_BROWSERS_PATH=/opt/pw-browsers` ensures browsers are accessible by the `node` user at runtime.
 
 ## Next Steps
 - **Re-invite bot to groups**: Owner must add +15106412088 back to: Girthy Calamenca 2.0, boop, Beep, Testing, ppp (via Signal app → group settings → Add member)

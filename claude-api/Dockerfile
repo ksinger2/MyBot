@@ -55,8 +55,13 @@ RUN for i in 1 2 3; do \
     done \
     || (echo "FATAL: claude binary failed to install after 3 attempts" && exit 1)
 
-# Install Playwright with Chromium for browser automation testing
-RUN npx playwright install --with-deps chromium
+# Install Playwright browsers in a shared path accessible by both root (build)
+# and node (runtime). Uses the MCP's bundled Playwright to ensure version match
+# (MCP bundles 1.61.x which needs different browser revisions than system 1.60.x).
+ENV PLAYWRIGHT_BROWSERS_PATH=/opt/pw-browsers
+RUN mkdir -p /opt/pw-browsers \
+    && node /usr/local/lib/node_modules/@playwright/mcp/node_modules/playwright/cli.js install --with-deps chromium \
+    && chmod -R 755 /opt/pw-browsers
 
 WORKDIR /app
 
