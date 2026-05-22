@@ -1,7 +1,7 @@
 # MyBot — Next Steps
 
 ## What's Working
-<!-- Updated each session — 2026-05-20 -->
+<!-- Updated each session — 2026-05-21 -->
 - On-call watchdog (`oncall-watchdog.js`) running every 2min with 6 deterministic health checks:
   1. CLI auth health (escalates after 3 failures, 30min cooldown)
   2. Sandbox credential freshness (auto-refreshes if >5min stale)
@@ -26,7 +26,7 @@
 - **`!plan` command enhanced**: Accepts event poster images or text, runs 7-step research pipeline (venue, seating, interior photo, ticket prices via concert scraper, calendar check for all group members, parking/transport), stores result server-side for deterministic follow-ups
 - **WSL stability**: `.wslconfig` has `autoMemoryReclaim=gradual`, WSL vhdx compacted (141GB→56GB), Windows credentials mounted read-only into container
 - **Signal admin role**: `isSignalAdmin()` in `project-permissions.js` — trusted users bypass group mention filters, get owner-like turn caps (75), no tool restrictions in DMs
-- **Progress circuit breaker with agent awareness**: 3 auto-kill triggers with dynamic thresholds. Default: 15 silent turns / 15min no output / 10min stale. Post-answer agents (answered user, then spawned agent): 8 turns / 5min / 5min. Fail-fast (3+ agent errors or spawn cap exceeded): 3 turns / 2min / 2min. Prevents rogue agents from burning tokens after answering conversational questions.
+- **Progress circuit breaker with agent awareness**: 3 auto-kill triggers with dynamic thresholds. Default: 15 silent turns / 15min no output / 10min stale. Sandbox sessions: turn-count breaker disabled (coding needs unlimited tool calls), time-based only (25min no output / 15min stale). Post-answer agents (answered user >200 chars, then spawned agent): 8 turns / 5min / 5min. Fail-fast (3+ agent errors or spawn cap exceeded): 3 turns / 2min / 2min. Short progress messages (<200 chars) no longer trigger post-answer mode.
 - **Group stall detector**: Separate thresholds (2min thinking, 5min bash), friendly "try again" message instead of diagnostic dumps. `currentTool` now correctly tracks active tool (was always null due to premature clear).
 - **Group chat link detection**: Messages with URLs now trigger bot response in listenToAll mode even without question marks or task keywords — fixes TikTok/Instagram link sharing being ignored
 - **Signal link formatting**: URLs no longer stripped from markdown links — always preserved as clickable text
@@ -47,8 +47,29 @@
 - **Cart approval fast-path (deterministic)**: "1", "add 1", "add all" now processed directly via `approvalGate` without spawning Claude — same pattern as the greeting fast-path. 👍 reactions on cart prompts (identified by 🛒 prefix, which is infrastructure-generated) also auto-approve directly. Pending items cleared after processing to prevent duplicate execution. Previously, both paths spawned a full Claude CLI session that had to figure out it should emit `[CART_ADD: action="add" ids="1"]` — which stalled at turn 0 twice in a row.
 - **Content-based message dedup**: New early dedup layer catches Signal re-deliveries with different timestamps but identical normalized content (e.g. with/without U+FFFC prefix). Keyed on `chatId:senderId:normalizedContent` with 2s window. Runs before command handler — fixes duplicate `!listen on` responses.
 - **Parallel link enrichment**: Link metadata, TikTok transcripts, Instagram transcripts, and auto-context now fetch in parallel via `Promise.all`. Response time for link messages drops from ~25s (sequential) to ~10s (max of individual fetches).
+- **Sandbox group chat parity**: Sandbox users' group chats now behave like owner DM engineering sessions:
+  - Auto-respond to all messages (bypass listenToAll, mention filter, and conversational filter)
+  - Use Opus model (was Sonnet — can't code with Sonnet)
+  - 30-turn limit (was 8 for regular groups)
+  - System prompt says "SANDBOX GROUP: Full engineering access" (was "No file ops, no Bash")
+  - Agents allowed for coding tasks (were suppressed in groups)
+  - Normal stall thresholds (5min thinking, 10min bash) instead of aggressive group thresholds (2min/5min)
+  - Normal 5min check-in interval instead of 90s group interval
+  - Ghost-reaper treats sandbox as owner-level (75min limit, was 15min non-owner limit — this was killing active coding sessions)
+  - Circuit breaker turn-count disabled (time-based only — coding routinely does 50+ tool calls without text output)
+  - Session IDs preserved through rebuilds (was wiping all sessions on every rebuild)
+  - Detection works by sender ID (sandbox user in any group) OR chat link (via `!sandbox link`)
 
-## Recently Fixed (2026-05-20)
+## Recently Fixed (2026-05-21)
+- **Sandbox `sandboxUser is not defined` crash**: `runner.js` referenced `sandboxUser` as a bare variable instead of `this.sandboxUser` in 3 places (system prompt builder, stall detector, check-in interval). Every sandbox session crashed immediately with "Sorry, something went wrong." Fixed by using `this.sandboxUser` consistently.
+- **Ghost-reaper killing sandbox sessions at 15min**: Sandbox processes were registered as non-owner (`isOwner: false`), so the ghost-reaper killed them after `MAX_NON_OWNER_AGE_MS` (15min). Daniel's 67-turn site deployment was killed at 16min. Fixed by setting `this.isOwner = true` for sandbox sessions, giving them the 75min owner limit.
+- **Circuit breaker killing sandbox at 15/25 turns**: Turn-count breaker fired on legitimate engineering work (write files, run builds, deploy). Disabled turn-count trigger entirely for sandbox sessions — only time-based checks remain (25min silent, 15min stale).
+- **Post-answer agent detection too aggressive**: Any streamed text (even "Let me look...") set `streamedAny=true`, causing subsequent Agent spawns to trigger the tight 8-turn threshold. Now requires >200 chars of streamed text before counting as a "substantive answer." Tracked via `streamedChars` counter in progress state.
+- **Sandbox groups ignored messages**: Three independent filters blocked sandbox group messages: (1) `listenToAll` OFF by default, (2) "addressing another person" heuristic, (3) "short conversational" heuristic. All three now bypassed when sender is a sandbox user or chat is sandbox-linked.
+- **Sandbox groups used Sonnet with 8-turn limit**: Both main dispatch and queue handler hardcoded Sonnet for all groups. Now sandbox groups use Opus with 30-turn limit. System prompt switched from "GROUPS: No file ops, no Bash" to "SANDBOX GROUP: Full engineering access."
+- **Rebuild wiped all session IDs**: `_startupMarkers.wasRebuild` cleared every channel's `sessionId` to prevent rebuild loops. Now only clears owner/social sessions — sandbox sessions are preserved so coding work resumes seamlessly.
+
+## Previously Fixed (2026-05-20)
 - **Chrome MCP tools in group chat whitelist**: `nonOwnerToolWhitelist` now includes `ToolSearch` + 5 Chrome MCP tools (`navigate_page`, `take_snapshot`, `take_screenshot`, `close_page`, `list_pages`). When WebFetch is blocked by a site, the bot can now fall back to Chrome browser automation instead of trying 10+ workaround approaches over 11 minutes. Fixed in both the main dispatch path (bot.js:2771) and queue handler (bot.js:1430).
 - **Sandbox tools include Chrome MCP**: `DEFAULT_TOOLS` in sandbox.js now includes Chrome MCP tools. Existing sandbox users (Daniel, Lee, Merrisa) auto-migrated on startup via `provisionAll()`. Sandbox-linked group chats in the queue handler now resolve sandbox config (tools, cwd) correctly — previously always used the flat nonOwnerToolWhitelist.
 - **Group chat speed — 3 fixes**:

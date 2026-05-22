@@ -346,6 +346,7 @@ function freshProgress() {
     loopState: loopDetection.createState(),
     activeAgents: new Map(),
     completedAgents: [],
+    streamedChars: 0,
   };
 }
 
@@ -419,7 +420,7 @@ class Runner {
     this.profileContext = profileContext;
     this.streamReplies = streamReplies;
     this.isVoice = isVoice;
-    this.isOwner = isOwner || ownerDmMode; // ownerDmMode implies isOwner
+    this.isOwner = isOwner || ownerDmMode || !!sandboxUser;
     this.sandboxUser = sandboxUser;
     this.userTimezone = userTimezone || 'America/Los_Angeles';
     this.recentMessages = recentMessages;
@@ -606,6 +607,7 @@ class Runner {
         personalityFile,
         readOnly,
         isGroupChat: !!groupAllowedTools,
+        isSandboxGroup: !!groupAllowedTools && !!this.sandboxUser,
         isVoice: this.isVoice,
         profileContext,
         discordUserId,
@@ -931,11 +933,14 @@ class Runner {
                 const agentDesc = block.input?.description || 'sub-agent';
                 const agentType = block.input?.subagent_type || 'general-purpose';
                 const totalAgents = channelState.progress.activeAgents.size + channelState.progress.completedAgents.length;
-                if (streamedAny && totalAgents >= 2) {
+                // Only trigger post-answer guardrails if a substantive answer (>200 chars)
+                // was already delivered. Short progress messages don't count.
+                const _substantive = streamedAny && (channelState.progress.streamedChars || 0) > 200;
+                if (_substantive && totalAgents >= 2) {
                   console.warn(`[agent-cap] Post-answer agent spawn #${totalAgents + 1} ("${agentDesc}") — triggering fail-fast`);
                   channelState.progress._agentFailFast = true;
                 }
-                if (streamedAny && totalAgents === 0) {
+                if (_substantive && totalAgents === 0) {
                   console.warn(`[agent-guard] Post-answer agent spawn: "${agentDesc}" — applying tighter thresholds`);
                 }
                 channelState.progress.activeAgents.set(block.id, {
@@ -1013,6 +1018,7 @@ class Runner {
                   chunk = chunk.replace(/\[(LEARNED|IMAGINE|CALENDAR|WEATHER|PRODUCT|REMIND|REBUILD|EVENT|EVENT_JOIN|SET_PREF|UPDATE_NOTES|BACKGROUND|CONCERT_PRICES|FLIGHT_SEARCH|FLIGHT_PRICE|EIGHTSLEEP|NEEDS_AGENT|EMAIL_UNSUB|CART_ADD)[:|\]][^\]]*\]?/gi, '').trim();
                   if (chunk.length > 0) {
                     streamedAny = true;
+                    channelState.progress.streamedChars += chunk.length;
                     channelState.progress.lastOutputTurn = channelState.progress.turnCount;
                     channelState.progress.lastOutputTime = Date.now();
                     channelState.progress.lastActivity = Date.now();
@@ -1124,12 +1130,20 @@ class Runner {
           const silentTurns = p.turnCount - p.lastOutputTurn;
           const silentMinutes = Math.round((Date.now() - p.lastOutputTime) / 60000);
           const turnStaleMinutes = Math.round((Date.now() - p.lastTurnTime) / 60000);
-          const postAnswerAgent = streamedAny && p.activeAgents.size > 0;
+          // Only count as "post-answer" if a substantive response was delivered (>200 chars).
+          // Short progress messages ("Let me look...", "Investigating...") are not answers —
+          // subsequent Agent spawns for investigation are legitimate, not rogue.
+          const substantiveAnswer = streamedAny && (p.streamedChars || 0) > 200;
+          const postAnswerAgent = substantiveAnswer && p.activeAgents.size > 0;
           const agentFailFast = p._agentFailFast;
+          // Sandbox sessions: disable turn-count breaker entirely. Coding work
+          // routinely does 30-50+ tool calls without streaming text. Only time-based
+          // checks apply (stale = stuck on one turn, silent = no output for N minutes).
+          const isSandbox = !!this.sandboxUser;
           const turnThreshold = agentFailFast ? 3 : postAnswerAgent ? 8 : 15;
-          const silentTimeThreshold = agentFailFast ? 2 : postAnswerAgent ? 5 : 15;
-          const staleThreshold = agentFailFast ? 2 : postAnswerAgent ? 5 : 10;
-          const turnTriggered = silentTurns >= turnThreshold && p.turnCount >= 5;
+          const silentTimeThreshold = agentFailFast ? 2 : postAnswerAgent ? 5 : (isSandbox ? 25 : 15);
+          const staleThreshold = agentFailFast ? 2 : postAnswerAgent ? 5 : (isSandbox ? 15 : 10);
+          const turnTriggered = !isSandbox && silentTurns >= turnThreshold && p.turnCount >= 5;
           const timeTriggered = silentMinutes >= silentTimeThreshold;
           const staleTriggered = turnStaleMinutes >= staleThreshold;
           if ((turnTriggered || timeTriggered || staleTriggered) && childAlive) {
@@ -1177,8 +1191,9 @@ class Runner {
         }
 
         // Social group chats: kill on threshold, but only if process is alive
-        // (if dead, clean up immediately)
-        const _isGroupStall = !!groupAllowedTools;
+        // (if dead, clean up immediately). Sandbox groups use normal thresholds
+        // since they're coding sessions, not social chats.
+        const _isGroupStall = !!groupAllowedTools && !this.sandboxUser;
         let threshold = getStallThreshold(p.currentTool, _isGroupStall);
         // Startup grace: first API response can be slow (auth refresh, rate
         // limit queue, cold start). Give 3min before killing at turn 0.
@@ -1247,7 +1262,7 @@ class Runner {
       const checkinTimer = setInterval(() => {
         if (!channelProxy || !channelState || !channelState.startedAt) return;
         const now = Date.now();
-        const checkinInterval = groupAllowedTools ? GROUP_CHECKIN_INTERVAL : CHECKIN_INTERVAL;
+        const checkinInterval = (groupAllowedTools && !this.sandboxUser) ? GROUP_CHECKIN_INTERVAL : CHECKIN_INTERVAL;
         if (now - lastCheckin < checkinInterval) return;
         lastCheckin = now;
 

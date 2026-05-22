@@ -1088,13 +1088,21 @@ async function startBot() {
 
   // Restore persisted channel states from previous container lifecycle
   _savedChannelStates = loadAllChannelStates();
-  // After a rebuild, clear all session IDs so conversations start fresh.
-  // Stale sessions contain the pre-rebuild conversation history which can
-  // include instructions like "rebuild" that cause infinite rebuild loops.
+  // After a rebuild, clear owner/social session IDs to prevent infinite rebuild loops
+  // (owner sessions may contain "rebuild" instructions in their history).
+  // Sandbox user sessions are preserved — they're doing independent coding work
+  // and should resume seamlessly after infrastructure rebuilds.
   if (_startupMarkers.wasRebuild) {
-    for (const state of Object.values(_savedChannelStates)) {
-      if (state.sessionId) {
-        console.log(`[rebuild] Clearing stale sessionId for fresh start`);
+    const { getSandboxUser, getSandboxForChat } = require('./sandbox');
+    for (const [channelId, state] of Object.entries(_savedChannelStates)) {
+      if (channelId.startsWith('_')) continue;
+      if (!state.sessionId) continue;
+      const chatId = channelId.replace(/^signal:/, '');
+      const isSandboxSession = !!getSandboxUser(chatId) || !!getSandboxForChat(chatId);
+      if (isSandboxSession) {
+        console.log(`[rebuild] Preserving sandbox sessionId for ${channelId.substring(0, 25)}`);
+      } else {
+        console.log(`[rebuild] Clearing stale sessionId for ${channelId.substring(0, 25)}`);
         state.sessionId = null;
       }
     }
@@ -1429,8 +1437,8 @@ async function processQueue(state) {
       channelProxy: queueProxy,
       isOwner: senderIsOwnerQ,
       ownerDmMode: ownerDmModeQ,
-      model: ownerDmModeQ ? 'claude-opus-4-6' : 'sonnet',
-      maxTurns: ownerDmModeQ ? null : (isGroupChatQ && !qSandbox ? 8 : 20),
+      model: ownerDmModeQ ? 'claude-opus-4-6' : (qSandbox ? 'claude-opus-4-6' : 'sonnet'),
+      maxTurns: ownerDmModeQ ? null : (isGroupChatQ && !qSandbox ? 8 : (qSandbox ? 30 : 20)),
       streamReplies: true,
       readOnly: false,
       groupAllowedTools: qSandbox ? qSandbox.allowedTools
@@ -1841,7 +1849,15 @@ function startSignalAdapter() {
         (m.uuid && botUuid && m.uuid === botUuid)
       );
 
-      if (!state.listenToAll && !hasPendingSenderWizard && !senderIsAdmin) {
+      // Sandbox-linked groups (or groups where the sender is a sandbox user) are
+      // work environments — always respond without needing @mention or listenToAll.
+      let _isSandboxGroup = false;
+      try {
+        const _sb = require('./sandbox');
+        _isSandboxGroup = !!_sb.getSandboxForChat(msg.chatId) || !!_sb.getSandboxUser(msg.senderId);
+      } catch {}
+
+      if (!state.listenToAll && !hasPendingSenderWizard && !senderIsAdmin && !_isSandboxGroup) {
         if (!botMentioned) {
           console.log(`[signal] Group message — bot not mentioned, ignoring (${mentionList.length} other mention(s))`);
           return;
@@ -1852,7 +1868,7 @@ function startSignalAdapter() {
       // directly (imperative verb directed at them), skip. But if it mentions
       // someone in the context of a request to the bot ("@Merrisa wants to join"),
       // don't skip — fall through so Claude can handle it.
-      if (state.listenToAll && !botMentioned && mentionList.length > 0) {
+      if (state.listenToAll && !botMentioned && mentionList.length > 0 && !_isSandboxGroup) {
         // Strip U+FFFC placeholders AND any literal @Name text Signal may include
         const textWithoutMentions = text
           .replace(/\uFFFC/g, '')
@@ -1878,8 +1894,8 @@ function startSignalAdapter() {
 
       // Even in listenToAll mode: if the message is clearly a short conversational
       // exchange not addressed to the bot (no question, no task, no bot name), skip.
-      // Owner always bypasses this filter — they set up listenToAll and should always get responses.
-      if (state.listenToAll && !botMentioned && mentionList.length === 0 && !senderIsOwner && !senderIsAdmin) {
+      // Owner, admins, and sandbox groups always bypass — they're work environments.
+      if (state.listenToAll && !botMentioned && mentionList.length === 0 && !senderIsOwner && !senderIsAdmin && !_isSandboxGroup) {
         const botName = (state.identity?.name || '').toLowerCase();
         const textLower = text.toLowerCase().replace(/\uFFFC/g, '').trim();
         const hasQuestion = textLower.includes('?');
@@ -2817,7 +2833,7 @@ async function _dispatchSignalMessage(msg, chatId, text, state) {
         streamReplies: true,
         maxTurns: ownerDmMode ? null
           : (isGroupChat && !sandboxUser ? 8
-          : isGroupChat && sandboxUser ? 20
+          : isGroupChat && sandboxUser ? 30
           : (senderIsOwner || senderIsAdmin) ? (parseInt(process.env.SIGNAL_OWNER_MAX_TURNS, 10) || 75)
           : 20),
         ownerDmMode,
@@ -2828,11 +2844,12 @@ async function _dispatchSignalMessage(msg, chatId, text, state) {
         // Pass recent messages for conversation context persistence
         recentMessages: state.recentMessages || [],
         // Model selection.
-        //   - Owner DM → always Opus 4.7 (full 200k context)
-        //   - Groups and non-owner DMs → Sonnet by default
+        //   - Owner DM → Opus (full 200k context)
+        //   - Sandbox groups → Opus (coding work needs capable model)
+        //   - Regular groups and non-owner DMs → Sonnet
         model: ownerDmMode ? 'claude-opus-4-6'
-          : (isGroupChat ? 'sonnet'
-          : (!senderIsOwner ? 'sonnet' : 'sonnet')),
+          : (sandboxUser ? 'claude-opus-4-6'
+          : 'sonnet'),
       };
 
       // Pre-fetch link metadata, video transcripts, and auto-context in parallel.
