@@ -39,7 +39,9 @@ async function sendErrorAlert(error, { source = 'unknown', channel = null, detai
       try {
         const { SIGNAL_OWNER } = require('./project-permissions');
         if (SIGNAL_OWNER) {
-          const msg = `Error in ${source}: ${truncated.substring(0, 500)}`;
+          const msg = channel
+            ? `Error in ${source} [${channel}]: ${truncated.substring(0, 500)}`
+            : `Error in ${source}: ${truncated.substring(0, 500)}`;
           await _signalAdapter.sendMessage(SIGNAL_OWNER, msg);
         }
       } catch {}

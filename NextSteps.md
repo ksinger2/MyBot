@@ -40,7 +40,7 @@
 - **Agent guardrails (system prompt)**: Both owner DM and non-owner prompts now explicitly bar self-initiated agent spawning: "ONLY for user-requested multi-step engineering tasks. NEVER for self-initiated investigation, follow-up diagnostics, or curiosity."
 - **Agent fail-fast**: Each sub-agent tracks `consecutiveErrors`. On 3+ consecutive tool errors, `_agentFailFast` flag triggers 2-minute kill thresholds. Post-answer agent spawn cap: 3rd+ agent after answer delivered triggers immediate fail-fast.
 - **Oncall watchdog dedup**: All escalations now route through `sendErrorAlert` for 15-min dedup. Previously, `escalate()` sent direct Signal DMs bypassing dedup — process leak and disk alerts could spam every 2 minutes.
-- **Token refresh efficiency**: Tiered approach — (1) sync Windows credentials (free), (2) `claude --version` to trigger SDK auth exchange (free), (3) full CLI prompt only in critical zone (<30min remaining). Previously burned API tokens every 15min on failed refresh attempts.
+- **Token refresh efficiency**: Tiered approach — (1) sync Windows credentials (free), (2) `claude -p "ok"` to force SDK through OAuth exchange (triggers actual token refresh). Runs whenever token < 2hr remaining. Queue and direct paths both retry once on auth failure before alerting owner.
 - **Claude CLI pinned**: `CLAUDE_CODE_VERSION: "2.1.143"` in docker-compose.yml (was "latest" — any rebuild could pull breaking changes).
 - **Command context continuity**: Commands (`!product`, `!help`, etc.) now record both the user's command and the bot's reply in `recentMessages`. Follow-up questions ("how much are those?") have full context about what the command found. Implemented via reply/send proxy wrapper in bot.js.
 - **Product query cleaning**: `cleanProductQuery()` strips conversational filler from natural language product requests, extracts store preference (Amazon/Walmart/Target), and preserves brand names. "add a nice and good deal product to my amazon cart that is a planter, 8 ft long" → query: "planter 8 ft long", store: amazon.
@@ -59,6 +59,14 @@
   - Circuit breaker turn-count disabled (time-based only — coding routinely does 50+ tool calls without text output)
   - Session IDs preserved through rebuilds (was wiping all sessions on every rebuild)
   - Detection works by sender ID (sandbox user in any group) OR chat link (via `!sandbox link`)
+
+## Recently Fixed (2026-05-22)
+- **Auth token refresh actually works now**: `_proactiveRefresh()` was using `claude --version` (Step 2) which exits before initializing the OAuth layer — tokens were never actually refreshed. Replaced with `claude -p "ok" --max-turns 1` which forces the SDK through the full auth exchange. Removed the redundant Step 3 that only ran in critical zone (<30min) — now the single prompt step runs whenever token < 2hr.
+- **Queue path auth retry**: Queue processing had NO retry on auth failure (instant fail + misleading message). Now mirrors the direct message path: refreshes sandbox creds + Windows sync → retries spawn once → only fails if retry also fails.
+- **Auth error messages fixed**: "I'm taking a quick break — try again in a few minutes!" replaced with context-aware messages. Owner sees "Auth expired — send !login to re-authenticate." Non-owners see "Sorry, I'm having a temporary issue. The owner has been notified."
+- **Auth alerts consolidated**: Three separate error sources (`token-refresh`, `auth-signal`, `auth-queue`) all used different dedup keys, so the owner got 2-3 alerts for one root cause. All unified to `source: 'auth'` — owner gets exactly one alert per 15-min window, now with `[channelId]` context showing which chat triggered it.
+- **Notification suppression gap closed**: `notifyOwnerAuthExpiring()` suppressed alerts when token > 10min remaining, but the 15-min heartbeat could miss the window entirely (11min at check → suppressed → next check at -4min → expired without warning). Removed the inner suppression — already guarded by 1-hour dedup and the `<= EXPIRY_WARN_MINUTES` caller check.
+- **Queue double-send fix**: `sendLongMessage` in queue path wasn't guarded by `result.streamed` — successful streamed responses were sent twice (once via streaming, once via `sendLongMessage`). Now matches the direct path pattern: `if (!result.streamed && result.text)`.
 
 ## Recently Fixed (2026-05-21)
 - **Sandbox `sandboxUser is not defined` crash**: `runner.js` referenced `sandboxUser` as a bare variable instead of `this.sandboxUser` in 3 places (system prompt builder, stall detector, check-in interval). Every sandbox session crashed immediately with "Sorry, something went wrong." Fixed by using `this.sandboxUser` consistently.

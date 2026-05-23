@@ -1467,14 +1467,28 @@ async function processQueue(state) {
       queueOpts.sessionId = null;
       result = await runClaudeWithContinuation(combined, queueOpts, queueProxy);
     }
-    // Auth failure during queue processing — friendly message to user, diagnostic to owner
+    // Auth failure during queue processing — refresh creds and retry once (mirrors direct path)
     if (result.authFailed) {
-      const signalChatIdForAuth = replyTarget?._signalChatId || (channelId ? channelId.replace(/^signal:/, '') : null);
-      if (signalChatIdForAuth && signalAdapter) {
-        await signalAdapter.sendMessage(signalChatIdForAuth, "I'm taking a quick break — try again in a few minutes!").catch(() => {});
+      try { require('./sandbox').refreshAllCredentials(); } catch {}
+      try { require('./token-refresh').syncWindowsCredentials(); } catch {}
+      console.log(`[auth-retry] Queue: refreshed creds, retrying spawn for ${channelId}`);
+      try {
+        result = await runClaudeWithContinuation(combined, queueOpts, queueProxy);
+      } catch (err) {
+        console.warn(`[auth-retry] Queue retry threw: ${err.message}`);
+        result = { authFailed: true, stopped: true };
       }
-      sendErrorAlert(new Error('Auth failed in queue — token may be expired. Send !login to re-authenticate.'), { source: 'auth-queue' });
-      return;
+      if (result && result.authFailed) {
+        const signalChatIdForAuth = replyTarget?._signalChatId || (channelId ? channelId.replace(/^signal:/, '') : null);
+        if (signalChatIdForAuth && signalAdapter) {
+          const authMsg = senderIsOwnerQ
+            ? 'Auth expired — send !login to re-authenticate.'
+            : 'Sorry, I\'m having a temporary issue. The owner has been notified.';
+          await signalAdapter.sendMessage(signalChatIdForAuth, authMsg).catch(() => {});
+        }
+        sendErrorAlert(new Error('Auth failed after retry — token expired. Send !login to re-authenticate.'), { source: 'auth', channel: channelId });
+        return;
+      }
     }
 
     if (result.sessionId) {
@@ -1510,7 +1524,9 @@ async function processQueue(state) {
           turnCount: result.numTurns || 0,
         });
       }
-      await sendLongMessage(replyTarget, result.text, state.cwd);
+      if (!result.streamed && result.text) {
+        await sendLongMessage(replyTarget, result.text, state.cwd);
+      }
 
       const elapsed = state.startedAt ? Math.round((Date.now() - state.startedAt) / 1000) : 0;
       const completedProgress = state.progress;
@@ -2970,10 +2986,14 @@ async function _dispatchSignalMessage(msg, chatId, text, state) {
           result = await runClaudeWithContinuation(signalPrompt, claudeOpts, signalProxy);
         } catch (err) {
           console.warn(`[auth-retry] retry threw: ${err.message}`);
+          result = { authFailed: true, stopped: true };
         }
         if (result && result.authFailed) {
-          await signalAdapter.sendMessage(msg.chatId, "I'm taking a quick break — try again in a few minutes!").catch(() => {});
-          sendErrorAlert(new Error('Auth failed after retry — token expired. Send !login to re-authenticate.'), { source: 'auth-signal' });
+          const authMsg = senderIsOwner
+            ? 'Auth expired — send !login to re-authenticate.'
+            : 'Sorry, I\'m having a temporary issue. The owner has been notified.';
+          await signalAdapter.sendMessage(msg.chatId, authMsg).catch(() => {});
+          sendErrorAlert(new Error('Auth failed after retry — token expired. Send !login to re-authenticate.'), { source: 'auth', channel: chatId });
           return;
         }
       }

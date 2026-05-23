@@ -111,12 +111,6 @@ function runHeadlessLogin() {
 
 async function notifyOwnerAuthExpiring(minsLeft) {
   if (Date.now() - _ownerNotifiedAt < 60 * 60 * 1000) return;
-  // Suppress notifications while token has plenty of time — tiered refresh
-  // usually recovers silently. Alert at <=10min so owner has one last cycle.
-  if (minsLeft > 10) {
-    console.warn(`[token-refresh] Token low (${minsLeft}min) — suppressing notification, refresh may still recover`);
-    return;
-  }
   try {
     const { sendErrorAlert } = require('./error-alerting');
     const msg = minsLeft <= 0
@@ -124,7 +118,7 @@ async function notifyOwnerAuthExpiring(minsLeft) {
       : `Auth token expires in ${minsLeft}min — send !login if refresh doesn't recover`;
     await sendErrorAlert(
       new Error(msg),
-      { source: 'token-refresh' }
+      { source: 'auth' }
     );
     _ownerNotifiedAt = Date.now();
   } catch {}
@@ -154,44 +148,23 @@ async function _proactiveRefresh() {
     return true;
   }
 
-  // Step 2: Run claude --version (free, no API tokens) to trigger SDK auth exchange
+  // Step 2: Run a minimal prompt to force the SDK through the auth layer.
+  // `claude --version` does NOT trigger OAuth exchange — it exits before init.
   try {
-    await execFileAsync('claude', ['--version'], {
-      timeout: 15000,
+    await execFileAsync('claude', ['-p', 'respond with only the word ok', '--max-turns', '1', '--output-format', 'text'], {
+      timeout: 45000,
       env: { ...process.env, HOME: '/home/node' },
     });
   } catch (err) {
-    console.error('[token-refresh] Proactive refresh (--version) failed:', err.message);
+    console.error('[token-refresh] Proactive refresh (prompt) failed:', err.message);
     return false;
   }
 
-  const afterVersion = getTokenExpiryMinutes();
-  if (afterVersion !== null && afterVersion > (beforeExpiry || 0) + 30) {
-    console.log(`[token-refresh] Token refreshed via --version! ${beforeExpiry}min → ${afterVersion}min remaining`);
+  const afterPrompt = getTokenExpiryMinutes();
+  if (afterPrompt !== null && afterPrompt > (beforeExpiry || 0) + 30) {
+    console.log(`[token-refresh] Token refreshed via prompt! ${beforeExpiry}min → ${afterPrompt}min remaining`);
     try { require('./sandbox').refreshAllCredentials(); } catch {}
     return true;
-  }
-
-  // Step 3: Only burn an API call if --version didn't refresh the token
-  // and we're within 30 minutes of expiry (critical zone)
-  if ((afterVersion || beforeExpiry || 999) <= EXPIRY_WARN_MINUTES) {
-    console.log('[token-refresh] Critical zone — trying full CLI prompt to force refresh...');
-    try {
-      await execFileAsync('claude', ['-p', 'respond with only the word ok', '--max-turns', '1', '--output-format', 'text'], {
-        timeout: 45000,
-        env: { ...process.env, HOME: '/home/node' },
-      });
-    } catch (err) {
-      console.error('[token-refresh] Proactive refresh (prompt) failed:', err.message);
-      return false;
-    }
-
-    const afterPrompt = getTokenExpiryMinutes();
-    if (afterPrompt !== null && afterPrompt > (beforeExpiry || 0) + 30) {
-      console.log(`[token-refresh] Token refreshed via prompt! ${beforeExpiry}min → ${afterPrompt}min remaining`);
-      try { require('./sandbox').refreshAllCredentials(); } catch {}
-      return true;
-    }
   }
 
   console.log(`[token-refresh] CLI ran but token not extended (${beforeExpiry}min → ${getTokenExpiryMinutes()}min)`);
