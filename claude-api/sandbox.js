@@ -43,7 +43,9 @@ function _save(config) {
 }
 
 function _linuxUserName(name) {
-  return 'sandbox-' + name.toLowerCase().replace(/[^a-z0-9]/g, '').slice(0, 20);
+  const sanitized = name.toLowerCase().replace(/[^a-z0-9]/g, '').slice(0, 20);
+  if (!sanitized) throw new Error(`Cannot create sandbox user: name "${name}" has no alphanumeric characters`);
+  return 'sandbox-' + sanitized;
 }
 
 /**

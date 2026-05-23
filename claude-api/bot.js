@@ -1472,6 +1472,7 @@ async function processQueue(state) {
       try { require('./sandbox').refreshAllCredentials(); } catch {}
       try { require('./token-refresh').syncWindowsCredentials(); } catch {}
       console.log(`[auth-retry] Queue: refreshed creds, retrying spawn for ${channelId}`);
+      queueOpts.sessionId = null;
       try {
         result = await runClaudeWithContinuation(combined, queueOpts, queueProxy);
       } catch (err) {
@@ -1526,6 +1527,11 @@ async function processQueue(state) {
       }
       if (!result.streamed && result.text) {
         await sendLongMessage(replyTarget, result.text, state.cwd);
+      } else if (!result.streamed && !result.text && result.hitTurnLimit) {
+        const signalChatIdForTurnLimit = replyTarget?._signalChatId || (channelId ? channelId.replace(/^signal:/, '') : null);
+        if (signalChatIdForTurnLimit && signalAdapter) {
+          await signalAdapter.sendMessage(signalChatIdForTurnLimit, 'I ran out of turns before I could respond — try again or simplify your request.').catch(() => {});
+        }
       }
 
       const elapsed = state.startedAt ? Math.round((Date.now() - state.startedAt) / 1000) : 0;
@@ -2366,8 +2372,6 @@ function startSignalAdapter() {
     if (state.busy && state._triggeredByTimestamp === deletedTimestamp && state.process) {
       console.log(`[signal] Deleted message ${deletedTimestamp} was the active task — stopping`);
       try { state.process.kill('SIGTERM'); } catch {}
-      state.busy = false;
-      state._triggeredByTimestamp = null;
     }
   });
 
@@ -2982,6 +2986,7 @@ async function _dispatchSignalMessage(msg, chatId, text, state) {
         try { require('./sandbox').refreshAllCredentials(); } catch {}
         try { require('./token-refresh').syncWindowsCredentials(); } catch {}
         console.log(`[auth-retry] refreshed creds, retrying spawn for ${_redactId(chatId)}`);
+        claudeOpts.sessionId = null;
         try {
           result = await runClaudeWithContinuation(signalPrompt, claudeOpts, signalProxy);
         } catch (err) {

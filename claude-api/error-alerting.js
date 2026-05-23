@@ -27,7 +27,7 @@ async function sendErrorAlert(error, { source = 'unknown', channel = null, detai
     // Clean old entries
     if (_recentErrors.size > 100) {
       for (const [k, t] of _recentErrors) {
-        if (now - t > 10 * 60 * 1000) _recentErrors.delete(k);
+        if (now - t > 15 * 60 * 1000) _recentErrors.delete(k);
       }
     }
 

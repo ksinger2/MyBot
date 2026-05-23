@@ -119,12 +119,13 @@ function _acquireSlot(isOwner = false) {
       }
       if (oldestNonOwner && oldestNonOwner.child) {
         console.log(`[semaphore] owner evicting non-owner pid=${oldestPid} (started ${Math.round((Date.now() - oldestNonOwner.startedAt) / 1000)}s ago)`);
+        // Queue owner BEFORE killing — if the process dies instantly, the close
+        // handler will release the slot and drain the queue. Pushing after the
+        // kill creates a race where the slot is freed before the waiter is queued.
+        _ownerQueue.push(resolve);
         forceKillProcess(oldestNonOwner.child, 3000).then(() => {
           // Slot will be released by the close handler, then we acquire it
-          // Put owner at front of owner queue to grab it immediately
         }).catch(() => {});
-        // Queue owner — the evicted process's close handler will release a slot
-        _ownerQueue.push(resolve);
         return;
       }
       // No non-owner to evict — queue the owner (shouldn't happen with 4 slots)
@@ -819,7 +820,7 @@ class Runner {
               resultCost = event.total_cost_usd != null ? event.total_cost_usd : resultCost;
               resultNumTurns = event.num_turns != null ? event.num_turns : resultNumTurns;
               // Detect auth failure from result text or flag
-              if (event.is_error && (hitAuthFailure || (resultText && resultText.includes('Not logged in')))) {
+              if (hitAuthFailure || (resultText && resultText.includes('Not logged in'))) {
                 hitAuthFailure = true;
                 resultSubtype = 'authentication_failed';
               }
@@ -1088,6 +1089,8 @@ class Runner {
           this._saveChannelState(channelState._channelId, channelState);
           this._flushPendingWrites();
         }
+        clearInterval(stallCheck);
+        clearInterval(checkinTimer);
         const timeoutErr = new Error(`Claude CLI hit hard timeout after ${MAX_TIMEOUT / 60000} minutes`);
         sendErrorAlert(timeoutErr, { source: 'askClaude hard timeout' });
         wrappedReject(timeoutErr);
@@ -1363,6 +1366,7 @@ class Runner {
               hitTurnLimit: resultNumTurns >= maxTurns,
               stopped: false,
               streamed: streamedAny,
+              rateLimited: hitRateLimit || false,
             });
           }
           const exitErr = new Error(`Claude CLI exited with code ${code}\n${stderr.substring(0, 300)}`);

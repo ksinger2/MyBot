@@ -14,6 +14,7 @@ const ACTIVE_CREDS = '/home/node/.claude/.credentials.json';
 let _ownerNotifiedAt = 0;
 let _loginInProgress = false;
 let _lastProactiveRefreshAt = 0;
+let _refreshInProgress = false;
 
 function isLoginInProgress() { return _loginInProgress; }
 function setLoginInProgress(v) { _loginInProgress = !!v; }
@@ -33,7 +34,7 @@ function syncWindowsCredentials() {
         const winExpiry = winParsed?.claudeAiOauth?.expiresAt || 0;
         const activeExpiry = activeParsed?.claudeAiOauth?.expiresAt || 0;
         if (winExpiry <= activeExpiry) return false;
-      } catch {}
+      } catch { return false; }
 
       const tmpPath = ACTIVE_CREDS + '.tmp.' + process.pid;
       fs.writeFileSync(tmpPath, winRaw, { mode: 0o600 });
@@ -112,6 +113,7 @@ function runHeadlessLogin() {
 async function notifyOwnerAuthExpiring(minsLeft) {
   if (Date.now() - _ownerNotifiedAt < 60 * 60 * 1000) return;
   try {
+    _ownerNotifiedAt = Date.now();
     const { sendErrorAlert } = require('./error-alerting');
     const msg = minsLeft <= 0
       ? 'Auth token expired — send !login to re-authenticate'
@@ -120,7 +122,6 @@ async function notifyOwnerAuthExpiring(minsLeft) {
       new Error(msg),
       { source: 'auth' }
     );
-    _ownerNotifiedAt = Date.now();
   } catch {}
 }
 
@@ -172,39 +173,45 @@ async function _proactiveRefresh() {
 }
 
 async function refreshToken() {
-  const synced = syncWindowsCredentials();
-  if (synced) {
-    try { require('./sandbox').refreshAllCredentials(); } catch {}
-  }
+  if (_refreshInProgress) return;
+  _refreshInProgress = true;
+  try {
+    const synced = syncWindowsCredentials();
+    if (synced) {
+      try { require('./sandbox').refreshAllCredentials(); } catch {}
+    }
 
-  const minsLeft = getTokenExpiryMinutes();
-  if (minsLeft === null) {
-    console.warn('[token-refresh] Cannot read token expiry');
-    return;
-  }
+    const minsLeft = getTokenExpiryMinutes();
+    if (minsLeft === null) {
+      console.warn('[token-refresh] Cannot read token expiry');
+      return;
+    }
 
-  if (minsLeft > PROACTIVE_REFRESH_MINUTES) {
-    console.log(`[token-refresh] Token valid (${minsLeft}min remaining)`);
-    return;
-  }
+    if (minsLeft > PROACTIVE_REFRESH_MINUTES) {
+      console.log(`[token-refresh] Token valid (${minsLeft}min remaining)`);
+      return;
+    }
 
-  // Token is within the proactive refresh window — try to extend it
-  console.warn(`[token-refresh] Token low (${minsLeft}min remaining) — attempting proactive refresh`);
-  const refreshed = await _proactiveRefresh();
+    // Token is within the proactive refresh window — try to extend it
+    console.warn(`[token-refresh] Token low (${minsLeft}min remaining) — attempting proactive refresh`);
+    const refreshed = await _proactiveRefresh();
 
-  if (refreshed) return;
+    if (refreshed) return;
 
-  // Proactive refresh didn't work — if really low, alert owner
-  const minsAfter = getTokenExpiryMinutes() || minsLeft;
-  if (minsAfter <= EXPIRY_WARN_MINUTES) {
-    console.error(`[token-refresh] Proactive refresh failed, token critical (${minsAfter}min)`);
-    await notifyOwnerAuthExpiring(minsAfter);
+    // Proactive refresh didn't work — if really low, alert owner
+    const minsAfter = getTokenExpiryMinutes() || minsLeft;
+    if (minsAfter <= EXPIRY_WARN_MINUTES) {
+      console.error(`[token-refresh] Proactive refresh failed, token critical (${minsAfter}min)`);
+      await notifyOwnerAuthExpiring(minsAfter);
+    }
+  } finally {
+    _refreshInProgress = false;
   }
 }
 
 function startTokenRefresh() {
-  refreshToken();
-  const timer = setInterval(refreshToken, REFRESH_INTERVAL_MS);
+  refreshToken().catch(err => console.error('[token-refresh] error:', err.message));
+  const timer = setInterval(() => refreshToken().catch(err => console.error('[token-refresh] error:', err.message)), REFRESH_INTERVAL_MS);
   timer.unref();
   console.log(`[token-refresh] Heartbeat started — every ${REFRESH_INTERVAL_MS / 60000}min`);
 }
