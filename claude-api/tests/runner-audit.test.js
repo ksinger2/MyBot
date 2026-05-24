@@ -55,14 +55,17 @@ const stubs = {
   },
 };
 
+const path = require('node:path');
+const CLAUDE_API_DIR = path.resolve(__dirname, '..');
+
 for (const [rel, exports] of Object.entries(stubs)) {
-  const abs = require.resolve(rel.replace('../', '/mnt/c/Users/karen/Desktop/Github Projects/MyBot/claude-api/'));
+  const abs = require.resolve(path.join(CLAUDE_API_DIR, rel.replace('../', '')));
   stubModule(abs, exports);
 }
 
 // Now load runner.js — all stubs are in cache
-delete require.cache[require.resolve('/mnt/c/Users/karen/Desktop/Github Projects/MyBot/claude-api/runner.js')];
-const runner = require('/mnt/c/Users/karen/Desktop/Github Projects/MyBot/claude-api/runner.js');
+delete require.cache[require.resolve(path.join(CLAUDE_API_DIR, 'runner.js'))];
+const runner = require(path.join(CLAUDE_API_DIR, 'runner.js'));
 const {
   forceKillProcess,
   freshProgress,
