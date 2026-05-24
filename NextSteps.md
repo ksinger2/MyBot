@@ -1,7 +1,7 @@
 # MyBot — Next Steps
 
 ## What's Working
-<!-- Updated each session — 2026-05-21 -->
+<!-- Updated each session — 2026-05-24 -->
 - On-call watchdog (`oncall-watchdog.js`) running every 2min with 6 deterministic health checks:
   1. CLI auth health (escalates after 3 failures, 30min cooldown)
   2. Sandbox credential freshness (auto-refreshes if >5min stale)
@@ -59,6 +59,15 @@
   - Circuit breaker turn-count disabled (time-based only — coding routinely does 50+ tool calls without text output)
   - Session IDs preserved through rebuilds (was wiping all sessions on every rebuild)
   - Detection works by sender ID (sandbox user in any group) OR chat link (via `!sandbox link`)
+
+## Recently Fixed (2026-05-24)
+- **`!listen off` actually sticks now — 3 root causes** (the user-facing complaint: "bot turns listen on every rebuild on all channels despite explicitly being turned off in some channels"):
+  1. **Sandbox-user bypass too broad** (bot.js:1880, now `getSandboxForChat` only): Detection used `getSandboxForChat(chatId) || getSandboxUser(senderId)`. The senderId clause meant Daniel/Lee/Merrisa speaking in ANY casual group (family chat, etc.) was treated as a sandbox engineering session, bypassing `!listen off` entirely. Now only chats explicitly linked via `!sandbox link` get the bypass; casual chats obey listen state regardless of who's talking.
+  2. **Admin (Merrisa) bypass on listen filter** (bot.js:1893): `SIGNAL_ADMIN_NUMBERS` members skipped the listen check unconditionally. Removed — admins still get owner-like access (no tool restrictions, higher turn caps) once a message is processed, but they no longer auto-trigger the bot in listen-off groups.
+  3. **Duplicate channel-state keys** (bot.js:2569 + channel-persistence.js): Different code paths in `_dispatchSignalMessage` saved state under `signal:<id>` (correct) vs raw `<id>` (resumeChannel, reaction handler, rebuild-resume). The same chat ended up with two entries on disk, with `!listen on` only sticking on whichever path ran last. Normalized via `const channelId = chatId.startsWith('signal:') ? chatId : \`signal:${chatId}\`` at function entry; added one-shot migration in `loadAllChannelStates` to merge any existing duplicates on load.
+- **Auto-retry transient runner failures + preserve activeTask through errors** (bot.js:`_isTransientRunnerError`, direct path & queue path): Previously a spawn-time EACCES/ENOENT or stall-killed dead process surfaced to the user as "Sorry, something went wrong" with no retry. Auth failures had retry; nothing else did. Now: transient errors (EACCES, ENOENT, EPERM, ECONNRESET, ETIMEDOUT, EAGAIN, EPIPE, `spawn X` failures, "process died with no output") get one auto-retry with 2s backoff before showing the user-facing error. Hard timeouts, progress circuit breakers, and turn-limit exhaustion are deliberate kills and intentionally still fall through (retrying them just wastes turns). Separately: `activeTask` is now preserved on fatal errors (was unconditionally cleared in finally) so the cross-rebuild auto-resume path picks them up on next start. 1hr stale-TTL in channel-persistence guards against forever-loops.
+- **Real Google Chrome installed in container** (Dockerfile): Both `@playwright/mcp` (default `--browser chrome`) and `chrome-devtools-mcp` look for `/opt/google/chrome/chrome` and silently error if it's missing. The container only had Chromium (from Playwright's `install chromium`). Every TikTok navigate failed with "Chromium distribution 'chrome' is not found at /opt/google/chrome/chrome" or "Could not find Google Chrome executable for channel 'stable'" — this was the visible "no Chrome available" loop where Bianca tried 9+ approaches and gave up. Dockerfile now runs `playwright install chrome` alongside chromium. Chromium stays for amazon-cart.js (uses Playwright Node API directly).
+- **Tests: hardcoded host paths broke container build** (tests/runner-audit.test.js): Used `/mnt/c/Users/karen/.../claude-api/` absolute paths to require stubbed modules. Container has files at `/app/`, so the build's `node --test tests/*.test.js` step failed and aborted every Docker rebuild. Switched to `path.resolve(__dirname, '..')`. Build is green again.
 
 ## Recently Fixed (2026-05-22)
 - **Auth token refresh actually works now**: `_proactiveRefresh()` was using `claude --version` (Step 2) which exits before initializing the OAuth layer — tokens were never actually refreshed. Replaced with `claude -p "ok" --max-turns 1` which forces the SDK through the full auth exchange. Removed the redundant Step 3 that only ran in critical zone (<30min) — now the single prompt step runs whenever token < 2hr.
