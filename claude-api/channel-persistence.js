@@ -120,8 +120,32 @@ function loadAllChannelStates() {
   let cleared = 0;
   let dirty = false;
 
-  // One-time migration: reset all listenToAll to false (default = mentions-only)
+  // One-time migration: drop duplicate unprefixed Signal channel keys.
+  // Prior versions of _dispatchSignalMessage saved state under the raw chat
+  // ID (e.g. "abc123") when called from the reaction handler / resumeChannel,
+  // while the normal handler saved under the prefixed form ("signal:abc123").
+  // Result: two entries per chat with diverging state — !listen on would stick
+  // on one path and not the other. Merge by dropping the unprefixed copy when
+  // a prefixed twin exists (prefixed wins; saved state proves it's canonical).
   const migrations = store._migrations || {};
+  if (!migrations.dedupeUnprefixedKeys) {
+    let removed = 0;
+    for (const k of Object.keys(store)) {
+      if (k.startsWith('_') || k.startsWith('signal:')) continue;
+      if (store[`signal:${k}`]) {
+        delete store[k];
+        removed++;
+      }
+    }
+    migrations.dedupeUnprefixedKeys = Date.now();
+    store._migrations = migrations;
+    dirty = true;
+    if (removed > 0) {
+      console.log(`[channel-persistence] Migration: removed ${removed} duplicate unprefixed channel key(s)`);
+    }
+  }
+
+  // One-time migration: reset all listenToAll to false (default = mentions-only)
   if (!migrations.listenToAllReset) {
     let resetCount = 0;
     for (const [id, s] of Object.entries(store)) {

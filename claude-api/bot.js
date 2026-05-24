@@ -1893,7 +1893,12 @@ function startSignalAdapter() {
         _isSandboxGroup = !!_sb.getSandboxForChat(msg.chatId);
       } catch {}
 
-      if (!state.listenToAll && !hasPendingSenderWizard && !senderIsAdmin && !_isSandboxGroup) {
+      // Admins (SIGNAL_ADMIN_NUMBERS) used to bypass this filter, but that meant
+      // an admin speaking in a casual group would trigger the bot on every message
+      // even after !listen off. Admins now obey the per-chat listen state like
+      // everyone else; they still get owner-like access (no tool restrictions,
+      // higher turn caps) once a message is actually being processed.
+      if (!state.listenToAll && !hasPendingSenderWizard && !_isSandboxGroup) {
         if (!botMentioned) {
           console.log(`[signal] Group message — bot not mentioned, ignoring (${mentionList.length} other mention(s))`);
           return;
@@ -2568,6 +2573,16 @@ async function _dispatchSignalMessage(msg, chatId, text, state) {
   // uses it to preserve activeTask so the next container start can auto-resume.
   let _hadFatalError = false;
 
+  // Callers historically pass `chatId` in two forms: the prefixed channel ID
+  // ("signal:<id>") from the main signal handler, or the raw chat ID from the
+  // reaction handler / resumeChannel / rebuild-resume path. State is always
+  // keyed by the prefixed form (getChannel uses it; channel-state.json stores
+  // it). Normalize here so saveChannelState always writes to the correct key
+  // regardless of caller — fixes the duplicate-key bug where prefixed and
+  // unprefixed entries were diverging and `!listen on` only stuck on whichever
+  // path happened to run last.
+  const channelId = chatId.startsWith('signal:') ? chatId : `signal:${chatId}`;
+
   // Resolve UUID→phone for downstream profile/calendar/preference lookups.
   // This can be called directly (e.g., from !testas) with a UUID senderId.
   if (msg.senderId && !msg.senderId.startsWith('+') && signalAdapter) {
@@ -2631,7 +2646,7 @@ async function _dispatchSignalMessage(msg, chatId, text, state) {
     }
 
     state.busy = true;
-    saveChannelState(chatId, state, { critical: true });
+    saveChannelState(channelId, state, { critical: true });
 
       const signalProxy = ChannelProxy.fromSignal(signalAdapter, msg.chatId);
       signalProxy.setGroupChat(isGroupMessage, msg.senderId);
@@ -4098,7 +4113,7 @@ async function _dispatchSignalMessage(msg, chatId, text, state) {
       state.sessionTurns += (result.numTurns || 0);
       state.sessionCost += (result.cost || 0);
       // Flush sessionId immediately so it survives stall kills / container restarts
-      saveChannelState(chatId, state, { critical: true });
+      saveChannelState(channelId, state, { critical: true });
 
       // Cost guardrail — auto-clear session if cost cap exceeded
       const maxCost = state.config?.maxSessionCost;
@@ -4108,7 +4123,7 @@ async function _dispatchSignalMessage(msg, chatId, text, state) {
         ).catch(() => {});
         state.sessionId = null;
         state.sessionStartedAt = null; state.sessionTurns = 0; state.sessionCost = 0;
-        saveChannelState(chatId, state, { critical: true });
+        saveChannelState(channelId, state, { critical: true });
       }
 
       // Voice response: if the user sent a voice message, speak the response back
@@ -4209,12 +4224,12 @@ async function _dispatchSignalMessage(msg, chatId, text, state) {
       if (!_hadFatalError) state.activeTask = null;
       // Clean up image registry for this session so it doesn't leak into a later request
       require('./image-registry').end(chatId);
-      saveChannelState(chatId, state, { critical: true });
+      saveChannelState(channelId, state, { critical: true });
       // Drain queue
       if (state.queue.length > 0) {
         await processQueue(state);
         // processQueue clears in-memory state; re-persist so disk matches.
-        saveChannelState(chatId, state, { critical: true });
+        saveChannelState(channelId, state, { critical: true });
       }
       // Start session inactivity timer now that bot is idle
       _resetSessionInactivityTimer(state, chatId);
