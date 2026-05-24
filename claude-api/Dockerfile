@@ -58,9 +58,17 @@ RUN for i in 1 2 3; do \
 # Install Playwright browsers in a shared path accessible by both root (build)
 # and node (runtime). Uses the MCP's bundled Playwright to ensure version match
 # (MCP bundles 1.61.x which needs different browser revisions than system 1.60.x).
+#
+# Two browsers installed:
+#   * chromium → used by amazon-cart.js (Playwright Node API, persistent profile).
+#   * chrome   → real Google Chrome. Required by BOTH @playwright/mcp (its default
+#                browser channel) and chrome-devtools-mcp; both look for
+#                /opt/google/chrome/chrome and silently error if it's missing —
+#                that was the "no Chrome available" TikTok loop.
 ENV PLAYWRIGHT_BROWSERS_PATH=/opt/pw-browsers
 RUN mkdir -p /opt/pw-browsers \
     && node /usr/local/lib/node_modules/@playwright/mcp/node_modules/playwright/cli.js install --with-deps chromium \
+    && node /usr/local/lib/node_modules/@playwright/mcp/node_modules/playwright/cli.js install chrome \
     && chmod -R 755 /opt/pw-browsers
 
 WORKDIR /app
