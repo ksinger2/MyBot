@@ -1375,6 +1375,9 @@ async function processQueue(state) {
 
   // CRITICAL: Set busy BEFORE splicing to prevent race with incoming messages
   state.busy = true;
+  // Set true when an unrecoverable error reaches the outer catch — finally
+  // uses it to preserve activeTask for cross-rebuild auto-resume.
+  let _hadFatalError = false;
 
   const queued = state.queue.splice(0);
   const combined = queued.length === 1
@@ -1455,6 +1458,12 @@ async function processQueue(state) {
         state.sessionId = null;
         state.sessionStartedAt = null; state.sessionTurns = 0; state.sessionCost = 0;
         queueOpts.sessionId = null;
+        result = await runClaudeWithContinuation(combined, queueOpts, queueProxy);
+      } else if (_isTransientRunnerError(err)) {
+        console.log(`[transient-retry] queue: ${err.code || ''} ${(err.message || '').substring(0, 100)} — retrying once`);
+        await new Promise(r => setTimeout(r, 2000));
+        queueOpts.sessionId = null;
+        state.sessionId = null;
         result = await runClaudeWithContinuation(combined, queueOpts, queueProxy);
       } else {
         throw err;
@@ -1562,6 +1571,7 @@ async function processQueue(state) {
       if (meta.length) console.log(`Queue completed: ${meta.join(' | ')}`);
     }
   } catch (err) {
+    _hadFatalError = true;
     console.error('Error processing queued message:', err.message);
     if (isGroupChatQ) {
       await signalAdapter.sendMessage(signalChatId, "Sorry, something went wrong. Try again?").catch(() => {});
@@ -1575,7 +1585,7 @@ async function processQueue(state) {
     state.busy = false;
     state.startedAt = null;
     state.progress = freshProgress();
-    state.activeTask = null;
+    if (!_hadFatalError) state.activeTask = null;
     if (channelId) {
       saveChannelState(channelId, state, { critical: true });
     }
@@ -2554,6 +2564,9 @@ function startSignalAdapter() {
 async function _dispatchSignalMessage(msg, chatId, text, state) {
   const { buildMinimalProfileContext, buildProfileLookup, buildProfileContext, getProfile } = require('./user-profiles');
   const { isSignalOwner, isSignalAdmin } = require('./project-permissions');
+  // Set true when an unrecoverable error reaches the outer catch — finally
+  // uses it to preserve activeTask so the next container start can auto-resume.
+  let _hadFatalError = false;
 
   // Resolve UUID→phone for downstream profile/calendar/preference lookups.
   // This can be called directly (e.g., from !testas) with a UUID senderId.
@@ -2982,6 +2995,14 @@ async function _dispatchSignalMessage(msg, chatId, text, state) {
           state.sessionId = null;
           state.sessionStartedAt = null; state.sessionTurns = 0; state.sessionCost = 0;
           claudeOpts.sessionId = null;
+          result = await runClaudeWithContinuation(signalPrompt, claudeOpts, signalProxy);
+        } else if (_isTransientRunnerError(err)) {
+          // Transient infra failure (spawn EACCES/ENOENT, stall-killed dead process).
+          // Hard timeouts, circuit breakers, and turn limits intentionally fall through.
+          console.log(`[transient-retry] ${err.code || ''} ${(err.message || '').substring(0, 100)} — retrying once`);
+          await new Promise(r => setTimeout(r, 2000));
+          claudeOpts.sessionId = null;
+          state.sessionId = null;
           result = await runClaudeWithContinuation(signalPrompt, claudeOpts, signalProxy);
         } else {
           throw err;
@@ -4168,6 +4189,9 @@ async function _dispatchSignalMessage(msg, chatId, text, state) {
         console.log(`[signal] SlotTimeoutError for ${_redactId(msg.senderId)} in ${_redactId(chatId)}`);
         await signalAdapter.sendMessage(msg.chatId, "I'm handling a few conversations right now — try again in a minute");
       } else {
+        // Mark fatal so the finally block preserves activeTask for cross-rebuild resume.
+        // The 1hr stale TTL in channel-persistence guards against forever-loops.
+        _hadFatalError = true;
         console.error(`[signal] Error: ${err.message}`);
         console.error(`[signal] Stack: ${err.stack}`);
         if (isGroupMessage) {
@@ -4182,7 +4206,7 @@ async function _dispatchSignalMessage(msg, chatId, text, state) {
       state.busy = false;
       state.startedAt = null;
       state.progress = freshProgress();
-      state.activeTask = null;
+      if (!_hadFatalError) state.activeTask = null;
       // Clean up image registry for this session so it doesn't leak into a later request
       require('./image-registry').end(chatId);
       saveChannelState(chatId, state, { critical: true });
@@ -4222,6 +4246,19 @@ function createSignalMessageProxy(msg, chatId, state) {
     _signalBotPhone: signalAdapter?.phoneNumber || null,
     _signalRaw: msg.raw || null, // for UUID/phone extraction in commands
   };
+}
+
+// Returns true if the error looks like a transient infra failure worth one
+// automatic retry: spawn-time errors (EACCES, ENOENT, ECONNRESET, etc.) and
+// stall-killed dead processes. Hard timeouts, progress circuit breakers, and
+// turn-limit exhaustion are deliberate kills — retrying them just wastes turns.
+function _isTransientRunnerError(err) {
+  if (!err) return false;
+  if (err.code && /^(EACCES|ENOENT|EPERM|ECONNRESET|ETIMEDOUT|EAGAIN|EPIPE)$/.test(err.code)) return true;
+  const msg = err.message || '';
+  if (/^spawn /i.test(msg)) return true;
+  if (/process died with no output/i.test(msg)) return true;
+  return false;
 }
 
 function releaseSemaphore(channelId) {
