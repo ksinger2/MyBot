@@ -14,7 +14,7 @@ describe('reinit command helpers', () => {
       });
     }
 
-    for (const text of ['hello there', 'reinit please', 'status?', ' / not a command']) {
+    for (const text of ['hello there', 'reinit please', 'status?', ' / not a command', '/home/user/file.txt', '/tmp/foo', '/usr/bin/node']) {
       it(`does not match non-command text: "${text}"`, () => {
         assert.equal(isCommandLike(text), false);
       });

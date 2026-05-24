@@ -1,10 +1,10 @@
 let _signalAdapter = null;
 const _recentErrors = new Map(); // dedupKey -> timestamp
 
-// Signal-only init. Accepts a Signal adapter (or nothing — the function is
-// called early during boot before the adapter exists). The legacy two-arg
-// `init(client, adapter)` signature is preserved by ignoring extra args.
-function init(adapter) {
+// Signal-only init. Accepts a Signal adapter, or the legacy two-arg form
+// `init(client, adapter)` where the first arg is a Discord client.
+function init(adapterOrClient, maybeAdapter) {
+  const adapter = maybeAdapter || adapterOrClient;
   if (adapter) _signalAdapter = adapter;
 }
 

@@ -304,21 +304,9 @@ function checkSemaphoreLeaks() {
 
     for (const [channelId, state] of bot.channels) {
       if (!state || !state.busy) continue;
-      // If busy but no live process, it's a leaked semaphore
-      const proc = state.process;
-      let alive = false;
-      if (proc && proc.pid) {
-        try { process.kill(proc.pid, 0); alive = true; } catch {}
-      }
-      if (!alive && state.busy) {
-        log(`Clearing leaked session in channel ${channelId} (no live process)`);
-        state.busy = false;
-        state.process = null;
-        state.startedAt = null;
-        try {
-          const { freshProgress } = require('./runner');
-          state.progress = freshProgress();
-        } catch {}
+      const released = bot.releaseSemaphore(channelId);
+      if (released) {
+        log(`Cleared leaked session in channel ${channelId} (no live process)`);
         result.leaked++;
         result.cleaned.push(channelId);
       }
@@ -341,12 +329,12 @@ async function runAllChecks() {
     const ts = Date.now();
     const results = {};
     const checks = [
+      ['event_loop_lag', checkEventLoopLag],
       ['cli_auth', checkCliAuth],
       ['sandbox_creds', checkSandboxCreds],
       ['process_leaks', checkProcessLeaks],
       ['disk_space', checkDiskSpace],
       ['docker_cleanup', checkDockerCleanup],
-      ['event_loop_lag', checkEventLoopLag],
       ['semaphore_leaks', checkSemaphoreLeaks],
     ];
 

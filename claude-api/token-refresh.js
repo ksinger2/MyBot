@@ -63,6 +63,7 @@ function runHeadlessLogin() {
     _loginInProgress = true;
     let url = null;
     let stderr = '';
+    let urlTimer = null;
 
     const proc = spawn('claude', ['auth', 'login', '--claudeai'], {
       env: { ...process.env, BROWSER: 'echo', DISPLAY: '' },
@@ -70,37 +71,40 @@ function runHeadlessLogin() {
       timeout: 120000,
     });
 
+    function onUrlFound(foundUrl) {
+      if (url) return;
+      url = foundUrl;
+      if (urlTimer) clearTimeout(urlTimer);
+      resolve({ process: proc, url });
+    }
+
     proc.stdout.on('data', (chunk) => {
       const text = chunk.toString();
       const match = text.match(/(https:\/\/claude\.com\/[^\s]+)/);
-      if (match && !url) {
-        url = match[1];
-        resolve({ process: proc, url });
-      }
+      if (match) onUrlFound(match[1]);
     });
 
     proc.stderr.on('data', (chunk) => {
       stderr += chunk.toString();
       const match = stderr.match(/(https:\/\/claude\.com\/[^\s]+)/);
-      if (match && !url) {
-        url = match[1];
-        resolve({ process: proc, url });
-      }
+      if (match) onUrlFound(match[1]);
     });
 
     proc.on('error', (err) => {
+      if (urlTimer) clearTimeout(urlTimer);
       _loginInProgress = false;
       if (!url) reject(err);
     });
 
     proc.on('close', (code) => {
+      if (urlTimer) clearTimeout(urlTimer);
       _loginInProgress = false;
       if (!url) {
         reject(new Error(`Login process exited (code ${code}) without producing URL`));
       }
     });
 
-    setTimeout(() => {
+    urlTimer = setTimeout(() => {
       if (!url) {
         proc.kill();
         _loginInProgress = false;
@@ -135,7 +139,6 @@ async function notifyOwnerAuthExpiring(minsLeft) {
 async function _proactiveRefresh() {
   const cooldown = 5 * 60_000;
   if (Date.now() - _lastProactiveRefreshAt < cooldown) return false;
-  _lastProactiveRefreshAt = Date.now();
 
   console.log('[token-refresh] Proactive refresh — syncing credentials and testing CLI...');
   const beforeExpiry = getTokenExpiryMinutes();
@@ -144,6 +147,7 @@ async function _proactiveRefresh() {
   syncWindowsCredentials();
   const afterSync = getTokenExpiryMinutes();
   if (afterSync !== null && afterSync > (beforeExpiry || 0) + 30) {
+    _lastProactiveRefreshAt = Date.now();
     console.log(`[token-refresh] Windows sync refreshed token! ${beforeExpiry}min → ${afterSync}min remaining`);
     try { require('./sandbox').refreshAllCredentials(); } catch {}
     return true;
@@ -160,6 +164,8 @@ async function _proactiveRefresh() {
     console.error('[token-refresh] Proactive refresh (prompt) failed:', err.message);
     return false;
   }
+
+  _lastProactiveRefreshAt = Date.now();
 
   const afterPrompt = getTokenExpiryMinutes();
   if (afterPrompt !== null && afterPrompt > (beforeExpiry || 0) + 30) {

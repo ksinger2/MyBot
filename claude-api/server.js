@@ -268,13 +268,16 @@ app.post('/ask', requireInternalToken, (req, res) => {
   child.stdout.on('data', (d) => { stdout += d; });
   child.stderr.on('data', (d) => { stderr += d; });
 
+  let timedOut = false;
   const timeout = setTimeout(() => {
+    timedOut = true;
     child.kill();
     res.status(504).json({ error: 'Claude CLI timed out' });
   }, 120000);
 
   child.on('close', (code) => {
     clearTimeout(timeout);
+    if (timedOut || res.headersSent) return;
     if (code !== 0) {
       console.error('Claude CLI error, code:', code);
       if (stderr) console.error('stderr:', stderr);
@@ -657,7 +660,7 @@ app.get('/health', (req, res) => {
   }
 });
 
-app.get('/health/watchdog', (req, res) => {
+app.get('/health/watchdog', requireInternalToken, (req, res) => {
   try {
     const { getHealthReport } = require('./oncall-watchdog');
     res.json(getHealthReport());
@@ -1333,8 +1336,9 @@ app.post('/rebuild', requireInternalToken, async (req, res) => {
     // verified it has content, so this preserves the session context for the
     // rebuild-complete DM and future debugging.
     const nextStepsPath = path.join('/workspace/MyBot', 'NextSteps.md');
+    let currentContent = '';
     try {
-      const currentContent = fs.readFileSync(nextStepsPath, 'utf-8');
+      currentContent = fs.readFileSync(nextStepsPath, 'utf-8');
       if (currentContent.trim()) {
         fs.writeFileSync(path.join('/home/node/.claude', '.last-nextsteps'), currentContent);
         console.log('[rebuild] Snapshotted NextSteps.md → .last-nextsteps');

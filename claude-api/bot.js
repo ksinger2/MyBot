@@ -1350,6 +1350,7 @@ async function resumeChannel(channelId, savedState) {
       mentions: [],
       timestamp: Date.now(),
     };
+    state.busy = true;
     _dispatchSignalMessage(syntheticMsg, signalChatId, task.prompt, state).catch(err => {
       console.error(`[auto-resume] Dispatch failed for ${channelId}:`, err.message);
     });
@@ -1871,12 +1872,15 @@ function startSignalAdapter() {
         (m.uuid && botUuid && m.uuid === botUuid)
       );
 
-      // Sandbox-linked groups (or groups where the sender is a sandbox user) are
-      // work environments — always respond without needing @mention or listenToAll.
+      // Sandbox-linked groups are work environments — always respond without
+      // needing @mention or listenToAll. Detection is by explicit chat link
+      // only (via `!sandbox link`). A sandbox user speaking in an unlinked
+      // group (e.g. a casual family chat) does NOT count — otherwise the bot
+      // would respond to every message they send anywhere, ignoring !listen off.
       let _isSandboxGroup = false;
       try {
         const _sb = require('./sandbox');
-        _isSandboxGroup = !!_sb.getSandboxForChat(msg.chatId) || !!_sb.getSandboxUser(msg.senderId);
+        _isSandboxGroup = !!_sb.getSandboxForChat(msg.chatId);
       } catch {}
 
       if (!state.listenToAll && !hasPendingSenderWizard && !senderIsAdmin && !_isSandboxGroup) {
@@ -2198,6 +2202,7 @@ function startSignalAdapter() {
         state.groupingSenderId = null;
         if (prev.length > 0) {
           const combined = prev.map(e => e.content).join('\n');
+          state.busy = true;
           setImmediate(() => {
             state._triggeredByTimestamp = prev[prev.length - 1].msg?.timestamp;
             _dispatchSignalMessage(prev[prev.length - 1].msg, prev[prev.length - 1].chatId, combined, state).catch(err => {
@@ -2221,6 +2226,15 @@ function startSignalAdapter() {
         state.groupingSenderId = null;
         if (buf.length === 0) return;
         const combined = buf.map(e => e.content).join('\n');
+        if (state.busy) {
+          const lastMsg = buf[buf.length - 1].msg;
+          const fakeMessage = createSignalMessageProxy(lastMsg, buf[buf.length - 1].chatId, state);
+          if (state.queue.length >= 10) state.queue.shift();
+          state.queue.push({ message: fakeMessage, content: combined, _timestamp: lastMsg?.timestamp });
+          saveChannelState(buf[buf.length - 1].chatId, state, { critical: true });
+          return;
+        }
+        state.busy = true;
         state._triggeredByTimestamp = buf[buf.length - 1].msg?.timestamp;
         state._isVoiceMessage = isVoiceMessage;
         _dispatchSignalMessage(buf[buf.length - 1].msg, buf[buf.length - 1].chatId, combined, state).catch(err => {
@@ -2230,6 +2244,7 @@ function startSignalAdapter() {
       return;
     }
     // Immediate path (ends with punctuation or long message)
+    state.busy = true;
     state._triggeredByTimestamp = msg.timestamp;
     state._isVoiceMessage = isVoiceMessage;
     _dispatchSignalMessage(msg, chatId, text, state).catch(err => {
@@ -2339,6 +2354,7 @@ function startSignalAdapter() {
       raw: null,
     };
     state._triggeredByTimestamp = syntheticMsg.timestamp;
+    state.busy = true;
     _dispatchSignalMessage(syntheticMsg, chatId, syntheticText, state).catch(err => {
       console.error('[signal] dispatch error (reaction):', err.message);
     });
@@ -2494,6 +2510,7 @@ function startSignalAdapter() {
           const chatId = `signal:${SIGNAL_OWNER}`;
           const state = getChannel(chatId);
           if (!state.busy) {
+            state.busy = true;
             const syntheticMsg = {
               chatId: SIGNAL_OWNER,
               senderId: SIGNAL_OWNER,
@@ -4207,6 +4224,21 @@ function createSignalMessageProxy(msg, chatId, state) {
   };
 }
 
+function releaseSemaphore(channelId) {
+  const state = channels.get(channelId);
+  if (!state || !state.busy) return false;
+  const proc = state.process;
+  if (proc && proc.pid) {
+    try { process.kill(proc.pid, 0); return false; } catch {}
+  }
+  state.busy = false;
+  state.process = null;
+  state.startedAt = null;
+  state.progress = freshProgress();
+  saveChannelState(channelId, state);
+  return true;
+}
+
 function start() {
   // Signal-only. startSignalAdapter() will call startBot() once the adapter is
   // ready. We also schedule a fallback startBot() invocation in case Signal
@@ -4216,4 +4248,4 @@ function start() {
   setTimeout(() => { startBot().catch(err => console.error('[startBot] fallback failed:', err.message)); }, 15000);
 }
 
-module.exports = { start, askClaude, runClaudeWithContinuation, getChannelState, getPersonalityFile, sendLongMessage, freshProgress, channels, signalAdapter, _tryUnlock, _isChannelElevated, _addKnownGroupMember, _dispatchSignalMessage };
+module.exports = { start, askClaude, runClaudeWithContinuation, getChannelState, getPersonalityFile, sendLongMessage, freshProgress, channels, signalAdapter, releaseSemaphore, _tryUnlock, _isChannelElevated, _addKnownGroupMember, _dispatchSignalMessage };

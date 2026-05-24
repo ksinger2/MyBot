@@ -115,21 +115,22 @@
 - **Sandbox tunnel instability**: Cloudflared QUIC connections frequently timeout and reconnect (non-blocking but noisy logs).
 - **No unified notification bus**: 7 independent systems can send unsolicited messages to owner (signal-watchdog, token-refresh, oncall-watchdog, error-alerting, bot.js startup, briefings, monitor-runner). No quiet hours, no consolidation. P1 improvement: build a `NotificationManager` with severity levels, dedup, and quiet hours.
 
-### Bugs from 2026-05-22 audit (not yet fixed)
+### Bugs from 2026-05-22 audit — all fixed (2026-05-23)
 
-- **MEDIUM — Grouping buffer concurrent dispatch race** (bot.js:2188-2231): When user A has messages buffered and user B sends a `shouldGroupImmediately` message (e.g. ends with `?`), the `setImmediate` flush for A's buffer and B's immediate dispatch can both run before `state.busy` is set, spawning two concurrent CLI processes for the same channel. Fix: check `state.busy` inside `_dispatchSignalMessage` at the top, or set `state.busy = true` synchronously in the grouping flush before yielding.
-- **MEDIUM — `child.on('error')` double-reject** (runner.js:718-720): When spawn fails, both the `error` and `close` events fire, each calling `wrappedReject`. Promise silently drops the second, but `sendErrorAlert` may fire twice. Fix: add a `let errorFired = false` flag.
-- **MEDIUM — Sandbox `linuxUser` not re-validated in runner.js** (runner.js:705): Shell command uses string concatenation with `sandboxLinuxUser` from caller — trusted without regex validation. If future code constructs `sandboxUser` manually, it's a command injection vector. Fix: add `if (!/^sandbox-[a-z0-9]{1,20}$/.test(sandboxLinuxUser))` guard before spawn.
-- **MEDIUM — `/rebuild` currentContent ReferenceError** (server.js:1337-1352): `currentContent` declared with `const` inside inner `try` block, referenced in sibling `try`. If `fs.readFileSync` throws (TOCTOU), `ReferenceError` is swallowed silently — rebuild handoff loses previous session context. Fix: declare `let currentContent = '';` in outer scope.
-- **MEDIUM — `/ask` endpoint double-response on timeout** (server.js:271-290): Timeout handler sends 504, then `close` event fires and sends 500 — "Cannot set headers after sent" error. Fix: set `timedOut` flag before `kill()`, check in `close` handler.
-- **MEDIUM — `/health` and `/health/watchdog` unauthenticated** (server.js:637-667): Leak internal state (process counts, PIDs, disk usage, kill history) to unauthenticated callers. Fix: gate behind `requireInternalToken` or strip sensitive fields.
-- **LOW — `isCommandLike` false-positives on Unix paths** (command-utils.js:2): Regex `/^[/!][a-z0-9_-]+\b/i` matches `/home/user/file.txt` and `/tmp/foo` as commands. In group chats, sharing a file path triggers a bot response without @mention. Fix: restrict `/`-prefixed commands to known names, or require 2+ chars after prefix.
-- **LOW — Watchdog event loop lag false positives** (oncall-watchdog.js:252-289): `setTimeout(0)` lag check runs after the watchdog's own async I/O (CLI spawns, Docker prune), inflating readings. Three consecutive >30s readings trigger `process.exit(1)`. Fix: run lag check first, before other checks, or use a separate dedicated interval.
-- **LOW — Watchdog direct channel state mutation** (oncall-watchdog.js:305-328): Semaphore leak check directly sets `state.busy = false`, `state.process = null` on live channel map from outside bot.js. Can race with concurrent task completion. Fix: call a dedicated bot function for safe semaphore release.
-- **LOW — `forceKillProcess` hangs ~4s for already-exited procs** (runner.js:284-296): If process exits before `once('exit')` is registered, the handler never fires. Waits full `timeoutMs` + 1s SIGKILL. Fix: check `proc.exitCode !== null` after registering listener.
-- **LOW — `init()` and `initSignal()` both set `_signalAdapter`** (error-alerting.js:7-13): Legacy two-arg `init(client, adapter)` stores the Discord client as `_signalAdapter` — silently fails the `_signalAdapter?.ready` check. Fix: document single-arg contract or handle two-arg case.
-- **LOW — Token refresh cooldown stamped before async work** (token-refresh.js:136-137): `_lastProactiveRefreshAt` set before 45s CLI call. If it times out, the 5-min cooldown was already charged — can't retry for 5 min even though nothing happened. Fix: stamp after async work completes.
-- **LOW — `runHeadlessLogin` 30s URL timeout not cleared** (token-refresh.js:102-108): Timer that kills the login process is never `clearTimeout`'d when URL is found. The `if (!url)` guard prevents damage, but holds closure references unnecessarily. Fix: capture timer ID and clear on URL match.
+All 13 audit bugs fixed, code-reviewed by independent agents, and verified with 375 tests (0 failures):
+- **Grouping buffer race**: `state.busy = true` set synchronously before all 6 `_dispatchSignalMessage` callers (3 grouping paths + reaction + resumeChannel + rebuild auto-resume)
+- **Spawn double-reject**: `spawnErrorFired` flag prevents duplicate `wrappedReject`/`sendErrorAlert` on error+close
+- **Sandbox linuxUser injection**: Regex `/^sandbox-[a-z0-9]{1,20}$/` validation before shell command concatenation
+- **`/rebuild` ReferenceError**: `let currentContent = ''` in outer scope
+- **`/ask` double-response**: `timedOut` flag + `res.headersSent` guard in close handler
+- **`/health/watchdog` auth**: `requireInternalToken` on `/health/watchdog`; `/health` left public (Docker HEALTHCHECK needs it)
+- **`isCommandLike` false positives**: `/` prefix only matches known `SLASH_COMMANDS` set; `!` prefix matches broadly
+- **Watchdog lag false positives**: Event loop lag check runs first, before I/O-heavy operations
+- **Watchdog state mutation**: `releaseSemaphore()` in bot.js with process-liveness check + state persistence
+- **`forceKillProcess` hang**: `proc.exitCode !== null` check after listener registration
+- **error-alerting init()**: Handles both one-arg and two-arg calling conventions
+- **Token refresh cooldown**: `_lastProactiveRefreshAt` stamped after async work completes
+- **Headless login timeout leak**: `clearTimeout(urlTimer)` in success, error, and close paths
 
 - **Amazon cart execution via Playwright**: `amazon-cart.js` module provides deterministic cart operations — `checkLoginStatus()`, `addToCart(url)`, `getCartContents()`. Uses Playwright's Node.js API with persistent browser profile at `/app/data/browser-profile`. Stealth settings (custom user agent, webdriver flag removal, AutomationControlled disabled) prevent Amazon's bot detection. Cart fast-path now attempts actual Playwright add-to-cart before falling back to "queued for cart" placeholder.
 - **`!amazon` command**: Owner-only Amazon account management — `!amazon status` (check login), `!amazon cart` (view cart), `!amazon login` (interactive login flow). Screenshots sent as Signal attachments.

@@ -289,6 +289,7 @@ function forceKillProcess(proc, timeoutMs = 3000) {
     const done = () => { if (!resolved) { resolved = true; resolve(); } };
     proc.once('exit', done);
     proc.kill('SIGTERM');
+    if (proc.exitCode !== null) { done(); return; }
     setTimeout(() => {
       try { process.kill(proc.pid, 0); proc.kill('SIGKILL'); } catch {}
       setTimeout(done, 1000);
@@ -691,6 +692,10 @@ class Runner {
             return;
           }
           const sandboxLinuxUser = this.sandboxUser.linuxUser;
+          if (!/^sandbox-[a-z0-9]{1,20}$/.test(sandboxLinuxUser)) {
+            wrappedReject(new Error(`Invalid sandbox username: ${sandboxLinuxUser}`));
+            return;
+          }
           // Refresh sandbox OAuth creds from live /home/node copy before each
           // spawn — sandbox creds are otherwise frozen at provision time and
           // 401 once the live token rotates.
@@ -716,7 +721,10 @@ class Runner {
       }
 
       // Handle async spawn failures (e.g., ENOENT when binary not found)
+      let spawnErrorFired = false;
       child.on('error', (err) => {
+        if (spawnErrorFired) return;
+        spawnErrorFired = true;
         wrappedReject(err);
       });
 
@@ -1284,6 +1292,7 @@ class Runner {
 
       // --- Close handler ---
       child.on('close', (code) => {
+        if (spawnErrorFired) return;
         if (hardTimeout) clearTimeout(hardTimeout);
         clearInterval(stallCheck);
         clearInterval(checkinTimer);

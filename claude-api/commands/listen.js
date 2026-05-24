@@ -12,7 +12,7 @@ module.exports = {
   description: 'Toggle responding to all group messages vs only @mentions',
   async run(message, arg, state, ctx) {
     const reply = ctx._dreply || ((m, t) => m.reply(t));
-    const channelId = message.channel?.id || message._signalChatId || state?._channelId;
+    const channelId = state?._channelId || message.channel?.id || (message._signalChatId ? `signal:${message._signalChatId}` : null);
 
     const sub = (arg || '').trim().toLowerCase();
 
