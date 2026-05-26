@@ -134,6 +134,10 @@ async function transcribeWithWhisper(url) {
     });
 
     const json = JSON.parse(response);
+    if (json.error) {
+      console.error('[tiktok-whisper] API error:', json.error.message);
+      return null;
+    }
     return json.text || null;
   } catch (err) {
     console.error('[tiktok-whisper] Error:', err.message);
@@ -159,11 +163,34 @@ async function getTikTokTranscript(url) {
     // Fetch the page with a mobile UA to get subtitle data
     const html = await fetchText(canonicalUrl);
 
-    // Extract title and description from meta tags
-    const titleMatch = html.match(/<title[^>]*>([^<]+)<\/title>/);
-    const descMatch = html.match(/<meta[^>]+name="description"[^>]+content="([^"]+)"/);
-    const title = titleMatch ? titleMatch[1].trim() : '';
-    const description = descMatch ? descMatch[1].trim() : '';
+    // Prefer the embedded universal-data JSON (real video desc + author).
+    // Falls back to meta tags when the JSON path moves or is missing.
+    let title = '';
+    let description = '';
+    try {
+      const jsonMatch = html.match(/<script[^>]*id="__UNIVERSAL_DATA_FOR_REHYDRATION__"[^>]*>([\s\S]*?)<\/script>/);
+      if (jsonMatch) {
+        const universal = JSON.parse(jsonMatch[1]);
+        const scope = universal['__DEFAULT_SCOPE__'] || {};
+        // TikTok renames this scope occasionally — check both known keys.
+        const detail = scope['webapp.reflow.video.detail'] || scope['webapp.video-detail'];
+        const item = detail?.itemInfo?.itemStruct;
+        if (item?.desc) description = String(item.desc).trim();
+        if (item?.author?.nickname || item?.author?.uniqueId) {
+          title = `@${item.author.uniqueId || ''}${item.author.nickname ? ` (${item.author.nickname})` : ''}`.trim();
+        }
+      }
+    } catch {}
+    if (!title) {
+      const titleMatch = html.match(/<title[^>]*>([^<]+)<\/title>/);
+      const raw = titleMatch ? titleMatch[1].trim() : '';
+      // Skip TikTok's generic landing-page title.
+      if (raw && raw !== 'TikTok - Make Your Day') title = raw;
+    }
+    if (!description) {
+      const descMatch = html.match(/<meta[^>]+name="description"[^>]+content="([^"]+)"/);
+      if (descMatch) description = descMatch[1].trim();
+    }
 
     // Extract subtitleInfos URL — TikTok embeds it as JSON-escaped Unicode in the page
     const idx = html.indexOf('subtitleInfos');
