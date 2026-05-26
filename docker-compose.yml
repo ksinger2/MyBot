@@ -143,10 +143,13 @@ services:
       - bot-data:/app/data
     healthcheck:
       test: ["CMD", "node", "-e", "require('http').get('http://localhost:3400/health', r => { process.exit(r.statusCode === 200 ? 0 : 1) })"]
+      # Bumped 2026-05-25: /health occasionally takes >10s under load
+      # (Claude session spawn, channel state save). Old 10s/3 = ~90s to
+      # unhealthy → autoheal restart loop. 30s/5 gives ~150s grace.
       interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 30s
+      timeout: 30s
+      retries: 5
+      start_period: 60s
 
   # Signal messenger sidecar — REST API for signal-cli
   # Enable by setting SIGNAL_PHONE_NUMBER in .env and running registration:
@@ -196,6 +199,11 @@ services:
     build: ./concert-scraper
     container_name: mybot-concert-scraper
     restart: unless-stopped
+    # tini as PID 1 — uvicorn doesn't reap exited Playwright/Chrome
+    # children, and the zombies accumulate in the host kernel's process
+    # table. Past incident: 94 zombies caused WSL fork() stalls that
+    # manifested as Claude Code freezes on the Windows host.
+    init: true
     expose:
       - "5000"
     labels:
