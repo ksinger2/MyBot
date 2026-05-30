@@ -293,6 +293,49 @@ app.post('/ask', requireInternalToken, (req, res) => {
   });
 });
 
+// Deterministic test runner — runs the project's test command and returns structured results.
+// Used by the QA gate to verify code before [REBUILD].
+app.post('/test', requireInternalToken, async (req, res) => {
+  const { cwd } = req.body;
+  const testDir = cwd || '/app';
+
+  const child = spawn('node', ['--test', 'tests/*.test.js'], {
+    cwd: testDir,
+    env: { ...process.env, NODE_ENV: 'test' },
+    stdio: ['ignore', 'pipe', 'pipe'],
+    shell: true,
+  });
+
+  let stdout = '';
+  let stderr = '';
+  child.stdout.on('data', (d) => { stdout += d; });
+  child.stderr.on('data', (d) => { stderr += d; });
+
+  let timedOut = false;
+  const timeout = setTimeout(() => {
+    timedOut = true;
+    child.kill();
+    if (!res.headersSent) res.status(504).json({ error: 'Test run timed out (120s)' });
+  }, 120000);
+
+  child.on('close', (code) => {
+    clearTimeout(timeout);
+    if (timedOut || res.headersSent) return;
+
+    const passed = code === 0;
+    const passMatch = stdout.match(/# pass (\d+)/);
+    const failMatch = stdout.match(/# fail (\d+)/);
+    res.json({
+      passed,
+      exitCode: code,
+      passCount: passMatch ? parseInt(passMatch[1], 10) : null,
+      failCount: failMatch ? parseInt(failMatch[1], 10) : null,
+      output: stdout.slice(-2000),
+      errors: stderr.slice(-1000),
+    });
+  });
+});
+
 // Internal image generation endpoint — called by Claude CLI via curl
 app.post('/imagine', requireInternalToken, async (req, res) => {
   const { prompt } = req.body;

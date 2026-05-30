@@ -385,6 +385,7 @@ class Runner {
     // system preamble so Claude researches + proposes instead of editing.
     // Toggled by the `!mode plan` / `!mode auto` command.
     planMode = false,
+    reviewMode = false,
     isVoice = false, // Siri voice mode — ultra-compact prompt, no engineering tools
     // Is this an owner session? Used by the priority semaphore.
     isOwner = false,
@@ -410,6 +411,7 @@ class Runner {
     // historical default.
     this.ownerDmMode = ownerDmMode;
     this.planMode = planMode;
+    this.reviewMode = reviewMode;
     this.maxTurns = ownerDmMode
       ? (maxTurns || 200)
       : (maxTurns || (channelState?.config?.maxTurns) || DEFAULT_MAX_TURNS);
@@ -573,7 +575,9 @@ class Runner {
         '--max-turns', String(maxTurns),
         '--dangerously-skip-permissions',
         '--mcp-config', '/app/.mcp.json',
-        '--effort', ownerDmMode ? 'high' : 'medium',
+        '--effort', this.sandboxUser ? 'high'
+          : (ownerDmMode && !planMode && this.sessionId) ? 'high'
+          : 'medium',
       ];
 
       // Tool restrictions — group chats get a social allowlist, read-only
@@ -583,11 +587,14 @@ class Runner {
         // for curl), sub-agents. NO Edit/Write/Grep/Glob (engineering tools).
         args.push('--allowedTools', groupAllowedTools);
       } else if (ownerDmMode && planMode) {
-        // Plan mode: read-only exploration. Claude can research the codebase,
-        // web-search, and draft a plan — but can't edit, write, or shell out.
         args.push(
           '--allowedTools',
           ['Read', 'Grep', 'Glob', 'LS', 'WebSearch', 'WebFetch', 'TodoWrite', 'Task'].join(',')
+        );
+      } else if (ownerDmMode && this.reviewMode) {
+        args.push(
+          '--allowedTools',
+          ['Read', 'Grep', 'Glob', 'LS', 'Bash', 'WebSearch', 'WebFetch', 'TodoWrite', 'Task'].join(',')
         );
       } else if (readOnly) {
         args.push(
@@ -617,6 +624,7 @@ class Runner {
         availableAgents: AVAILABLE_AGENTS,
         ownerDmMode,
         planMode,
+        reviewMode: this.reviewMode,
         userTimezone: this.userTimezone,
       });
       if (systemPromptText) {
@@ -668,8 +676,8 @@ class Runner {
           // Cloudflare (their sandbox has wrangler access) but not the owner's
           // GitHub or full Cloudflare account.
           GH_TOKEN: this.sandboxUser ? '' : (process.env.GH_TOKEN || ''),
-          CLOUDFLARE_API_TOKEN: process.env.CLOUDFLARE_API_TOKEN || '',
-          CLOUDFLARE_ACCOUNT_ID: process.env.CLOUDFLARE_ACCOUNT_ID || '',
+          CLOUDFLARE_API_TOKEN: this.sandboxUser ? (this.sandboxUser.cloudflareToken || '') : (process.env.CLOUDFLARE_API_TOKEN || ''),
+          CLOUDFLARE_ACCOUNT_ID: this.sandboxUser ? '' : (process.env.CLOUDFLARE_ACCOUNT_ID || ''),
         },
         stdio: ['ignore', 'pipe', 'pipe'],
       };

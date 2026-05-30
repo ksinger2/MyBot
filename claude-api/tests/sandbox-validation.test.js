@@ -32,16 +32,20 @@ const sandbox = require('../sandbox');
 // are passed to functions that call it. We also test via a white-box approach
 // by extracting the validation logic here to keep tests fast and hermetic.
 
-// Replicate _validateCwd exactly as in sandbox.js for direct testing:
+// Replicate _validateCwd exactly as in sandbox.js for direct testing.
+// Uses path.posix because sandbox.js runs inside a Linux Docker container —
+// on the Windows test host, path.resolve('/sandbox/Alice') becomes
+// 'C:\sandbox\Alice' which breaks every assertion.
 const path = require('path');
+const posix = path.posix;
 const SANDBOX_ROOT = '/sandbox';
 
 function validateCwd(cwd) {
   if (!cwd || typeof cwd !== 'string') {
     throw new Error(`[sandbox] Invalid cwd: must be a non-empty string`);
   }
-  const resolved = path.resolve(cwd);
-  if (!resolved.startsWith(SANDBOX_ROOT + path.sep) && resolved !== SANDBOX_ROOT) {
+  const resolved = posix.resolve(cwd);
+  if (!resolved.startsWith(SANDBOX_ROOT + '/') && resolved !== SANDBOX_ROOT) {
     throw new Error(`[sandbox] cwd "${cwd}" resolves outside ${SANDBOX_ROOT}`);
   }
   if (/[;&|`$(){}]/.test(cwd)) {

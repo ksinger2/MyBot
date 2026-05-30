@@ -16,14 +16,17 @@ const TUNNEL_ID = '2ff0f7ff-417a-4a2a-92c7-039897719713';
 const CREDENTIALS_FILE = `/home/node/.cloudflared/${TUNNEL_ID}.json`;
 const CONFIG_PATH = '/tmp/sandbox-tunnel-config.yml';
 const DOMAIN = 'backtoirl.com';
-const MAX_RESTART_ATTEMPTS = 3;
-const RESTART_COOLDOWN_MS = 5000;
+const MAX_RESTART_ATTEMPTS = 10;
+const RESTART_COOLDOWN_MS = 5000; // Base for exponential backoff
+const MAX_BACKOFF_MS = 300000;    // 5 minute cap
+const STABILITY_WINDOW_MS = 30 * 60 * 1000; // 30 minutes
 
 // ── State ────────────────────────────────────────────────────────────────────
 const portMap = new Map(); // sandboxName (lowercase) → port number
 let tunnelProcess = null;
 let restartCount = 0;
 let restartTimer = null;
+let stabilityTimer = null;
 let stopped = false; // true if max retries exceeded
 
 // ── Config generation ────────────────────────────────────────────────────────
@@ -65,7 +68,7 @@ function startTunnel() {
 
   console.log('[sandbox-tunnel] Starting cloudflared tunnel run...');
   const proc = spawn('cloudflared', [
-    'tunnel', '--config', CONFIG_PATH, 'run', TUNNEL_ID,
+    'tunnel', '--config', CONFIG_PATH, 'run', '--protocol', 'http2', TUNNEL_ID,
   ], {
     stdio: ['ignore', 'pipe', 'pipe'],
   });
@@ -96,12 +99,29 @@ function startTunnel() {
     }
   });
 
+  // Stability timer: if the process runs for 30 minutes without crashing,
+  // reset the restart counter so transient blips don't accumulate.
+  if (stabilityTimer) clearTimeout(stabilityTimer);
+  stabilityTimer = setTimeout(() => {
+    stabilityTimer = null;
+    if (tunnelProcess === proc && !proc.killed) {
+      console.log('[sandbox-tunnel] Tunnel stable for 30 min — resetting restart counter');
+      restartCount = 0;
+    }
+  }, STABILITY_WINDOW_MS);
+
   tunnelProcess = proc;
   return proc;
 }
 
 function handleCrash() {
   if (stopped) return;
+
+  // Clear stability timer — the process crashed
+  if (stabilityTimer) {
+    clearTimeout(stabilityTimer);
+    stabilityTimer = null;
+  }
 
   restartCount++;
   if (restartCount > MAX_RESTART_ATTEMPTS) {
@@ -110,11 +130,12 @@ function handleCrash() {
     return;
   }
 
-  console.log(`[sandbox-tunnel] Auto-restart ${restartCount}/${MAX_RESTART_ATTEMPTS} in ${RESTART_COOLDOWN_MS}ms...`);
+  const delay = Math.min(RESTART_COOLDOWN_MS * Math.pow(2, restartCount - 1), MAX_BACKOFF_MS);
+  console.log(`[sandbox-tunnel] Auto-restart ${restartCount}/${MAX_RESTART_ATTEMPTS} in ${delay}ms (backoff)...`);
   restartTimer = setTimeout(() => {
     restartTimer = null;
     startTunnel();
-  }, RESTART_COOLDOWN_MS);
+  }, delay);
 }
 
 function restartTunnel() {
@@ -200,4 +221,18 @@ if (fs.existsSync(CREDENTIALS_FILE)) {
   stopped = true;
 }
 
-module.exports = { registerPort, unregisterPort, getTunnelUrl, getStatus };
+/**
+ * Revive a permanently stopped tunnel. Resets state and restarts.
+ * Intended for use by the oncall watchdog.
+ */
+function reviveTunnel() {
+  stopped = false;
+  restartCount = 0;
+  if (restartTimer) {
+    clearTimeout(restartTimer);
+    restartTimer = null;
+  }
+  startTunnel();
+}
+
+module.exports = { registerPort, unregisterPort, getTunnelUrl, getStatus, reviveTunnel };

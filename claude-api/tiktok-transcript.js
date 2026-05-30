@@ -176,8 +176,10 @@ async function getTikTokTranscript(url) {
         const detail = scope['webapp.reflow.video.detail'] || scope['webapp.video-detail'];
         const item = detail?.itemInfo?.itemStruct;
         if (item?.desc) description = String(item.desc).trim();
-        if (item?.author?.nickname || item?.author?.uniqueId) {
-          title = `@${item.author.uniqueId || ''}${item.author.nickname ? ` (${item.author.nickname})` : ''}`.trim();
+        if (item?.author?.uniqueId) {
+          title = `@${item.author.uniqueId}${item.author.nickname ? ` (${item.author.nickname})` : ''}`;
+        } else if (item?.author?.nickname) {
+          title = item.author.nickname;
         }
       }
     } catch {}

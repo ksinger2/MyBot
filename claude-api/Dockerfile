@@ -101,7 +101,7 @@ RUN mkdir -p /home/node-nonowner/.claude && chown -R node:node /home/node-nonown
 # sandbox user provisioning. Minimal sudoers — only these four commands.
 # Sandbox sudoers: SETENV allows env passthrough for sudo -E (required so
 # Claude CLI inherits HOME, PATH, etc. inside the mount namespace).
-RUN echo 'node ALL=(root) NOPASSWD:SETENV: /usr/sbin/useradd, /usr/bin/chown, /usr/bin/mkdir, /usr/bin/cp, /usr/bin/chmod, /usr/bin/unshare' > /etc/sudoers.d/sandbox \
+RUN echo 'node ALL=(root) NOPASSWD:SETENV: /usr/sbin/useradd, /usr/sbin/userdel, /usr/bin/chown, /usr/bin/mkdir, /usr/bin/cp, /usr/bin/chmod, /usr/bin/rm, /usr/bin/unshare' > /etc/sudoers.d/sandbox \
     && chmod 440 /etc/sudoers.d/sandbox
 
 # Run as non-root user (required by Claude CLI)

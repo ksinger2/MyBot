@@ -1,4 +1,4 @@
-const { addSandboxUser, removeSandboxUser, listSandboxUsers, linkGroupChat, unlinkGroupChat, getSandboxUser, SANDBOX_ROOT, DEFAULT_TOOLS } = require('../sandbox');
+const { addSandboxUser, removeSandboxUser, listSandboxUsers, linkGroupChat, unlinkGroupChat, getSandboxUser, setCloudflareToken, purgeSandboxUser, SANDBOX_ROOT, DEFAULT_TOOLS } = require('../sandbox');
 
 module.exports = {
   name: '!sandbox',
@@ -85,8 +85,37 @@ module.exports = {
       let msg = `**Sandbox users:**\n${lines.join('\n')}`;
       if (linkLines.length > 0) msg += `\n\n**Linked groups:**\n${linkLines.join('\n')}`;
       await reply(message, msg);
+    } else if (sub === 'cloudflare') {
+      const senderId = parts[1];
+      const token = parts[2];
+      if (!senderId || !token) {
+        await reply(message, 'Usage: `!sandbox cloudflare <phone-or-id> <scoped-api-token>`');
+        return;
+      }
+      try {
+        const entry = setCloudflareToken(senderId, token);
+        await reply(message, `Cloudflare API token set for **${entry.name}**. Token will be injected as $CLOUDFLARE_API_TOKEN in their sessions.`);
+      } catch (err) {
+        await reply(message, `Failed: ${err.message}`);
+      }
+    } else if (sub === 'purge') {
+      const senderId = parts[1];
+      if (!senderId) {
+        await reply(message, 'Usage: `!sandbox purge <phone-or-id>` — removes sandbox config, Linux user, home dir, and workspace files');
+        return;
+      }
+      try {
+        const entry = purgeSandboxUser(senderId);
+        if (entry) {
+          await reply(message, `Purged sandbox **${entry.name}**: config removed, Linux user deleted, workspace \`${entry.cwd}\` deleted.`);
+        } else {
+          await reply(message, `No sandbox found for \`${senderId}\`.`);
+        }
+      } catch (err) {
+        await reply(message, `Purge failed: ${err.message}`);
+      }
     } else {
-      await reply(message, 'Usage: `!sandbox add|remove|link|unlink|list`\n\n`!sandbox add <phone> <name>` — create sandbox\n`!sandbox remove <phone>` — remove sandbox\n`!sandbox link <phone>` — link this group to a sandbox (run in group)\n`!sandbox unlink` — unlink this group\n`!sandbox list` — show all sandboxes');
+      await reply(message, 'Usage: `!sandbox add|remove|purge|link|unlink|list|cloudflare`\n\n`!sandbox add <phone> <name>` — create sandbox\n`!sandbox remove <phone>` — remove config (keep files)\n`!sandbox purge <phone>` — remove config + delete all files\n`!sandbox link <phone>` — link this group to a sandbox\n`!sandbox unlink` — unlink this group\n`!sandbox cloudflare <phone> <token>` — set scoped CF token\n`!sandbox list` — show all sandboxes');
     }
   },
 };

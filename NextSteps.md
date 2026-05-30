@@ -1,14 +1,16 @@
 # MyBot — Next Steps
 
 ## What's Working
-<!-- Updated each session — 2026-05-24 -->
-- On-call watchdog (`oncall-watchdog.js`) running every 2min with 6 deterministic health checks:
+<!-- Updated each session — 2026-05-30 -->
+- On-call watchdog (`oncall-watchdog.js`) running every 2min with 8 deterministic health checks:
   1. CLI auth health (escalates after 3 failures, 30min cooldown)
   2. Sandbox credential freshness (auto-refreshes if >5min stale)
   3. Process leak detection (kills orphan claude processes >10, escalates node >20)
   4. Disk space monitoring (/tmp sweep at 80%, escalate /app/data at 90%)
   5. Event loop lag (graceful restart after 3 consecutive >30s readings)
   6. Semaphore leak detection (clears stuck busy channels with dead processes)
+  7. Tunnel health (auto-revives stopped Cloudflare tunnel when port mappings exist)
+  8. Sandbox disk usage (alerts owner when any workspace >2GB)
 - `/health/watchdog` endpoint returns rolling health report (last 10 cycles)
 - `/health` endpoint now uses watchdog's cached CLI result (no redundant spawns)
 - Sandbox auth hardening: 3-layer defense (per-spawn refresh + 60s periodic + auth-failure retry)
@@ -118,11 +120,57 @@
 - **Sandbox provisionAll error**: `_groupLinks` internal entry was iterated as a sandbox user, causing "Failed to provision undefined" error. Fixed by filtering entries to those with `linuxUser` property.
 - **Sandbox spawn EACCES**: `sandboxUser` was never passed through `askClaude()` to the Runner — the destructured parameter list was missing it, so sandbox sessions spawned `claude` directly (not via `sudo/unshare/runuser`), hitting EACCES on the 700 sandbox dir. Fixed by adding `sandboxUser` to `askClaude()` parameter list. Also fixed the spawn cwd: sandbox dirs are 700 so Node's pre-exec chdir fails — now spawns with `cwd: '/tmp'` and `cd`s into the sandbox dir inside the unshare command where root can traverse it.
 
+## Recently Fixed (2026-05-30)
+
+### WSL 24/7 Uptime Hardening
+- **WSL watchdog rewritten** (`wsl-autostart.bat`): Now runs `wsl --shutdown` when Docker is wedged in HCS_E_CONNECTION_TIMEOUT, escalates to restarting HcsService + LxssManager as last resort. Previously just retried the same broken state for hours.
+- **watchdog.sh**: Added Docker socket pre-check (10s timeout). Exit code 2 signals the .bat to force WSL shutdown instead of retrying.
+- **Poll interval reduced** (`fix-autostart-task.ps1`): 5min → 1min. Task Scheduler `Duration = "P9999D"` added to ensure indefinite repetition.
+- **New heartbeat** (`scripts/mybot-heartbeat.ps1`): 30s health checks, immediate HCS_E_CONNECTION_TIMEOUT detection, async stderr reading (fixes .NET pipe-buffer deadlock), 3-failure threshold → shutdown + recovery.
+- **`.wslconfig`**: Memory 16GB → 12GB, `autoMemoryReclaim=gradual`, `sparseVhd=true`, `vmIdleTimeout=-1`.
+
+### Agent Orchestration & Token Optimization
+- **`!mode review`**: Third mode — read access + Bash (for tests/lint), no Edit/Write. System prompt: "REVIEW MODE: Audit, run tests, report issues. Do NOT make edits."
+- **TOKEN BUDGET rules**: Explicit depth tiers in system prompt — 0 tools for chat, 1-2 for lookups, 3-5 for research, deep for engineering. "NEVER retry >2x", "STOP after answering".
+- **Effort scaling**: `--effort medium` for first messages, `high` for continuing sessions and sandbox engineering. Saves tokens on simple questions.
+- **`!orchestrate` command**: Multi-agent workflows — `!orchestrate engineering-task <desc>` or `!orchestrate self-improvement`. Templates with structured phases (Analyze → Implement → Review → QA Gate).
+- **Self-review system** (`self-review.js`): Adversarial review prompts + read-only QA gate via separate Claude invocation (sonnet, cheap). QA:FAIL checked before QA:PASS.
+- **`!autonomous` command**: Self-improvement mode — 30min heartbeat, reads NextSteps.md, fixes top-priority item, max 20 iterations/day, concurrency guard, busy-channel check, never auto-rebuilds.
+
+### QA & Pre-Rebuild Gate
+- **`POST /test` endpoint** (`server.js`): Deterministic test runner, returns structured `{ passed, exitCode, passCount, failCount }`.
+- **Pre-rebuild test gate**: Tests must pass before `[REBUILD]` is allowed. Fail-open on gate errors. Uses `testsPassed` boolean flag (not stateful regex).
+
+### Security Fixes
+- **CLOUDFLARE_API_TOKEN leak fixed** (`runner.js`): Sandbox users no longer inherit owner's full Cloudflare token. Per-sandbox scoped tokens via `!sandbox cloudflare <phone> <token>`.
+- **CLOUDFLARE_ACCOUNT_ID scoped**: Empty for sandbox users.
+- **`purgeSandboxUser` hardened** (`sandbox.js`): linuxUser regex validation, absolute paths (`/usr/bin/sudo`, `/usr/sbin/userdel`), `_validateCwd()` for cwd deletion, error logging instead of swallowing.
+- **Dockerfile sudoers**: Added `/usr/sbin/userdel` and `/usr/bin/rm` to allowlist for purge support.
+
+### Workspace & Cloudflare
+- **Tunnel exponential backoff** (`sandbox-tunnel.js`): 5s→10s→20s...capped at 5min, reset after 30min stability, `reviveTunnel()` export, `--protocol http2` (fixes QUIC timeout issues).
+- **`!sandbox purge`**: Removes config + Linux user + home dir + workspace files.
+- **`!sandbox cloudflare`**: Sets per-sandbox scoped Cloudflare API tokens.
+
+### Bug Fixes from Review
+- **Queue handler missing `planMode`/`reviewMode`**: Queued messages bypassed mode restrictions — fixed.
+- **Stateful regex broke rebuild**: `rebuildRe` with `/g` flag caused `.test()` to miss on second call — replaced with boolean flag.
+- **Exit-code-2 recovery** (`wsl-autostart.bat`): Fell through to 30s delay on success — fixed with `goto watchdog_retry`.
+- **watchdog.sh**: Missing explicit `exit 0` on rebuild success.
+- **orchestrate.js**: `codingMode` restoration dropped `undefined` state — always restores now.
+- **oncall-watchdog.js**: `escalate()` called with wrong arity, `du` crash on empty dir, tunnel revival without port mappings.
+- **sandbox-validation tests**: 12 pre-existing failures fixed — `path.resolve` → `path.posix.resolve` for Windows test host compatibility.
+
+### Test Suite
+- **401 tests, 401 pass, 0 failures** (was 389/401 with 12 pre-existing failures).
+- **New**: `tests/sandbox-isolation.test.js` (26 tests) — env var scoping, linuxUser validation, tunnel backoff, reviveTunnel state.
+
 ## What's Broken / In Progress
 <!-- Active issues, blockers, half-done work -->
 - **Group membership lost after container recreation**: Bot (+15106412088) is listed as "PENDING" in test groups (boop, Beep, Testing, ppp) and "NOT IN" for Girthy Calamenca 2.0. The signal-cli REST API v0.98 has no endpoint to accept pending invites programmatically. Fix: owner must re-invite bot to those groups via Signal app.
-- **Sandbox tunnel instability**: Cloudflared QUIC connections frequently timeout and reconnect (non-blocking but noisy logs).
-- **No unified notification bus**: 7 independent systems can send unsolicited messages to owner (signal-watchdog, token-refresh, oncall-watchdog, error-alerting, bot.js startup, briefings, monitor-runner). No quiet hours, no consolidation. P1 improvement: build a `NotificationManager` with severity levels, dedup, and quiet hours.
+- **No unified notification bus**: 7 independent systems can send unsolicited messages to owner (signal-watchdog, token-refresh, oncall-watchdog, error-alerting, bot.js startup, briefings, monitor-runner). No quiet hours, no consolidation.
+- **`autonomous.js` cost tracking not wired**: `MAX_DAILY_COST_USD` declared but `costToday` is always 0 — needs integration with `askClaude` cost reporting.
+- **`autonomous.js` timer doesn't survive rebuilds**: `_autonomousTimer` is in-memory. After rebuild, `enabled: true` persists on disk but timer is gone. Needs startup hook to restart if enabled.
 
 ### Bugs from 2026-05-22 audit — all fixed (2026-05-23)
 
@@ -146,10 +194,12 @@ All 13 audit bugs fixed, code-reviewed by independent agents, and verified with 
 - **Playwright browser fix**: Dockerfile now installs Chromium using the MCP's bundled Playwright version (not the system's) to prevent version mismatch. `PLAYWRIGHT_BROWSERS_PATH=/opt/pw-browsers` ensures browsers are accessible by the `node` user at runtime.
 
 ## Next Steps
+- **Re-run `fix-autostart-task.ps1`** from elevated PowerShell to apply the 1-min polling + Duration fix to the live Task Scheduler task
+- **Register heartbeat task**: Create a 30s-interval Task Scheduler task running `scripts\mybot-heartbeat.ps1`
 - **Re-invite bot to groups**: Owner must add +15106412088 back to: Girthy Calamenca 2.0, boop, Beep, Testing, ppp (via Signal app → group settings → Add member)
-- **Build NotificationManager**: Unified notification bus with severity levels (critical/warn/info), dedup by category, quiet hours (11pm-8am), and batched daily digest for low-severity events. Replace all 7 direct notification paths.
-- **Add `!alerts` and `!quiet` commands**: View suppressed notifications and toggle quiet hours on/off
+- **Wire autonomous cost tracking**: Integrate `askClaude` cost reporting into `autonomous.js` so `MAX_DAILY_COST_USD` is enforced
+- **Add autonomous startup hook**: Check `autonomous-state.json` `enabled` flag on container start, restart timer if true
+- **Build NotificationManager**: Unified notification bus with severity levels, dedup, quiet hours. Replace 7 direct notification paths.
+- **Create scoped Cloudflare API tokens**: One per sandbox user via Cloudflare dashboard, then `!sandbox cloudflare <phone> <token>`
 - Run `node claude-api/tests/e2e-signal-test.js` to verify all 8 tests pass after any future changes
-- Monitor watchdog: `docker compose logs claude-api | grep signal-watchdog`
-- Test `!plan` with a venue that has downloadable photos — verify the image arrives as a Signal attachment
 - Consider bumping `CLAUDE_CODE_VERSION` in docker-compose.yml when a new stable CLI is verified

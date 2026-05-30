@@ -742,11 +742,11 @@ function listPersonalities() {
     .map(f => f.replace('.md', ''));
 }
 
-function askClaude(prompt, { sessionId = null, personalityFile = null, identity = null, cwd = DEFAULT_WORKSPACE, maxTurns = null, channelState = null, channelProxy = null, discordUserId = null, readOnly = false, groupAllowedTools = undefined, profileContext = null, streamReplies = false, model = 'sonnet', ownerDmMode = false, planMode = false, isVoice = false, isOwner = false, sandboxUser = null, recentMessages = null, userTimezone = null } = {}) {
+function askClaude(prompt, { sessionId = null, personalityFile = null, identity = null, cwd = DEFAULT_WORKSPACE, maxTurns = null, channelState = null, channelProxy = null, discordUserId = null, readOnly = false, groupAllowedTools = undefined, profileContext = null, streamReplies = false, model = 'sonnet', ownerDmMode = false, planMode = false, reviewMode = false, isVoice = false, isOwner = false, sandboxUser = null, recentMessages = null, userTimezone = null } = {}) {
   const runnerOpts = {
     sessionId, personalityFile, identity, cwd, maxTurns,
     channelState, channelProxy, discordUserId, readOnly,
-    groupAllowedTools, profileContext, streamReplies, model, ownerDmMode, planMode, isVoice,
+    groupAllowedTools, profileContext, streamReplies, model, ownerDmMode, planMode, reviewMode, isVoice,
     isOwner, sandboxUser, recentMessages, userTimezone,
     freshProgressFn: freshProgress,
     saveChannelStateFn: saveChannelState,
@@ -1432,6 +1432,8 @@ async function processQueue(state) {
 
     let result;
     const _qProfile = require('./user-profiles').getProfile(signalChatId);
+    const planModeQ = ownerDmModeQ && state.codingMode === 'plan';
+    const reviewModeQ = ownerDmModeQ && state.codingMode === 'review';
     const queueOpts = {
       sessionId: state.sessionId,
       personalityFile,
@@ -1441,10 +1443,12 @@ async function processQueue(state) {
       channelProxy: queueProxy,
       isOwner: senderIsOwnerQ,
       ownerDmMode: ownerDmModeQ,
+      planMode: planModeQ,
+      reviewMode: reviewModeQ,
       model: ownerDmModeQ ? 'claude-opus-4-6' : (qSandbox ? 'claude-opus-4-6' : 'sonnet'),
       maxTurns: ownerDmModeQ ? null : (isGroupChatQ && !qSandbox ? 8 : (qSandbox ? 30 : 20)),
       streamReplies: true,
-      readOnly: false,
+      readOnly: ownerDmModeQ ? planModeQ || reviewModeQ : false,
       groupAllowedTools: qSandbox ? qSandbox.allowedTools
         : isGroupChatQ ? nonOwnerToolWhitelistQ : undefined,
       sandboxUser: qSandbox || undefined,
@@ -2852,6 +2856,7 @@ async function _dispatchSignalMessage(msg, chatId, text, state) {
       // Plan mode (owner DM only): read-only exploration, no edits/bash/writes.
       // Toggled via `!mode plan` / `!mode auto`; default is auto.
       const planMode = ownerDmMode && state.codingMode === 'plan';
+      const reviewMode = ownerDmMode && state.codingMode === 'review';
 
       // Non-owner DMs are aligned with group chats: same tool whitelist,
       // same turn cap (8), personality applied. readOnly=false so the Runner
@@ -2889,7 +2894,7 @@ async function _dispatchSignalMessage(msg, chatId, text, state) {
         // Groups and non-owner DMs use a SOCIAL allowlist: web search, reading,
         // sub-agents — but NOT Edit/Write/Grep/Glob (engineering tools).
         // Sandbox users override this with their own tool set.
-        readOnly: ownerDmMode ? !ownerDmFullAccess || planMode : false,
+        readOnly: ownerDmMode ? !ownerDmFullAccess || planMode || reviewMode : false,
         groupAllowedTools: sandboxUser ? sandboxUser.allowedTools
           : (isGroupChat || isNonOwnerDm) ? nonOwnerToolWhitelist : undefined,
         profileContext: (combinedProfileContext || '') + groupOnboardHint + pendingEventContext + lastPlanContext + groupNotesContext + activeFlightsContext + imageRefinementContext
@@ -2903,6 +2908,7 @@ async function _dispatchSignalMessage(msg, chatId, text, state) {
           : 20),
         ownerDmMode,
         planMode,
+        reviewMode,
         isOwner: senderIsOwner,
         sandboxUser,
         userTimezone: _userTimezone,
@@ -3769,8 +3775,39 @@ async function _dispatchSignalMessage(msg, chatId, text, state) {
         try {
           const { isSignalOwner } = require('./project-permissions');
           if (isSignalOwner(msg.senderId) && !isGroupChat) {
+            // Pre-rebuild test gate — run tests before allowing rebuild
             const http = require('http');
+            let testsPassed = true;
             try {
+              const testResult = await new Promise((resolve, reject) => {
+                const treq = http.request({
+                  hostname: 'localhost', port: 3400, path: '/test',
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json', 'X-Internal-Token': INTERNAL_API_TOKEN },
+                  timeout: 130000,
+                }, (tres) => {
+                  let data = '';
+                  tres.on('data', c => data += c);
+                  tres.on('end', () => { try { resolve(JSON.parse(data)); } catch { resolve({ passed: false }); } });
+                });
+                treq.on('error', () => resolve({ passed: true }));
+                treq.on('timeout', () => { treq.destroy(); resolve({ passed: true }); });
+                treq.write(JSON.stringify({ cwd: '/app' }));
+                treq.end();
+              });
+              if (!testResult.passed) {
+                testsPassed = false;
+                console.warn(`[rebuild-tag] blocked by test gate: ${testResult.failCount} test(s) failed`);
+                await signalAdapter.sendMessage(msg.chatId,
+                  `Rebuild blocked: ${testResult.failCount || 'some'} test(s) failed. Fix tests first.\n${(testResult.errors || '').slice(0, 500)}`
+                ).catch(() => {});
+                result.text = (result.text || '').replace(rebuildRe, '').trim();
+              }
+            } catch (testErr) {
+              console.warn(`[rebuild-tag] test gate error (proceeding): ${testErr.message}`);
+            }
+            // Proceed with rebuild if tests passed (or gate errored — fail-open)
+            if (testsPassed) try {
               const rebuildResult = await new Promise((resolve, reject) => {
                 const req = http.request({
                   hostname: 'localhost', port: 3400, path: '/rebuild',

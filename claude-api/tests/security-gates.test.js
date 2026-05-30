@@ -106,14 +106,14 @@ describe('Security gates', () => {
       assert.ok(prompt.includes('[IMAGINE:'), 'Should include IMAGINE tag');
     });
 
-    it('owner DM prompt includes speed guidance', () => {
+    it('owner DM prompt includes token budget guidance', () => {
       const { buildSystemPrompt } = require('../system-prompt');
       const prompt = buildSystemPrompt({
         identity: { name: 'Bianca', description: 'AI assistant' },
         ownerDmMode: true,
       });
-      assert.ok(prompt.includes('SPEED:'),
-        'Owner DM prompt should include speed guidance');
+      assert.ok(prompt.includes('TOKEN BUDGET'),
+        'Owner DM prompt should include token budget guidance');
     });
   });
 });

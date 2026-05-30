@@ -315,6 +315,51 @@ function removeSandboxUser(senderId) {
   return entry;
 }
 
+function setCloudflareToken(senderId, token) {
+  const config = _load();
+  const entry = config[senderId];
+  if (!entry) throw new Error(`No sandbox user found for ${senderId}`);
+  entry.cloudflareToken = token;
+  _save(config);
+  console.log(`[sandbox] Set Cloudflare token for ${entry.name}`);
+  return entry;
+}
+
+function purgeSandboxUser(senderId) {
+  const config = _load();
+  const entry = config[senderId];
+  if (!entry) return null;
+  const linuxUser = entry.linuxUser;
+  const cwd = entry.cwd;
+
+  // Validate linuxUser before using it in any shell commands — persisted JSON
+  // could be tampered with, so never trust it blindly.
+  if (!linuxUser || !/^sandbox-[a-z0-9]{1,20}$/.test(linuxUser)) {
+    throw new Error(`[sandbox] purgeSandboxUser: linuxUser "${linuxUser}" fails validation — refusing to proceed`);
+  }
+
+  delete config[senderId];
+  _save(config);
+  try { execFileSync('/usr/bin/sudo', ['/usr/sbin/userdel', linuxUser], { stdio: 'ignore' }); }
+  catch (err) { console.warn(`[sandbox] purgeSandboxUser: userdel ${linuxUser} failed: ${err.message}`); }
+  try { execFileSync('/usr/bin/sudo', ['/usr/bin/rm', '-rf', `/home/${linuxUser}`], { stdio: 'ignore' }); }
+  catch (err) { console.warn(`[sandbox] purgeSandboxUser: rm home dir failed: ${err.message}`); }
+
+  // Validate cwd is actually under SANDBOX_ROOT before rm -rf
+  if (cwd) {
+    try {
+      const safeCwd = _validateCwd(cwd);
+      execFileSync('/usr/bin/sudo', ['/usr/bin/rm', '-rf', safeCwd], { stdio: 'ignore' });
+    } catch (err) {
+      console.warn(`[sandbox] purgeSandboxUser: skipping cwd removal — ${err.message}`);
+    }
+  }
+
+  _uidCache.delete(linuxUser);
+  console.log(`[sandbox] Purged sandbox: ${senderId} (${entry.name}) — user, home, and workspace removed`);
+  return entry;
+}
+
 function listSandboxUsers() {
   return _load();
 }
@@ -331,6 +376,8 @@ module.exports = {
   provisionUser,
   refreshCredentials,
   refreshAllCredentials,
+  setCloudflareToken,
+  purgeSandboxUser,
   _getUid,
   SANDBOX_ROOT,
   DEFAULT_TOOLS,

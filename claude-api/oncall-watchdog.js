@@ -289,7 +289,7 @@ function checkEventLoopLag() {
   });
 }
 
-// ── Check 6: Semaphore Leak Detection ──
+// ── Check 7: Semaphore Leak Detection ──
 function checkSemaphoreLeaks() {
   const result = { check: 'semaphore_leaks', ok: true, leaked: 0, cleaned: [] };
   try {
@@ -318,6 +318,55 @@ function checkSemaphoreLeaks() {
   return result;
 }
 
+// ── Check 8: Tunnel Health ──
+function checkTunnelHealth() {
+  const result = { check: 'tunnel_health', ok: true };
+  try {
+    const { getStatus, reviveTunnel } = require('./sandbox-tunnel');
+    const status = getStatus();
+    result.running = status.running;
+    result.stopped = status.stopped;
+    result.mappings = Object.keys(status.mappings).length;
+    if (status.stopped && reviveTunnel && Object.keys(status.mappings).length > 0) {
+      logWarn('Tunnel stopped — attempting revival');
+      reviveTunnel();
+      result.action = 'revived';
+    }
+    result.ok = !status.stopped;
+  } catch (err) {
+    result.ok = true;
+    result.note = 'tunnel module not loaded';
+  }
+  return result;
+}
+
+// ── Check 9: Sandbox Disk Usage ──
+function checkSandboxDisk() {
+  const result = { check: 'sandbox_disk', ok: true, sandboxes: {} };
+  try {
+    const SANDBOX_ROOT = '/sandbox';
+    if (!fs.existsSync(SANDBOX_ROOT)) return result;
+    const dirs = fs.readdirSync(SANDBOX_ROOT).map(d => `${SANDBOX_ROOT}/${d}`);
+    if (dirs.length === 0) return result;
+    const output = execFileSync('/usr/bin/du', ['-s', '--block-size=1M', ...dirs], { timeout: 10000, encoding: 'utf8' }).trim();
+    if (!output) return result;
+    for (const line of output.split('\n')) {
+      const [sizeMB, dir] = line.split('\t');
+      if (!sizeMB || !dir) continue;
+      const name = dir.split('/').pop();
+      const mb = parseInt(sizeMB, 10);
+      result.sandboxes[name] = mb;
+      if (mb > 2048) {
+        result.ok = false;
+        escalate('Sandbox Disk Quota', `${name} using ${sizeMB}MB (>2GB limit)`);
+      }
+    }
+  } catch (err) {
+    result.error = err.message;
+  }
+  return result;
+}
+
 // ── Run all checks ──
 async function runAllChecks() {
   if (_running) {
@@ -336,6 +385,8 @@ async function runAllChecks() {
       ['disk_space', checkDiskSpace],
       ['docker_cleanup', checkDockerCleanup],
       ['semaphore_leaks', checkSemaphoreLeaks],
+      ['tunnel_health', checkTunnelHealth],
+      ['sandbox_disk', checkSandboxDisk],
     ];
 
     for (const [name, fn] of checks) {

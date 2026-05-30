@@ -8,7 +8,7 @@
     Graceful Shutdown) that run as SYSTEM (cannot access karen WSL) and recreates
     "MyBot Autostart" with:
       - AtStartup trigger (60s delay) for reboots
-      - Daily trigger with 5-minute repeat for WSL crash recovery
+      - Daily trigger with 1-minute repeat for WSL crash recovery
       - Runs as karen, whether logged on or not
       - Battery restrictions disabled
 
@@ -25,7 +25,7 @@ $UserName       = "karen"
 $StartupDelay   = "PT60S"
 $ExecTimeLimit  = "PT10M"
 $RestartCount   = 3
-$RestartInterval = "PT5M"
+$RestartInterval = "PT1M"
 
 $ObsoleteTasks = @(
     "WSL SSH Watchdog",
@@ -78,7 +78,7 @@ Write-Host ""
 
 # -- Step 3: Build new task ----------------------------------------------
 Write-Host "[3/4] Building new task..." -ForegroundColor White
-Write-Host "  Triggers: AtStartup (60s delay) + Daily repeat every 5 min" -ForegroundColor Green
+Write-Host "  Triggers: AtStartup (60s delay) + Daily repeat every 1 min" -ForegroundColor Green
 Write-Host "  User: $UserName (run whether logged on or not)" -ForegroundColor Green
 Write-Host "  Battery: allowed on battery, won't stop on battery" -ForegroundColor Green
 Write-Host ""
@@ -87,10 +87,11 @@ Write-Host ""
 $triggerStartup = New-ScheduledTaskTrigger -AtStartup
 $triggerStartup.Delay = $StartupDelay
 
-# Trigger 2: Daily at midnight with 5-minute repetition indefinitely
+# Trigger 2: Daily at midnight with 1-minute repetition indefinitely
 $triggerDaily = New-ScheduledTaskTrigger -Daily -At "12:00AM"
 $rep = New-CimInstance -CimClass (Get-CimClass -Namespace Root/Microsoft/Windows/TaskScheduler -ClassName MSFT_TaskRepetitionPattern) -ClientOnly
-$rep.Interval = "PT5M"
+$rep.Interval = "PT1M"
+$rep.Duration = "P9999D"
 $rep.StopAtDurationEnd = $false
 $triggerDaily.Repetition = $rep
 
@@ -104,7 +105,7 @@ $settings = New-ScheduledTaskSettingsSet `
     -StartWhenAvailable `
     -ExecutionTimeLimit (New-TimeSpan -Minutes 10) `
     -RestartCount $RestartCount `
-    -RestartInterval (New-TimeSpan -Minutes 5) `
+    -RestartInterval (New-TimeSpan -Minutes 1) `
     -MultipleInstances IgnoreNew
 
 # -- Step 4: Register ---------------------------------------------------
@@ -113,7 +114,7 @@ Write-Host ""
 
 $task = New-ScheduledTask -Action $action -Trigger $triggerStartup, $triggerDaily -Principal $principal -Settings $settings
 $task.Author = "MyBot fix-autostart-task.ps1"
-$task.Description = "Watchdog: checks MyBot every 5 min, boots WSL + Docker if needed. Also runs at startup."
+$task.Description = "Watchdog: checks MyBot every 1 min, boots WSL + Docker if needed. Also runs at startup."
 
 $cred = Get-Credential -UserName $UserName -Message "Enter password for '$UserName' to register the scheduled task"
 $plainPassword = $cred.GetNetworkCredential().Password
