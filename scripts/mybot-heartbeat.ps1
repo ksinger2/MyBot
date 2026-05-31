@@ -85,6 +85,32 @@ function Invoke-WslShutdownAndRecover {
 # Trim log on every run to prevent unbounded growth
 Trim-Log
 
+# -- D: drive presence check (WSL VHDX lives there) ----------------------
+$WslVhdxPath = "D:\WSL\Ubuntu\ext4.vhdx"
+if (-not (Test-Path $WslVhdxPath)) {
+    Write-Log "CRITICAL: D:\WSL VHDX not found — USB drive may be disconnected"
+    try {
+        Get-PnpDevice -Class USB -ErrorAction SilentlyContinue |
+            Where-Object { $_.Status -eq 'Error' } |
+            Enable-PnpDevice -Confirm:$false -ErrorAction SilentlyContinue
+    } catch {}
+    Start-Sleep -Seconds 5
+    if (-not (Test-Path $WslVhdxPath)) {
+        Write-Log "FATAL: D: drive still unavailable — skipping recovery (WSL cannot start)"
+        exit 0
+    }
+    Write-Log "D: drive recovered after USB re-enumeration"
+}
+
+# -- Disk space check (runs every heartbeat) ------------------------------
+$cFreeGB = [math]::Round((Get-Volume -DriveLetter C).SizeRemaining / 1GB, 2)
+if ($cFreeGB -lt 5) {
+    Write-Log "DISK EMERGENCY: C: drive has $cFreeGB GB free — triggering cleanup"
+    & powershell -NoProfile -ExecutionPolicy Bypass -File "$PSScriptRoot\disk-space-monitor.ps1" -EmergencyOnly
+} elseif ($cFreeGB -lt 20) {
+    Write-Log "DISK WARNING: C: drive has $cFreeGB GB free"
+}
+
 # Attempt health check via WSL curl
 $healthOk = $false
 $hcsError = $false

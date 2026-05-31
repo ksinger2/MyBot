@@ -20,9 +20,9 @@ function buildSandboxEnv(sandboxUser) {
   return {
     GH_TOKEN: sandboxUser ? '' : (process.env.GH_TOKEN || ''),
     CLOUDFLARE_API_TOKEN: sandboxUser
-      ? (sandboxUser.cloudflareToken || '')
+      ? (sandboxUser.cloudflareToken || process.env.CLOUDFLARE_API_TOKEN || '')
       : (process.env.CLOUDFLARE_API_TOKEN || ''),
-    CLOUDFLARE_ACCOUNT_ID: sandboxUser ? '' : (process.env.CLOUDFLARE_ACCOUNT_ID || ''),
+    CLOUDFLARE_ACCOUNT_ID: process.env.CLOUDFLARE_ACCOUNT_ID || '',
   };
 }
 
@@ -46,9 +46,16 @@ const SANDBOX_USER_REGEX = /^sandbox-[a-z0-9]{1,20}$/;
 // ─────────────────────────────────────────────────────────────────────────────
 
 describe('sandbox env isolation — CLOUDFLARE_API_TOKEN', () => {
-  it('is empty string when sandboxUser has no cloudflareToken', () => {
-    const env = buildSandboxEnv({ name: 'alice', linuxUser: 'sandbox-alice' });
-    assert.equal(env.CLOUDFLARE_API_TOKEN, '');
+  it('falls through to process.env when sandboxUser has no cloudflareToken', () => {
+    const saved = process.env.CLOUDFLARE_API_TOKEN;
+    try {
+      process.env.CLOUDFLARE_API_TOKEN = 'global_cf_token';
+      const env = buildSandboxEnv({ name: 'alice', linuxUser: 'sandbox-alice' });
+      assert.equal(env.CLOUDFLARE_API_TOKEN, 'global_cf_token');
+    } finally {
+      if (saved === undefined) delete process.env.CLOUDFLARE_API_TOKEN;
+      else process.env.CLOUDFLARE_API_TOKEN = saved;
+    }
   });
 
   it('uses per-sandbox scoped token when present', () => {
@@ -93,9 +100,16 @@ describe('sandbox env isolation — GH_TOKEN', () => {
 });
 
 describe('sandbox env isolation — CLOUDFLARE_ACCOUNT_ID', () => {
-  it('is empty string when sandboxUser is truthy', () => {
-    const env = buildSandboxEnv({ name: 'alice', linuxUser: 'sandbox-alice' });
-    assert.equal(env.CLOUDFLARE_ACCOUNT_ID, '');
+  it('is available to sandbox users from process.env', () => {
+    const saved = process.env.CLOUDFLARE_ACCOUNT_ID;
+    try {
+      process.env.CLOUDFLARE_ACCOUNT_ID = 'acct_12345';
+      const env = buildSandboxEnv({ name: 'alice', linuxUser: 'sandbox-alice' });
+      assert.equal(env.CLOUDFLARE_ACCOUNT_ID, 'acct_12345');
+    } finally {
+      if (saved === undefined) delete process.env.CLOUDFLARE_ACCOUNT_ID;
+      else process.env.CLOUDFLARE_ACCOUNT_ID = saved;
+    }
   });
 
   it('uses process.env when sandboxUser is null', () => {

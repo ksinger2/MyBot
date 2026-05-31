@@ -34,6 +34,23 @@ if ! docker info >/dev/null 2>&1; then
   exit 1
 fi
 
+# ── Disk space monitoring ─────────────────────────────────────────────
+# Check WSL root filesystem usage
+WSL_DISK_PERCENT=$(df / 2>/dev/null | tail -1 | awk '{print $5}' | tr -d '%')
+if [ -n "$WSL_DISK_PERCENT" ] && [ "$WSL_DISK_PERCENT" -gt 80 ]; then
+    log "WARNING: WSL root filesystem is ${WSL_DISK_PERCENT}% full — pruning Docker"
+    docker system prune -af --filter "until=72h" 2>>"$LOG"
+fi
+
+# Check C: drive free space from WSL side
+C_FREE_KB=$(df /mnt/c 2>/dev/null | tail -1 | awk '{print $4}')
+if [ -n "$C_FREE_KB" ] && [ "$C_FREE_KB" -lt 5242880 ]; then
+    log "WARNING: C: drive has less than 5 GB free (${C_FREE_KB} KB)"
+fi
+
+# Prune dangling images on every run (safe, only removes untagged)
+docker image prune -f >/dev/null 2>&1
+
 # Check if container is running and healthy
 STATUS=$(docker inspect mybot-claude-api-1 --format '{{.State.Status}}' 2>/dev/null)
 HEALTH=$(docker inspect mybot-claude-api-1 --format '{{.State.Health.Status}}' 2>/dev/null)

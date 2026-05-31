@@ -8,6 +8,9 @@ REM and retries. As a last resort, restarts HcsService + LxssManager.
 
 set LOG=%USERPROFILE%\mybot-autostart.log
 
+REM ── Log rotation: keep last 500 lines ─────────────────────────────
+powershell -NoProfile -Command "if (Test-Path '%LOG%') { $l = Get-Content '%LOG%'; if ($l.Count -gt 500) { $l | Select-Object -Last 500 | Set-Content '%LOG%' -Encoding utf8 } }"
+
 REM ── Fast path: check if bot is already running ────────────────────────
 wsl -d Ubuntu -- bash -c "docker inspect mybot-claude-api-1 --format '{{.State.Status}}'" 2>nul | findstr /C:"running" >nul
 if %errorlevel% equ 0 (
@@ -16,6 +19,43 @@ if %errorlevel% equ 0 (
 
 REM ── If we get here, either WSL is dead or the container is not running ─
 echo [%date% %time%] === MyBot watchdog triggered === >> "%LOG%"
+
+REM ── D: drive presence check (WSL VHDX lives on D:\WSL) ─────────────
+if not exist "D:\WSL\Ubuntu\ext4.vhdx" (
+    echo [%date% %time%] CRITICAL: D:\WSL\Ubuntu\ext4.vhdx not found — USB drive may be disconnected >> "%LOG%"
+    powershell -NoProfile -Command "try { Get-PnpDevice -Class USB -ErrorAction SilentlyContinue | Where-Object {$_.Status -eq 'Error'} | Enable-PnpDevice -Confirm:$false -ErrorAction SilentlyContinue } catch {}"
+    timeout /t 10 /nobreak >nul
+    if not exist "D:\WSL\Ubuntu\ext4.vhdx" (
+        echo [%date% %time%] FATAL: D: drive still not available after USB re-enumeration >> "%LOG%"
+        exit /b 1
+    )
+    echo [%date% %time%] D: drive recovered after USB re-enumeration >> "%LOG%"
+)
+
+REM ── Disk space pre-check ────────────────────────────────────────────
+powershell -NoProfile -Command "$free = (Get-Volume -DriveLetter C).SizeRemaining; if ($free -lt 2GB) { exit 1 } else { exit 0 }"
+if %errorlevel% neq 0 (
+    echo [%date% %time%] DISK EMERGENCY: C: drive has less than 2 GB free — running cleanup >> "%LOG%"
+    powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\disk-space-monitor.ps1" -EmergencyOnly >> "%LOG%" 2>&1
+    powershell -NoProfile -Command "$free = (Get-Volume -DriveLetter C).SizeRemaining; if ($free -lt 2GB) { exit 1 } else { exit 0 }"
+    if %errorlevel% neq 0 (
+        echo [%date% %time%] FATAL: Cleanup failed to free enough space. Manual intervention required. >> "%LOG%"
+        exit /b 1
+    )
+    echo [%date% %time%] Disk cleanup freed enough space to proceed >> "%LOG%"
+)
+
+REM ── Wedged state detection ──────────────────────────────────────────
+wsl -l -v 2>nul | findstr /C:"Running" >nul
+if %errorlevel% equ 0 (
+    wsl -d Ubuntu -- echo "alive" 2>nul | findstr /C:"alive" >nul
+    if !errorlevel! neq 0 (
+        echo [%date% %time%] WSL reports Running but commands fail — wedged state detected >> "%LOG%"
+        echo [%date% %time%] Forcing wsl --shutdown to clear wedged state >> "%LOG%"
+        wsl --shutdown >> "%LOG%" 2>&1
+        timeout /t 15 /nobreak >nul
+    )
+)
 
 REM ── Attempt 1: Normal boot ───────────────────────────────────────────
 call :boot_wsl_and_docker
@@ -98,6 +138,26 @@ timeout /t 30 /nobreak >nul
 goto watchdog_retry
 
 :watchdog_done
+REM ── Blockbuster PM2 health check ────────────────────────────────────
+REM Ensure PM2 services (Blockbuster frontend, backend, tunnel) are running.
+set NODE=/home/karen/.nvm/versions/node/v24.14.1/bin/node
+set PM2BIN=/home/karen/.nvm/versions/node/v24.14.1/lib/node_modules/pm2/bin/pm2
+wsl -d Ubuntu -- %NODE% %PM2BIN% ping 2>nul | findstr /C:"pong" >nul
+if !errorlevel! neq 0 (
+    echo [%date% %time%] PM2 daemon not running — starting Blockbuster services >> "%LOG%"
+    wsl -d Ubuntu -- %NODE% %PM2BIN% resurrect >> "%LOG%" 2>&1
+    if !errorlevel! neq 0 (
+        echo [%date% %time%] PM2 resurrect failed — starting from ecosystem config >> "%LOG%"
+        wsl -d Ubuntu -- %NODE% %PM2BIN% start "/mnt/c/Users/karen/Desktop/Github Projects/Blockbuster/ecosystem.config.js" >> "%LOG%" 2>&1
+    )
+) else (
+    REM PM2 is alive — check if cloudflare-tunnel is running
+    wsl -d Ubuntu -- %NODE% %PM2BIN% describe cloudflare-tunnel 2>nul | findstr /C:"online" >nul
+    if !errorlevel! neq 0 (
+        echo [%date% %time%] Blockbuster cloudflare-tunnel is down — restarting >> "%LOG%"
+        wsl -d Ubuntu -- %NODE% %PM2BIN% restart cloudflare-tunnel >> "%LOG%" 2>&1
+    )
+)
 echo [%date% %time%] === MyBot watchdog finished === >> "%LOG%"
 exit /b 0
 

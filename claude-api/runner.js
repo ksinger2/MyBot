@@ -672,12 +672,13 @@ class Runner {
           IMAGE_SESSION_KEY: channelState?._channelId || '',
           // F6: owner is trusted; gh capability is documented. Risk: prompt-injection
           // could exfiltrate via Bash — mitigated by scrubSecrets (F5).
-          // Sandbox users do NOT get infra credentials — they can deploy via
-          // Cloudflare (their sandbox has wrangler access) but not the owner's
-          // GitHub or full Cloudflare account.
+          // Sandbox users do NOT get GitHub credentials. Cloudflare tokens
+          // fall through to the global env if no per-sandbox token is set.
           GH_TOKEN: this.sandboxUser ? '' : (process.env.GH_TOKEN || ''),
-          CLOUDFLARE_API_TOKEN: this.sandboxUser ? (this.sandboxUser.cloudflareToken || '') : (process.env.CLOUDFLARE_API_TOKEN || ''),
-          CLOUDFLARE_ACCOUNT_ID: this.sandboxUser ? '' : (process.env.CLOUDFLARE_ACCOUNT_ID || ''),
+          CLOUDFLARE_API_TOKEN: this.sandboxUser
+            ? (this.sandboxUser.cloudflareToken || process.env.CLOUDFLARE_API_TOKEN || '')
+            : (process.env.CLOUDFLARE_API_TOKEN || ''),
+          CLOUDFLARE_ACCOUNT_ID: process.env.CLOUDFLARE_ACCOUNT_ID || '',
         },
         stdio: ['ignore', 'pipe', 'pipe'],
       };

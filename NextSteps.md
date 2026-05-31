@@ -1,7 +1,7 @@
 # MyBot — Next Steps
 
 ## What's Working
-<!-- Updated each session — 2026-05-30 -->
+<!-- Updated each session — 2026-05-31 -->
 - On-call watchdog (`oncall-watchdog.js`) running every 2min with 8 deterministic health checks:
   1. CLI auth health (escalates after 3 failures, 30min cooldown)
   2. Sandbox credential freshness (auto-refreshes if >5min stale)
@@ -15,6 +15,7 @@
 - `/health` endpoint now uses watchdog's cached CLI result (no redundant spawns)
 - Sandbox auth hardening: 3-layer defense (per-spawn refresh + 60s periodic + auth-failure retry)
 - All sandbox users (Merrisa, Daniel, Lee) have fresh creds and are ready
+- **Cloudflare tokens shared globally**: Sandbox users now inherit global `CLOUDFLARE_API_TOKEN` and `CLOUDFLARE_ACCOUNT_ID` from process.env when no per-sandbox token is set (fixes group chat "no API key" errors)
 - Missed-message recovery: on restart, detects webhook gaps >90s via persisted timestamp (`/app/data/watchdog-state.json`), proactively messages recently active chats to resend. Guards against null adapter, double-notify with auto-resume, and logs write failures.
 - Owner DM now uses `claude-opus-4-6` (200k context) with high effort (was `claude-opus-4-7`)
 - `!reinit` command and `/reinit` skill wired up (command-utils.js, reinit-prompt.js, commands/reinit.js)
@@ -122,12 +123,29 @@
 
 ## Recently Fixed (2026-05-30)
 
-### WSL 24/7 Uptime Hardening
+### WSL 24/7 Uptime Hardening (Phase 2 — Root Cause Fix)
+- **Root cause identified**: C: drive at 0 GB free (931 GB total) caused all WSL failures. WSL enters "Running but wedged" states when disk is full — reports Running but commands fail with `getpwnam failed`, `CreateInstance/E_FAIL`, path translation errors. Existing watchdog detected failures but recovery also failed when disk was full, creating infinite fail loops.
+- **WSL VHDX moved to D: drive** (226 GB freed): Exported via `wsl --export --vhd`, re-imported at `D:\WSL\Ubuntu\`. D: is a 14.9TB external USB HDD with 14.5TB free. Old VHDX on C: deleted. Default user (`karen`) preserved via `/etc/wsl.conf`.
+- **Disk space monitoring added** (`scripts/disk-space-monitor.ps1`): Tiered auto-cleanup — warning at <20GB, standard cleanup at <10GB (temp files, orphaned swap VHDXs, Docker build cache, npm/pip cache), aggressive cleanup at <5GB (old node_modules, build dirs, old Downloads). Runs every 5min via Task Scheduler.
+- **wsl-autostart.bat hardened**: Disk pre-check (if C: <2GB, run cleanup before recovery, FATAL if still full instead of infinite loop). D: drive presence check (VHDX on USB — attempts USB re-enumeration if missing). Wedged state detection (if `wsl -l -v` says Running but `echo alive` fails, forces `wsl --shutdown`). Log rotation (500 lines). Blockbuster PM2 health check (verifies PM2 daemon alive, cloudflare-tunnel online, starts from ecosystem config if needed).
+- **mybot-heartbeat.ps1 hardened**: D: drive presence check before health check (skips recovery if VHDX drive missing). C: free space check every 30s with warning/emergency thresholds.
+- **watchdog.sh hardened**: Docker disk usage monitoring (`docker system df`). WSL root filesystem check (auto-prune at >80%). C: drive free space check from WSL side. Dangling image prune on every run.
+- **USB power management**: Disabled USB selective suspend and hard disk sleep timeout to prevent D: drive from sleeping/disconnecting.
+- **Downloads cleaned**: ~58 GB of media moved to `D:\downloads-archive\`. Temp files and orphaned swap VHDXs cleaned.
+
+### WSL 24/7 Uptime Hardening (Phase 1 — Original)
 - **WSL watchdog rewritten** (`wsl-autostart.bat`): Now runs `wsl --shutdown` when Docker is wedged in HCS_E_CONNECTION_TIMEOUT, escalates to restarting HcsService + LxssManager as last resort. Previously just retried the same broken state for hours.
 - **watchdog.sh**: Added Docker socket pre-check (10s timeout). Exit code 2 signals the .bat to force WSL shutdown instead of retrying.
 - **Poll interval reduced** (`fix-autostart-task.ps1`): 5min → 1min. Task Scheduler `Duration = "P9999D"` added to ensure indefinite repetition.
 - **New heartbeat** (`scripts/mybot-heartbeat.ps1`): 30s health checks, immediate HCS_E_CONNECTION_TIMEOUT detection, async stderr reading (fixes .NET pipe-buffer deadlock), 3-failure threshold → shutdown + recovery.
 - **`.wslconfig`**: Memory 16GB → 12GB, `autoMemoryReclaim=gradual`, `sparseVhd=true`, `vmIdleTimeout=-1`.
+
+### Cloudflare Tunnel 24/7 Uptime Hardening
+- **Blockbuster PM2 boot persistence fixed**: PM2 systemd service (`pm2-karen.service`) updated with `ExecStartPre=/usr/local/bin/wait-for-mnt-c.sh` — waits up to 60s for `/mnt/c` mount before resurrecting services. Previously, PM2 resurrect ran before Windows filesystem was available, silently failing to start all Blockbuster services on WSL reboot.
+- **Blockbuster monitoring added to watchdog** (`wsl-autostart.bat`): Every 1-min poll now checks PM2 daemon (`pm2 ping`), verifies `cloudflare-tunnel` is online, starts from ecosystem config if PM2 is down. Previously, only the MyBot Docker container was monitored — Blockbuster could be completely down with no detection.
+- **MyBot tunnel permanent death removed** (`sandbox-tunnel.js`): Removed `MAX_RESTART_ATTEMPTS = 10` limit. Tunnel now retries forever with exponential backoff (5s→5min cap), reset after 30min stability. Previously, 10 consecutive crashes permanently killed the tunnel with no recovery.
+- **Watchdog tunnel revival unconditional** (`oncall-watchdog.js`): Tunnel is now revived regardless of active port mappings. Previously required `mappings.length > 0`, so a tunnel that died with no active users stayed dead until someone registered a port.
+- **Tunnel health check errors exposed** (`oncall-watchdog.js`): Tunnel module load errors now report `ok: false` instead of silently returning `ok: true`. Previously, a broken tunnel module was invisible to the watchdog.
 
 ### Agent Orchestration & Token Optimization
 - **`!mode review`**: Third mode — read access + Bash (for tests/lint), no Edit/Write. System prompt: "REVIEW MODE: Audit, run tests, report issues. Do NOT make edits."
@@ -193,9 +211,35 @@ All 13 audit bugs fixed, code-reviewed by independent agents, and verified with 
 - **`!amazon` command**: Owner-only Amazon account management — `!amazon status` (check login), `!amazon cart` (view cart), `!amazon login` (interactive login flow). Screenshots sent as Signal attachments.
 - **Playwright browser fix**: Dockerfile now installs Chromium using the MCP's bundled Playwright version (not the system's) to prevent version mismatch. `PLAYWRIGHT_BROWSERS_PATH=/opt/pw-browsers` ensures browsers are accessible by the `node` user at runtime.
 
+## 24/7 Uptime Requirements
+<!-- These are non-negotiable reliability requirements. Do not remove. -->
+
+### WSL Must Stay Up
+- **VHDX location**: `D:\WSL\Ubuntu\ext4.vhdx` on external USB HDD. If D: disconnects, WSL dies.
+- **Disk monitoring**: `scripts/disk-space-monitor.ps1` runs every 5min. Auto-cleans at <10GB, aggressive at <5GB.
+- **Watchdog chain**: Task Scheduler (1min) → `wsl-autostart.bat` → `watchdog.sh` inside WSL. Heartbeat (30s) → `mybot-heartbeat.ps1`.
+- **Failure modes covered**: Disk full (auto-cleanup), D: disconnected (USB re-enum), wedged state (force shutdown), HCS timeout (service restart), Docker socket hung (exit code 2), container unhealthy (compose up/rebuild), Windows Update reboot (disabled + AtStartup recovery), memory pressure (.wslconfig limits), log growth (rotation in all scripts).
+- **USB power**: Selective suspend disabled, hard disk sleep disabled. Do NOT re-enable.
+
+### Cloudflare Tunnels Must Stay Up
+- **Blockbuster tunnel**: PM2 process `cloudflare-tunnel` in `ecosystem.config.js`. Unlimited restarts, HTTP/2 protocol (WSL UDP unreliable). PM2 systemd service waits for `/mnt/c` mount before resurrect.
+- **MyBot tunnel**: `sandbox-tunnel.js` inside Docker container. Unlimited restarts with exponential backoff (5s→5min cap, resets after 30min stability). Watchdog revives unconditionally every 2min.
+- **Monitoring**: `wsl-autostart.bat` checks PM2 daemon + cloudflare-tunnel status every 1min. `oncall-watchdog.js` check #8 monitors MyBot tunnel every 2min.
+
+### Key Files for Uptime
+| File | Purpose | Frequency |
+|------|---------|-----------|
+| `wsl-autostart.bat` | WSL + Docker + PM2 recovery | 1min (Task Scheduler) |
+| `scripts/mybot-heartbeat.ps1` | Health endpoint + disk check | 30s (Task Scheduler) |
+| `watchdog.sh` | Container health + disk monitoring | Called by autostart |
+| `scripts/disk-space-monitor.ps1` | Tiered disk cleanup | 5min (Task Scheduler) |
+| `scripts/install-pm2-service.sh` | PM2 systemd with mount-wait | One-time install |
+| `~/.wslconfig` | WSL memory/swap/idle config | On WSL boot |
+
 ## Next Steps
-- **Re-run `fix-autostart-task.ps1`** from elevated PowerShell to apply the 1-min polling + Duration fix to the live Task Scheduler task
-- **Register heartbeat task**: Create a 30s-interval Task Scheduler task running `scripts\mybot-heartbeat.ps1`
+- **Register disk-space-monitor task**: Create a 5min-interval Task Scheduler task running `scripts\disk-space-monitor.ps1` (elevated)
+- **Move Steam games to D:**: Steam Settings → Storage → Add D:\SteamLibrary → Move games (207 GB)
+- **Move Epic Games to D:**: Epic Launcher Settings → Change install to D:\EpicGames → Move games (101 GB)
 - **Re-invite bot to groups**: Owner must add +15106412088 back to: Girthy Calamenca 2.0, boop, Beep, Testing, ppp (via Signal app → group settings → Add member)
 - **Wire autonomous cost tracking**: Integrate `askClaude` cost reporting into `autonomous.js` so `MAX_DAILY_COST_USD` is enforced
 - **Add autonomous startup hook**: Check `autonomous-state.json` `enabled` flag on container start, restart timer if true

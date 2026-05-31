@@ -327,15 +327,16 @@ function checkTunnelHealth() {
     result.running = status.running;
     result.stopped = status.stopped;
     result.mappings = Object.keys(status.mappings).length;
-    if (status.stopped && reviveTunnel && Object.keys(status.mappings).length > 0) {
+    if (status.stopped && reviveTunnel) {
       logWarn('Tunnel stopped — attempting revival');
       reviveTunnel();
       result.action = 'revived';
     }
     result.ok = !status.stopped;
   } catch (err) {
-    result.ok = true;
-    result.note = 'tunnel module not loaded';
+    result.ok = false;
+    result.note = `tunnel module error: ${err.message}`;
+    logWarn(`Tunnel health check failed: ${err.message}`);
   }
   return result;
 }

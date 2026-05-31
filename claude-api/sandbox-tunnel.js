@@ -16,7 +16,6 @@ const TUNNEL_ID = '2ff0f7ff-417a-4a2a-92c7-039897719713';
 const CREDENTIALS_FILE = `/home/node/.cloudflared/${TUNNEL_ID}.json`;
 const CONFIG_PATH = '/tmp/sandbox-tunnel-config.yml';
 const DOMAIN = 'backtoirl.com';
-const MAX_RESTART_ATTEMPTS = 10;
 const RESTART_COOLDOWN_MS = 5000; // Base for exponential backoff
 const MAX_BACKOFF_MS = 300000;    // 5 minute cap
 const STABILITY_WINDOW_MS = 30 * 60 * 1000; // 30 minutes
@@ -124,14 +123,8 @@ function handleCrash() {
   }
 
   restartCount++;
-  if (restartCount > MAX_RESTART_ATTEMPTS) {
-    console.error(`[sandbox-tunnel] Max restart attempts (${MAX_RESTART_ATTEMPTS}) exceeded — giving up`);
-    stopped = true;
-    return;
-  }
-
   const delay = Math.min(RESTART_COOLDOWN_MS * Math.pow(2, restartCount - 1), MAX_BACKOFF_MS);
-  console.log(`[sandbox-tunnel] Auto-restart ${restartCount}/${MAX_RESTART_ATTEMPTS} in ${delay}ms (backoff)...`);
+  console.log(`[sandbox-tunnel] Auto-restart #${restartCount} in ${delay}ms (backoff, cap ${MAX_BACKOFF_MS / 1000}s)...`);
   restartTimer = setTimeout(() => {
     restartTimer = null;
     startTunnel();

@@ -1,0 +1,24 @@
+[Unit]
+Description=PM2 process manager
+Documentation=https://pm2.keymetrics.io/
+After=network.target local-fs.target
+
+[Service]
+Type=forking
+User=karen
+LimitNOFILE=infinity
+LimitNPROC=infinity
+LimitCORE=infinity
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/snap/bin:/home/karen/.nvm/versions/node/v24.14.1/bin
+Environment=PM2_HOME=/home/karen/.pm2
+PIDFile=/home/karen/.pm2/pm2.pid
+Restart=on-failure
+RestartSec=10
+
+ExecStartPre=/usr/local/bin/wait-for-mnt-c.sh
+ExecStart=/home/karen/.nvm/versions/node/v24.14.1/lib/node_modules/pm2/bin/pm2 resurrect
+ExecReload=/home/karen/.nvm/versions/node/v24.14.1/lib/node_modules/pm2/bin/pm2 reload all
+ExecStop=/home/karen/.nvm/versions/node/v24.14.1/lib/node_modules/pm2/bin/pm2 kill
+
+[Install]
+WantedBy=multi-user.target

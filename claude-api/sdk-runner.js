@@ -232,7 +232,11 @@ class SDKRunner {
       LANG: process.env.LANG || 'en_US.UTF-8',
       TERM: process.env.TERM || 'xterm-256color',
       IMAGE_SESSION_KEY: channelState?._channelId || '',
-      GH_TOKEN: process.env.GH_TOKEN || '',
+      GH_TOKEN: this.sandboxUser ? '' : (process.env.GH_TOKEN || ''),
+      CLOUDFLARE_API_TOKEN: this.sandboxUser
+        ? (this.sandboxUser.cloudflareToken || process.env.CLOUDFLARE_API_TOKEN || '')
+        : (process.env.CLOUDFLARE_API_TOKEN || ''),
+      CLOUDFLARE_ACCOUNT_ID: process.env.CLOUDFLARE_ACCOUNT_ID || '',
     };
 
     // Build query options
