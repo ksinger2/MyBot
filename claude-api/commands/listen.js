@@ -8,7 +8,7 @@
 module.exports = {
   name: '!listen',
   aliases: ['!listenall', '!listening'],
-  adminOnly: true,
+  adminOnly: false,
   description: 'Toggle responding to all group messages vs only @mentions',
   async run(message, arg, state, ctx) {
     const reply = ctx._dreply || ((m, t) => m.reply(t));

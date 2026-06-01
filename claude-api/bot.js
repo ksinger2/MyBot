@@ -1424,7 +1424,7 @@ async function processQueue(state) {
   queueProxy.setGroupChat(isGroupChatQ, signalChatId);
   if (ownerDmModeQ) queueProxy.setOwnerDm(true);
 
-  const nonOwnerToolWhitelistQ = 'Read,WebSearch,WebFetch,Task,TodoWrite,ToolSearch,mcp__chrome-devtools__navigate_page,mcp__chrome-devtools__take_snapshot,mcp__chrome-devtools__take_screenshot,mcp__chrome-devtools__close_page,mcp__chrome-devtools__list_pages';
+  const nonOwnerToolWhitelistQ = 'Bash,Read,WebSearch,WebFetch,Task,TodoWrite,ToolSearch,mcp__chrome-devtools__navigate_page,mcp__chrome-devtools__take_snapshot,mcp__chrome-devtools__take_screenshot,mcp__chrome-devtools__close_page,mcp__chrome-devtools__list_pages';
 
   try {
     state.startedAt = Date.now();
@@ -1940,17 +1940,14 @@ function startSignalAdapter() {
       // Even in listenToAll mode: if the message is clearly a short conversational
       // exchange not addressed to the bot (no question, no task, no bot name), skip.
       // Owner, admins, and sandbox groups always bypass — they're work environments.
-      if (state.listenToAll && !botMentioned && mentionList.length === 0 && !senderIsOwner && !senderIsAdmin && !_isSandboxGroup) {
+      if (false) { // listenToAll = owner wants ALL messages handled, no filtering
         const botName = (state.identity?.name || '').toLowerCase();
         const textLower = text.toLowerCase().replace(/\uFFFC/g, '').trim();
         const hasQuestion = textLower.includes('?');
         const hasTask = /\b(can you|could you|please|remind|schedule|search|find|look up|what|who|when|where|how|tell me|do you|help|show|get|check|track|set|add|list|commands|u have|u know)\b/i.test(textLower);
         const namesMeByName = botName && textLower.includes(botName);
         const hasLink = /https?:\/\/\S+/i.test(textLower);
-        if (!hasQuestion && !hasTask && !namesMeByName && !hasLink) {
-          console.log(`[signal] Group listenToAll — short conversational message, not directed at bot, ignoring`);
-          return;
-        }
+        // Removed: listenToAll means the owner wants the bot engaged on ALL messages
       }
     }
 
@@ -2862,7 +2859,7 @@ async function _dispatchSignalMessage(msg, chatId, text, state) {
       // same turn cap (8), personality applied. readOnly=false so the Runner
       // uses the groupAllowedTools whitelist instead of the restrictive readOnly list.
       const isNonOwnerDm = !senderIsOwner && !isGroupChat;
-      const nonOwnerToolWhitelist = 'Read,WebSearch,WebFetch,Task,TodoWrite,ToolSearch,mcp__chrome-devtools__navigate_page,mcp__chrome-devtools__take_snapshot,mcp__chrome-devtools__take_screenshot,mcp__chrome-devtools__close_page,mcp__chrome-devtools__list_pages';
+      const nonOwnerToolWhitelist = 'Bash,Read,WebSearch,WebFetch,Task,TodoWrite,ToolSearch,mcp__chrome-devtools__navigate_page,mcp__chrome-devtools__take_snapshot,mcp__chrome-devtools__take_screenshot,mcp__chrome-devtools__close_page,mcp__chrome-devtools__list_pages';
 
       // Sandbox lookup — non-owner users with a configured sandbox get write
       // access scoped to their own directory (enforced by Linux file permissions).

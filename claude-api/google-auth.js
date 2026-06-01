@@ -2,6 +2,8 @@ const { google } = require('googleapis');
 const userTokens = require('./user-tokens');
 const oauthState = require('./oauth-state');
 
+const BOT_CALENDAR_KEY = '__bot_calendar__';
+
 // Requires env vars: GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET
 // The redirect URI should match what's configured in Google Cloud Console.
 // For the bot's internal Express server, this would be something like:
@@ -211,4 +213,28 @@ async function getGmailClient(userId) {
   return google.gmail({ version: 'v1', auth: client });
 }
 
-module.exports = { getAuthUrl, handleCallback, getCalendarClient, getGmailClient, refreshTokenIfNeeded };
+/**
+ * Get the bot's own calendar client (for centralized event scheduling).
+ * Returns null if bot calendar account is not connected.
+ */
+async function getBotCalendarClient() {
+  return getCalendarClient(BOT_CALENDAR_KEY);
+}
+
+/**
+ * Get the bot's own Gmail client (for sending emails from the bot's account).
+ * Returns null if bot account is not connected.
+ */
+async function getBotGmailClient() {
+  return getGmailClient(BOT_CALENDAR_KEY);
+}
+
+/**
+ * Get the bot calendar account's email, or null if not connected.
+ */
+function getBotCalendarEmail() {
+  const tokenData = userTokens.getToken(BOT_CALENDAR_KEY);
+  return tokenData?.email || null;
+}
+
+module.exports = { getAuthUrl, handleCallback, getCalendarClient, getGmailClient, refreshTokenIfNeeded, getBotCalendarClient, getBotGmailClient, getBotCalendarEmail, BOT_CALENDAR_KEY };

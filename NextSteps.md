@@ -121,6 +121,25 @@
 - **Sandbox provisionAll error**: `_groupLinks` internal entry was iterated as a sandbox user, causing "Failed to provision undefined" error. Fixed by filtering entries to those with `linuxUser` property.
 - **Sandbox spawn EACCES**: `sandboxUser` was never passed through `askClaude()` to the Runner — the destructured parameter list was missing it, so sandbox sessions spawned `claude` directly (not via `sudo/unshare/runuser`), hitting EACCES on the 700 sandbox dir. Fixed by adding `sandboxUser` to `askClaude()` parameter list. Also fixed the spawn cwd: sandbox dirs are 700 so Node's pre-exec chdir fails — now spawns with `cwd: '/tmp'` and `cd`s into the sandbox dir inside the unshare command where root can traverse it.
 
+## Recently Fixed (2026-05-31)
+
+### Bot Calendar Account (bianca.she.da.cow@gmail.com)
+- **Centralized event scheduling**: Bot now has its own Google account connected via `!botcalendar connect`. All events (`/event`, `/remind`, `/event/join`, `createGroupEvent`) are created on the bot's calendar with users added as attendees via `sendUpdates: 'all'`. No more per-user calendar creation — one event, Google sends invite emails.
+- **Email drafts from bot account**: `/email/draft` defaults to bot's Gmail (`bianca.she.da.cow@gmail.com`). Pass `userId` explicitly to send from the owner's account instead (e.g. in owner DM).
+- **`!botcalendar` command** (owner-only): `connect` / `disconnect` / `status` to manage the bot's Google account.
+- **google-auth.js**: Added `BOT_CALENDAR_KEY`, `getBotCalendarClient()`, `getBotGmailClient()`, `getBotCalendarEmail()`.
+
+### Permissions & Access
+- **`!listen` open to all users**: Was `adminOnly: true` — non-owners couldn't toggle listen mode in groups. Now anyone can `!listen on/off`.
+- **`!login` redirects non-owners**: Non-owners who run `!login` get a friendly redirect to `!setup` or `!connect`. CLI re-auth still owner-only.
+- **Non-owner Bash access**: Added `Bash` to non-owner tool whitelist (both queue and direct paths). Non-owners can now ask the bot to create calendar events, set reminders, draft emails — all via internal API curl calls.
+
+### Listen Filter Removed
+- **listenToAll = respond to everything**: Removed the "short conversational message" heuristic that filtered non-question, non-task messages in `!listen on` groups. If listen mode is on, the bot responds to every message — owner's intent is explicit.
+
+### Token & Auth Fixes
+- **Merrisa's email resolved**: Token was stored under UUID only (`59237aa4-...`), not phone (`+16318487903`). Saved under both keys so lookups always find `merrisang13@gmail.com`.
+
 ## Recently Fixed (2026-05-30)
 
 ### WSL 24/7 Uptime Hardening (Phase 2 — Root Cause Fix)

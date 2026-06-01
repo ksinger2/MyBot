@@ -3,10 +3,17 @@ const { runHeadlessLogin, isLoginInProgress, setLoginInProgress, getTokenExpiryM
 module.exports = {
   name: '!login',
   aliases: ['!auth', '!reauth'],
-  adminOnly: true,
-  description: 'Re-authenticate Claude CLI from your phone',
+  adminOnly: false,
+  description: 'Connect your account (non-owner) or re-authenticate CLI (owner)',
   async run(message, arg, state, ctx) {
     const reply = ctx._dreply || ((m, t) => m.reply(t));
+    const { isSignalOwner } = require('../project-permissions');
+    const senderId = message.author?.id || message._signalSenderId;
+
+    if (!isSignalOwner(senderId)) {
+      await reply(message, 'To connect your Google Calendar, use !setup or !connect instead.\n\n• !setup — full profile setup (name, location, calendar, Spotify)\n• !connect — quick Google Calendar link only');
+      return;
+    }
 
     if (isLoginInProgress()) {
       await reply(message, 'Login already in progress — check your earlier message for the auth URL.');

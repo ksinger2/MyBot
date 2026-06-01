@@ -237,6 +237,7 @@ class SDKRunner {
         ? (this.sandboxUser.cloudflareToken || process.env.CLOUDFLARE_API_TOKEN || '')
         : (process.env.CLOUDFLARE_API_TOKEN || ''),
       CLOUDFLARE_ACCOUNT_ID: process.env.CLOUDFLARE_ACCOUNT_ID || '',
+      TOKEN_ENCRYPTION_KEY: process.env.TOKEN_ENCRYPTION_KEY || '',
     };
 
     // Build query options

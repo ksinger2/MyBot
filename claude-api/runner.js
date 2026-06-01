@@ -679,6 +679,7 @@ class Runner {
             ? (this.sandboxUser.cloudflareToken || process.env.CLOUDFLARE_API_TOKEN || '')
             : (process.env.CLOUDFLARE_API_TOKEN || ''),
           CLOUDFLARE_ACCOUNT_ID: process.env.CLOUDFLARE_ACCOUNT_ID || '',
+          TOKEN_ENCRYPTION_KEY: process.env.TOKEN_ENCRYPTION_KEY || '',
         },
         stdio: ['ignore', 'pipe', 'pipe'],
       };
@@ -1034,6 +1035,7 @@ class Runner {
                   // never see raw tags. The post-result handler extracts them
                   // from the full accumulated text for processing.
                   chunk = chunk.replace(/\[(LEARNED|IMAGINE|CALENDAR|WEATHER|PRODUCT|REMIND|REBUILD|EVENT|EVENT_JOIN|SET_PREF|UPDATE_NOTES|BACKGROUND|CONCERT_PRICES|FLIGHT_SEARCH|FLIGHT_PRICE|EIGHTSLEEP|NEEDS_AGENT|EMAIL_UNSUB|CART_ADD)[:|\]][^\]]*\]?/gi, '').trim();
+                  chunk = require('./response-filter').stripNoResponse(chunk);
                   if (chunk.length > 0) {
                     streamedAny = true;
                     channelState.progress.streamedChars += chunk.length;

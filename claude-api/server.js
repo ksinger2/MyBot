@@ -421,22 +421,30 @@ app.post('/remind', requireInternalToken, async (req, res) => {
 
   try {
     const googleAuth = require('./google-auth');
-    const calendar = await googleAuth.getCalendarClient(discord_user_id);
-    if (!calendar) {
-      return res.status(400).json({ error: 'User has not connected Google Calendar. Tell them to run !connect first.' });
-    }
+    const userTokens = require('./user-tokens');
 
     const startTime = new Date(datetime);
     const durationMs = (duration_minutes || 15) * 60 * 1000;
     const endTime = new Date(startTime.getTime() + durationMs);
 
-    const event = await calendar.events.insert({
+    // Always create reminders on the bot's calendar, invite user as attendee
+    const botCalendar = await googleAuth.getBotCalendarClient();
+    if (!botCalendar) {
+      return res.status(400).json({ error: 'Bot calendar not connected. Owner must run !botcalendar connect first.' });
+    }
+
+    const tok = userTokens.getTokenForSignalUser(discord_user_id);
+    const attendees = tok?.email ? [{ email: tok.email }] : [];
+
+    const event = await botCalendar.events.insert({
       calendarId: 'primary',
+      sendUpdates: 'all',
       requestBody: {
         summary: title,
-        description: description || `Reminder set via Discord bot`,
+        description: description || `Reminder set via bot`,
         start: { dateTime: startTime.toISOString() },
         end: { dateTime: endTime.toISOString() },
+        attendees,
         reminders: {
           useDefault: false,
           overrides: [
@@ -553,43 +561,51 @@ app.post('/event', requireInternalToken, async (req, res) => {
   const durationMs = (duration_minutes || 120) * 60 * 1000;
   const endTime = endDt || new Date(startTime.getTime() + durationMs);
 
-  // Do NOT pre-gather a shared attendees list — adding all user emails as
-  // attendees on every calendar entry sends unwanted cross-invitations.
-  // Each event is created independently on each person's own calendar.
-
   const created = [];
   const failed = [];
 
+  // Always create events on the bot's calendar and invite users as attendees
+  const botCalendar = await googleAuth.getBotCalendarClient();
+  if (!botCalendar) {
+    return res.status(400).json({ error: 'Bot calendar not connected. Owner must run !botcalendar connect first.' });
+  }
+
+  // Gather attendee emails from connected users
+  const attendeeEmails = [];
   for (const userId of user_ids) {
-    const calendar = await googleAuth.getCalendarClient(userId);
-    if (!calendar) {
-      failed.push({ userId, error: 'not_connected — tell them to run !connect or !setup to link Google Calendar' });
-      continue;
+    const tok = userTokens.getTokenForSignalUser(userId);
+    if (tok?.email) attendeeEmails.push({ userId, email: tok.email });
+    else failed.push({ userId, error: 'no_email — user has not connected Google. They will not receive a calendar invite.' });
+  }
+
+  let botEventId = null;
+  try {
+    const event = await botCalendar.events.insert({
+      calendarId: 'primary',
+      sendUpdates: 'all',
+      requestBody: {
+        summary: title,
+        description: description || '',
+        location: location || undefined,
+        start: { dateTime: startTime.toISOString() },
+        end: { dateTime: endTime.toISOString() },
+        attendees: attendeeEmails.map(a => ({ email: a.email })),
+        ...(color_id ? { colorId: String(color_id) } : {}),
+        ...(reminder_minutes != null ? {
+          reminders: {
+            useDefault: false,
+            overrides: [{ method: 'popup', minutes: parseInt(reminder_minutes, 10) }],
+          },
+        } : {}),
+      },
+    });
+    botEventId = event.data.id;
+    for (const a of attendeeEmails) {
+      created.push({ userId: a.userId, email: a.email, eventId: event.data.id });
     }
-    try {
-      const event = await calendar.events.insert({
-        calendarId: 'primary',
-        requestBody: {
-          summary: title,
-          description: description || '',
-          location: location || undefined,
-          start: { dateTime: startTime.toISOString() },
-          end: { dateTime: endTime.toISOString() },
-          ...(color_id ? { colorId: String(color_id) } : {}),
-          ...(reminder_minutes != null ? {
-            reminders: {
-              useDefault: false,
-              overrides: [{ method: 'popup', minutes: parseInt(reminder_minutes, 10) }],
-            },
-          } : {}),
-        },
-      });
-      const tok = userTokens.getTokenForSignalUser(userId);
-      created.push({ userId, email: tok?.email || 'unknown', eventId: event.data.id });
-    } catch (err) {
-      console.error(`[event] create error for ${userId}:`, err.message);
-      failed.push({ userId, error: err.message });
-    }
+  } catch (err) {
+    console.error(`[event] bot calendar create error:`, err.message);
+    return res.status(500).json({ error: `Failed to create event: ${err.message}` });
   }
 
   // Store as pending event for the group so "I'm in" works later
@@ -604,6 +620,7 @@ app.post('/event', requireInternalToken, async (req, res) => {
       createdAt: Date.now(),
       createdBy: user_ids[0],
       attendees: created.map(c => c.userId),
+      botEventId,
     });
     _savePendingEvents();
   }
@@ -632,49 +649,50 @@ app.post('/event/join', requireInternalToken, async (req, res) => {
   const googleAuth = require('./google-auth');
   const userTokens = require('./user-tokens');
 
-  const calendar = await googleAuth.getCalendarClient(user_id);
-  if (!calendar) {
-    return res.status(400).json({ error: 'User has not connected Google Calendar. Tell them to run !connect or !setup first.' });
+  const botCalendar = await googleAuth.getBotCalendarClient();
+  if (!botCalendar) {
+    return res.status(500).json({ error: 'Bot calendar not connected. Owner must run !botcalendar connect first.' });
   }
 
-  // Gather all existing + new attendee emails
-  const allAttendees = [...new Set([...pending.attendees, user_id])];
-  const attendeeEmails = [];
-  for (const uid of allAttendees) {
-    const tok = userTokens.getTokenForSignalUser(uid);
-    if (tok?.email) attendeeEmails.push(tok.email);
+  const tok = userTokens.getTokenForSignalUser(user_id);
+  if (!tok?.email) {
+    return res.status(400).json({ error: 'User has not connected Google Calendar. Tell them to run !connect or !setup so we know their email.' });
+  }
+
+  const eventId = pending.botEventId;
+  if (!eventId) {
+    return res.status(400).json({ error: 'Pending event has no bot calendar event ID — it was created before bot calendar was connected. Create a new event instead.' });
   }
 
   try {
-    const event = await calendar.events.insert({
+    const existing = await botCalendar.events.get({ calendarId: 'primary', eventId });
+    const currentAttendees = existing.data.attendees || [];
+    if (!currentAttendees.some(a => a.email === tok.email)) {
+      currentAttendees.push({ email: tok.email });
+    }
+
+    await botCalendar.events.patch({
       calendarId: 'primary',
-      requestBody: {
-        summary: pending.title,
-        description: pending.description || '',
-        location: pending.location || undefined,
-        start: { dateTime: pending.datetime },
-        end: { dateTime: pending.end_datetime },
-        attendees: attendeeEmails.map(email => ({ email })),
-      },
+      eventId,
+      sendUpdates: 'all',
+      requestBody: { attendees: currentAttendees },
     });
 
-    // Update pending event attendees list
     if (!pending.attendees.includes(user_id)) {
       pending.attendees.push(user_id);
       _savePendingEvents();
     }
-    const tok = userTokens.getTokenForSignalUser(user_id);
 
     res.json({
       success: true,
       userId: user_id,
-      email: tok?.email || 'unknown',
-      eventId: event.data.id,
+      email: tok.email,
+      eventId,
       event_title: pending.title,
       event_datetime: pending.datetime,
     });
   } catch (err) {
-    console.error(`[event/join] error for ${user_id}:`, err.message);
+    console.error(`[event/join] bot calendar patch error for ${user_id}:`, err.message);
     res.status(500).json({ error: err.message });
   }
 });
@@ -2958,16 +2976,26 @@ app.post('/email/draft', requireInternalToken, async (req, res) => {
   const { to, subject, body, threadId, userId } = req.body || {};
   if (!to || !body) return res.status(400).json({ error: 'to and body are required' });
 
-  const targetUserId = userId || SIGNAL_OWNER;
   try {
     const googleAuth = require('./google-auth');
-    const gmail = await googleAuth.getGmailClient(targetUserId);
+    // If userId is explicitly provided, use that user's Gmail (e.g. owner sending from their own account).
+    // Otherwise default to bot's Gmail so emails come FROM the bot.
+    let gmail, fromLabel;
+    if (userId) {
+      gmail = await googleAuth.getGmailClient(userId);
+      const userTokens = require('./user-tokens');
+      const tok = userTokens.getTokenForSignalUser(userId);
+      fromLabel = tok?.email || userId;
+    } else {
+      gmail = await googleAuth.getBotGmailClient();
+      fromLabel = googleAuth.getBotCalendarEmail() || 'bot';
+    }
     if (!gmail) {
-      return res.json({ success: false, error: 'Gmail not connected.' });
+      return res.json({ success: false, error: userId ? 'Gmail not connected for that user.' : 'Bot Gmail not connected. Owner must run !botcalendar connect first.' });
     }
 
     const raw = Buffer.from(
-      `To: ${to}\r\nSubject: ${subject || '(no subject)'}\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n${body}`
+      `From: ${fromLabel}\r\nTo: ${to}\r\nSubject: ${subject || '(no subject)'}\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n${body}`
     ).toString('base64url');
 
     const draftBody = { message: { raw } };
@@ -2981,7 +3009,7 @@ app.post('/email/draft', requireInternalToken, async (req, res) => {
     res.json({
       success: true,
       draftId: draft.data.id,
-      text: `Draft saved — "${subject || '(no subject)'}" to ${to}`,
+      text: `Draft saved (${fromLabel}) — "${subject || '(no subject)'}" to ${to}`,
     });
   } catch (err) {
     console.error('[email/draft] error:', err.message);

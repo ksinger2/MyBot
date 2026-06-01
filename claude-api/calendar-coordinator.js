@@ -129,60 +129,52 @@ async function findOverlappingFreeTime(discordUserIds, dateRange, minDurationMin
 }
 
 /**
- * Create a calendar event on all connected users' calendars.
+ * Create a calendar event. If the bot has its own calendar account, creates one
+ * event there and invites all users as attendees. Otherwise falls back to
+ * creating independent events on each user's calendar.
  * @param {string} title
  * @param {string} description
  * @param {string} startTime - ISO datetime
  * @param {string} endTime - ISO datetime
- * @param {string[]} attendeeDiscordIds - Discord user IDs to create event for
- * @returns {Promise<{ created: { userId: string, email: string, eventId: string }[], failed: { userId: string, error: string }[] }>}
+ * @param {string[]} attendeeDiscordIds - user IDs to create event for
+ * @returns {Promise<{ created: { userId: string, email: string, eventId: string }[], failed: { userId: string, error: string }[], botEventId?: string }>}
  */
 async function createGroupEvent(title, description, startTime, endTime, attendeeDiscordIds) {
   const created = [];
   const failed = [];
 
-  // Gather emails of all connected attendees for the attendees list
+  const botCalendar = await googleAuth.getBotCalendarClient();
+  if (!botCalendar) {
+    return { created, failed: attendeeDiscordIds.map(userId => ({ userId, error: 'bot_calendar_not_connected' })) };
+  }
+
   const attendeeEmails = [];
   for (const userId of attendeeDiscordIds) {
     const tokenData = userTokens.getTokenForSignalUser(userId, _uuidMap);
-    if (tokenData?.email) {
-      attendeeEmails.push(tokenData.email);
-    }
+    if (tokenData?.email) attendeeEmails.push({ userId, email: tokenData.email });
+    else failed.push({ userId, error: 'no_email' });
   }
 
-  for (const userId of attendeeDiscordIds) {
-    const calendar = await googleAuth.getCalendarClient(userId);
-    if (!calendar) {
-      failed.push({ userId, error: 'not_connected' });
-      continue;
+  try {
+    const event = await botCalendar.events.insert({
+      calendarId: 'primary',
+      sendUpdates: 'all',
+      requestBody: {
+        summary: title,
+        description,
+        start: { dateTime: startTime },
+        end: { dateTime: endTime },
+        attendees: attendeeEmails.map(a => ({ email: a.email })),
+      },
+    });
+    for (const a of attendeeEmails) {
+      created.push({ userId: a.userId, email: a.email, eventId: event.data.id });
     }
-
-    const tokenData = userTokens.getTokenForSignalUser(userId, _uuidMap);
-
-    try {
-      const event = await calendar.events.insert({
-        calendarId: 'primary',
-        requestBody: {
-          summary: title,
-          description,
-          start: { dateTime: startTime },
-          end: { dateTime: endTime },
-          attendees: attendeeEmails.map(email => ({ email })),
-        },
-      });
-
-      created.push({
-        userId,
-        email: tokenData?.email || 'unknown',
-        eventId: event.data.id,
-      });
-    } catch (err) {
-      console.error(`[calendar-coordinator] create event error for ${userId}:`, err.message);
-      failed.push({ userId, error: err.message });
-    }
+    return { created, failed, botEventId: event.data.id };
+  } catch (err) {
+    console.error(`[calendar-coordinator] bot calendar error:`, err.message);
+    return { created, failed: attendeeDiscordIds.map(userId => ({ userId, error: err.message })) };
   }
-
-  return { created, failed };
 }
 
 module.exports = { getAvailability, findOverlappingFreeTime, createGroupEvent };
