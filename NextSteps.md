@@ -23,7 +23,7 @@
 - `isCommandLike()` utility replaces raw `text.startsWith('!')` checks (supports `/` prefix too)
 - Google auth token reconciliation now cross-references UUID↔phone map for accurate token lookup
 - Concert price scraper now deterministic: `auto-context.js` detects ticket/price intent, extracts artist names, pre-fetches from scraper, injects `<concert-price-data>` into prompt — no tag emission needed from Claude
-- **OAuth token auto-refresh**: `token-refresh.js` now does real OAuth2 refresh via `https://api.anthropic.com/token` using the refresh_token, syncs from Windows credentials mount — bot never loses auth even overnight
+- **OAuth token auto-refresh**: `token-refresh.js` does direct OAuth2 refresh via `https://platform.claude.com/v1/oauth/token` — no CLI spawn needed. Syncs from Windows credentials mount as first try, falls back to direct HTTP refresh. Token refreshes every 10min when <2hr remaining.
 - **Signal user token cross-referencing**: `getTokenForSignalUser()` in `user-tokens.js` tries phone→UUID and UUID→phone via the UUID map, fixing Merrisa's calendar connection and all Signal user Google integrations
 - **`/calendar/freebusy` endpoint**: New internal API for checking multi-user availability in one call
 - **`!plan` command enhanced**: Accepts event poster images or text, runs 7-step research pipeline (venue, seating, interior photo, ticket prices via concert scraper, calendar check for all group members, parking/transport), stores result server-side for deterministic follow-ups
@@ -121,7 +121,13 @@
 - **Sandbox provisionAll error**: `_groupLinks` internal entry was iterated as a sandbox user, causing "Failed to provision undefined" error. Fixed by filtering entries to those with `linuxUser` property.
 - **Sandbox spawn EACCES**: `sandboxUser` was never passed through `askClaude()` to the Runner — the destructured parameter list was missing it, so sandbox sessions spawned `claude` directly (not via `sudo/unshare/runuser`), hitting EACCES on the 700 sandbox dir. Fixed by adding `sandboxUser` to `askClaude()` parameter list. Also fixed the spawn cwd: sandbox dirs are 700 so Node's pre-exec chdir fails — now spawns with `cwd: '/tmp'` and `cd`s into the sandbox dir inside the unshare command where root can traverse it.
 
-## Recently Fixed (2026-05-31)
+## Recently Fixed (2026-06-01)
+
+### Direct OAuth Token Refresh (replaces fragile CLI spawn)
+- **Root cause**: Token refresh depended on spawning `claude -p "ok"` to force the SDK through OAuth exchange. This was unreliable — the CLI could fail to start (EACCES, missing deps, rate limits), the SDK only refreshed near expiry (not proactively), and a 45s timeout locked out retries for 5 minutes.
+- **Fix**: Direct HTTP POST to `https://platform.claude.com/v1/oauth/token` with the refresh_token. No CLI spawn, no SDK dependency, no DPoP. Extracted the production client_id (`9d1c250a-...`) and scopes from the CLI binary.
+- **Result**: Token refresh is now deterministic — a single HTTP call that takes <1s, works at any token age, and writes fresh credentials atomically. The bot should never lose auth between `!login` sessions again.
+- Removed: `AGGRESSIVE_REFRESH_MINUTES` near-expiry retry (no longer needed — direct refresh always works), `execFileAsync` import (CLI prompt no longer spawned for refresh).
 
 ### Auto-Resume Attachment Loop Fix
 - **Root cause**: `activeTask.prompt` stored the file-augmented text (with `/tmp/signal-attachments/...` paths) truncated to 500 chars. After rebuild, files are gone and paths may be cut mid-way (e.g. `/tmp/signa`). `resumeChannel()` replayed the broken prompt verbatim with `attachments: []`, so Claude looped trying to read non-existent files until the circuit breaker killed it at 28 silent turns.
