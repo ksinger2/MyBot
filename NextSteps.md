@@ -123,6 +123,11 @@
 
 ## Recently Fixed (2026-06-01)
 
+### Deterministic Reminders (timezone + multi-user)
+- **Wrong timezone**: `auto-context.js` defaulted to `America/New_York` when user had no profile timezone. System prompt said `America/Los_Angeles`. Claude saw conflicting hints and picked Eastern. Fixed: both defaults now `America/Los_Angeles`. More importantly, datetime is now **parsed server-side** — `_resolveRemindDatetime()` extracts "tomorrow at 2pm" into a resolved ISO string with correct timezone offset, injected into the prompt so Claude just fills in the title.
+- **Single-user only**: REMIND tag handler clobbered `user_id` to `msg.senderId`, ignoring "for both me and Karen". Fixed: `_resolveRemindAttendees()` matches mentioned names against group member profiles, passes all matched IDs as `attendee_ids` to `/remind`. The endpoint now creates one calendar event with all matched users as attendees (Google sends invite emails to each).
+- **No attendee resolution**: `/remind` only looked up the sender's email. If lookup failed silently, the event had 0 attendees. Now logs a warning per unresolved user and reports `attendees_resolved/attendees_requested` in the response.
+
 ### Direct OAuth Token Refresh (replaces fragile CLI spawn)
 - **Root cause**: Token refresh depended on spawning `claude -p "ok"` to force the SDK through OAuth exchange. This was unreliable — the CLI could fail to start (EACCES, missing deps, rate limits), the SDK only refreshed near expiry (not proactively), and a 45s timeout locked out retries for 5 minutes.
 - **Fix**: Direct HTTP POST to `https://platform.claude.com/v1/oauth/token` with the refresh_token. No CLI spawn, no SDK dependency, no DPoP. Extracted the production client_id (`9d1c250a-...`) and scopes from the CLI binary.

@@ -307,6 +307,51 @@ function summarizeToolInput(name, jsonStr) {
   } catch { return ''; }
 }
 
+// Resolve additional attendees for multi-user reminders ("both me and Karen").
+// Matches names from the original message against known group member profiles.
+// Returns array of user IDs (phone numbers) to include as attendees.
+function _resolveRemindAttendees(msg, channelState) {
+  const text = (msg.text || msg.content || '').toLowerCase();
+  if (!/\b(both|all|us|everyone|me and|and me|for .+ and)\b/i.test(text)) return [];
+
+  try {
+    const { getProfile } = require('./user-profiles');
+    const groupInfo = channelState?._groupInfo || _groupInfoCache?.get(msg.chatId);
+    if (!groupInfo?.members) {
+      // DM — check if message mentions owner by name
+      const ownerPhone = process.env.SIGNAL_OWNER_NUMBER;
+      if (!ownerPhone || msg.senderId === ownerPhone) return [];
+      const ownerProfile = getProfile(ownerPhone);
+      const ownerName = (ownerProfile?.name || '').toLowerCase();
+      if (ownerName && text.includes(ownerName)) return [ownerPhone];
+      if (/\b(karen)\b/i.test(text)) return [ownerPhone];
+      return [];
+    }
+
+    // Group chat — match mentioned names against known members
+    const attendees = [];
+    const rawMembers = groupInfo.members || [];
+    for (const memberId of rawMembers) {
+      if (memberId === msg.senderId) continue;
+      const prof = getProfile(memberId);
+      const name = (prof?.name || '').toLowerCase();
+      if (!name) continue;
+      const firstName = name.split(/\s+/)[0];
+      if (firstName && text.includes(firstName)) {
+        attendees.push(memberId);
+      }
+    }
+    // "for us" / "everyone" / "both of us" — include all group members
+    if (attendees.length === 0 && /\b(us|everyone|both of us|all of us)\b/i.test(text)) {
+      for (const memberId of rawMembers) {
+        if (memberId === msg.senderId) continue;
+        attendees.push(memberId);
+      }
+    }
+    return attendees;
+  } catch { return []; }
+}
+
 function freshProgress() {
   const loopDetection = require('./loop-detection');
   return {
@@ -3468,21 +3513,22 @@ async function _dispatchSignalMessage(msg, chatId, text, state) {
 
       // [REMIND:] tag extraction — create a Google Calendar reminder.
       //
-      // SECURITY / DETERMINISM (H2): the user_id / discord_user_id fields are
-      // NOT taken from Claude's output — they are clobbered with msg.senderId
-      // after the parse loop. Same parse-then-clobber pattern used by [CALENDAR:].
+      // DETERMINISM: Identity fields are clobbered to msg.senderId. If the
+      // original message mentions other group members ("both me and Karen"),
+      // we resolve their IDs from the group member list and pass them as
+      // attendee_ids so the /remind endpoint invites everyone.
       const remindRe = /\[REMIND:\s*(.+?)\]/gi;
       const remindMatches = [...(result.text || '').matchAll(remindRe)];
       if (remindMatches.length > 0 && msg?.senderId) {
         try {
           const http = require('http');
+          // Resolve additional attendees from the original message text
+          const attendeeIds = _resolveRemindAttendees(msg, channelState);
           for (const match of remindMatches) {
             const raw = (match[1] || '').trim();
             const params = {};
             raw.replace(/(\w+)="([^"]+)"/g, (_, k, v) => { params[k] = v; });
-            // Bare numeric duration_minutes=15 (no quotes)
             raw.replace(/(\w+)=(\d+)/g, (_, k, v) => { params[k] = v; });
-            // Clobber identity fields — Claude does not get to choose who the reminder is for.
             params.discord_user_id = msg.senderId;
             params.user_id = msg.senderId;
             if (!params.title || !params.datetime) continue;
@@ -3493,6 +3539,7 @@ async function _dispatchSignalMessage(msg, chatId, text, state) {
                 duration_minutes: parseInt(params.duration_minutes, 10) || 15,
                 discord_user_id: msg.senderId,
                 user_id: msg.senderId,
+                attendee_ids: attendeeIds,
               });
               const remResult = await new Promise((resolve, reject) => {
                 const req = http.request({
@@ -3512,7 +3559,8 @@ async function _dispatchSignalMessage(msg, chatId, text, state) {
               if (remResult?.error) {
                 await signalAdapter.sendMessage(msg.chatId, `Reminder failed: ${remResult.error}`);
               }
-              console.log(`[remind-tag] ${msg.senderId.slice(0,4)}**** "${params.title.slice(0,40)}" at ${params.datetime}`);
+              const attendeeInfo = attendeeIds.length > 0 ? ` (+${attendeeIds.length} attendee(s))` : '';
+              console.log(`[remind-tag] ${msg.senderId.slice(0,4)}**** "${params.title.slice(0,40)}" at ${params.datetime}${attendeeInfo} resolved=${remResult?.attendees_resolved || 0}/${remResult?.attendees_requested || 1}`);
             } catch (e) { console.warn(`[remind-tag] failed: ${e.message}`); }
           }
         } catch (e) { console.warn(`[remind-tag] handler error: ${e.message}`); }

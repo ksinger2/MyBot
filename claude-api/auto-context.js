@@ -35,7 +35,7 @@ const EIGHTSLEEP_INTENT = /\b(bed|eight\s*sleep|eightsleep|mattress|pod|side)\b.
 const CONCERT_PRICE_INTENT = /\b(ticket|tickets|prices?|pricing|how much|cost|cheapest|best deal|best price|stub\s*hub|vivid\s*seats|tick\s*pick|seat\s*geek|ticketmaster|resale|face value|nosebleed|pit|floor seats?|ga tickets?|general admission)\b.*\b(concert|show|tour|festival|gig|perform|event|arena|stadium|venue|live)\b|\b(concert|show|tour|festival|gig|perform|event|arena|stadium|venue|live)\b.*\b(ticket|tickets|prices?|pricing|how much|cost|cheapest|best deal|best price)\b|\b(find|get|check|compare|look up|search|scrape)\b.*\b(ticket|tickets|prices?)\b|\btickets?\s+(for|to)\b|\bprices?\s+(for|to)\b|\bhow much\b.*\btickets?\b|\bticket\s+prices?\b/i;
 
 // Date range extraction from natural language
-function _extractDateRange(text, timezone = 'America/New_York') {
+function _extractDateRange(text, timezone = 'America/Los_Angeles') {
   const now = new Date();
   const today = new Date(now.toLocaleString('en-US', { timeZone: timezone }));
   const todayStr = _fmt(today);
@@ -96,6 +96,48 @@ function _extractDateRange(text, timezone = 'America/New_York') {
 
 function _fmt(d) {
   return d.toISOString().slice(0, 10);
+}
+
+function _resolveRemindDatetime(text, timezone) {
+  const lower = text.toLowerCase();
+
+  // Extract time: "at 2pm", "at 3:30pm", "at 14:00", "at noon"
+  let hours = null, minutes = 0;
+  const timeMatch = lower.match(/\bat\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\b/);
+  if (timeMatch) {
+    hours = parseInt(timeMatch[1], 10);
+    minutes = parseInt(timeMatch[2] || '0', 10);
+    const ampm = timeMatch[3];
+    if (ampm === 'pm' && hours < 12) hours += 12;
+    if (ampm === 'am' && hours === 12) hours = 0;
+  } else if (/\bnoon\b/.test(lower)) {
+    hours = 12;
+  } else if (/\bmidnight\b/.test(lower)) {
+    hours = 0;
+  }
+
+  if (hours === null) return null;
+
+  const dateRange = _extractDateRange(text, timezone);
+  const dateStr = dateRange.from;
+
+  // Build a date in the target timezone
+  const [y, m, d] = dateStr.split('-').map(Number);
+  // Format as IANA timezone offset
+  const fakeDate = new Date(y, m - 1, d, hours, minutes, 0);
+  const formatter = new Intl.DateTimeFormat('en-US', {
+    timeZone: timezone,
+    year: 'numeric', month: '2-digit', day: '2-digit',
+    hour: '2-digit', minute: '2-digit', second: '2-digit',
+    hour12: false, timeZoneName: 'longOffset',
+  });
+  // Get the UTC offset for this date/time in the target timezone
+  const parts = formatter.formatToParts(fakeDate);
+  const tzOffset = parts.find(p => p.type === 'timeZoneName')?.value || '';
+  // Convert "GMT-07:00" → "-07:00"
+  const offset = tzOffset.replace('GMT', '') || '+00:00';
+
+  return `${dateStr}T${String(hours).padStart(2, '0')}:${String(minutes).padStart(2, '0')}:00${offset}`;
 }
 
 // ── Concert artist extraction ──────────────────────────────────────────────
@@ -296,7 +338,7 @@ async function enrichWithContext(text, senderId, isGroupChat) {
   const profile = getProfile(senderId);
   const parts = [];
 
-  const _tz = profile?.timezone || 'America/New_York';
+  const _tz = profile?.timezone || 'America/Los_Angeles';
 
   // Calendar auto-fetch
   if (CALENDAR_INTENT.test(text)) {
@@ -350,8 +392,16 @@ async function enrichWithContext(text, senderId, isGroupChat) {
   }
 
   if (REMIND_INTENT.test(text)) {
-    parts.push(`<system-hint type="reminder">The user wants a reminder set. You MUST emit a [REMIND: title="what" datetime="ISO 8601" duration_minutes=15] tag with ${_tz} timezone. Parse the time from their message.</system-hint>`);
-    console.log(`[auto-context] REMIND intent detected`);
+    const resolvedDt = _resolveRemindDatetime(text, _tz);
+    const dtHint = resolvedDt
+      ? ` The resolved datetime is: ${resolvedDt}. Use this EXACT value for the datetime field — do NOT recalculate.`
+      : ` Use timezone ${_tz}.`;
+    // If multiple people mentioned ("both me and Karen", "for us", etc.), emit one REMIND tag per person.
+    const multiHint = /\b(both|all|us|everyone|me and|and me)\b/i.test(text)
+      ? ' The user wants reminders for MULTIPLE people. Emit one [REMIND:] tag per person, each with a different user_ids value.'
+      : '';
+    parts.push(`<system-hint type="reminder">The user wants a reminder set. You MUST emit a [REMIND: title="what" datetime="ISO 8601" duration_minutes=15] tag.${dtHint}${multiHint}</system-hint>`);
+    console.log(`[auto-context] REMIND intent detected${resolvedDt ? ` resolved=${resolvedDt}` : ''}`);
   }
 
   if (EIGHTSLEEP_INTENT.test(text)) {

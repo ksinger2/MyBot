@@ -414,7 +414,7 @@ app.post('/imagine', requireInternalToken, async (req, res) => {
 // Internal reminder endpoint — creates a Google Calendar event as a reminder
 // Called by Claude CLI via curl when user asks "remind me..."
 app.post('/remind', requireInternalToken, async (req, res) => {
-  const { title, datetime, duration_minutes, discord_user_id, description } = req.body;
+  const { title, datetime, duration_minutes, discord_user_id, attendee_ids, description } = req.body;
   if (!title || !datetime || !discord_user_id) {
     return res.status(400).json({ error: 'title, datetime (ISO 8601), and discord_user_id are required' });
   }
@@ -427,14 +427,19 @@ app.post('/remind', requireInternalToken, async (req, res) => {
     const durationMs = (duration_minutes || 15) * 60 * 1000;
     const endTime = new Date(startTime.getTime() + durationMs);
 
-    // Always create reminders on the bot's calendar, invite user as attendee
     const botCalendar = await googleAuth.getBotCalendarClient();
     if (!botCalendar) {
       return res.status(400).json({ error: 'Bot calendar not connected. Owner must run !botcalendar connect first.' });
     }
 
-    const tok = userTokens.getTokenForSignalUser(discord_user_id);
-    const attendees = tok?.email ? [{ email: tok.email }] : [];
+    // Resolve all attendee emails: sender + any additional attendee_ids
+    const allIds = new Set([discord_user_id, ...(attendee_ids || [])]);
+    const attendees = [];
+    for (const id of allIds) {
+      const tok = userTokens.getTokenForSignalUser(id);
+      if (tok?.email) attendees.push({ email: tok.email });
+      else console.warn(`[remind] No email found for ${id.slice(0, 8)}...`);
+    }
 
     const event = await botCalendar.events.insert({
       calendarId: 'primary',
@@ -461,6 +466,8 @@ app.post('/remind', requireInternalToken, async (req, res) => {
       title,
       start: startTime.toISOString(),
       end: endTime.toISOString(),
+      attendees_resolved: attendees.length,
+      attendees_requested: allIds.size,
       link: event.data.htmlLink,
     });
   } catch (err) {
