@@ -183,7 +183,13 @@ async function _proactiveRefresh() {
 
     if (!resp.ok) {
       const text = await resp.text().catch(() => '');
+      const isInvalidGrant = resp.status === 401 || text.includes('invalid_grant');
       console.error(`[token-refresh] OAuth refresh HTTP ${resp.status}: ${text.substring(0, 200)}`);
+      if (isInvalidGrant) {
+        console.error('[token-refresh] Refresh token revoked/expired — must re-login via !login');
+        _lastProactiveRefreshAt = Date.now() + 30 * 60_000; // suppress retries for 30min
+        await notifyOwnerAuthExpiring(0);
+      }
       return false;
     }
 
@@ -193,20 +199,14 @@ async function _proactiveRefresh() {
       return false;
     }
 
-    // Write new credentials atomically
-    const updated = {
-      claudeAiOauth: {
-        accessToken: data.access_token,
-        refreshToken: data.refresh_token || refreshToken,
-        expiresAt: Date.now() + data.expires_in * 1000,
-        scopes: (data.scope || OAUTH_SCOPES).split(' '),
-        subscriptionType: creds.claudeAiOauth.subscriptionType || 'max',
-        rateLimitTier: creds.claudeAiOauth.rateLimitTier || 'default_claude_max_20x',
-      },
-    };
+    // Merge into existing creds to preserve any unknown fields
+    creds.claudeAiOauth.accessToken = data.access_token;
+    creds.claudeAiOauth.refreshToken = data.refresh_token ?? creds.claudeAiOauth.refreshToken;
+    creds.claudeAiOauth.expiresAt = Date.now() + data.expires_in * 1000;
+    creds.claudeAiOauth.scopes = (data.scope || OAUTH_SCOPES).split(' ');
 
     const tmpPath = ACTIVE_CREDS + '.tmp.' + process.pid;
-    fs.writeFileSync(tmpPath, JSON.stringify(updated), { mode: 0o600 });
+    fs.writeFileSync(tmpPath, JSON.stringify(creds), { mode: 0o600 });
     fs.renameSync(tmpPath, ACTIVE_CREDS);
 
     _lastProactiveRefreshAt = Date.now();
@@ -216,6 +216,7 @@ async function _proactiveRefresh() {
     return true;
   } catch (err) {
     console.error('[token-refresh] OAuth refresh failed:', err.message);
+    try { fs.unlinkSync(ACTIVE_CREDS + '.tmp.' + process.pid); } catch {}
     return false;
   }
 }

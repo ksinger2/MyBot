@@ -418,6 +418,9 @@ app.post('/remind', requireInternalToken, async (req, res) => {
   if (!title || !datetime || !discord_user_id) {
     return res.status(400).json({ error: 'title, datetime (ISO 8601), and discord_user_id are required' });
   }
+  if (attendee_ids && !Array.isArray(attendee_ids)) {
+    return res.status(400).json({ error: 'attendee_ids must be an array' });
+  }
 
   try {
     const googleAuth = require('./google-auth');

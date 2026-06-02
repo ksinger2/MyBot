@@ -724,7 +724,7 @@ class Runner {
           ], sandboxSpawnOpts);
         } else {
           if (spawnOpts.env.HOME === '/home/node-nonowner') {
-            try { fs.copyFileSync('/home/node/.claude/.credentials.json', '/home/node-nonowner/.claude/.credentials.json'); } catch {}
+            try { fs.copyFileSync('/home/node/.claude/.credentials.json', '/home/node-nonowner/.claude/.credentials.json'); } catch (e) { console.warn(`[runner] non-owner cred copy failed: ${e.message}`); }
           }
           child = spawn('claude', args, spawnOpts);
         }
@@ -815,8 +815,6 @@ class Runner {
               hitRateLimit = true;
               if (channelState) {
                 channelState.progress.lastActivity = Date.now();
-                channelState.progress.lastOutputTime = Date.now();
-                channelState.progress.lastOutputTurn = channelState.progress.turnCount;
               }
             }
 

@@ -95,7 +95,10 @@ function _extractDateRange(text, timezone = 'America/Los_Angeles') {
 }
 
 function _fmt(d) {
-  return d.toISOString().slice(0, 10);
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, '0');
+  const day = String(d.getDate()).padStart(2, '0');
+  return `${y}-${m}-${day}`;
 }
 
 function _resolveRemindDatetime(text, timezone) {

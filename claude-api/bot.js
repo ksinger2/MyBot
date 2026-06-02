@@ -328,7 +328,7 @@ function _resolveRemindAttendees(msg, channelState) {
       return [];
     }
 
-    // Group chat — match mentioned names against known members
+    // Group chat — match mentioned names against known members (word-boundary)
     const attendees = [];
     const rawMembers = groupInfo.members || [];
     for (const memberId of rawMembers) {
@@ -337,8 +337,9 @@ function _resolveRemindAttendees(msg, channelState) {
       const name = (prof?.name || '').toLowerCase();
       if (!name) continue;
       const firstName = name.split(/\s+/)[0];
-      if (firstName && text.includes(firstName)) {
-        attendees.push(memberId);
+      if (firstName && firstName.length >= 2) {
+        const nameRe = new RegExp(`\\b${firstName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i');
+        if (nameRe.test(text)) attendees.push(memberId);
       }
     }
     // "for us" / "everyone" / "both of us" — include all group members
@@ -349,7 +350,7 @@ function _resolveRemindAttendees(msg, channelState) {
       }
     }
     return attendees;
-  } catch { return []; }
+  } catch (e) { console.warn(`[remind-attendees] ${e.message}`); return []; }
 }
 
 function freshProgress() {
@@ -1359,6 +1360,15 @@ async function resumeChannel(channelId, savedState) {
     return;
   }
 
+  // Attachment check runs first — attachment-only messages have empty prompt
+  if (task?.hadAttachments || (task?.prompt && task.prompt.includes('[The user attached'))) {
+    console.log(`[auto-resume] Skipping attachment task in ${channelId} — files lost on rebuild`);
+    await signalAdapter.sendMessage(signalChatId,
+      `I restarted while working on your file — the attachment was lost. Please resend it.`
+    ).catch(() => {});
+    return;
+  }
+
   // If we have an activeTask with a prompt, auto-retry it instead of just notifying
   if (task?.prompt && task.senderId) {
     // Don't auto-resume reaction-triggered tasks — the synthetic context
@@ -1367,17 +1377,6 @@ async function resumeChannel(channelId, savedState) {
       console.log(`[auto-resume] Skipping reaction-triggered task in ${channelId}`);
       await signalAdapter.sendMessage(signalChatId,
         `I restarted while handling a reaction — send your request again if needed.`
-      ).catch(() => {});
-      return;
-    }
-
-    // Don't auto-resume tasks that had file attachments — files live in
-    // /tmp/signal-attachments/ inside the container and don't survive rebuilds.
-    // Also catch stale persisted state from before this fix (truncated paths).
-    if (task.hadAttachments || task.prompt.includes('[The user attached')) {
-      console.log(`[auto-resume] Skipping attachment task in ${channelId} — files lost on rebuild`);
-      await signalAdapter.sendMessage(signalChatId,
-        `I restarted while working on your file — the attachment was lost. Please resend it.`
       ).catch(() => {});
       return;
     }
@@ -3523,7 +3522,7 @@ async function _dispatchSignalMessage(msg, chatId, text, state) {
         try {
           const http = require('http');
           // Resolve additional attendees from the original message text
-          const attendeeIds = _resolveRemindAttendees(msg, channelState);
+          const attendeeIds = _resolveRemindAttendees(msg, state);
           for (const match of remindMatches) {
             const raw = (match[1] || '').trim();
             const params = {};

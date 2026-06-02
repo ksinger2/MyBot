@@ -166,9 +166,8 @@ function refreshAllCredentials() {
     refreshCredentials(entry.linuxUser);
   }
   try {
-    const fs = require('fs');
     fs.copyFileSync('/home/node/.claude/.credentials.json', '/home/node-nonowner/.claude/.credentials.json');
-  } catch {}
+  } catch (e) { console.warn(`[sandbox] non-owner cred copy failed: ${e.message}`); }
 }
 
 /**
