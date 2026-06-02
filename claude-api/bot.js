@@ -1326,6 +1326,17 @@ async function resumeChannel(channelId, savedState) {
       return;
     }
 
+    // Don't auto-resume tasks that had file attachments — files live in
+    // /tmp/signal-attachments/ inside the container and don't survive rebuilds.
+    // Also catch stale persisted state from before this fix (truncated paths).
+    if (task.hadAttachments || task.prompt.includes('[The user attached')) {
+      console.log(`[auto-resume] Skipping attachment task in ${channelId} — files lost on rebuild`);
+      await signalAdapter.sendMessage(signalChatId,
+        `I restarted while working on your file — the attachment was lost. Please resend it.`
+      ).catch(() => {});
+      return;
+    }
+
     const maxRetries = 2;
     const attempts = (task.resumeAttempts || 0) + 1;
     if (attempts > maxRetries) {
@@ -2632,8 +2643,13 @@ async function _dispatchSignalMessage(msg, chatId, text, state) {
     if (state.recentMessages.length > 20) state.recentMessages = state.recentMessages.slice(-20);
 
     state._isGroupChat = isGroupMessage; // used by commands (e.g. !btw) to suppress in groups
+    const _attachInline = text.indexOf('\n\n[The user attached');
+    const _attachStart = text.startsWith('[The user attached');
+    const _hadAttachments = _attachInline !== -1 || _attachStart;
+    const _cleanPrompt = _attachInline !== -1 ? text.substring(0, _attachInline) : _attachStart ? '' : text;
     state.activeTask = {
-      prompt: text.substring(0, 500),
+      prompt: _cleanPrompt.substring(0, 500),
+      hadAttachments: _hadAttachments,
       channelId: chatId,
       senderId: msg.senderId,
       senderName: msg.senderName || msg.senderId,

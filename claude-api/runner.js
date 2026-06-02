@@ -723,6 +723,9 @@ class Runner {
             'claude', ...args,
           ], sandboxSpawnOpts);
         } else {
+          if (spawnOpts.env.HOME === '/home/node-nonowner') {
+            try { fs.copyFileSync('/home/node/.claude/.credentials.json', '/home/node-nonowner/.claude/.credentials.json'); } catch {}
+          }
           child = spawn('claude', args, spawnOpts);
         }
       } catch (spawnErr) {
@@ -813,6 +816,7 @@ class Runner {
               if (channelState) {
                 channelState.progress.lastActivity = Date.now();
                 channelState.progress.lastOutputTime = Date.now();
+                channelState.progress.lastOutputTurn = channelState.progress.turnCount;
               }
             }
 
@@ -1023,6 +1027,11 @@ class Runner {
               if (parentId) {
                 const existing = subagentText.get(parentId) || '';
                 subagentText.set(parentId, existing + block.text);
+                if (channelState) {
+                  channelState.progress.lastOutputTurn = channelState.progress.turnCount;
+                  channelState.progress.lastOutputTime = Date.now();
+                  channelState.progress.lastActivity = Date.now();
+                }
               } else {
                 accumulatedText += block.text;
 

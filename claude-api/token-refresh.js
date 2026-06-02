@@ -4,9 +4,10 @@ const fs = require('fs');
 
 const execFileAsync = promisify(execFile);
 
-const REFRESH_INTERVAL_MS = 15 * 60 * 1000; // 15 minutes — aggressive to catch expiry early
+const REFRESH_INTERVAL_MS = 10 * 60 * 1000; // 10 minutes
 const PROACTIVE_REFRESH_MINUTES = 120; // trigger refresh when < 2hr remaining
 const EXPIRY_WARN_MINUTES = 30; // only alert owner if proactive refresh FAILS
+const AGGRESSIVE_REFRESH_MINUTES = 15; // near-expiry: SDK will actually exchange refresh token
 
 const WINDOWS_CREDS = '/host/windows-claude-credentials.json';
 const ACTIVE_CREDS = '/home/node/.claude/.credentials.json';
@@ -200,9 +201,19 @@ async function refreshToken() {
 
     // Token is within the proactive refresh window — try to extend it
     console.warn(`[token-refresh] Token low (${minsLeft}min remaining) — attempting proactive refresh`);
-    const refreshed = await _proactiveRefresh();
+    let refreshed = await _proactiveRefresh();
 
     if (refreshed) return;
+
+    // The CLI SDK often won't exchange the refresh token until access token is
+    // very near expiry. If we're in that aggressive window, reset the cooldown
+    // and retry — this time the SDK should actually cooperate.
+    if (minsLeft <= AGGRESSIVE_REFRESH_MINUTES && !refreshed) {
+      _lastProactiveRefreshAt = 0; // bypass cooldown for near-expiry retry
+      console.warn(`[token-refresh] Near-expiry retry (${minsLeft}min) — SDK should exchange refresh token now`);
+      refreshed = await _proactiveRefresh();
+      if (refreshed) return;
+    }
 
     // Proactive refresh didn't work — if really low, alert owner
     const minsAfter = getTokenExpiryMinutes() || minsLeft;

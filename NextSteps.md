@@ -123,6 +123,16 @@
 
 ## Recently Fixed (2026-05-31)
 
+### Auto-Resume Attachment Loop Fix
+- **Root cause**: `activeTask.prompt` stored the file-augmented text (with `/tmp/signal-attachments/...` paths) truncated to 500 chars. After rebuild, files are gone and paths may be cut mid-way (e.g. `/tmp/signa`). `resumeChannel()` replayed the broken prompt verbatim with `attachments: []`, so Claude looped trying to read non-existent files until the circuit breaker killed it at 28 silent turns.
+- **Fix 1** (bot.js:2646-2649): `_dispatchSignalMessage` now derives `_hadAttachments` and `_cleanPrompt` from `text` by detecting the `[The user attached` block. Strips ephemeral file paths from `activeTask.prompt`. Handles both inline (`\n\n[The user attached`) and start-of-text (attachment-only messages) cases.
+- **Fix 2** (bot.js:2652): `activeTask` now includes `hadAttachments` flag, persisted to disk.
+- **Fix 3** (bot.js:1332): `resumeChannel()` skips auto-resume when `task.hadAttachments` is true OR when the prompt contains `[The user attached` (catches stale persisted state from before this fix). User gets: "I restarted while working on your file — the attachment was lost. Please resend it."
+
+### Circuit Breaker Hardening
+- **Rate limit turn reset** (runner.js:816): `lastOutputTurn` now reset to current `turnCount` on `rate_limit_event`. Previously only `lastOutputTime` was reset — turn-based breaker could fire during rate-limited waits.
+- **Sub-agent text counts as output** (runner.js:1027-1031): Sub-agent text blocks now update `lastOutputTurn`, `lastOutputTime`, and `lastActivity` on the parent session. Previously, sub-agent text was routed to `subagentText` bucket without updating progress counters, so sessions with active sub-agents appeared "silent" to the circuit breaker.
+
 ### Bot Calendar Account (bianca.she.da.cow@gmail.com)
 - **Centralized event scheduling**: Bot now has its own Google account connected via `!botcalendar connect`. All events (`/event`, `/remind`, `/event/join`, `createGroupEvent`) are created on the bot's calendar with users added as attendees via `sendUpdates: 'all'`. No more per-user calendar creation — one event, Google sends invite emails.
 - **Email drafts from bot account**: `/email/draft` defaults to bot's Gmail (`bianca.she.da.cow@gmail.com`). Pass `userId` explicitly to send from the owner's account instead (e.g. in owner DM).
