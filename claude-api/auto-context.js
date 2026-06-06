@@ -30,6 +30,8 @@ const IMAGINE_INTENT = /\b(draw|sketch|paint|illustrate|generate|create|make|des
 
 const REMIND_INTENT = /\b(remind|reminder|alert)\s+(me|us)\b|\bdon'?t (let me )?forget\b|\bset (a |an )?(reminder|alarm|timer)\b|\bremind .* (at|in|on|tomorrow|tonight|later|morning|evening|afternoon)\b/i;
 
+const EVENT_INTENT = /\b(schedule|create|add|set up|make|put)\s+(a |an )?(event|appointment|meeting|hangout|dinner|lunch|brunch|party|gathering)\b|\b(schedule|create|add)\s+(something|this|that|it)\s+(on|for|at)\b/i;
+
 const EIGHTSLEEP_INTENT = /\b(bed|eight\s*sleep|eightsleep|mattress|pod|side)\b.*\b(on|off|warm|cool|cold|hot|temperature|temp|status|level|set|turn|switch)\b|\b(turn|switch)\s+(on|off|up|down)\s+(my\s+|the\s+)?(bed|mattress|pod|side)\b|\bhow\s+(warm|cool|cold|hot)\s+is\s+(my\s+)?(bed|mattress|side|pod)\b|\bhow('s| is) (my )?(bed|mattress|side|pod)\b|\bmake\s+(my\s+)?(bed|side|pod)\s+(warm|cool|cold|hot|cooler|warmer)\b/i;
 
 const CONCERT_PRICE_INTENT = /\b(ticket|tickets|prices?|pricing|how much|cost|cheapest|best deal|best price|stub\s*hub|vivid\s*seats|tick\s*pick|seat\s*geek|ticketmaster|resale|face value|nosebleed|pit|floor seats?|ga tickets?|general admission)\b.*\b(concert|show|tour|festival|gig|perform|event|arena|stadium|venue|live)\b|\b(concert|show|tour|festival|gig|perform|event|arena|stadium|venue|live)\b.*\b(ticket|tickets|prices?|pricing|how much|cost|cheapest|best deal|best price)\b|\b(find|get|check|compare|look up|search|scrape)\b.*\b(ticket|tickets|prices?)\b|\btickets?\s+(for|to)\b|\bprices?\s+(for|to)\b|\bhow much\b.*\btickets?\b|\bticket\s+prices?\b/i;
@@ -119,7 +121,7 @@ function _resolveRemindDatetime(text, timezone) {
     hours = 0;
   }
 
-  if (hours === null) return null;
+  if (hours === null) hours = 10; // default to 10am when no time specified
 
   const dateRange = _extractDateRange(text, timezone);
   const dateStr = dateRange.from;
@@ -403,8 +405,17 @@ async function enrichWithContext(text, senderId, isGroupChat) {
     const multiHint = /\b(both|all|us|everyone|me and|and me)\b/i.test(text)
       ? ' The user wants reminders for MULTIPLE people. Emit one [REMIND:] tag per person, each with a different user_ids value.'
       : '';
-    parts.push(`<system-hint type="reminder">The user wants a reminder set. You MUST emit a [REMIND: title="what" datetime="ISO 8601" duration_minutes=15] tag.${dtHint}${multiHint}</system-hint>`);
+    parts.push(`<system-hint type="reminder">The user wants a reminder set. You MUST emit a [REMIND: title="what" datetime="ISO 8601" duration_minutes=15] tag in your TEXT RESPONSE.${dtHint}${multiHint} Do NOT use Bash, Read, Grep, or any tools — just emit the tag directly in your response text. This is a 1-turn task.</system-hint>`);
     console.log(`[auto-context] REMIND intent detected${resolvedDt ? ` resolved=${resolvedDt}` : ''}`);
+  }
+
+  if (EVENT_INTENT.test(text) && !REMIND_INTENT.test(text)) {
+    const resolvedDt = _resolveRemindDatetime(text, _tz);
+    const dtHint = resolvedDt
+      ? ` The resolved datetime is: ${resolvedDt}. Use this EXACT value for the datetime field — do NOT recalculate.`
+      : ` Use timezone ${_tz}.`;
+    parts.push(`<system-hint type="event">The user wants a calendar event created. You MUST emit an [EVENT: title="name" datetime="ISO" duration_minutes=120 location="venue" description="details" user_ids="sender-id"] tag in your TEXT RESPONSE.${dtHint} Do NOT use Bash, Read, Grep, or any tools — just emit the tag directly in your response text. This is a 1-turn task.</system-hint>`);
+    console.log(`[auto-context] EVENT intent detected${resolvedDt ? ` resolved=${resolvedDt}` : ''}`);
   }
 
   if (EIGHTSLEEP_INTENT.test(text)) {
@@ -417,4 +428,4 @@ async function enrichWithContext(text, senderId, isGroupChat) {
   return parts.join('\n\n') + '\n\n';
 }
 
-module.exports = { enrichWithContext, CALENDAR_INTENT, WEATHER_INTENT, IMAGINE_INTENT, REMIND_INTENT, EIGHTSLEEP_INTENT, CONCERT_PRICE_INTENT };
+module.exports = { enrichWithContext, CALENDAR_INTENT, WEATHER_INTENT, IMAGINE_INTENT, REMIND_INTENT, EVENT_INTENT, EIGHTSLEEP_INTENT, CONCERT_PRICE_INTENT };

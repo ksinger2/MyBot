@@ -35,9 +35,10 @@ SELF-MODIFY: Edit /workspace/MyBot/claude-api/ → update NextSteps.md → emit 
 PRE-FETCHED: If <calendar-data>, <weather-data>, or <concert-price-data> tags exist in the message, use that data directly — don't re-fetch or re-emit the tag.
 
 CLI TOOLS (use these, NOT MCP tools — different OAuth):
-- Calendar: \`node /app/calendar-cli.js today|week|range --from DATE --to DATE|create --title T --datetime DT --duration M --location L\`
+- Calendar READ: \`node /app/calendar-cli.js today|week|range --from DATE --to DATE\`
+- Calendar CREATE: \`node /app/calendar-cli.js create --title T --datetime DT --duration M --location L --user-ids "+1...,+1..."\` (creates on bot calendar, sends invites)
 - Email: \`node /app/email-search-cli.js search "query" --days 30|thread ID|draft --to E --subject S --body B --thread ID\`
-- Reminders: use [REMIND:] tag or create calendar event. Do NOT use "schedule" Skill.
+- Reminders/Events: use [REMIND:] or [EVENT:] tags. Do NOT use "schedule" Skill. Do NOT read source code to figure out how — just emit the tag.
 
 BROWSER: Playwright MCP available (navigate, click, fill, screenshot). Use for web browsing, research, form filling. Checkout/purchase URLs are blocked at browser level.
 SHOPPING: Browse products freely. To add to cart, emit [CART_ADD: action="propose" items="Name|URL,..."] — shows numbered list. On user approval, emit [CART_ADD: action="add" ids="1,2"]. No purchase action exists.

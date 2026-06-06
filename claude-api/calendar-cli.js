@@ -142,38 +142,61 @@ async function listEventsRange(calendar, fromISO, toISO) {
   }
 }
 
-async function createEvent(calendar, args) {
+async function createEvent(_unused, args) {
+  const googleAuth = require('./google-auth');
+  const userTokens = require('./user-tokens');
+
+  // ALL event creation goes through the bot calendar — never the owner's personal calendar
+  const botCalendar = await googleAuth.getBotCalendarClient();
+  if (!botCalendar) {
+    console.error('Bot calendar not connected. Owner must run !botcalendar connect first.');
+    process.exit(1);
+  }
+
   const title = getFlag(args, '--title');
   const datetime = getFlag(args, '--datetime');
   const duration = parseInt(getFlag(args, '--duration', '60'), 10);
   const location = getFlag(args, '--location');
   const description = getFlag(args, '--description');
+  const userIds = getFlag(args, '--user-ids');
 
   if (!title || !datetime) {
-    console.error('Usage: create --title "X" --datetime "ISO" [--duration 60] [--location "X"] [--description "X"]');
+    console.error('Usage: create --title "X" --datetime "ISO" [--duration 60] [--location "X"] [--description "X"] [--user-ids "+1...,+1..."]');
     process.exit(1);
   }
 
   const startTime = new Date(datetime);
   const endTime = new Date(startTime.getTime() + duration * 60 * 1000);
-
   const _eventTz = _resolveTimezone(args);
+
+  // Resolve attendee emails — always include owner
+  const ids = new Set([SIGNAL_OWNER, ...(userIds ? userIds.split(',').map(s => s.trim()) : [])]);
+  const attendees = [];
+  for (const id of ids) {
+    const tok = userTokens.getTokenForSignalUser(id);
+    if (tok?.email) attendees.push({ email: tok.email });
+    else console.warn(`  No email for ${id.slice(0, 8)}... — they won't get an invite`);
+  }
+
   const event = {
     summary: title,
     start: { dateTime: startTime.toISOString(), timeZone: _eventTz },
     end: { dateTime: endTime.toISOString(), timeZone: _eventTz },
+    attendees,
   };
   if (location) event.location = location;
   if (description) event.description = description;
 
-  const res = await calendar.events.insert({
+  const res = await botCalendar.events.insert({
     calendarId: 'primary',
+    sendUpdates: 'all',
     requestBody: event,
   });
 
   console.log(`Event created: "${title}"`);
   console.log(`  When: ${startTime.toLocaleString('en-US', { timeZone: _eventTz })} (${duration}min)`);
   if (location) console.log(`  Where: ${location}`);
+  console.log(`  Attendees: ${attendees.map(a => a.email).join(', ') || 'none'}`);
   console.log(`  ID: ${res.data.id}`);
   console.log(`  Link: ${res.data.htmlLink}`);
 }
