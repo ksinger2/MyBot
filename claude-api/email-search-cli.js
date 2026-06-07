@@ -27,18 +27,18 @@ async function main() {
   }
 
   const googleAuth = require('./google-auth');
-  const gmail = await googleAuth.getGmailClient(SIGNAL_OWNER);
-  if (!gmail) {
-    console.error('Gmail not connected. Run !connect to authorize.');
-    process.exit(1);
-  }
 
-  if (command === 'search') {
-    await searchEmails(gmail, args.slice(1));
-  } else if (command === 'thread') {
-    await readThread(gmail, args[1]);
+  if (command === 'search' || command === 'thread') {
+    // READ operations use owner's Gmail (reading owner's inbox)
+    const gmail = await googleAuth.getGmailClient(SIGNAL_OWNER);
+    if (!gmail) { console.error('Gmail not connected. Run !connect to authorize.'); process.exit(1); }
+    if (command === 'search') await searchEmails(gmail, args.slice(1));
+    else await readThread(gmail, args[1]);
   } else if (command === 'draft') {
-    await createDraft(gmail, args.slice(1));
+    // Drafts always go through the bot's Gmail account
+    const botGmail = await googleAuth.getBotGmailClient();
+    if (!botGmail) { console.error('Bot Gmail not connected. Owner must run !botcalendar connect first.'); process.exit(1); }
+    await createDraft(botGmail, args.slice(1));
   } else {
     console.error(`Unknown command: ${command}`);
     process.exit(1);
