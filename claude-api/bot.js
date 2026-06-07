@@ -1435,7 +1435,8 @@ async function processQueue(state) {
   let _hadFatalError = false;
 
   const queued = state.queue.splice(0);
-  const combined = queued.length === 1
+  const lastQueuedMsg = queued[queued.length - 1];
+  let combined = queued.length === 1
     ? queued[0].content
     : '[Additional messages from user while you were working]\n' + queued.map(q => `- ${q.content}`).join('\n');
 
@@ -1452,6 +1453,16 @@ async function processQueue(state) {
     state.busy = false;
     return;
   }
+
+  // Enrich queued text with auto-context (REMIND/EVENT/CALENDAR hints, pre-fetched data)
+  try {
+    const { enrichWithContext } = require('./auto-context');
+    const qSenderId = lastQueuedMsg.message?.senderId || lastQueuedMsg.message?._senderId;
+    if (qSenderId) {
+      const enriched = await enrichWithContext(combined, qSenderId, !signalChatId.startsWith('+'));
+      if (enriched) combined = enriched + combined;
+    }
+  } catch (e) { console.warn(`[queue] enrichWithContext failed: ${e.message}`); }
 
   const personalityFile = getPersonalityFile(state.personality);
 
@@ -1586,6 +1597,73 @@ async function processQueue(state) {
       }
       state._userStopped = false;
     } else {
+      // Process tags from queued results (REMIND, EVENT, EVENT_JOIN) — same as direct path
+      const _qMsg = lastQueuedMsg.message;
+      if (result.text && _qMsg?.senderId) {
+        try {
+          const remindRe = /\[REMIND:\s*(.+?)\]/gi;
+          const remindMatches = [...(result.text || '').matchAll(remindRe)];
+          if (remindMatches.length > 0) {
+            const http = require('http');
+            const attendeeIds = _resolveRemindAttendees(_qMsg, state);
+            for (const match of remindMatches) {
+              const raw = (match[1] || '').trim();
+              const params = {};
+              raw.replace(/(\w+)="([^"]+)"/g, (_, k, v) => { params[k] = v; });
+              raw.replace(/(\w+)=(\d+)/g, (_, k, v) => { params[k] = v; });
+              if (!params.title || !params.datetime) continue;
+              try {
+                const body = JSON.stringify({
+                  title: params.title, datetime: params.datetime,
+                  duration_minutes: parseInt(params.duration_minutes, 10) || 15,
+                  discord_user_id: _qMsg.senderId, user_id: _qMsg.senderId,
+                  attendee_ids: attendeeIds,
+                });
+                await new Promise((resolve, reject) => {
+                  const req = http.request({ hostname: 'localhost', port: 3400, path: '/remind', method: 'POST',
+                    headers: { 'Content-Type': 'application/json', 'X-Internal-Token': INTERNAL_API_TOKEN, 'Content-Length': Buffer.byteLength(body) }, timeout: 15000,
+                  }, (res) => { let d = ''; res.on('data', c => d += c); res.on('end', () => { try { resolve(JSON.parse(d)); } catch { resolve({ text: d }); } }); });
+                  req.on('error', reject); req.on('timeout', () => { req.destroy(); reject(new Error('timeout')); });
+                  req.write(body); req.end();
+                });
+                console.log(`[remind-tag:queue] ${_qMsg.senderId.slice(0,4)}**** "${params.title.slice(0,40)}" at ${params.datetime}`);
+              } catch (e) { console.warn(`[remind-tag:queue] failed: ${e.message}`); }
+            }
+            result.text = result.text.replace(remindRe, '').trim();
+          }
+
+          const eventRe = /\[EVENT:\s*(.+?)\]/gi;
+          const eventMatches = [...(result.text || '').matchAll(eventRe)];
+          if (eventMatches.length > 0) {
+            const http = require('http');
+            for (const match of eventMatches) {
+              const raw = (match[1] || '').trim();
+              const params = {};
+              raw.replace(/(\w+)="([^"]+)"/g, (_, k, v) => { params[k] = v; });
+              raw.replace(/(\w+)=(\d+)/g, (_, k, v) => { params[k] = v; });
+              if (!params.title || !params.datetime) continue;
+              try {
+                const body = JSON.stringify({
+                  title: params.title, datetime: params.datetime,
+                  duration_minutes: parseInt(params.duration_minutes, 10) || 120,
+                  location: params.location || '', description: params.description || '',
+                  user_ids: _qMsg.senderId, chat_id: signalChatId,
+                });
+                await new Promise((resolve, reject) => {
+                  const req = http.request({ hostname: 'localhost', port: 3400, path: '/event', method: 'POST',
+                    headers: { 'Content-Type': 'application/json', 'X-Internal-Token': INTERNAL_API_TOKEN, 'Content-Length': Buffer.byteLength(body) }, timeout: 15000,
+                  }, (res) => { let d = ''; res.on('data', c => d += c); res.on('end', () => { try { resolve(JSON.parse(d)); } catch { resolve({ text: d }); } }); });
+                  req.on('error', reject); req.on('timeout', () => { req.destroy(); reject(new Error('timeout')); });
+                  req.write(body); req.end();
+                });
+                console.log(`[event-tag:queue] "${params.title.slice(0,40)}" at ${params.datetime}`);
+              } catch (e) { console.warn(`[event-tag:queue] failed: ${e.message}`); }
+            }
+            result.text = result.text.replace(eventRe, '').trim();
+          }
+        } catch (e) { console.warn(`[queue-tags] handler error: ${e.message}`); }
+      }
+
       if (channelId) {
         appendEntry(channelId, {
           cwd: state.cwd,
