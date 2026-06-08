@@ -1,7 +1,7 @@
 # MyBot — Next Steps
 
 ## What's Working
-<!-- Updated each session — 2026-05-31 -->
+<!-- Updated each session — 2026-06-07 -->
 - On-call watchdog (`oncall-watchdog.js`) running every 2min with 8 deterministic health checks:
   1. CLI auth health (escalates after 3 failures, 30min cooldown)
   2. Sandbox credential freshness (auto-refreshes if >5min stale)
@@ -23,7 +23,13 @@
 - `isCommandLike()` utility replaces raw `text.startsWith('!')` checks (supports `/` prefix too)
 - Google auth token reconciliation now cross-references UUID↔phone map for accurate token lookup
 - Concert price scraper now deterministic: `auto-context.js` detects ticket/price intent, extracts artist names, pre-fetches from scraper, injects `<concert-price-data>` into prompt — no tag emission needed from Claude
-- **OAuth token auto-refresh**: `token-refresh.js` does direct OAuth2 refresh via `https://platform.claude.com/v1/oauth/token` — no CLI spawn needed. Syncs from Windows credentials mount as first try, falls back to direct HTTP refresh. Token refreshes every 10min when <2hr remaining.
+- **OAuth token auto-refresh**: `token-refresh.js` does direct OAuth2 refresh via `https://platform.claude.com/v1/oauth/token` — no CLI spawn needed. Syncs from Windows credentials mount as first try, falls back to direct HTTP refresh. Token refreshes every 10min when <2hr remaining. Detects `invalid_grant`/401 (revoked tokens) and suppresses retries for 30min. Deep-merges creds to preserve unknown fields. Uses `??` for refresh_token preservation (not `||`).
+- **All calendar events via bot account**: Every event mutation (create, patch) goes through `getBotCalendarClient()` (`bianca.she.da.cow@gmail.com`). Verified across all 11 mutation paths: calendar-cli.js, /remind, /event, /event/join, calendar-coordinator, and all 6 tag handlers. `getCalendarClient(userId)` only used for READ (list events, freebusy). All null-check paths fail hard with zero fallback to personal calendars.
+- **All email drafts via bot account**: `email-search-cli.js draft` and `/email/draft` endpoint both use `getBotGmailClient()`. Search/thread reads correctly use owner's inbox.
+- **EVENT_INTENT detection**: `auto-context.js` detects "schedule/create/add an event" and injects a system hint telling Claude to emit an `[EVENT:]` tag — prevents the 22-turn code investigation spirals.
+- **Queue path runs tag handlers**: `processQueue` now calls `enrichWithContext()` before Claude (injects REMIND/EVENT hints for queued messages) and runs REMIND/EVENT tag handlers on the result. Previously, queued messages silently dropped all tags.
+- **Deterministic datetime parsing**: `_resolveRemindDatetime()` parses "tomorrow at 2pm" server-side into an ISO string with correct timezone offset. Defaults to 10am when no time specified. Injected into prompt so Claude just fills in the title.
+- **Multi-user reminders**: `_resolveRemindAttendees()` matches names in message against group member profiles (word-boundary matching). All matched users passed as `attendee_ids` to `/remind`, which creates one event with all attendees.
 - **Signal user token cross-referencing**: `getTokenForSignalUser()` in `user-tokens.js` tries phone→UUID and UUID→phone via the UUID map, fixing Merrisa's calendar connection and all Signal user Google integrations
 - **`/calendar/freebusy` endpoint**: New internal API for checking multi-user availability in one call
 - **`!plan` command enhanced**: Accepts event poster images or text, runs 7-step research pipeline (venue, seating, interior photo, ticket prices via concert scraper, calendar check for all group members, parking/transport), stores result server-side for deterministic follow-ups
@@ -43,7 +49,7 @@
 - **Agent guardrails (system prompt)**: Both owner DM and non-owner prompts now explicitly bar self-initiated agent spawning: "ONLY for user-requested multi-step engineering tasks. NEVER for self-initiated investigation, follow-up diagnostics, or curiosity."
 - **Agent fail-fast**: Each sub-agent tracks `consecutiveErrors`. On 3+ consecutive tool errors, `_agentFailFast` flag triggers 2-minute kill thresholds. Post-answer agent spawn cap: 3rd+ agent after answer delivered triggers immediate fail-fast.
 - **Oncall watchdog dedup**: All escalations now route through `sendErrorAlert` for 15-min dedup. Previously, `escalate()` sent direct Signal DMs bypassing dedup — process leak and disk alerts could spam every 2 minutes.
-- **Token refresh efficiency**: Tiered approach — (1) sync Windows credentials (free), (2) `claude -p "ok"` to force SDK through OAuth exchange (triggers actual token refresh). Runs whenever token < 2hr remaining. Queue and direct paths both retry once on auth failure before alerting owner.
+- **Token refresh efficiency**: Tiered approach — (1) sync Windows credentials (free), (2) direct OAuth2 POST to `platform.claude.com/v1/oauth/token` with refresh_token (<1s, no CLI spawn). Runs every 10min when token < 2hr remaining. Queue and direct paths both retry once on auth failure before alerting owner.
 - **Claude CLI pinned**: `CLAUDE_CODE_VERSION: "2.1.143"` in docker-compose.yml (was "latest" — any rebuild could pull breaking changes).
 - **Command context continuity**: Commands (`!product`, `!help`, etc.) now record both the user's command and the bot's reply in `recentMessages`. Follow-up questions ("how much are those?") have full context about what the command found. Implemented via reply/send proxy wrapper in bot.js.
 - **Product query cleaning**: `cleanProductQuery()` strips conversational filler from natural language product requests, extracts store preference (Amazon/Walmart/Target), and preserves brand names. "add a nice and good deal product to my amazon cart that is a planter, 8 ft long" → query: "planter 8 ft long", store: amazon.
@@ -121,7 +127,29 @@
 - **Sandbox provisionAll error**: `_groupLinks` internal entry was iterated as a sandbox user, causing "Failed to provision undefined" error. Fixed by filtering entries to those with `linuxUser` property.
 - **Sandbox spawn EACCES**: `sandboxUser` was never passed through `askClaude()` to the Runner — the destructured parameter list was missing it, so sandbox sessions spawned `claude` directly (not via `sudo/unshare/runuser`), hitting EACCES on the 700 sandbox dir. Fixed by adding `sandboxUser` to `askClaude()` parameter list. Also fixed the spawn cwd: sandbox dirs are 700 so Node's pre-exec chdir fails — now spawns with `cwd: '/tmp'` and `cd`s into the sandbox dir inside the unshare command where root can traverse it.
 
-## Recently Fixed (2026-06-01)
+## Recently Fixed (2026-06-01 → 2026-06-07)
+
+### Queue Path Tag Handlers (2026-06-07)
+- **Critical bug**: `processQueue` never ran `enrichWithContext` (no system hints for queued messages) and never ran tag handlers (REMIND/EVENT tags silently swallowed). Any reminder or event request that arrived while the bot was busy processing another message would appear to work but create nothing.
+- **Fix**: `enrichWithContext()` now runs before Claude in the queue path, and REMIND/EVENT tag handlers run on queued results — matching the direct dispatch path.
+
+### Bot Calendar Enforcement (2026-06-06)
+- **calendar-cli.js create**: Was using `getCalendarClient(SIGNAL_OWNER)` — events went on owner's personal Google Calendar. Now uses `getBotCalendarClient()` exclusively with `sendUpdates: 'all'` for invite emails.
+- **email-search-cli.js draft**: Was using `getGmailClient(SIGNAL_OWNER)` — drafts went to owner's personal Gmail. Now uses `getBotGmailClient()`. Search/thread reads remain on owner's inbox.
+- **EVENT_INTENT detection**: Added `EVENT_INTENT` regex in `auto-context.js` — "schedule/create an event" now triggers a system hint. Previously, only REMIND intent existed, so event requests went into 22-turn code investigation spirals.
+- **Anti-investigation guardrails**: Both REMIND and EVENT system hints now say "Do NOT use Bash, Read, Grep, or any tools — just emit the tag directly. This is a 1-turn task."
+
+### 10 Reliability Fixes from Agent Review (2026-06-02)
+- `channelState` → `state` in REMIND tag handler (was undefined — group attendees silently failed)
+- `||` → `??` for refresh_token preservation (empty string would kill auth permanently)
+- Deep-merge creds instead of rebuilding from scratch (preserves unknown fields)
+- Detect `invalid_grant`/401 — stop retrying for 30min, alert owner immediately
+- `_fmt()` uses local date fields not `toISOString()` (avoids UTC date-shift in Docker)
+- Word-boundary name matching for attendees (prevents "Al" matching "all")
+- Rate-limit only resets `lastActivity`, not output counters (prevents masking stuck sessions)
+- Attachment check moved before prompt guard (attachment-only messages now get "resend file" message)
+- Credential copy catch blocks log warnings instead of swallowing silently
+- `attendee_ids` type validation + `_resolveRemindAttendees` error logging
 
 ### Deterministic Reminders (timezone + multi-user)
 - **Wrong timezone**: `auto-context.js` defaulted to `America/New_York` when user had no profile timezone. System prompt said `America/Los_Angeles`. Claude saw conflicting hints and picked Eastern. Fixed: both defaults now `America/Los_Angeles`. More importantly, datetime is now **parsed server-side** — `_resolveRemindDatetime()` extracts "tomorrow at 2pm" into a resolved ISO string with correct timezone offset, injected into the prompt so Claude just fills in the title.
