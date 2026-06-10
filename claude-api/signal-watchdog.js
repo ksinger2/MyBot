@@ -12,16 +12,19 @@ let lastDataMessageAt = 0;
 let startedAt = 0;
 let consecutiveFailures = 0;
 let lastRestartAt = 0;
-let lastOwnerAlertAt = 0;
+let staleRestartCount = 0;
 
 const HEALTH_CHECK_INTERVAL = 60_000;
 const RESTART_COOLDOWN = 10 * 60_000;
 const MAX_CONSECUTIVE_FAILURES = 5;
 const CONTAINER_NAME = 'mybot-signal-api-1';
-// If HTTP is healthy but no webhook envelopes at all in 60 min, WebSocket is likely dead.
-// Uses webhook activity (any envelope including receipts/read notifications), NOT text
-// messages — 30+ minutes of no texts is normal, but no envelopes at all means dead.
 const STALE_WEBSOCKET_MS = 60 * 60_000;
+// After this many simple restarts fail to restore webhooks, escalate to force-recreate
+const ESCALATE_AFTER_RESTARTS = 2;
+// After force-recreate also fails, alert owner
+const ALERT_AFTER_RESTARTS = 3;
+const OWNER_ALERT_COOLDOWN = 60 * 60_000;
+let lastOwnerAlertAt = 0;
 
 function _readState() {
   try { return JSON.parse(fs.readFileSync(WATCHDOG_STATE_FILE, 'utf-8')); } catch { return {}; }
@@ -35,6 +38,10 @@ function _writeState(patch) {
 
 function recordWebhookActivity() {
   lastWebhookAt = Date.now();
+  if (staleRestartCount > 0) {
+    log(`Webhook activity resumed after ${staleRestartCount} restart(s)`);
+    staleRestartCount = 0;
+  }
 }
 
 function recordDataMessage() {
@@ -62,6 +69,36 @@ async function checkHealth(apiUrl) {
   }
 }
 
+function _alertOwner(message) {
+  const now = Date.now();
+  if (now - lastOwnerAlertAt < OWNER_ALERT_COOLDOWN) return;
+  lastOwnerAlertAt = now;
+  try {
+    const { sendErrorAlert } = require('./error-alerting');
+    sendErrorAlert(message, { source: 'signal-watchdog' });
+  } catch (e) {
+    log(`Owner alert failed: ${e.message}`);
+  }
+}
+
+function _forceRecreateContainer() {
+  const composeDir = process.env.HOST_PROJECT_PATH || '/workspace/MyBot';
+  log(`Force-recreating ${CONTAINER_NAME} via compose (cwd=${composeDir})`);
+  execFile('docker', ['compose', 'up', '-d', '--force-recreate', 'signal-api'], {
+    cwd: composeDir,
+  }, (err) => {
+    if (err) {
+      log(`Compose force-recreate failed: ${err.message} — falling back to rm+start`);
+      execFile('docker', ['rm', '-f', CONTAINER_NAME], (rmErr) => {
+        if (rmErr) { log(`rm -f failed: ${rmErr.message}`); return; }
+        log('Container removed — external watchdog will recreate it');
+      });
+    } else {
+      log('Force-recreate succeeded');
+    }
+  });
+}
+
 function restartContainer(signalAdapter, ownerChatId, reason) {
   const now = Date.now();
   if (now - lastRestartAt < RESTART_COOLDOWN) {
@@ -70,19 +107,27 @@ function restartContainer(signalAdapter, ownerChatId, reason) {
   }
   lastRestartAt = now;
   consecutiveFailures = 0;
+  staleRestartCount++;
 
-  log(`Restarting ${CONTAINER_NAME} — ${reason}`);
-  execFile('docker', ['restart', CONTAINER_NAME], (err, stdout, stderr) => {
+  if (staleRestartCount >= ALERT_AFTER_RESTARTS) {
+    _alertOwner(`Signal bridge dead — ${staleRestartCount} restart attempts failed to restore webhook flow. Bot cannot receive messages.`);
+  }
+
+  if (staleRestartCount > ESCALATE_AFTER_RESTARTS) {
+    log(`${staleRestartCount} restarts failed — escalating to force-recreate`);
+    _forceRecreateContainer();
+    return;
+  }
+
+  log(`Restarting ${CONTAINER_NAME} — ${reason} (attempt ${staleRestartCount})`);
+  execFile('docker', ['restart', CONTAINER_NAME], (err) => {
     if (err) {
       log(`Restart failed: ${err.message}`);
       return;
     }
     log('Restart succeeded');
-
-    lastWebhookAt = Date.now();
-    lastDataMessageAt = Date.now();
-    // No owner notification — bridge restarts are not user-actionable.
-    // Check !health or docker logs for bridge status.
+    // Do NOT reset lastWebhookAt — wait for a real webhook to arrive.
+    // recordWebhookActivity() will clear staleRestartCount when one does.
   });
 }
 
@@ -93,6 +138,7 @@ function startSignalWatchdog(signalAdapter, ownerChatId) {
   lastWebhookAt = Date.now();
   lastDataMessageAt = Date.now();
   consecutiveFailures = 0;
+  staleRestartCount = 0;
   log('Started');
 
   const apiUrl = (signalAdapter && signalAdapter.apiUrl) || 'http://signal-api:8080';
@@ -114,10 +160,6 @@ function startSignalWatchdog(signalAdapter, ownerChatId) {
       return;
     }
 
-    // WebSocket death detection: HTTP is healthy but no webhook envelopes at all
-    // (receipts, read notifications, typing indicators, or text messages).
-    // 30+ minutes of no TEXT messages is totally normal — but no envelopes at all
-    // means the WebSocket is genuinely dead.
     if (healthy && lastWebhookAt > 0) {
       const staleness = Date.now() - lastWebhookAt;
       const uptime = Date.now() - startedAt;
