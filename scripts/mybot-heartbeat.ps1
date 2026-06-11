@@ -85,21 +85,35 @@ function Invoke-WslShutdownAndRecover {
 # Trim log on every run to prevent unbounded growth
 Trim-Log
 
-# -- D: drive presence check (WSL VHDX lives there) ----------------------
-$WslVhdxPath = "D:\WSL\Ubuntu\ext4.vhdx"
+# -- VHDX presence check ---------------------------------------------------
+$WslVhdxPath = "C:\WSL\UbuntuNew\ext4.vhdx"
 if (-not (Test-Path $WslVhdxPath)) {
-    Write-Log "CRITICAL: D:\WSL VHDX not found — USB drive may be disconnected"
-    try {
-        Get-PnpDevice -Class USB -ErrorAction SilentlyContinue |
-            Where-Object { $_.Status -eq 'Error' } |
-            Enable-PnpDevice -Confirm:$false -ErrorAction SilentlyContinue
-    } catch {}
-    Start-Sleep -Seconds 5
-    if (-not (Test-Path $WslVhdxPath)) {
-        Write-Log "FATAL: D: drive still unavailable — skipping recovery (WSL cannot start)"
-        exit 0
+    Write-Log "CRITICAL: WSL VHDX not found at $WslVhdxPath"
+    exit 0
+}
+
+# -- WSL alive check (catches wedged state before health check hangs) ------
+$aliveProc = New-Object System.Diagnostics.Process
+$aliveProc.StartInfo.FileName = "wsl"
+$aliveProc.StartInfo.Arguments = "-d Ubuntu -- echo alive"
+$aliveProc.StartInfo.UseShellExecute = $false
+$aliveProc.StartInfo.RedirectStandardOutput = $true
+$aliveProc.StartInfo.RedirectStandardError = $true
+$aliveProc.StartInfo.CreateNoWindow = $true
+try {
+    $aliveStarted = $aliveProc.Start()
+    if ($aliveStarted) {
+        $aliveExited = $aliveProc.WaitForExit(10000)
+        $aliveOut = if ($aliveExited) { $aliveProc.StandardOutput.ReadToEnd().Trim() } else { "" }
+        if (-not $aliveExited) { try { $aliveProc.Kill() } catch {} }
+        if ($aliveOut -ne "alive") {
+            Write-Log "WSL alive check failed (wedged or stopped) — forcing wsl --shutdown"
+            & wsl --shutdown 2>&1 | Out-Null
+            Start-Sleep -Seconds 10
+        }
     }
-    Write-Log "D: drive recovered after USB re-enumeration"
+} catch {
+    Write-Log "WSL alive check exception: $($_.Exception.Message)"
 }
 
 # -- Disk space check (runs every heartbeat) ------------------------------

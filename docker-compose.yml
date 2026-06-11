@@ -185,6 +185,8 @@ services:
       - LOG_LEVEL=info
     volumes:
       - signal-data:/home/.local/share/signal-cli
+    tmpfs:
+      - /tmp:size=1g
     # No depends_on — both containers come up independently and the signal
     # adapter retries with backoff if signal-api isn't ready yet. Webhook
     # deliveries from signal-api that happen during the brief window before

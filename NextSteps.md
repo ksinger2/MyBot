@@ -1,7 +1,7 @@
 # MyBot — Next Steps
 
 ## What's Working
-<!-- Updated each session — 2026-06-07 -->
+<!-- Updated each session — 2026-06-10 -->
 - On-call watchdog (`oncall-watchdog.js`) running every 2min with 8 deterministic health checks:
   1. CLI auth health (escalates after 3 failures, 30min cooldown)
   2. Sandbox credential freshness (auto-refreshes if >5min stale)
@@ -33,7 +33,7 @@
 - **Signal user token cross-referencing**: `getTokenForSignalUser()` in `user-tokens.js` tries phone→UUID and UUID→phone via the UUID map, fixing Merrisa's calendar connection and all Signal user Google integrations
 - **`/calendar/freebusy` endpoint**: New internal API for checking multi-user availability in one call
 - **`!plan` command enhanced**: Accepts event poster images or text, runs 7-step research pipeline (venue, seating, interior photo, ticket prices via concert scraper, calendar check for all group members, parking/transport), stores result server-side for deterministic follow-ups
-- **WSL stability**: `.wslconfig` has `autoMemoryReclaim=gradual`, WSL vhdx compacted (141GB→56GB), Windows credentials mounted read-only into container
+- **WSL stability**: VHDX migrated from D: USB HDD to C:\WSL\UbuntuNew (internal SSD). `.wslconfig` has `autoMemoryReclaim=gradual`, `sparseVhd=false`. Windows credentials mounted read-only into container
 - **Signal admin role**: `isSignalAdmin()` in `project-permissions.js` — trusted users bypass group mention filters, get owner-like turn caps (75), no tool restrictions in DMs
 - **Progress circuit breaker with agent awareness**: 3 auto-kill triggers with dynamic thresholds. Default: 15 silent turns / 15min no output / 10min stale. Sandbox sessions: turn-count breaker disabled (coding needs unlimited tool calls), time-based only (25min no output / 15min stale). Post-answer agents (answered user >200 chars, then spawned agent): 8 turns / 5min / 5min. Fail-fast (3+ agent errors or spawn cap exceeded): 3 turns / 2min / 2min. Short progress messages (<200 chars) no longer trigger post-answer mode.
 - **Group stall detector**: Separate thresholds (2min thinking, 5min bash), friendly "try again" message instead of diagnostic dumps. `currentTool` now correctly tracks active tool (was always null due to premature clear).
@@ -126,6 +126,25 @@
 - **XSS in setup page**: `server.js` CSRF token injection changed from `escapeHtml()` (insufficient for JS context) to `JSON.stringify()`.
 - **Sandbox provisionAll error**: `_groupLinks` internal entry was iterated as a sandbox user, causing "Failed to provision undefined" error. Fixed by filtering entries to those with `linuxUser` property.
 - **Sandbox spawn EACCES**: `sandboxUser` was never passed through `askClaude()` to the Runner — the destructured parameter list was missing it, so sandbox sessions spawned `claude` directly (not via `sudo/unshare/runuser`), hitting EACCES on the 700 sandbox dir. Fixed by adding `sandboxUser` to `askClaude()` parameter list. Also fixed the spawn cwd: sandbox dirs are 700 so Node's pre-exec chdir fails — now spawns with `cwd: '/tmp'` and `cd`s into the sandbox dir inside the unshare command where root can traverse it.
+
+## Recently Fixed (2026-06-10)
+
+### WSL VHDX Migration: D: USB HDD → C: Internal SSD
+- **Root cause of chronic WSL crashes**: VHDX was on external USB HDD (D:). USB hiccups (power management, cable, hub) caused instant WSL death. USB HDD random I/O was ~50x slower than internal SSD.
+- **Migration**: Exported WSL, cleaned 157GB leaked libsignal temp files + 58GB Docker cruft inside WSL, imported to `C:\WSL\UbuntuNew\ext4.vhdx` (54GB on internal Samsung NVMe SSD).
+- **libsignal temp leak**: signal-cli JVM extracted 143MB native library to /tmp on every restart, never cleaned up. 1,160 leaked copies = 157GB. Fixed with `tmpfs: /tmp:size=1g` in docker-compose.yml signal-api service.
+- **watchdog.sh**: Added signal-api temp cleanup (keeps 2 newest, prunes rest) before container health check.
+- **weekly-maintenance.ps1** (NEW): Docker prune, signal-api temp cleanup, fstrim, VHDX size check. Needs Task Scheduler registration.
+
+### UTF-16 Wedge Detection Bug
+- **Root cause**: `wsl -l -v` outputs UTF-16 text. `findstr /C:"Running"` never matches UTF-16 — watchdog thought WSL was always down, wasted 2+ minutes on unnecessary recovery every cycle.
+- **Fix**: Replaced with `wsl -d Ubuntu -- echo "alive" | findstr /C:"alive"` — direct functional test, immune to encoding issues.
+
+### All Watchdog Scripts Hardened for C: Path
+- `wsl-autostart.bat`: VHDX check, Docker timeout, wedge detection, Docker prune on recovery, explicit `sudo service docker start`
+- `scripts/mybot-heartbeat.ps1`: WSL alive check before health check, simplified VHDX presence check
+- `scripts/disk-space-monitor.ps1`: Removed D: USB logic, simplified to C:\WSL check
+- `.wslconfig`: `sparseVhd=false` (was blocking WSL import)
 
 ## Recently Fixed (2026-06-01 → 2026-06-07)
 
@@ -283,11 +302,11 @@ All 13 audit bugs fixed, code-reviewed by independent agents, and verified with 
 <!-- These are non-negotiable reliability requirements. Do not remove. -->
 
 ### WSL Must Stay Up
-- **VHDX location**: `D:\WSL\Ubuntu\ext4.vhdx` on external USB HDD. If D: disconnects, WSL dies.
+- **VHDX location**: `C:\WSL\UbuntuNew\ext4.vhdx` on internal Samsung NVMe SSD. No USB dependency — eliminates the #1 crash category.
 - **Disk monitoring**: `scripts/disk-space-monitor.ps1` runs every 5min. Auto-cleans at <10GB, aggressive at <5GB.
 - **Watchdog chain**: Task Scheduler (1min) → `wsl-autostart.bat` → `watchdog.sh` inside WSL. Heartbeat (30s) → `mybot-heartbeat.ps1`.
-- **Failure modes covered**: Disk full (auto-cleanup), D: disconnected (USB re-enum), wedged state (force shutdown), HCS timeout (service restart), Docker socket hung (exit code 2), container unhealthy (compose up/rebuild), Windows Update reboot (disabled + AtStartup recovery), memory pressure (.wslconfig limits), log growth (rotation in all scripts).
-- **USB power**: Selective suspend disabled, hard disk sleep disabled. Do NOT re-enable.
+- **Failure modes covered**: Disk full (auto-cleanup), wedged state (force shutdown via alive-echo test), HCS timeout (service restart), Docker socket hung (exit code 2), container unhealthy (compose up/rebuild), Windows Update reboot (disabled + AtStartup recovery), memory pressure (.wslconfig limits), log growth (rotation in all scripts), libsignal temp leak (tmpfs + watchdog cleanup).
+- **Weekly maintenance**: `scripts/weekly-maintenance.ps1` — Docker prune, fstrim, VHDX size monitoring.
 
 ### Cloudflare Tunnels Must Stay Up
 - **Blockbuster tunnel**: PM2 process `cloudflare-tunnel` in `ecosystem.config.js`. Unlimited restarts, HTTP/2 protocol (WSL UDP unreliable). PM2 systemd service waits for `/mnt/c` mount before resurrect.
@@ -299,15 +318,14 @@ All 13 audit bugs fixed, code-reviewed by independent agents, and verified with 
 |------|---------|-----------|
 | `wsl-autostart.bat` | WSL + Docker + PM2 recovery | 1min (Task Scheduler) |
 | `scripts/mybot-heartbeat.ps1` | Health endpoint + disk check | 30s (Task Scheduler) |
-| `watchdog.sh` | Container health + disk monitoring | Called by autostart |
+| `watchdog.sh` | Container health + signal-api temp cleanup | Called by autostart |
 | `scripts/disk-space-monitor.ps1` | Tiered disk cleanup | 5min (Task Scheduler) |
+| `scripts/weekly-maintenance.ps1` | Docker prune + fstrim + VHDX check | Weekly (Task Scheduler) |
 | `scripts/install-pm2-service.sh` | PM2 systemd with mount-wait | One-time install |
 | `~/.wslconfig` | WSL memory/swap/idle config | On WSL boot |
 
 ## Next Steps
-- **Register disk-space-monitor task**: Create a 5min-interval Task Scheduler task running `scripts\disk-space-monitor.ps1` (elevated)
-- **Move Steam games to D:**: Steam Settings → Storage → Add D:\SteamLibrary → Move games (207 GB)
-- **Move Epic Games to D:**: Epic Launcher Settings → Change install to D:\EpicGames → Move games (101 GB)
+- **Register weekly-maintenance task**: Create a weekly Task Scheduler task running `scripts\weekly-maintenance.ps1` (elevated)
 - **Re-invite bot to groups**: Owner must add +15106412088 back to: Girthy Calamenca 2.0, boop, Beep, Testing, ppp (via Signal app → group settings → Add member)
 - **Wire autonomous cost tracking**: Integrate `askClaude` cost reporting into `autonomous.js` so `MAX_DAILY_COST_USD` is enforced
 - **Add autonomous startup hook**: Check `autonomous-state.json` `enabled` flag on container start, restart timer if true

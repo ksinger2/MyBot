@@ -19,7 +19,7 @@ param(
 )
 
 $LogFile = "$env:USERPROFILE\disk-monitor.log"
-$WslVhdxPath = "D:\WSL\Ubuntu\ext4.vhdx"
+$WslVhdxPath = "C:\WSL\UbuntuNew\ext4.vhdx"
 
 function Write-Log {
     param([string]$Message)
@@ -141,19 +141,9 @@ function Invoke-AggressiveCleanup {
 
 Trim-Log
 
-# Check D: drive presence (WSL VHDX lives there)
+# Check VHDX presence (now on C: — no USB dependency)
 if (-not (Test-Path $WslVhdxPath)) {
-    if (-not (Test-Path "D:\")) {
-        Write-Log "CRITICAL: D: drive not mounted — USB may be disconnected"
-        try {
-            Get-PnpDevice -Class USB -ErrorAction SilentlyContinue |
-                Where-Object { $_.Status -eq 'Error' } |
-                Enable-PnpDevice -Confirm:$false -ErrorAction SilentlyContinue
-            Write-Log "Attempted USB re-enumeration"
-        } catch {}
-    } else {
-        Write-Log "CRITICAL: D:\WSL VHDX not found but D: is mounted — path may have changed"
-    }
+    Write-Log "CRITICAL: WSL VHDX not found at $WslVhdxPath"
 }
 
 # Check C: drive free space

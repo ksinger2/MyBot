@@ -51,6 +51,16 @@ fi
 # Prune dangling images on every run (safe, only removes untagged)
 docker image prune -f >/dev/null 2>&1
 
+# ── Signal-api temp cleanup (prevents 150GB+ libsignal leak) ─────
+# signal-cli's JVM extracts a 143MB native lib to /tmp on each restart
+# and never cleans up. With tmpfs in docker-compose this is less critical,
+# but clean up anyway in case tmpfs wasn't configured.
+SIGNAL_TMP_COUNT=$(docker exec mybot-signal-api-1 bash -c 'ls -d /tmp/libsignal* 2>/dev/null | wc -l' 2>/dev/null)
+if [ -n "$SIGNAL_TMP_COUNT" ] && [ "$SIGNAL_TMP_COUNT" -gt 5 ]; then
+    docker exec mybot-signal-api-1 bash -c 'ls -dt /tmp/libsignal* | tail -n +3 | xargs rm -rf' 2>/dev/null
+    log "Cleaned $((SIGNAL_TMP_COUNT - 2)) stale libsignal temp dirs from signal-api"
+fi
+
 # Check if container is running and healthy
 STATUS=$(docker inspect mybot-claude-api-1 --format '{{.State.Status}}' 2>/dev/null)
 HEALTH=$(docker inspect mybot-claude-api-1 --format '{{.State.Health.Status}}' 2>/dev/null)

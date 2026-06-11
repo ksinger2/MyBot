@@ -12,7 +12,9 @@ REM ── Log rotation: keep last 500 lines ───────────�
 powershell -NoProfile -Command "if (Test-Path '%LOG%') { $l = Get-Content '%LOG%'; if ($l.Count -gt 500) { $l | Select-Object -Last 500 | Set-Content '%LOG%' -Encoding utf8 } }"
 
 REM ── Fast path: check if bot is already running ────────────────────────
-wsl -d Ubuntu -- bash -c "docker inspect mybot-claude-api-1 --format '{{.State.Status}}'" 2>nul | findstr /C:"running" >nul
+REM Use timeout to prevent wedged WSL from blocking the check for minutes.
+REM 15s is generous — docker inspect returns in <1s when healthy.
+wsl -d Ubuntu -- bash -c "timeout 10 docker inspect mybot-claude-api-1 --format '{{.State.Status}}' 2>/dev/null" 2>nul | findstr /C:"running" >nul
 if %errorlevel% equ 0 (
     exit /b 0
 )
@@ -20,16 +22,10 @@ if %errorlevel% equ 0 (
 REM ── If we get here, either WSL is dead or the container is not running ─
 echo [%date% %time%] === MyBot watchdog triggered === >> "%LOG%"
 
-REM ── D: drive presence check (WSL VHDX lives on D:\WSL) ─────────────
-if not exist "D:\WSL\Ubuntu\ext4.vhdx" (
-    echo [%date% %time%] CRITICAL: D:\WSL\Ubuntu\ext4.vhdx not found — USB drive may be disconnected >> "%LOG%"
-    powershell -NoProfile -Command "try { Get-PnpDevice -Class USB -ErrorAction SilentlyContinue | Where-Object {$_.Status -eq 'Error'} | Enable-PnpDevice -Confirm:$false -ErrorAction SilentlyContinue } catch {}"
-    timeout /t 10 /nobreak >nul
-    if not exist "D:\WSL\Ubuntu\ext4.vhdx" (
-        echo [%date% %time%] FATAL: D: drive still not available after USB re-enumeration >> "%LOG%"
-        exit /b 1
-    )
-    echo [%date% %time%] D: drive recovered after USB re-enumeration >> "%LOG%"
+REM ── VHDX presence check (WSL VHDX now lives on C:\WSL) ─────────────
+if not exist "C:\WSL\UbuntuNew\ext4.vhdx" (
+    echo [%date% %time%] CRITICAL: C:\WSL\UbuntuNew\ext4.vhdx not found >> "%LOG%"
+    exit /b 1
 )
 
 REM ── Disk space pre-check ────────────────────────────────────────────
@@ -46,15 +42,15 @@ if %errorlevel% neq 0 (
 )
 
 REM ── Wedged state detection ──────────────────────────────────────────
-wsl -l -v 2>nul | findstr /C:"Running" >nul
-if %errorlevel% equ 0 (
-    wsl -d Ubuntu -- echo "alive" 2>nul | findstr /C:"alive" >nul
-    if !errorlevel! neq 0 (
-        echo [%date% %time%] WSL reports Running but commands fail — wedged state detected >> "%LOG%"
-        echo [%date% %time%] Forcing wsl --shutdown to clear wedged state >> "%LOG%"
-        wsl --shutdown >> "%LOG%" 2>&1
-        timeout /t 15 /nobreak >nul
-    )
+REM Previous approach used `wsl -l -v | findstr "Running"` but that never
+REM matched because wsl -l outputs UTF-16 which findstr can't parse.
+REM New approach: directly test if WSL responds. If the echo fails, WSL is
+REM either stopped or wedged — either way, wsl --shutdown clears it safely.
+wsl -d Ubuntu -- echo "alive" 2>nul | findstr /C:"alive" >nul
+if !errorlevel! neq 0 (
+    echo [%date% %time%] WSL command test failed — clearing wedged state via wsl --shutdown >> "%LOG%"
+    wsl --shutdown >> "%LOG%" 2>&1
+    timeout /t 15 /nobreak >nul
 )
 
 REM ── Attempt 1: Normal boot ───────────────────────────────────────────
@@ -96,6 +92,12 @@ echo [%date% %time%] === MyBot watchdog finished (FAILED) === >> "%LOG%"
 exit /b 1
 
 :docker_ok
+REM ── Quick Docker cleanup on recovery (prevents VHDX bloat) ─────────
+wsl -d Ubuntu -- bash -c "docker image prune -f >/dev/null 2>&1"
+
+REM ── Ensure Docker service is started ────────────────────────────────
+wsl -d Ubuntu -- bash -c "sudo service docker start >/dev/null 2>&1"
+
 REM ── Run watchdog.sh with retry loop ──────────────────────────────────
 set ATTEMPTS=0
 set MAX_ATTEMPTS=3
@@ -172,6 +174,10 @@ echo [%date% %time%] Ensuring WSL is running... >> "%LOG%"
 wsl -d Ubuntu -- echo "WSL up" >> "%LOG%" 2>&1
 echo [%date% %time%] WSL boot complete >> "%LOG%"
 
+REM Explicitly start Docker — systemd sometimes fails on WSL boot
+REM ("Failed to start the systemd user session" seen in logs)
+wsl -d Ubuntu -- bash -c "sudo service docker start >/dev/null 2>&1"
+
 echo [%date% %time%] Waiting for Docker daemon... >> "%LOG%"
 for /L %%i in (1,1,24) do (
     if !DOCKER_READY! equ 0 (
@@ -180,6 +186,11 @@ for /L %%i in (1,1,24) do (
             set DOCKER_READY=1
             echo [%date% %time%] Docker ready after %%i checks >> "%LOG%"
         ) else (
+            REM Retry Docker service start every 3rd check
+            set /a MOD=%%i %% 3
+            if !MOD! equ 0 (
+                wsl -d Ubuntu -- bash -c "sudo service docker start >/dev/null 2>&1"
+            )
             timeout /t 5 /nobreak >nul
         )
     )
