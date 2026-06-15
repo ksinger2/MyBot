@@ -1,7 +1,7 @@
 # MyBot — Next Steps
 
 ## What's Working
-<!-- Updated each session — 2026-06-10 -->
+<!-- Updated each session — 2026-06-14 -->
 - On-call watchdog (`oncall-watchdog.js`) running every 2min with 8 deterministic health checks:
   1. CLI auth health (escalates after 3 failures, 30min cooldown)
   2. Sandbox credential freshness (auto-refreshes if >5min stale)
@@ -126,6 +126,23 @@
 - **XSS in setup page**: `server.js` CSRF token injection changed from `escapeHtml()` (insufficient for JS context) to `JSON.stringify()`.
 - **Sandbox provisionAll error**: `_groupLinks` internal entry was iterated as a sandbox user, causing "Failed to provision undefined" error. Fixed by filtering entries to those with `linuxUser` property.
 - **Sandbox spawn EACCES**: `sandboxUser` was never passed through `askClaude()` to the Runner — the destructured parameter list was missing it, so sandbox sessions spawned `claude` directly (not via `sudo/unshare/runuser`), hitting EACCES on the 700 sandbox dir. Fixed by adding `sandboxUser` to `askClaude()` parameter list. Also fixed the spawn cwd: sandbox dirs are 700 so Node's pre-exec chdir fails — now spawns with `cwd: '/tmp'` and `cd`s into the sandbox dir inside the unshare command where root can traverse it.
+
+## Recently Fixed (2026-06-14)
+
+### Signal Re-Registration on New Number
+- **Root cause**: 19h downtime (kernel crash + VHDX migration + Windows Update reboot + Task Scheduler WSL limitation) caused Signal account +15106412088 to lose registration. Original temp number no longer accessible.
+- **New number**: +15105191582 registered and verified on fresh Docker volume.
+- **`docker exec` user bug**: All early registration attempts wrote account data to `/root/.local/share/signal-cli/` (root's home) instead of `/home/.local/share/signal-cli/` (daemon's config path). Fix: `docker exec -u signal-api` with explicit `-c /home/.local/share/signal-cli/`.
+- **Poison message NPE**: Failed registration attempts left undecryptable messages in Signal's server-side queue. signal-cli 0.14.1 crashed with `getServerGuid(...) must not be null` NPE in `retryFailedReceivedMessages`, killing the receive thread permanently.
+- **Fix**: Upgraded `bbernhard/signal-cli-rest-api` from 0.98 → 0.100 (signal-cli 0.14.1 → 0.14.5). NPE fixed upstream.
+- **tmpfs exec fix**: Docker tmpfs defaults to `noexec` — JVM couldn't mmap `libsignal_jni_amd64.so` from `/tmp`. Changed `- /tmp:size=1g` → `- /tmp:size=1g,exec` in docker-compose.yml.
+- **Files changed**: `.env` (SIGNAL_PHONE_NUMBER), `docker-compose.yml` (image tag + tmpfs), `claude-api/tests/e2e-signal-test.js` (hardcoded BOT_PHONE).
+- **Permissions unaffected**: All access control (owner, admin, sandbox, email) is env-var based, keyed by sender phone number — not tied to bot number.
+- **Groups need re-invite**: Owner must add +15105191582 to all Signal groups manually.
+
+### Windows Update Auto-Reboot Disabled
+- **Root cause**: Windows Update's `MoUsoCoreWorker.exe` force-rebooted the machine at 3:29am, killing WSL and all containers. Task Scheduler AtStartup recovery requires a logged-in user (WSL limitation), so the bot stayed down until manual login.
+- **Fix**: `scripts/disable-auto-reboot.ps1` — sets `NoAutoUpdate=1`, `NoAutoRebootWithLoggedOnUsers=1`, `AUOptions=2` (notify only) in registry. Active hours 0-23. Disables `UsoSvc` and `WaaSMedicSvc` services. Defender definitions still update manually.
 
 ## Recently Fixed (2026-06-10)
 
@@ -272,7 +289,7 @@
 
 ## What's Broken / In Progress
 <!-- Active issues, blockers, half-done work -->
-- **Group membership lost after container recreation**: Bot (+15106412088) is listed as "PENDING" in test groups (boop, Beep, Testing, ppp) and "NOT IN" for Girthy Calamenca 2.0. The signal-cli REST API v0.98 has no endpoint to accept pending invites programmatically. Fix: owner must re-invite bot to those groups via Signal app.
+- **Group membership lost after number change**: Bot number changed from +15106412088 → +15105191582 (2026-06-14). New number needs to be re-invited to all Signal groups (Girthy Calamenca 2.0, boop, Beep, Testing, ppp). The signal-cli REST API has no endpoint to accept pending invites programmatically — owner must re-invite via Signal app.
 - **No unified notification bus**: 7 independent systems can send unsolicited messages to owner (signal-watchdog, token-refresh, oncall-watchdog, error-alerting, bot.js startup, briefings, monitor-runner). No quiet hours, no consolidation.
 - **`autonomous.js` cost tracking not wired**: `MAX_DAILY_COST_USD` declared but `costToday` is always 0 — needs integration with `askClaude` cost reporting.
 - **`autonomous.js` timer doesn't survive rebuilds**: `_autonomousTimer` is in-memory. After rebuild, `enabled: true` persists on disk but timer is gone. Needs startup hook to restart if enabled.
@@ -305,7 +322,7 @@ All 13 audit bugs fixed, code-reviewed by independent agents, and verified with 
 - **VHDX location**: `C:\WSL\UbuntuNew\ext4.vhdx` on internal Samsung NVMe SSD. No USB dependency — eliminates the #1 crash category.
 - **Disk monitoring**: `scripts/disk-space-monitor.ps1` runs every 5min. Auto-cleans at <10GB, aggressive at <5GB.
 - **Watchdog chain**: Task Scheduler (1min) → `wsl-autostart.bat` → `watchdog.sh` inside WSL. Heartbeat (30s) → `mybot-heartbeat.ps1`.
-- **Failure modes covered**: Disk full (auto-cleanup), wedged state (force shutdown via alive-echo test), HCS timeout (service restart), Docker socket hung (exit code 2), container unhealthy (compose up/rebuild), Windows Update reboot (disabled + AtStartup recovery), memory pressure (.wslconfig limits), log growth (rotation in all scripts), libsignal temp leak (tmpfs + watchdog cleanup).
+- **Failure modes covered**: Disk full (auto-cleanup), wedged state (force shutdown via alive-echo test), HCS timeout (service restart), Docker socket hung (exit code 2), container unhealthy (compose up/rebuild), Windows Update reboot (registry-disabled via `scripts/disable-auto-reboot.ps1` + AtStartup recovery), memory pressure (.wslconfig limits), log growth (rotation in all scripts), libsignal temp leak (tmpfs + watchdog cleanup).
 - **Weekly maintenance**: `scripts/weekly-maintenance.ps1` — Docker prune, fstrim, VHDX size monitoring.
 
 ### Cloudflare Tunnels Must Stay Up
@@ -321,12 +338,13 @@ All 13 audit bugs fixed, code-reviewed by independent agents, and verified with 
 | `watchdog.sh` | Container health + signal-api temp cleanup | Called by autostart |
 | `scripts/disk-space-monitor.ps1` | Tiered disk cleanup | 5min (Task Scheduler) |
 | `scripts/weekly-maintenance.ps1` | Docker prune + fstrim + VHDX check | Weekly (Task Scheduler) |
+| `scripts/disable-auto-reboot.ps1` | Disable Windows Update auto-reboot | One-time (run as admin) |
 | `scripts/install-pm2-service.sh` | PM2 systemd with mount-wait | One-time install |
 | `~/.wslconfig` | WSL memory/swap/idle config | On WSL boot |
 
 ## Next Steps
 - **Register weekly-maintenance task**: Create a weekly Task Scheduler task running `scripts\weekly-maintenance.ps1` (elevated)
-- **Re-invite bot to groups**: Owner must add +15106412088 back to: Girthy Calamenca 2.0, boop, Beep, Testing, ppp (via Signal app → group settings → Add member)
+- **Re-invite bot to groups**: Owner must add +15105191582 to: Girthy Calamenca 2.0, boop, Beep, Testing, ppp (via Signal app → group settings → Add member)
 - **Wire autonomous cost tracking**: Integrate `askClaude` cost reporting into `autonomous.js` so `MAX_DAILY_COST_USD` is enforced
 - **Add autonomous startup hook**: Check `autonomous-state.json` `enabled` flag on container start, restart timer if true
 - **Build NotificationManager**: Unified notification bus with severity levels, dedup, quiet hours. Replace 7 direct notification paths.

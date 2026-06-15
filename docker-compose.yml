@@ -156,10 +156,10 @@ services:
   #   docker compose exec signal-api curl -X POST 'http://localhost:8080/v1/register/+1YOURNUMBER'
   #   docker compose exec signal-api curl -X POST 'http://localhost:8080/v1/register/+1YOURNUMBER/verify/CODE'
   signal-api:
-    # Pinned 2026-04-11 to 0.98 to avoid silent supply-chain drift on rebuild.
+    # Pinned to 0.100 (signal-cli 0.14.5). Bumped from 0.98 on 2026-06-14 to fix
+    # NPE in retryFailedReceivedMessages that killed the receive thread.
     # To bump: check https://hub.docker.com/r/bbernhard/signal-cli-rest-api/tags
-    # for the latest stable, update the tag, and `docker compose up -d --build signal-api`.
-    image: bbernhard/signal-cli-rest-api:0.98
+    image: bbernhard/signal-cli-rest-api:0.100
     restart: unless-stopped
     # No autoheal label — signal-api's JVM takes 30-60s to start, and autoheal
     # restarts trigger a stale /etc/group.lock crash loop. restart:unless-stopped
@@ -186,7 +186,7 @@ services:
     volumes:
       - signal-data:/home/.local/share/signal-cli
     tmpfs:
-      - /tmp:size=1g
+      - /tmp:size=1g,exec
     # No depends_on — both containers come up independently and the signal
     # adapter retries with backoff if signal-api isn't ready yet. Webhook
     # deliveries from signal-api that happen during the brief window before

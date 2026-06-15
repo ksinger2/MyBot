@@ -45,7 +45,7 @@ const CONTAINER_SERVICE = 'claude-api';
 
 // Test identities
 const OWNER_PHONE = '+16315214787';
-const BOT_PHONE = '+15106412088';
+const BOT_PHONE = '+15105191582';
 const SANDBOX_USER_UUID = '59237aa4-ee2e-4f5b-a651-07457c4e4ba7'; // Daniel
 const SANDBOX_USER_UUID_LEE = 'b6f36d70-3ae5-4dd3-9db5-9c464b8807a0';
 
