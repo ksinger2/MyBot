@@ -82,6 +82,14 @@ function _deregisterProcess(pid) {
     console.log(`[registry] deregistered pid=${pid} (${_processRegistry.size} active)`);
   }
 }
+setInterval(() => {
+  for (const [pid, info] of _processRegistry) {
+    if (info.child && info.child.exitCode !== null) {
+      _processRegistry.delete(pid);
+      console.log(`[registry] reaped dead pid=${pid} (${_processRegistry.size} active)`);
+    }
+  }
+}, 30 * 1000).unref();
 
 // ── Priority Semaphore — caps simultaneous Claude CLI processes.
 // Owner gets priority: can evict oldest non-owner if at capacity.
@@ -405,6 +413,9 @@ class Runner {
     this.sessionId = sessionId;
     this.personalityFile = personalityFile;
     this.identity = identity;
+    if (!/^\/[a-zA-Z0-9._\/-]+$/.test(cwd)) {
+      throw new Error(`Invalid cwd path: ${cwd}`);
+    }
     this.cwd = cwd;
     // Owner DM mode intentionally passes maxTurns=null and uses a very high
     // ceiling so Claude runs to natural completion. Everyone else uses the
@@ -679,7 +690,9 @@ class Runner {
             ? (this.sandboxUser.cloudflareToken || process.env.CLOUDFLARE_API_TOKEN || '')
             : (process.env.CLOUDFLARE_API_TOKEN || ''),
           CLOUDFLARE_ACCOUNT_ID: process.env.CLOUDFLARE_ACCOUNT_ID || '',
-          TOKEN_ENCRYPTION_KEY: process.env.TOKEN_ENCRYPTION_KEY || '',
+          // TOKEN_ENCRYPTION_KEY intentionally excluded — Claude CLI never needs
+          // the at-rest encryption key, and exposing it via env widens the blast
+          // radius if a session is compromised via prompt injection.
         },
         stdio: ['ignore', 'pipe', 'pipe'],
       };
@@ -718,8 +731,8 @@ class Runner {
           child = spawn('sudo', [
             '-E', '/usr/bin/unshare', '--mount', '--',
             '/bin/sh', '-c',
-            'mount -t tmpfs -o size=4k,mode=000 tmpfs /workspace && mount -t tmpfs -o size=4k,mode=000 tmpfs /host && cd ' + cwd + ' && exec runuser -u ' + sandboxLinuxUser + ' -- "$@"',
-            'sandbox', // $0 placeholder for sh -c
+            'mount -t tmpfs -o size=4k,mode=000 tmpfs /workspace && mount -t tmpfs -o size=4k,mode=000 tmpfs /host && cd "$1" && SBU="$2" && shift 2 && exec runuser -u "$SBU" -- "$@"',
+            'sh', cwd, sandboxLinuxUser,
             'claude', ...args,
           ], sandboxSpawnOpts);
         } else {

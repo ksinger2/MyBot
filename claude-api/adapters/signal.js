@@ -262,17 +262,13 @@ class SignalAdapter extends MessagePlatform {
       if (typeof this._contactRefreshTimer.unref === 'function') this._contactRefreshTimer.unref();
     }
 
-    // Start inbound message ingestion. In webhook mode the signal-api container
-    // POSTs every incoming envelope to /signal/webhook in claude-api, so polling
-    // is unnecessary (and would fail anyway — /v1/receive returns "Not implemented"
-    // in MODE=json-rpc).
+    // Start inbound message ingestion via WebSocket. In json-rpc mode, signal-api
+    // does NOT forward envelopes to RECEIVE_WEBHOOK_URL (despite the env var being
+    // set). The only reliable inbound path is a WebSocket client connecting to
+    // /v1/receive/{number}. Falls back to webhook-only if WS fails repeatedly.
     this._stopping = false;
-    if (this.useWebhook) {
-      console.log(`[signal] Webhook mode — not polling. Inbound arrives at /signal/webhook for ${_redactPhone(this.phoneNumber)} (${Object.keys(this._uuidMap.byUuid).length} contacts mapped)`);
-    } else {
-      this._poll();
-      console.log(`[signal] Adapter started — polling every ${this.pollInterval}ms for ${_redactPhone(this.phoneNumber)} (${Object.keys(this._uuidMap.byUuid).length} contacts mapped)`);
-    }
+    this._startWebSocket();
+    console.log(`[signal] WebSocket receive mode for ${_redactPhone(this.phoneNumber)} (${Object.keys(this._uuidMap.byUuid).length} contacts mapped)`);
     this.ready = true;
     this.emit('ready');
   }
@@ -282,6 +278,14 @@ class SignalAdapter extends MessagePlatform {
     if (this._pollTimer) {
       clearTimeout(this._pollTimer);
       this._pollTimer = null;
+    }
+    if (this._wsReconnectTimer) {
+      clearTimeout(this._wsReconnectTimer);
+      this._wsReconnectTimer = null;
+    }
+    if (this._ws) {
+      this._ws.close();
+      this._ws = null;
     }
     if (this._cleanupTimer) {
       clearInterval(this._cleanupTimer);
@@ -390,8 +394,8 @@ class SignalAdapter extends MessagePlatform {
     const names = [...nameMap.keys()].sort((a, b) => b.length - a.length);
 
     for (const name of names) {
+      if (name.length > 100) continue;
       const { uuid } = nameMap.get(name);
-      // Case-insensitive search for @Name (word boundary after @)
       const re = new RegExp(`@(${name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')})(?=[^a-zA-Z]|$)`, 'gi');
       let match;
       // Collect all match positions first (re-scan after each replacement shifts offsets)
@@ -635,6 +639,43 @@ class SignalAdapter extends MessagePlatform {
 
   // --- Internal methods ---
 
+  _startWebSocket() {
+    if (this._stopping) return;
+    const WebSocket = require('ws');
+    const wsUrl = this.apiUrl.replace(/^http/, 'ws') +
+      `/v1/receive/${encodeURIComponent(this.phoneNumber)}`;
+    console.log(`[signal] Connecting WebSocket to ${wsUrl.replace(/\+\d{5,}/, '+***')}`);
+    const ws = new WebSocket(wsUrl);
+    this._ws = ws;
+
+    ws.on('open', () => {
+      console.log('[signal] WebSocket connected — receiving envelopes');
+      this._wsBackoff = 0;
+    });
+
+    ws.on('message', (data) => {
+      try {
+        const envelope = JSON.parse(data.toString());
+        this._handleIncoming(envelope);
+        try { require('../signal-watchdog').recordWebhookActivity(); } catch {}
+      } catch (e) {
+        console.warn(`[signal] WebSocket parse error: ${e.message}`);
+      }
+    });
+
+    ws.on('close', (code) => {
+      if (this._stopping) return;
+      this._wsBackoff = Math.min((this._wsBackoff || 1000) * 2, 30000);
+      console.log(`[signal] WebSocket closed (code=${code}), reconnecting in ${this._wsBackoff}ms`);
+      this._wsReconnectTimer = setTimeout(() => this._startWebSocket(), this._wsBackoff);
+    });
+
+    ws.on('error', (err) => {
+      console.warn(`[signal] WebSocket error: ${err.message}`);
+      // 'close' event fires after 'error', reconnect handled there
+    });
+  }
+
   async _poll() {
     if (this._stopping) return;
 
@@ -820,8 +861,8 @@ class SignalAdapter extends MessagePlatform {
   _toPublicGroupId(internalId) {
     const cached = this._groups.get(internalId);
     if (cached?.publicId) return cached.publicId;
-    // Fresh wrap — works even before _loadGroups has populated the cache.
-    return 'group.' + Buffer.from(internalId, 'utf-8').toString('base64');
+    // internalId is already base64 from signal-cli — just prefix it.
+    return 'group.' + internalId;
   }
 
   /**
@@ -1019,8 +1060,6 @@ class SignalAdapter extends MessagePlatform {
       if (wasNew) {
         _persistUuidMap(this._uuidMap);
         console.log(`[signal] Learned UUID→phone: ${_redactUuid(senderUuid)} → ${_redactPhone(envelope.sourceNumber)}`);
-      } else {
-        _persistUuidMap(this._uuidMap); // refresh lastSeen on disk
       }
     }
     // Even when envelope.sourceNumber is absent (newer Signal clients omit it),

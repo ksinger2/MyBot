@@ -275,8 +275,8 @@ function extractFlightTag(text) {
   while ((match = re.exec(text)) !== null) {
     const body = match[1];
     const get = (key) => {
-      // Match key=value where value can be quoted or unquoted
-      const m = body.match(new RegExp(`${key}=(?:"([^"]+)"|([^\\s\\]]+))`));
+      const escaped = key.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      const m = body.match(new RegExp(`${escaped}=(?:"([^"]+)"|([^\\s\\]]+))`));
       return m ? (m[1] || m[2] || null) : null;
     };
     flights.push({

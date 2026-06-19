@@ -82,17 +82,19 @@ function _alertOwner(message) {
 }
 
 function _forceRecreateContainer() {
-  const composeDir = process.env.HOST_PROJECT_PATH || '/workspace/MyBot';
+  // Use the container-internal mount path, NOT HOST_PROJECT_PATH (which is a
+  // host filesystem path that doesn't exist inside this container — execFile
+  // throws ENOENT on a missing cwd, which previously cascaded into rm -f
+  // permanently deleting signal-api with no way to recreate it).
+  const composeDir = '/workspace/MyBot';
   log(`Force-recreating ${CONTAINER_NAME} via compose (cwd=${composeDir})`);
-  execFile('docker', ['compose', 'up', '-d', '--force-recreate', 'signal-api'], {
+  execFile('docker', ['compose', '--profile', 'signal', 'up', '-d', '--force-recreate', 'signal-api'], {
     cwd: composeDir,
   }, (err) => {
     if (err) {
-      log(`Compose force-recreate failed: ${err.message} — falling back to rm+start`);
-      execFile('docker', ['rm', '-f', CONTAINER_NAME], (rmErr) => {
-        if (rmErr) { log(`rm -f failed: ${rmErr.message}`); return; }
-        log('Container removed — external watchdog will recreate it');
-      });
+      log(`Compose force-recreate failed: ${err.message} — will retry on next cycle`);
+      // Do NOT rm -f — removing the container with no way to recreate it from
+      // inside makes recovery impossible. External watchdog.sh handles this.
     } else {
       log('Force-recreate succeeded');
     }
@@ -108,6 +110,15 @@ function restartContainer(signalAdapter, ownerChatId, reason) {
   lastRestartAt = now;
   consecutiveFailures = 0;
   staleRestartCount++;
+
+  // Cap restarts for stale WebSocket at 3. Beyond that, the WebSocket is
+  // likely fine — just nobody texting. Without this cap, quiet periods
+  // (no inbound messages for hours) trigger infinite restart+alert loops.
+  // HTTP-failure restarts are uncapped since those indicate a real problem.
+  if (reason !== 'HTTP unresponsive' && staleRestartCount > 3) {
+    log(`Stale-restart cap reached (${staleRestartCount}) — suppressing further restarts until webhook activity or HTTP failure`);
+    return;
+  }
 
   if (staleRestartCount >= ALERT_AFTER_RESTARTS) {
     _alertOwner(`Signal bridge dead — ${staleRestartCount} restart attempts failed to restore webhook flow. Bot cannot receive messages.`);
@@ -135,8 +146,8 @@ function startSignalWatchdog(signalAdapter, ownerChatId) {
   if (watchdogInterval) return;
 
   startedAt = Date.now();
-  lastWebhookAt = Date.now();
-  lastDataMessageAt = Date.now();
+  lastWebhookAt = 0;
+  lastDataMessageAt = 0;
   consecutiveFailures = 0;
   staleRestartCount = 0;
   log('Started');
@@ -160,12 +171,19 @@ function startSignalWatchdog(signalAdapter, ownerChatId) {
       return;
     }
 
-    if (healthy && lastWebhookAt > 0) {
-      const staleness = Date.now() - lastWebhookAt;
+    if (healthy) {
       const uptime = Date.now() - startedAt;
-      if (uptime > 10 * 60_000 && staleness > STALE_WEBSOCKET_MS) {
-        log(`No webhook envelopes in ${Math.round(staleness / 60_000)}min — WebSocket likely dead`);
-        restartContainer(signalAdapter, ownerChatId, 'no webhook envelopes in 60min');
+      if (uptime > STALE_WEBSOCKET_MS) {
+        if (lastWebhookAt === 0) {
+          log(`No webhook envelopes received since startup (${Math.round(uptime / 60_000)}min) — WebSocket likely dead`);
+          restartContainer(signalAdapter, ownerChatId, 'no webhook envelopes since startup');
+        } else {
+          const staleness = Date.now() - lastWebhookAt;
+          if (staleness > STALE_WEBSOCKET_MS) {
+            log(`No webhook envelopes in ${Math.round(staleness / 60_000)}min — WebSocket likely dead`);
+            restartContainer(signalAdapter, ownerChatId, 'no webhook envelopes in 60min');
+          }
+        }
       }
     }
   }, HEALTH_CHECK_INTERVAL);

@@ -66,8 +66,8 @@ module.exports = {
 
       let publicIp = null;
       try {
-        const { execSync } = require('child_process');
-        publicIp = execSync('curl -sf --max-time 5 https://api.ipify.org', { encoding: 'utf8' }).trim();
+        const resp = await fetch('https://api.ipify.org', { signal: AbortSignal.timeout(5000) });
+        publicIp = (await resp.text()).trim();
       } catch {}
 
       const tunnel = spawn('cloudflared', ['tunnel', '--url', `http://localhost:${previewPort}`], {

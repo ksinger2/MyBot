@@ -164,6 +164,8 @@ function safeTokenEqual(a, b) {
   return a.length === b.length && crypto.timingSafeEqual(bufA, bufB);
 }
 
+const MAX_BUF = 2 * 1024 * 1024;
+
 // F14: hard-cap helper for in-memory maps. Evicts oldest entries (FIFO via
 // insertion order) when the map exceeds maxSize. Rate-limited warning log.
 function _capMap(map, maxSize, label) {
@@ -265,14 +267,14 @@ app.post('/ask', requireInternalToken, (req, res) => {
 
   let stdout = '';
   let stderr = '';
-  child.stdout.on('data', (d) => { stdout += d; });
-  child.stderr.on('data', (d) => { stderr += d; });
+  child.stdout.on('data', (d) => { if (stdout.length < MAX_BUF) stdout += d; });
+  child.stderr.on('data', (d) => { if (stderr.length < MAX_BUF) stderr += d; });
 
   let timedOut = false;
   const timeout = setTimeout(() => {
     timedOut = true;
     child.kill();
-    res.status(504).json({ error: 'Claude CLI timed out' });
+    if (!res.headersSent) res.status(504).json({ error: 'Claude CLI timed out' });
   }, 120000);
 
   child.on('close', (code) => {
@@ -298,18 +300,33 @@ app.post('/ask', requireInternalToken, (req, res) => {
 app.post('/test', requireInternalToken, async (req, res) => {
   const { cwd } = req.body;
   const testDir = cwd || '/app';
+  if (!/^\/[a-zA-Z0-9._\/-]+$/.test(testDir)) {
+    return res.status(400).json({ error: 'Invalid cwd path' });
+  }
 
-  const child = spawn('node', ['--test', 'tests/*.test.js'], {
+  let testFiles;
+  try {
+    const testPath = path.join(testDir, 'tests');
+    testFiles = fs.readdirSync(testPath).filter(f => f.endsWith('.test.js')).map(f => path.join('tests', f));
+  } catch {
+    testFiles = ['tests/'];
+  }
+
+  const child = spawn('node', ['--test', ...testFiles], {
     cwd: testDir,
-    env: { ...process.env, NODE_ENV: 'test' },
+    env: {
+      NODE_ENV: 'test',
+      PATH: process.env.PATH,
+      HOME: process.env.HOME,
+      LANG: process.env.LANG || 'en_US.UTF-8',
+    },
     stdio: ['ignore', 'pipe', 'pipe'],
-    shell: true,
   });
 
   let stdout = '';
   let stderr = '';
-  child.stdout.on('data', (d) => { stdout += d; });
-  child.stderr.on('data', (d) => { stderr += d; });
+  child.stdout.on('data', (d) => { if (stdout.length < MAX_BUF) stdout += d; });
+  child.stderr.on('data', (d) => { if (stderr.length < MAX_BUF) stderr += d; });
 
   let timedOut = false;
   const timeout = setTimeout(() => {
@@ -620,6 +637,7 @@ app.post('/event', requireInternalToken, async (req, res) => {
 
   // Store as pending event for the group so "I'm in" works later
   if (chat_id) {
+    _capMap(_pendingGroupEvents, 500, '_pendingGroupEvents');
     _pendingGroupEvents.set(chat_id, {
       title,
       datetime: startTime.toISOString(),
@@ -1141,6 +1159,7 @@ input[type=file]{display:none}
 <div id="files"></div>
 <script>
 const DEBUG_TOKEN=${JSON.stringify(debugToken)};
+function escH(s){const d=document.createElement('div');d.textContent=s;return d.innerHTML;}
 const drop=document.getElementById('drop'),picker=document.getElementById('picker'),filesDiv=document.getElementById('files');
 ['dragenter','dragover'].forEach(e=>drop.addEventListener(e,ev=>{ev.preventDefault();drop.classList.add('over')}));
 ['dragleave','drop'].forEach(e=>drop.addEventListener(e,ev=>{ev.preventDefault();drop.classList.remove('over')}));
@@ -1153,7 +1172,7 @@ async function upload(files){
     const j=await r.json();
     if(j.filename){
       const d=document.createElement('div');d.className='file-entry';
-      d.innerHTML='<img src="/debug/file/'+encodeURIComponent(j.filename)+'?t='+encodeURIComponent(DEBUG_TOKEN)+'"><div class="info"><div class="path">'+j.filename+'</div><div class="time">'+new Date().toLocaleTimeString()+'</div></div>';
+      d.innerHTML='<img src="/debug/file/'+encodeURIComponent(j.filename)+'?t='+encodeURIComponent(DEBUG_TOKEN)+'"><div class="info"><div class="path">'+escH(j.filename)+'</div><div class="time">'+new Date().toLocaleTimeString()+'</div></div>';
       filesDiv.prepend(d);
     }
   }
@@ -1162,7 +1181,7 @@ async function upload(files){
 fetch('/debug/files',{headers:{'X-Debug-Token':DEBUG_TOKEN}}).then(r=>r.json()).then(files=>{
   files.forEach(f=>{
     const d=document.createElement('div');d.className='file-entry';
-    d.innerHTML='<img src="/debug/file/'+encodeURIComponent(f.name)+'?t='+encodeURIComponent(DEBUG_TOKEN)+'"><div class="info"><div class="path">'+f.name+'</div><div class="time">'+new Date(f.mtime).toLocaleTimeString()+'</div></div>';
+    d.innerHTML='<img src="/debug/file/'+encodeURIComponent(f.name)+'?t='+encodeURIComponent(DEBUG_TOKEN)+'"><div class="info"><div class="path">'+escH(f.name)+'</div><div class="time">'+new Date(f.mtime).toLocaleTimeString()+'</div></div>';
     filesDiv.appendChild(d);
   });
 });
@@ -1793,7 +1812,7 @@ app.get('/setup/:userId', (req, res) => {
     token: csrfToken,
     expiresAt: Date.now() + SETUP_CSRF_TTL_MS,
   });
-  _capMap(_setupCsrfTokens, 10000, '_setupCsrfTokens');
+  _capMap(_setupCsrfTokens, 500, '_setupCsrfTokens');
 
   const calConnected = profile.gcal_connected
     ? `<p style="color:#4caf50;font-weight:bold;">✓ Google Calendar connected (${escapeHtml(profile.gcal_email)})</p>`
@@ -1808,7 +1827,7 @@ app.get('/setup/:userId', (req, res) => {
       userId,
       expiresAt: Date.now() + SETUP_ACCESS_TTL_MS,
     });
-    _capMap(_setupAccessTokens, 10000, '_setupAccessTokens');
+    _capMap(_setupAccessTokens, 500, '_setupAccessTokens');
   }
 
   const googleBtn = googleConfigured
@@ -1824,7 +1843,7 @@ app.get('/setup/:userId', (req, res) => {
       userId,
       expiresAt: Date.now() + SETUP_ACCESS_TTL_MS,
     });
-    _capMap(_setupAccessTokens, 10000, '_setupAccessTokens');
+    _capMap(_setupAccessTokens, 500, '_setupAccessTokens');
   }
 
   // Build rules list HTML
@@ -2631,11 +2650,18 @@ app.get('/active-sessions', requireInternalToken, (req, res) => {
 // Claude Code registers tasks here so !btw can show them even when the bot
 // itself isn't busy. Tasks are { id, description, startedAt }.
 const _backgroundTasks = new Map();
+setInterval(() => {
+  const cutoff = Date.now() - (24 * 60 * 60 * 1000);
+  for (const [id, task] of _backgroundTasks) {
+    if (task.startedAt < cutoff) _backgroundTasks.delete(id);
+  }
+}, 60 * 60 * 1000).unref();
 
 app.post('/internal/background-task', requireInternalToken, (req, res) => {
   const { id, description } = req.body || {};
   if (!id || !description) return res.status(400).json({ error: 'id and description required' });
   _backgroundTasks.set(String(id), { id: String(id), description: String(description).substring(0, 200), startedAt: Date.now() });
+  _capMap(_backgroundTasks, 500, '_backgroundTasks');
   res.json({ ok: true });
 });
 
@@ -2661,7 +2687,7 @@ app.post('/internal/setup-token', requireInternalToken, (req, res) => {
     userId,
     expiresAt: Date.now() + SETUP_ACCESS_TTL_MS,
   });
-  _capMap(_setupAccessTokens, 10000, '_setupAccessTokens');
+  _capMap(_setupAccessTokens, 500, '_setupAccessTokens');
   res.json({
     token,
     url: '/setup/' + encodeURIComponent(userId) + '?t=' + token,

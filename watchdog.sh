@@ -61,7 +61,25 @@ if [ -n "$SIGNAL_TMP_COUNT" ] && [ "$SIGNAL_TMP_COUNT" -gt 5 ]; then
     log "Cleaned $((SIGNAL_TMP_COUNT - 2)) stale libsignal temp dirs from signal-api"
 fi
 
-# Check if container is running and healthy
+# ── Signal-api container check (defense in depth) ───────────────────
+# The internal signal-watchdog.js monitors from inside claude-api, but if
+# it fails (wrong cwd, docker socket issues, claude-api itself restarting)
+# this external check catches a missing/dead signal-api container.
+SIGNAL_STATUS=$(docker inspect mybot-signal-api-1 --format '{{.State.Status}}' 2>/dev/null)
+if [ "$SIGNAL_STATUS" != "running" ]; then
+  log "signal-api not running (status=${SIGNAL_STATUS:-missing}) — bringing it up"
+  cd "$COMPOSE_DIR"
+  docker compose --profile signal up -d signal-api 2>>"$LOG"
+  sleep 10
+  SIGNAL_STATUS=$(docker inspect mybot-signal-api-1 --format '{{.State.Status}}' 2>/dev/null)
+  if [ "$SIGNAL_STATUS" = "running" ]; then
+    log "signal-api recovered"
+  else
+    log "WARNING: signal-api still not running after compose up"
+  fi
+fi
+
+# Check if claude-api container is running and healthy
 STATUS=$(docker inspect mybot-claude-api-1 --format '{{.State.Status}}' 2>/dev/null)
 HEALTH=$(docker inspect mybot-claude-api-1 --format '{{.State.Health.Status}}' 2>/dev/null)
 
@@ -73,7 +91,7 @@ log "Container not healthy (status=$STATUS health=$HEALTH) — attempting restar
 
 # Try a simple start/restart first
 cd "$COMPOSE_DIR"
-docker compose up -d 2>>"$LOG"
+docker compose --profile signal up -d 2>>"$LOG"
 sleep 15
 
 STATUS=$(docker inspect mybot-claude-api-1 --format '{{.State.Status}}' 2>/dev/null)
@@ -84,9 +102,9 @@ fi
 
 # If that failed, prune and rebuild from scratch
 log "Simple restart failed — pruning and rebuilding"
-docker compose down 2>>"$LOG"
+docker compose --profile signal down 2>>"$LOG"
 docker system prune -af 2>>"$LOG"
-docker compose up -d --build 2>>"$LOG"
+docker compose --profile signal up -d --build 2>>"$LOG"
 sleep 20
 
 STATUS=$(docker inspect mybot-claude-api-1 --format '{{.State.Status}}' 2>/dev/null)

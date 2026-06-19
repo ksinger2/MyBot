@@ -1,7 +1,7 @@
 # MyBot — Next Steps
 
 ## What's Working
-<!-- Updated each session — 2026-06-14 -->
+<!-- Updated each session — 2026-06-19 -->
 - On-call watchdog (`oncall-watchdog.js`) running every 2min with 8 deterministic health checks:
   1. CLI auth health (escalates after 3 failures, 30min cooldown)
   2. Sandbox credential freshness (auto-refreshes if >5min stale)
@@ -44,7 +44,8 @@
 - **Message grouping dedup**: Duplicate webhook deliveries (same timestamp + content) are now dropped before entering the grouping buffer — prevents doubled URLs/content.
 - **Sandbox UID resolution**: `_getUid()` no longer caches null results. Runner retries provisioning at spawn time if UID is missing, and rejects with a clear error instead of silently falling through to non-sandbox mode.
 - **E2E test harness** (`tests/e2e-signal-test.js`): 8-test suite validates full Signal webhook pipeline — owner DM greetings, Claude CLI queries, group ignore (listenToAll OFF), !status, sandbox user routing, auth rejection, @mention response, !listen toggle. Run with `node tests/e2e-signal-test.js`.
-- **Signal watchdog enhanced**: Detects dead WebSocket (HTTP healthy but no webhook envelopes in 60min), restarts signal-api container. Uses webhook envelope activity (receipts, read notifications — always flowing) instead of text messages (30min gaps normal). Restart notifications silenced — not user-actionable. Check `!health` or docker logs instead.
+- **Signal WebSocket receive mode**: Active WebSocket client connects to `ws://signal-api:8080/v1/receive/{number}` — replaced broken webhook mode (signal-cli-rest-api v0.100 json-rpc mode doesn't relay to `RECEIVE_WEBHOOK_URL`). Exponential backoff reconnect on close, clean shutdown.
+- **Signal watchdog enhanced**: Detects dead WebSocket (HTTP healthy but no webhook envelopes in 60min), restarts signal-api container. Stale restart capped at 3 to prevent infinite loops during quiet periods. Uses webhook envelope activity (receipts, read notifications — always flowing) instead of text messages (30min gaps normal). Restart notifications silenced — not user-actionable. No destructive `docker rm -f` fallback — external `watchdog.sh` handles unrecoverable cases.
 - **Remote auth (!login)**: Owner can re-authenticate Claude CLI from phone via Signal DM.
 - **Agent guardrails (system prompt)**: Both owner DM and non-owner prompts now explicitly bar self-initiated agent spawning: "ONLY for user-requested multi-step engineering tasks. NEVER for self-initiated investigation, follow-up diagnostics, or curiosity."
 - **Agent fail-fast**: Each sub-agent tracks `consecutiveErrors`. On 3+ consecutive tool errors, `_agentFailFast` flag triggers 2-minute kill thresholds. Post-answer agent spawn cap: 3rd+ agent after answer delivered triggers immediate fail-fast.
@@ -68,6 +69,45 @@
   - Circuit breaker turn-count disabled (time-based only — coding routinely does 50+ tool calls without text output)
   - Session IDs preserved through rebuilds (was wiping all sessions on every rebuild)
   - Detection works by sender ID (sandbox user in any group) OR chat link (via `!sandbox link`)
+
+## Recently Fixed (2026-06-19)
+
+### WebSocket Receive Mode (Root Cause of All "Bianca Not Working" Reports)
+- **Root cause**: `bbernhard/signal-cli-rest-api` v0.100 in json-rpc mode does NOT forward envelopes to `RECEIVE_WEBHOOK_URL`. The Go binary has no webhook relay in this mode — signal-cli daemon receives envelopes fine (visible in JVM logs), but the REST API never POSTs them to the configured webhook. This was the root cause of every "Bianca is not responding" report since upgrading to v0.100.
+- **Fix**: Replaced passive webhook mode with active WebSocket client (`ws` package). Signal adapter now connects to `ws://signal-api:8080/v1/receive/{number}`, processes envelopes via `_handleIncoming()`, and notifies the watchdog via `recordWebhookActivity()`. Exponential backoff reconnect (1s→30s) on close. Clean shutdown via `stop()`.
+- **Files changed**: `claude-api/adapters/signal.js` (WebSocket client), `claude-api/package.json` (`ws: ^8.18.0`).
+
+### Sandbox Runuser Shell Command Fix
+- **Symptom**: `runuser: failed to execute sandbox-daniel: No such file or directory` — every sandbox session crashed immediately.
+- **Root cause**: Shell positional parameter bug in mount-namespace spawn. After `shift` moved `$2→$1`, `$@` still included the username as a trailing argument, so `runuser -u sandbox-daniel -- shift sandbox-daniel <actual-command>` tried to execute `sandbox-daniel` as a binary.
+- **Fix**: `SBU="$2" && shift 2 && exec runuser -u "$SBU" -- "$@"` — captures username before shifting, then shifts both positional args cleanly.
+- **File changed**: `claude-api/runner.js` (line ~732).
+
+### Security: TOKEN_ENCRYPTION_KEY Removed from CLI Child Env
+- **Risk**: AES key for encrypting OAuth tokens was passed in the child process environment. A prompt injection attack could read it via `env` and decrypt all stored tokens.
+- **Fix**: Removed `TOKEN_ENCRYPTION_KEY` from the child env object. Only the parent process needs it.
+- **File changed**: `claude-api/runner.js` (line ~693).
+
+### Signal Watchdog Hardening (4 fixes)
+1. **Container-internal cwd**: Changed from `HOST_PROJECT_PATH` (host filesystem path that doesn't exist inside the container) to `/workspace/MyBot`. The ENOENT on missing cwd previously cascaded into `docker rm -f`, permanently deleting signal-api with no way to recreate it.
+2. **Removed destructive `docker rm -f` fallback**: If compose force-recreate fails, the watchdog now logs and retries on the next cycle. External `watchdog.sh` handles unrecoverable cases.
+3. **Added `--profile signal`** to compose commands so signal-api is included in the compose project.
+4. **Stale restart cap at 3**: Prevents infinite restart+alert loops during quiet periods (no inbound messages for hours). HTTP-failure restarts remain uncapped since those indicate a real problem.
+- **File changed**: `claude-api/signal-watchdog.js`, `watchdog.sh`.
+
+### 15-Bug Audit Fixes
+Comprehensive code review found 15 issues; 14 fixed, 1 won't-fix:
+- **EVENT tag `user_ids` as string** (bot.js): `/event` endpoint requires array, queue path sent bare string `senderId`. Fixed by wrapping in `[senderId]`.
+- **Queue group-chat heuristic** (bot.js): `senderIdQ` and `isGroupChatQ` detection fixed for accurate group/DM routing in queue path.
+- **Reaction access control** (bot.js): `senderAllowed` now checks owner OR known group member OR allowed number (was missing group member check).
+- **Voice flag per buffer entry** (bot.js): Voice message flag now stored per debounce buffer entry and propagated correctly, instead of being lost during grouping.
+- **UPDATE_NOTES regex state bug** (bot.js): `lastIndex` reset before test, then unconditional replace — fixes stateful regex reuse.
+- **Background task privileges** (bot.js): `ownerDmMode` and `isOwner` were hardcoded `true` for background tasks; now use actual `senderIsOwner`.
+- **Test endpoint env leak** (server.js): `/test` endpoint stripped to minimal env (`NODE_ENV`, `PATH`, `HOME`, `LANG`) — was passing full process.env including secrets.
+- **Group ID double-encoding** (signal.js): `return 'group.' + internalId` was double-encoding base64. Fixed to single encoding.
+- **UUID persist on every lookup** (signal.js): Removed `else` branch that wrote UUID map on every message, not just new entries.
+- **External watchdog signal-api monitoring** (watchdog.sh): Now checks signal-api container health before claude-api, uses `--profile signal` for all compose commands.
+- **Won't-fix**: `INTERNAL_API_TOKEN` visible in webhook URL is a `bbernhard/signal-cli-rest-api` architectural limitation — the token is container-internal only.
 
 ## Recently Fixed (2026-05-24)
 - **`!listen off` actually sticks now — 3 root causes** (the user-facing complaint: "bot turns listen on every rebuild on all channels despite explicitly being turned off in some channels"):

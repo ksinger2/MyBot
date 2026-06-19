@@ -181,6 +181,13 @@ const MAX_LOOP_ITERATIONS_PER_DAY = parseInt(process.env.MAX_LOOP_ITERATIONS_PER
 const _rateLimitMap = new Map();
 const RATE_LIMIT_WINDOW_MS = 15 * 60 * 1000;
 const RATE_LIMIT_MAX_SESSIONS = 5;
+setInterval(() => {
+  const now = Date.now();
+  for (const [userId, entry] of _rateLimitMap) {
+    const fresh = entry.timestamps.filter(t => now - t < RATE_LIMIT_WINDOW_MS);
+    if (fresh.length === 0) _rateLimitMap.delete(userId);
+  }
+}, RATE_LIMIT_WINDOW_MS).unref();
 
 function _checkRateLimit(userId) {
   const now = Date.now();
@@ -239,6 +246,12 @@ function _resetSessionInactivityTimer(state, channelId) {
 // M3: in-memory per-channel iteration counter, keyed by UTC date. Resets on
 // day rollover. Map<channelId, { date: 'YYYY-MM-DD', count: number }>.
 const _loopIterationsToday = new Map();
+setInterval(() => {
+  const today = new Date().toISOString().slice(0, 10);
+  for (const [ch, entry] of _loopIterationsToday) {
+    if (entry.date !== today) _loopIterationsToday.delete(ch);
+  }
+}, 60 * 60 * 1000).unref();
 function _todayUTC() {
   return new Date().toISOString().slice(0, 10);
 }
@@ -680,6 +693,10 @@ try {
 } catch {}
 function _addKnownGroupMember(identifier) {
   if (!identifier || _knownGroupMembers.has(identifier)) return;
+  if (_knownGroupMembers.size >= 5000) {
+    const oldest = _knownGroupMembers.values().next().value;
+    _knownGroupMembers.delete(oldest);
+  }
   _knownGroupMembers.add(identifier);
   try { writeEncryptedJson(KNOWN_GROUP_MEMBERS_FILE, { members: [..._knownGroupMembers] }, KNOWN_GROUP_MEMBERS_DOMAIN); } catch {}
 }
@@ -756,7 +773,7 @@ function getChannel(channelId) {
       startedAt: null, // timestamp when Claude started working
       progress: freshProgress(), // structured progress for !btw
       queue: (saved?.pendingQueue || []).map(text => ({ content: text, timestamp: Date.now() })),
-      recentMessages: saved?.recentMessages || [], // recent messages for context persistence (capped at 20)
+      recentMessages: (saved?.recentMessages || []).slice(-20),
       groupingTimer: null,   // debounce timer for message grouping
       groupingBuffer: [],    // buffered messages waiting to be combined
       groupingSenderId: null, // sender of the buffered messages
@@ -786,6 +803,29 @@ function listPersonalities() {
   return fs.readdirSync(PERSONALITIES_DIR)
     .filter(f => f.endsWith('.md'))
     .map(f => f.replace('.md', ''));
+}
+
+const PERSONALITY_SENTENCE_CAPS = {
+  schpeedlebot: 2,
+  april_ludgate: 4,
+  tiffany_pollard: 4,
+};
+
+function enforcePersonalityLimits(text, personality) {
+  if (!text || !personality) return text;
+  const cap = PERSONALITY_SENTENCE_CAPS[personality];
+  if (!cap) return text;
+  const codeBlockRe = /```[\s\S]*?```/g;
+  const codeBlocks = [];
+  const stripped = text.replace(codeBlockRe, (m) => {
+    codeBlocks.push(m);
+    return `\x00CB${codeBlocks.length - 1}\x00`;
+  });
+  const sentences = stripped.split(/(?<=[.!?])\s+/).filter(Boolean);
+  if (sentences.length <= cap) return text;
+  let truncated = sentences.slice(0, cap).join(' ');
+  truncated = truncated.replace(/\x00CB(\d+)\x00/g, (_, i) => codeBlocks[parseInt(i)] || '');
+  return truncated;
 }
 
 function askClaude(prompt, { sessionId = null, personalityFile = null, identity = null, cwd = DEFAULT_WORKSPACE, maxTurns = null, channelState = null, channelProxy = null, discordUserId = null, readOnly = false, groupAllowedTools = undefined, profileContext = null, streamReplies = false, model = 'sonnet', ownerDmMode = false, planMode = false, reviewMode = false, isVoice = false, isOwner = false, sandboxUser = null, recentMessages = null, userTimezone = null } = {}) {
@@ -1471,8 +1511,9 @@ async function processQueue(state) {
   // queued owner messages fall through to the ANTHROPIC_API_KEY path and fail
   // with "Credit balance too low" because the env key has no credits.
   const { isSignalOwner } = require('./project-permissions');
-  const isGroupChatQ = !signalChatId.startsWith('+');
-  const senderIsOwnerQ = !isGroupChatQ && isSignalOwner(signalChatId);
+  const senderIdQ = replyTarget?.senderId;
+  const isGroupChatQ = senderIdQ ? (signalChatId !== senderIdQ) : !signalChatId.startsWith('+');
+  const senderIsOwnerQ = !isGroupChatQ && isSignalOwner(senderIdQ || signalChatId);
   const ownerDmModeQ = senderIsOwnerQ && !isGroupChatQ;
 
   // Resolve sandbox for group chats so queued messages use the right tools/cwd
@@ -1647,7 +1688,7 @@ async function processQueue(state) {
                   title: params.title, datetime: params.datetime,
                   duration_minutes: parseInt(params.duration_minutes, 10) || 120,
                   location: params.location || '', description: params.description || '',
-                  user_ids: _qMsg.senderId, chat_id: signalChatId,
+                  user_ids: [_qMsg.senderId], chat_id: signalChatId,
                 });
                 await new Promise((resolve, reject) => {
                   const req = http.request({ hostname: 'localhost', port: 3400, path: '/event', method: 'POST',
@@ -1673,12 +1714,15 @@ async function processQueue(state) {
         });
       }
       if (!result.streamed && result.text) {
+        result.text = enforcePersonalityLimits(result.text, state.personality);
         await sendLongMessage(replyTarget, result.text, state.cwd);
       } else if (!result.streamed && !result.text && result.hitTurnLimit) {
         const signalChatIdForTurnLimit = replyTarget?._signalChatId || (channelId ? channelId.replace(/^signal:/, '') : null);
         if (signalChatIdForTurnLimit && signalAdapter) {
           await signalAdapter.sendMessage(signalChatIdForTurnLimit, 'I ran out of turns before I could respond — try again or simplify your request.').catch(() => {});
         }
+      } else if (!result.streamed && !result.text && !result.stopped) {
+        await sendLongMessage(replyTarget, 'Done.', state.cwd);
       }
 
       const elapsed = state.startedAt ? Math.round((Date.now() - state.startedAt) / 1000) : 0;
@@ -1804,6 +1848,10 @@ function startSignalAdapter() {
 
   const { isSignalOwner, isSignalAdmin, hasProjectPermission } = require('./project-permissions');
   const { buildProfileContext, getProfile } = require('./user-profiles');
+
+  signalAdapter.removeAllListeners('message');
+  signalAdapter.removeAllListeners('reaction');
+  signalAdapter.removeAllListeners('messageDelete');
 
   signalAdapter.on('message', async (msg) => {
     // Resolve UUID→phone early so all downstream code uses a stable phone-based identity.
@@ -1960,9 +2008,9 @@ function startSignalAdapter() {
       return;
     }
     _contentDedup.set(_dedupKey, _dedupNow);
-    if (_contentDedup.size > 500) {
+    if (_contentDedup.size > 200) {
       for (const [k, v] of _contentDedup) {
-        if (_dedupNow - v > 10000) _contentDedup.delete(k);
+        if (_dedupNow - v > 5000) _contentDedup.delete(k);
       }
     }
 
@@ -2366,7 +2414,11 @@ function startSignalAdapter() {
         console.log(`[signal] Dedup: dropping duplicate message (ts=${msg.timestamp})`);
         return;
       }
-      state.groupingBuffer.push({ content: text, msg, chatId });
+      if (state.groupingBuffer.length >= 50) {
+        console.warn(`[signal] groupingBuffer overflow for ${channelId}, dropping oldest`);
+        state.groupingBuffer.shift();
+      }
+      state.groupingBuffer.push({ content: text, msg, chatId, isVoiceMessage });
       state.groupingSenderId = userId;
       if (state.groupingTimer) clearTimeout(state.groupingTimer);
       state.groupingTimer = setTimeout(() => {
@@ -2385,7 +2437,7 @@ function startSignalAdapter() {
         }
         state.busy = true;
         state._triggeredByTimestamp = buf[buf.length - 1].msg?.timestamp;
-        state._isVoiceMessage = isVoiceMessage;
+        state._isVoiceMessage = buf.some(e => e.isVoiceMessage);
         _dispatchSignalMessage(buf[buf.length - 1].msg, buf[buf.length - 1].chatId, combined, state).catch(err => {
           console.error('[signal] dispatch error (debounce):', err.message);
         });
@@ -2424,9 +2476,13 @@ function startSignalAdapter() {
     const signalChatId = `signal:${chatId}`;
     const state = getChannel(signalChatId);
 
-    // Access control — same rules as regular messages
+    // Access control — same rules as regular messages, but group reactions
+    // require the sender to be a known group member (prevents strangers who
+    // somehow see a group message from interacting via reactions).
     const isGroupMessage = chatId !== senderId;
-    const senderAllowed = isSignalOwner(senderId) || isGroupMessage || allowedNumbers.has(senderId);
+    const senderAllowed = isSignalOwner(senderId)
+      || (isGroupMessage && _knownGroupMembers.has(senderId))
+      || allowedNumbers.has(senderId);
     if (!senderAllowed) {
       console.log(`[signal] Reaction from non-allowlisted sender ${senderId} — ignored`);
       return;
@@ -3307,9 +3363,8 @@ async function _dispatchSignalMessage(msg, chatId, text, state) {
           }
         } catch (e) { console.warn(`[update-notes] failed: ${e.message}`); }
       }
-      if (updateNotesRe.test(result.text || '')) {
-        result.text = (result.text || '').replace(updateNotesRe, '').trim();
-      }
+      updateNotesRe.lastIndex = 0;
+      result.text = (result.text || '').replace(updateNotesRe, '').trim();
 
       // [IMAGINE:] tag extraction — server-side image generation without Bash.
       // Works in group chats where Bash is blocked. Claude outputs [IMAGINE: prompt]
@@ -3423,9 +3478,10 @@ async function _dispatchSignalMessage(msg, chatId, text, state) {
       // which could try to fetch another member's calendar. The clobber
       // lines below make both attacks impossible — parse Claude's output
       // first, then overwrite the sensitive fields with trusted values.
+      const _autoContextHadCalendar = signalPrompt && signalPrompt.includes('<calendar-data');
       const calendarRe = /\[CALENDAR:\s*(.*?)\]/gi;
       const calendarMatches = [...(result.text || '').matchAll(calendarRe)];
-      if (calendarMatches.length > 0 && msg?.senderId) {
+      if (calendarMatches.length > 0 && msg?.senderId && !_autoContextHadCalendar) {
         try {
           const http = require('http');
           for (const match of calendarMatches) {
@@ -3469,6 +3525,8 @@ async function _dispatchSignalMessage(msg, chatId, text, state) {
             } catch (e) { console.warn(`[calendar-tag] lookup failed: ${e.message}`); }
           }
         } catch (e) { console.warn(`[calendar-tag] plugin error: ${e.message}`); }
+      }
+      if (calendarMatches.length > 0) {
         result.text = (result.text || '').replace(calendarRe, '').trim();
       }
 
@@ -3559,9 +3617,10 @@ async function _dispatchSignalMessage(msg, chatId, text, state) {
       // [WEATHER:] tag extraction — Open-Meteo forecast without Bash.
       // Format: [WEATHER: location="Alameda CA" fromDate="YYYY-MM-DD" toDate="YYYY-MM-DD"]
       // Or shorthand: [WEATHER: Alameda CA]
+      const _autoContextHadWeather = signalPrompt && signalPrompt.includes('<weather-data');
       const weatherRe = /\[WEATHER:\s*(.+?)\]/gi;
       const weatherMatches = [...(result.text || '').matchAll(weatherRe)];
-      if (weatherMatches.length > 0) {
+      if (weatherMatches.length > 0 && !_autoContextHadWeather) {
         try {
           const weatherPlugin = require('./plugins/weather');
           for (const match of weatherMatches) {
@@ -3585,6 +3644,8 @@ async function _dispatchSignalMessage(msg, chatId, text, state) {
             } catch (e) { console.warn(`[weather-tag] lookup failed: ${e.message}`); }
           }
         } catch (e) { console.warn(`[weather-tag] plugin error: ${e.message}`); }
+      }
+      if (weatherMatches.length > 0) {
         result.text = (result.text || '').replace(weatherRe, '').trim();
       }
 
@@ -4137,8 +4198,8 @@ async function _dispatchSignalMessage(msg, chatId, text, state) {
                 maxTurns: state.config?.maxTurns || 30,
                 channelState: null,
                 model: 'sonnet',
-                ownerDmMode: true,
-                isOwner: true,
+                ownerDmMode: senderIsOwner,
+                isOwner: senderIsOwner,
               });
               bgTask.status = bgResult.stopped ? 'stopped' : 'done';
               bgTask.result = (bgResult.text || '').substring(0, 2000);
@@ -4347,7 +4408,7 @@ async function _dispatchSignalMessage(msg, chatId, text, state) {
           .filter(p => fs.existsSync(p));
 
         if (!result.streamed && result.text) {
-          // Strip image file paths from the text — they'll be sent as attachments below
+          result.text = enforcePersonalityLimits(result.text, state.personality);
           let textToSend = result.text;
           for (const imgPath of imagePaths) {
             textToSend = textToSend.replace(imgPath, '').trim();
@@ -4356,8 +4417,9 @@ async function _dispatchSignalMessage(msg, chatId, text, state) {
           if (textToSend) await signalAdapter.sendLongMessage(msg.chatId, textToSend);
         } else if (!result.streamed && !result.text && result.hitTurnLimit) {
           await signalAdapter.sendMessage(msg.chatId, 'I ran out of turns before I could respond — try again or simplify your request.');
+        } else if (!result.streamed && !result.text && !result.stopped) {
+          await signalAdapter.sendMessage(msg.chatId, 'Done.');
         }
-        // If no text and no turn limit, silently skip — don't send a placeholder
         if (imagePaths && imagePaths.length > 0) {
           for (const imgPath of imagePaths) {
             try {

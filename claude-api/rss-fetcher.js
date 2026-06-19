@@ -56,7 +56,7 @@ function parseXml(xml, feedUrl) {
 }
 
 function extractTag(block, tag) {
-  // Handle CDATA: <title><![CDATA[Some title]]></title>
+  if (!/^[a-zA-Z0-9:_-]+$/.test(tag)) return null;
   const cdataRe = new RegExp(`<${tag}[^>]*>\\s*<!\\[CDATA\\[([\\s\\S]*?)\\]\\]>\\s*</${tag}>`, 'i');
   const cdataMatch = block.match(cdataRe);
   if (cdataMatch) return cdataMatch[1].trim();
