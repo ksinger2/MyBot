@@ -17,9 +17,10 @@
 $LogFile      = "$env:USERPROFILE\mybot-auto-repair.log"
 $StateFile    = "$env:USERPROFILE\mybot-auto-repair-state.json"
 $LockFile     = "$env:USERPROFILE\mybot-autostart.lock"
+$GraceFile    = "$env:USERPROFILE\mybot-heartbeat-grace.txt"
 $ClaudeCli    = "$env:USERPROFILE\.local\bin\claude.exe"
 $ProjectRoot  = "C:\Users\karen\Desktop\Github Projects\MyBot"
-$SendDmScript = "/mnt/c/Users/karen/Desktop/Github\ Projects/MyBot/scripts/send-signal-dm.sh"
+$SendDmScript = "/mnt/c/Users/karen/Desktop/Github Projects/MyBot/scripts/send-signal-dm.sh"
 
 function Write-Log {
     param([string]$Message)
@@ -127,6 +128,7 @@ function Invoke-BasicRecovery {
     Start-Sleep -Seconds 20
 
     if (Test-Health) {
+        if (Test-Path $LockFile) { Remove-Item $LockFile -Force }
         Write-Log "Basic recovery succeeded (docker compose up)"
         return "fixed"
     }
@@ -140,6 +142,7 @@ function Invoke-BasicRecovery {
     Start-Sleep -Seconds 20
 
     if (Test-Health) {
+        if (Test-Path $LockFile) { Remove-Item $LockFile -Force }
         Write-Log "Basic recovery succeeded (Docker restart + compose up)"
         return "fixed"
     }
@@ -155,11 +158,13 @@ function Invoke-BasicRecovery {
         Start-Sleep -Seconds 30
 
         if (Test-Health) {
+            if (Test-Path $LockFile) { Remove-Item $LockFile -Force }
             Write-Log "Basic recovery succeeded (WSL shutdown + reboot)"
             return "fixed"
         }
     }
 
+    if (Test-Path $LockFile) { Remove-Item $LockFile -Force }
     Write-Log "Basic recovery FAILED -- escalating to Claude Code"
     return "failed"
 }
@@ -167,11 +172,12 @@ function Invoke-BasicRecovery {
 function Send-OwnerDM {
     param([string]$Message)
     try {
-        & wsl -d Ubuntu -- bash $SendDmScript $Message 2>&1 | Out-Null
+        $escaped = $Message -replace "'", "'\''"
+        $result = & wsl -d Ubuntu -- bash -c "'$SendDmScript' '$escaped'" 2>&1
         if ($LASTEXITCODE -eq 0) {
             Write-Log "Signal DM sent to owner"
         } else {
-            Write-Log "Signal DM send failed"
+            Write-Log "Signal DM send failed: $result"
         }
     } catch {
         Write-Log "Signal DM exception: $($_.Exception.Message)"
@@ -271,19 +277,27 @@ Commit any code fixes with a clear git commit message.
 Trim-Log
 
 # Quick health check -- if healthy, exit immediately (no cost, no logging)
-if ((Test-Health) -and (Test-SignalApi)) {
-    # Everything is fine -- check state for "was repairing" flag
+$healthOk = Test-Health
+$signalOk = Test-SignalApi
+
+if ($healthOk -and $signalOk) {
     $state = Get-State
     if ($state -and $state.repairing) {
-        # Was repairing last run, now healthy -- clear flag
         Set-State @{ repairing = $false; lastRepairAt = $null; consecutiveFailures = 0 }
     }
     exit 0
 }
 
-# Something is wrong -- log it
-$healthOk = Test-Health
-$signalOk = Test-SignalApi
+# If heartbeat recently ran recovery, give it time to take effect
+if (Test-Path $GraceFile) {
+    $graceAge = ((Get-Date) - (Get-Item $GraceFile).LastWriteTime).TotalMinutes
+    if ($graceAge -lt 5) {
+        Write-Log "Heartbeat recovery in progress (grace file is ${graceAge}min old) -- deferring"
+        exit 0
+    }
+}
+
+# Something is wrong -- reuse cached results, only check WSL separately
 $wslOk = Test-WslAlive
 
 $issues = @()

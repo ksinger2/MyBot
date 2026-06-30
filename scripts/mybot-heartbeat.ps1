@@ -1,25 +1,28 @@
 #Requires -Version 5.1
 <#
 .SYNOPSIS
-    Lightweight MyBot heartbeat -- checks health every 30s (Task Scheduler interval).
+    Lightweight MyBot heartbeat -- checks health every minute via Task Scheduler.
 
 .DESCRIPTION
     1. Curls http://localhost:3400/health inside WSL
     2. On success, resets failure counter and exits
-    3. On 3 consecutive failures, forces wsl --shutdown and runs watchdog.sh
-    4. On HCS_E_CONNECTION_TIMEOUT in stderr, immediately escalates to shutdown
-    5. Logs all actions to $env:USERPROFILE\mybot-heartbeat.log
-    6. Trims log to 500 lines on each run
-
-    Register as a Task Scheduler task with 30-second repeat interval.
+    3. On 5 consecutive failures, tries docker compose up -d (NOT wsl --shutdown)
+    4. On HCS_E_CONNECTION_TIMEOUT, logs and defers to auto-repair (WSL shutdown
+       is too heavy for a heartbeat -- auto-repair handles wedged WSL)
+    5. After any recovery, sets a 5-minute grace period to let containers start
+    6. All WSL calls use timeouts to prevent infinite hangs
+    7. Logs all actions to $env:USERPROFILE\mybot-heartbeat.log
+    8. Trims log to 500 lines on each run
 #>
 
 # -- Config ----------------------------------------------------------------
 $LogFile   = "$env:USERPROFILE\mybot-heartbeat.log"
 $StateFile = "$env:USERPROFILE\mybot-heartbeat-state.txt"
+$GraceFile = "$env:USERPROFILE\mybot-heartbeat-grace.txt"
 $HealthURL = "http://localhost:3400/health"
-$MaxFailures = 3
-$WatchdogPath = "/mnt/c/Users/karen/Desktop/Github\ Projects/MyBot/watchdog.sh"
+$MaxFailures = 5
+$GraceMinutes = 5
+$ProjectDir = "/mnt/c/Users/karen/Desktop/Github Projects/MyBot"
 
 # -- Helpers ---------------------------------------------------------------
 function Write-Log {
@@ -44,41 +47,74 @@ function Set-FailureCount {
 }
 
 function Trim-Log {
-    # Keep only the last 500 lines
     if (Test-Path $LogFile) {
-        $lines = Get-Content $LogFile -ErrorAction SilentlyContinue
-        if ($lines -and $lines.Count -gt 500) {
+        $lines = @(Get-Content $LogFile -ErrorAction SilentlyContinue)
+        if ($lines.Count -gt 500) {
             $lines | Select-Object -Last 500 | Set-Content $LogFile -Encoding utf8
         }
     }
 }
 
 $LockFile = "$env:USERPROFILE\mybot-autostart.lock"
-$SendDmScript = "/mnt/c/Users/karen/Desktop/Github\ Projects/MyBot/scripts/send-signal-dm.sh"
+
+function Invoke-WslWithTimeout {
+    param(
+        [string]$Arguments,
+        [int]$TimeoutMs = 120000
+    )
+    $proc = New-Object System.Diagnostics.Process
+    $proc.StartInfo.FileName = "wsl"
+    $proc.StartInfo.Arguments = $Arguments
+    $proc.StartInfo.UseShellExecute = $false
+    $proc.StartInfo.RedirectStandardOutput = $true
+    $proc.StartInfo.RedirectStandardError = $true
+    $proc.StartInfo.CreateNoWindow = $true
+
+    $started = $proc.Start()
+    if (-not $started) {
+        return @{ ExitCode = -1; Output = ""; Stderr = ""; TimedOut = $false }
+    }
+
+    $stdoutTask = $proc.StandardOutput.ReadToEndAsync()
+    $stderrTask = $proc.StandardError.ReadToEndAsync()
+    $exited = $proc.WaitForExit($TimeoutMs)
+
+    if (-not $exited) {
+        try { $proc.Kill() } catch {}
+        $stdout = if ($stdoutTask.Wait(2000)) { $stdoutTask.Result } else { "" }
+        $stderr = if ($stderrTask.Wait(2000)) { $stderrTask.Result } else { "" }
+        return @{ ExitCode = -1; Output = $stdout; Stderr = $stderr; TimedOut = $true }
+    }
+
+    $stdout = if ($stdoutTask.Wait(5000)) { $stdoutTask.Result } else { "" }
+    $stderr = if ($stderrTask.Wait(5000)) { $stderrTask.Result } else { "" }
+    return @{ ExitCode = $proc.ExitCode; Output = $stdout; Stderr = $stderr; TimedOut = $false }
+}
 
 function Send-OwnerDM {
     param([string]$Message)
     try {
-        $result = & wsl -d Ubuntu -- bash $SendDmScript $Message 2>&1
-        if ($LASTEXITCODE -eq 0) {
+        $escaped = $Message -replace "'", "'\''"
+        $result = Invoke-WslWithTimeout -Arguments "-d Ubuntu -- bash -c `"'/mnt/c/Users/karen/Desktop/Github Projects/MyBot/scripts/send-signal-dm.sh' '$escaped'`"" -TimeoutMs 30000
+        if ($result.ExitCode -eq 0) {
             Write-Log "Signal DM sent to owner"
         } else {
-            Write-Log "Signal DM failed: $result"
+            Write-Log "Signal DM failed (exit=$($result.ExitCode), timedOut=$($result.TimedOut))"
         }
     } catch {
         Write-Log "Signal DM exception: $($_.Exception.Message)"
     }
 }
 
-function Invoke-WslShutdownAndRecover {
+function Invoke-ContainerRecovery {
     param([string]$Reason)
 
-    # Shared lock with wsl-autostart.bat -- skip if another recovery is running
     if (Test-Path $LockFile) {
         $lockAge = ((Get-Date) - (Get-Item $LockFile).LastWriteTime).TotalMinutes
         if ($lockAge -lt 15) {
             Write-Log "Recovery skipped -- autostart lock exists (${lockAge}min old)"
             Set-FailureCount 0
+            Set-Content -Path $GraceFile -Value (Get-Date -Format o) -Encoding utf8
             return
         }
         Write-Log "Stale autostart lock (${lockAge}min) -- clearing and proceeding"
@@ -86,38 +122,40 @@ function Invoke-WslShutdownAndRecover {
     Set-Content -Path $LockFile -Value (Get-Date -Format o) -Encoding utf8
 
     Write-Log $Reason
-    Write-Log "Forcing wsl --shutdown..."
+    Write-Log "Running docker compose up -d (light recovery -- NOT wsl --shutdown)..."
 
-    # Run wsl --shutdown and capture stderr for HCS errors
-    $shutdownOutput = & wsl --shutdown 2>&1
-    if ($shutdownOutput) {
-        Write-Log "wsl --shutdown output: $shutdownOutput"
-    }
+    $result = Invoke-WslWithTimeout -Arguments "-d Ubuntu -- bash -c `"cd '$ProjectDir' && docker compose up -d 2>&1`"" -TimeoutMs 120000
 
-    Write-Log "Waiting 15s for clean slate..."
-    Start-Sleep -Seconds 15
-
-    Write-Log "Running watchdog.sh to recover..."
-    $watchdogOutput = & wsl -d Ubuntu -- bash -lc $WatchdogPath 2>&1
-    if ($watchdogOutput) {
-        foreach ($line in $watchdogOutput) {
-            Write-Log "  watchdog: $line"
+    if ($result.TimedOut) {
+        Write-Log "docker compose up -d TIMED OUT after 120s -- deferring to auto-repair"
+    } elseif ($result.Output) {
+        foreach ($line in ($result.Output -split "`n")) {
+            if ($line.Trim()) { Write-Log "  compose: $line" }
         }
     }
 
-    # Reset counter after recovery attempt -- keep lock so subsequent heartbeat
-    # runs skip recovery while the container finishes starting (ages out at 15min)
     Set-FailureCount 0
-    Write-Log "Recovery sequence complete (lock retained for grace period)"
+    Set-Content -Path $GraceFile -Value (Get-Date -Format o) -Encoding utf8
+    Write-Log "Recovery attempted -- grace period set (${GraceMinutes}min). Auto-repair will escalate if this doesn't fix it."
 
-    # Notify owner via Signal DM after recovery
-    Send-OwnerDM "I detected an issue and recovered automatically. Reason: $Reason -- running self-check now."
+    Send-OwnerDM "Health check failed ($Reason). Restarted containers. Will escalate if it doesn't recover."
+
+    if (Test-Path $LockFile) { Remove-Item $LockFile -Force }
 }
 
 # -- Main ------------------------------------------------------------------
 
-# Trim log on every run to prevent unbounded growth
 Trim-Log
+
+# -- Grace period check: skip if we recently recovered --------------------
+if (Test-Path $GraceFile) {
+    $graceAge = ((Get-Date) - (Get-Item $GraceFile).LastWriteTime).TotalMinutes
+    if ($graceAge -lt $GraceMinutes) {
+        exit 0
+    }
+    Remove-Item $GraceFile -Force
+    Write-Log "Grace period expired -- resuming health checks"
+}
 
 # -- VHDX presence check ---------------------------------------------------
 $WslVhdxPath = "C:\WSL\UbuntuNew\ext4.vhdx"
@@ -125,10 +163,6 @@ if (-not (Test-Path $WslVhdxPath)) {
     Write-Log "CRITICAL: WSL VHDX not found at $WslVhdxPath"
     exit 0
 }
-
-# -- WSL alive check removed: the health check's 15s timeout + 3-failure
-# -- threshold handles unresponsive WSL without false positives. The old
-# -- 10s alive check triggered spurious wsl --shutdown under load.
 
 # -- Disk space check (runs every heartbeat) ------------------------------
 $cFreeGB = [math]::Round((Get-Volume -DriveLetter C).SizeRemaining / 1GB, 2)
@@ -139,54 +173,25 @@ if ($cFreeGB -lt 5) {
     Write-Log "DISK WARNING: C: drive has $cFreeGB GB free"
 }
 
-# Attempt health check via WSL curl
-$healthOk = $false
-$hcsError = $false
+# Attempt health check via WSL curl (15s timeout, captures both stdout and stderr)
+$healthResult = Invoke-WslWithTimeout -Arguments "-d Ubuntu -- bash -c `"curl -sf $HealthURL 2>&1`"" -TimeoutMs 15000
 
-try {
-    $proc = New-Object System.Diagnostics.Process
-    $proc.StartInfo.FileName = "wsl"
-    $proc.StartInfo.Arguments = "-d Ubuntu -- bash -c `"curl -sf $HealthURL 2>&1`""
-    $proc.StartInfo.UseShellExecute = $false
-    $proc.StartInfo.RedirectStandardOutput = $true
-    $proc.StartInfo.RedirectStandardError = $false
-    $proc.StartInfo.CreateNoWindow = $true
+$healthOk = ($healthResult.ExitCode -eq 0)
+$hcsError = ($healthResult.Output -match "HCS_E_CONNECTION_TIMEOUT") -or ($healthResult.Stderr -match "HCS_E_CONNECTION_TIMEOUT")
 
-    $started = $proc.Start()
-    if ($started) {
-        $output = ""
-        $readTask = $proc.StandardOutput.ReadToEndAsync()
-        $exited = $proc.WaitForExit(15000)
-        if ($exited) {
-            if ($readTask.Wait(5000)) { $output = $readTask.Result }
-            if ($proc.ExitCode -eq 0) {
-                $healthOk = $true
-            }
-            if ($output -match "HCS_E_CONNECTION_TIMEOUT") {
-                $hcsError = $true
-            }
-        } else {
-            try { $proc.Kill() } catch {}
-            if ($readTask.Wait(1000)) { $output = $readTask.Result }
-            if ($output -match "HCS_E_CONNECTION_TIMEOUT") {
-                $hcsError = $true
-            }
-            Write-Log "Health check timed out after 15s"
-        }
-    }
-} catch {
-    Write-Log "Health check exception: $($_.Exception.Message)"
+# -- Handle HCS_E_CONNECTION_TIMEOUT -- log and defer to auto-repair ------
+if ($hcsError) {
+    Write-Log "HCS_E_CONNECTION_TIMEOUT detected -- WSL is wedged. Deferring to auto-repair (heartbeat does NOT do wsl --shutdown)."
+    Set-FailureCount ($MaxFailures)
+    exit 0
 }
 
-# -- Handle HCS_E_CONNECTION_TIMEOUT immediately --------------------------
-if ($hcsError) {
-    Invoke-WslShutdownAndRecover -Reason "HCS_E_CONNECTION_TIMEOUT detected -- immediate escalation"
-    exit 0
+if ($healthResult.TimedOut) {
+    Write-Log "Health check timed out after 15s"
 }
 
 # -- Handle success -------------------------------------------------------
 if ($healthOk) {
-    # Reset counter on success and exit quietly
     $current = Get-FailureCount
     if ($current -gt 0) {
         Write-Log "Health check OK (was at $current consecutive failures -- resetting)"
@@ -201,7 +206,7 @@ Set-FailureCount $failures
 Write-Log "Health check FAILED (consecutive failures: $failures/$MaxFailures)"
 
 if ($failures -ge $MaxFailures) {
-    Invoke-WslShutdownAndRecover -Reason "WSL/MyBot unresponsive for $failures checks -- forcing WSL shutdown"
+    Invoke-ContainerRecovery -Reason "MyBot unhealthy for $failures consecutive checks -- restarting containers"
 }
 
 exit 0
