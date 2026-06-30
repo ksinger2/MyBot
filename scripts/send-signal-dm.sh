@@ -11,8 +11,8 @@ fi
 
 SIGNAL_CONTAINER="mybot-signal-api-1"
 SIGNAL_URL="http://localhost:8080"
-BOT_NUMBER="+15105191582"
-OWNER_NUMBER="+16315214787"
+BOT_NUMBER="${SIGNAL_BOT_NUMBER:-+15105191582}"
+OWNER_NUMBER="${SIGNAL_OWNER_NUMBER:-+16315214787}"
 
 # Wait up to 90s for signal-api to be healthy
 for i in $(seq 1 18); do

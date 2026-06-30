@@ -11,7 +11,8 @@
     3. If unhealthy, attempt basic recovery (docker compose up / WSL restart)
     4. If basic recovery fails, launch Claude Code CLI for full diagnosis + fix
     5. After any repair, notify owner via Signal DM
-    6. Logs all actions to $env:USERPROFILE\mybot-auto-repair.log
+    6. All WSL calls use timeouts to prevent infinite hangs
+    7. Logs all actions to $env:USERPROFILE\mybot-auto-repair.log
 #>
 
 $LogFile      = "$env:USERPROFILE\mybot-auto-repair.log"
@@ -20,6 +21,7 @@ $LockFile     = "$env:USERPROFILE\mybot-autostart.lock"
 $GraceFile    = "$env:USERPROFILE\mybot-heartbeat-grace.txt"
 $ClaudeCli    = "$env:USERPROFILE\.local\bin\claude.exe"
 $ProjectRoot  = "C:\Users\karen\Desktop\Github Projects\MyBot"
+$ProjectDir   = "/mnt/c/Users/karen/Desktop/Github Projects/MyBot"
 $SendDmScript = "/mnt/c/Users/karen/Desktop/Github Projects/MyBot/scripts/send-signal-dm.sh"
 
 function Acquire-Lock {
@@ -79,59 +81,54 @@ function Set-State {
     $State | ConvertTo-Json -Depth 5 | Set-Content $StateFile -Encoding utf8
 }
 
-function Test-Health {
-    try {
-        $proc = New-Object System.Diagnostics.Process
-        $proc.StartInfo.FileName = "wsl"
-        $proc.StartInfo.Arguments = "-d Ubuntu -- bash -c `"curl -sf http://localhost:3400/health 2>&1`""
-        $proc.StartInfo.UseShellExecute = $false
-        $proc.StartInfo.RedirectStandardOutput = $true
-        $proc.StartInfo.RedirectStandardError = $false
-        $proc.StartInfo.CreateNoWindow = $true
+# Shared timeout wrapper for all WSL calls
+function Invoke-WslWithTimeout {
+    param(
+        [string]$Arguments,
+        [int]$TimeoutMs = 120000
+    )
+    $proc = New-Object System.Diagnostics.Process
+    $proc.StartInfo.FileName = "wsl"
+    $proc.StartInfo.Arguments = $Arguments
+    $proc.StartInfo.UseShellExecute = $false
+    $proc.StartInfo.RedirectStandardOutput = $true
+    $proc.StartInfo.RedirectStandardError = $true
+    $proc.StartInfo.CreateNoWindow = $true
 
-        $started = $proc.Start()
-        if (-not $started) { return $false }
-
-        $readTask = $proc.StandardOutput.ReadToEndAsync()
-        $exited = $proc.WaitForExit(15000)
-        if ($exited -and $proc.ExitCode -eq 0) { return $true }
-        if (-not $exited) { try { $proc.Kill() } catch {} }
-        return $false
-    } catch {
-        return $false
+    $started = $proc.Start()
+    if (-not $started) {
+        return @{ ExitCode = -1; Output = ""; Stderr = ""; TimedOut = $false }
     }
+
+    $stdoutTask = $proc.StandardOutput.ReadToEndAsync()
+    $stderrTask = $proc.StandardError.ReadToEndAsync()
+    $exited = $proc.WaitForExit($TimeoutMs)
+
+    if (-not $exited) {
+        try { $proc.Kill() } catch {}
+        $stdout = if ($stdoutTask.Wait(2000)) { $stdoutTask.Result } else { "" }
+        $stderr = if ($stderrTask.Wait(2000)) { $stderrTask.Result } else { "" }
+        return @{ ExitCode = -1; Output = $stdout; Stderr = $stderr; TimedOut = $true }
+    }
+
+    $stdout = if ($stdoutTask.Wait(5000)) { $stdoutTask.Result } else { "" }
+    $stderr = if ($stderrTask.Wait(5000)) { $stderrTask.Result } else { "" }
+    return @{ ExitCode = $proc.ExitCode; Output = $stdout; Stderr = $stderr; TimedOut = $false }
+}
+
+function Test-Health {
+    $result = Invoke-WslWithTimeout -Arguments "-d Ubuntu -- bash -c `"curl -sf http://localhost:3400/health 2>&1`"" -TimeoutMs 15000
+    return ($result.ExitCode -eq 0)
 }
 
 function Test-SignalApi {
-    try {
-        $proc = New-Object System.Diagnostics.Process
-        $proc.StartInfo.FileName = "wsl"
-        $proc.StartInfo.Arguments = "-d Ubuntu -- bash -c `"docker exec mybot-signal-api-1 curl -sf http://localhost:8080/v1/about 2>/dev/null`""
-        $proc.StartInfo.UseShellExecute = $false
-        $proc.StartInfo.RedirectStandardOutput = $true
-        $proc.StartInfo.RedirectStandardError = $false
-        $proc.StartInfo.CreateNoWindow = $true
-
-        $started = $proc.Start()
-        if (-not $started) { return $false }
-
-        $readTask = $proc.StandardOutput.ReadToEndAsync()
-        $exited = $proc.WaitForExit(15000)
-        if ($exited -and $proc.ExitCode -eq 0) { return $true }
-        if (-not $exited) { try { $proc.Kill() } catch {} }
-        return $false
-    } catch {
-        return $false
-    }
+    $result = Invoke-WslWithTimeout -Arguments "-d Ubuntu -- bash -c `"docker exec mybot-signal-api-1 curl -sf http://localhost:8080/v1/about 2>/dev/null`"" -TimeoutMs 15000
+    return ($result.ExitCode -eq 0)
 }
 
 function Test-WslAlive {
-    try {
-        $result = & wsl -d Ubuntu -- echo "alive" 2>&1
-        return ($LASTEXITCODE -eq 0)
-    } catch {
-        return $false
-    }
+    $result = Invoke-WslWithTimeout -Arguments "-d Ubuntu -- echo alive" -TimeoutMs 10000
+    return ($result.ExitCode -eq 0)
 }
 
 function Invoke-BasicRecovery {
@@ -147,20 +144,23 @@ function Invoke-BasicRecovery {
 
         # Try docker compose up first (cheapest fix)
         Write-Log "Attempting docker compose up..."
-        $composeResult = & wsl -d Ubuntu -- bash -c "cd '/mnt/c/Users/karen/Desktop/Github Projects/MyBot' && docker compose up -d 2>&1"
-        Start-Sleep -Seconds 20
-
-        if (Test-Health) {
-            Write-Log "Basic recovery succeeded (docker compose up)"
-            return "fixed"
+        $composeResult = Invoke-WslWithTimeout -Arguments "-d Ubuntu -- bash -c `"cd '$ProjectDir' && docker compose up -d 2>&1`"" -TimeoutMs 120000
+        if ($composeResult.TimedOut) {
+            Write-Log "docker compose up TIMED OUT -- WSL may be wedged, skipping to shutdown"
+        } else {
+            Start-Sleep -Seconds 20
+            if (Test-Health) {
+                Write-Log "Basic recovery succeeded (docker compose up)"
+                return "fixed"
+            }
         }
 
         # Docker compose didn't help -- try restarting Docker
         Write-Log "docker compose up didn't fix it -- restarting Docker service..."
-        & wsl -d Ubuntu -- bash -c "sudo service docker restart" 2>&1 | Out-Null
+        Invoke-WslWithTimeout -Arguments "-d Ubuntu -- bash -c `"sudo service docker restart`"" -TimeoutMs 30000 | Out-Null
         Start-Sleep -Seconds 15
 
-        & wsl -d Ubuntu -- bash -c "cd '/mnt/c/Users/karen/Desktop/Github Projects/MyBot' && docker compose up -d 2>&1" | Out-Null
+        Invoke-WslWithTimeout -Arguments "-d Ubuntu -- bash -c `"cd '$ProjectDir' && docker compose up -d 2>&1`"" -TimeoutMs 120000 | Out-Null
         Start-Sleep -Seconds 20
 
         if (Test-Health) {
@@ -174,8 +174,7 @@ function Invoke-BasicRecovery {
             & wsl --shutdown 2>&1 | Out-Null
             Start-Sleep -Seconds 15
 
-            # Re-boot WSL and Docker
-            & wsl -d Ubuntu -- bash -c "sudo service docker start && sleep 10 && cd '/mnt/c/Users/karen/Desktop/Github Projects/MyBot' && docker compose up -d 2>&1" | Out-Null
+            Invoke-WslWithTimeout -Arguments "-d Ubuntu -- bash -c `"sudo service docker start && sleep 10 && cd '$ProjectDir' && docker compose up -d 2>&1`"" -TimeoutMs 120000 | Out-Null
             Start-Sleep -Seconds 30
 
             if (Test-Health) {
@@ -196,11 +195,11 @@ function Send-OwnerDM {
     try {
         $escaped = $Message -replace "'", "'\''"
         $escaped = $escaped -replace '\$', '`$'
-        $result = & wsl -d Ubuntu -- bash -c "'$SendDmScript' '$escaped'" 2>&1
-        if ($LASTEXITCODE -eq 0) {
+        $result = Invoke-WslWithTimeout -Arguments "-d Ubuntu -- bash -c `"'$SendDmScript' '$escaped'`"" -TimeoutMs 30000
+        if ($result.ExitCode -eq 0) {
             Write-Log "Signal DM sent to owner"
         } else {
-            Write-Log "Signal DM send failed: $result"
+            Write-Log "Signal DM send failed (exit=$($result.ExitCode), timedOut=$($result.TimedOut))"
         }
     } catch {
         Write-Log "Signal DM exception: $($_.Exception.Message)"
@@ -217,10 +216,14 @@ function Invoke-ClaudeRepair {
 
     Write-Log "Launching Claude Code CLI for intelligent repair..."
 
+    # Sanitize reason to prevent prompt injection from error messages
+    $safeReason = $Reason -replace '[^\w\s\-;:.()/]', '' | Select-Object -First 1
+    if ($safeReason.Length -gt 200) { $safeReason = $safeReason.Substring(0, 200) }
+
     $prompt = @"
 You are an autonomous repair agent for Bianca (a Signal bot). Something is wrong and basic recovery failed. You have FULL access to this Windows machine, WSL, Docker, and all code.
 
-FAILURE REASON: $Reason
+FAILURE REASON: $safeReason
 
 ## RULES -- READ THESE FIRST
 - Be THOROUGH and METHODICAL. Never take shortcuts.
@@ -261,36 +264,52 @@ REPAIR_STATUS: FAILED -- <one line description of what is still broken>
 Commit any code fixes with a clear git commit message.
 "@
 
+    # Run with 25-min timeout (Task Scheduler limit is 30min, leave 5min for cleanup)
+    $cliTimeoutMs = 25 * 60 * 1000
+
     try {
-        $result = & $ClaudeCli -p $prompt --output-format text --max-turns 50 --cwd $ProjectRoot 2>&1
-        $resultText = $result -join "`n"
+        $job = Start-Job -ScriptBlock {
+            param($cli, $p, $root)
+            & $cli -p $p --output-format text --max-turns 20 --cwd $root 2>&1
+        } -ArgumentList $ClaudeCli, $prompt, $ProjectRoot
+
+        $completed = $job | Wait-Job -Timeout ([math]::Floor($cliTimeoutMs / 1000))
+
+        if (-not $completed) {
+            Write-Log "Claude CLI TIMED OUT after 25 minutes -- killing"
+            $job | Stop-Job -PassThru | Remove-Job -Force
+            Send-OwnerDM "[Auto-Repair] Claude Code timed out after 25min on: $safeReason. Manual intervention needed."
+            return $false
+        }
+
+        $resultText = ($job | Receive-Job) -join "`n"
+        $job | Remove-Job -Force
 
         if ($resultText -match "REPAIR_STATUS:\s*SUCCESS\s*--\s*(.+)") {
             $fixDesc = $Matches[1].Trim()
             Write-Log "Claude repair SUCCEEDED: $fixDesc"
-            Send-OwnerDM "[Auto-Repair] Detected: $Reason. Fixed: $fixDesc. All systems restored."
+            Send-OwnerDM "[Auto-Repair] Detected: $safeReason. Fixed: $fixDesc. All systems restored."
             return $true
         } elseif ($resultText -match "REPAIR_STATUS:\s*FAILED\s*--\s*(.+)") {
             $failDesc = $Matches[1].Trim()
             Write-Log "Claude repair FAILED: $failDesc"
-            Send-OwnerDM "[Auto-Repair] Detected: $Reason. Claude attempted repair but FAILED: $failDesc. Manual intervention needed."
+            Send-OwnerDM "[Auto-Repair] Detected: $safeReason. Claude attempted repair but FAILED: $failDesc. Manual intervention needed."
             return $false
         } else {
             Write-Log "Claude repair completed but no status line found. Output tail: $($resultText.Substring([Math]::Max(0, $resultText.Length - 500)))"
-            # Check health to determine outcome
             if (Test-Health) {
                 Write-Log "Post-repair health check: PASSING"
-                Send-OwnerDM "[Auto-Repair] Detected: $Reason. Claude ran repair and health checks are now passing."
+                Send-OwnerDM "[Auto-Repair] Detected: $safeReason. Claude ran repair and health checks are now passing."
                 return $true
             } else {
                 Write-Log "Post-repair health check: FAILING"
-                Send-OwnerDM "[Auto-Repair] Detected: $Reason. Claude attempted repair but health checks still failing. Manual intervention needed."
+                Send-OwnerDM "[Auto-Repair] Detected: $safeReason. Claude attempted repair but health checks still failing. Manual intervention needed."
                 return $false
             }
         }
     } catch {
         Write-Log "Claude CLI error: $($_.Exception.Message)"
-        Send-OwnerDM "[Auto-Repair] Detected: $Reason. Claude Code CLI crashed: $($_.Exception.Message). Manual intervention needed."
+        Send-OwnerDM "[Auto-Repair] Detected: $safeReason. Claude Code CLI crashed: $($_.Exception.Message). Manual intervention needed."
         return $false
     }
 }
@@ -313,10 +332,14 @@ if ($healthOk -and $signalOk) {
 
 # If heartbeat recently ran recovery, give it time to take effect
 if (Test-Path $GraceFile) {
-    $graceAge = ((Get-Date) - (Get-Item $GraceFile).LastWriteTime).TotalMinutes
-    if ($graceAge -lt 5) {
-        Write-Log "Heartbeat recovery in progress (grace file is ${graceAge}min old) -- deferring"
-        exit 0
+    try {
+        $graceAge = ((Get-Date) - (Get-Item $GraceFile).LastWriteTime).TotalMinutes
+        if ($graceAge -lt 5) {
+            Write-Log "Heartbeat recovery in progress (grace file is ${graceAge}min old) -- deferring"
+            exit 0
+        }
+    } catch {
+        Write-Log "Grace file check failed: $($_.Exception.Message)"
     }
 }
 

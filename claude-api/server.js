@@ -727,25 +727,26 @@ app.post('/event/join', requireInternalToken, async (req, res) => {
 
 let _rebuildInProgress = false;
 app.get('/health', (req, res) => {
-  // Reuse the oncall-watchdog's cached CLI health result instead of spawning
-  // a separate `claude --version` on every health check request.
+  // Always return 200 if the Express server is alive — monitoring scripts
+  // use curl -sf which treats 503 as failure and restarts the container,
+  // even when the bot core (Signal, Discord, Express) is working fine.
+  // CLI health is reported as a sub-field, not via HTTP status.
   try {
     const { getCliHealthCache } = require('./oncall-watchdog');
     const cached = getCliHealthCache();
     const STALE_THRESHOLD = 5 * 60 * 1000;
     if (cached.ts > 0 && (Date.now() - cached.ts) < STALE_THRESHOLD) {
-      return res.status(cached.ok ? 200 : 503).json({
-        status: cached.ok ? 'ok' : 'degraded',
-        claude: cached.version || 'unknown',
+      return res.json({
+        status: 'ok',
+        claude: cached.ok ? (cached.version || 'ok') : 'degraded',
       });
     }
   } catch {}
-  // Fallback: watchdog hasn't run yet — do a direct check
   try {
     const v = require('child_process').execFileSync('claude', ['--version'], { timeout: 5000, encoding: 'utf8' }).trim();
     res.json({ status: 'ok', claude: v });
   } catch (e) {
-    res.status(503).json({ status: 'degraded', error: 'Claude CLI not functional', detail: e.message });
+    res.json({ status: 'ok', claude: 'degraded', detail: e.message });
   }
 });
 

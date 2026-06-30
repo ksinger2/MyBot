@@ -17,8 +17,10 @@ REM Use timeout to prevent wedged WSL from blocking the check for minutes.
 REM 15s is generous -- docker inspect returns in <1s when healthy.
 wsl -d Ubuntu -- bash -c "timeout 10 docker inspect mybot-claude-api-1 --format '{{.State.Status}}' 2>/dev/null" 2>nul | findstr /C:"running" >nul
 if %errorlevel% equ 0 (
-    REM Clean up stale lock on success
-    if exist "%LOCKFILE%" del "%LOCKFILE%" >nul 2>&1
+    REM Bot is running -- only clean lock if stale (>15min), don't steal active locks
+    if exist "%LOCKFILE%" (
+        powershell -NoProfile -Command "if ((Test-Path '%LOCKFILE%') -and ((Get-Date) - (Get-Item '%LOCKFILE%').LastWriteTime).TotalMinutes -ge 15) { Remove-Item '%LOCKFILE%' -Force }"
+    )
     exit /b 0
 )
 
@@ -48,7 +50,12 @@ if exist "%LOCKFILE%" (
     echo [%date% %time%] Stale lock file detected (>15min) -- clearing and proceeding >> "%LOG%"
     del "%LOCKFILE%" >nul 2>&1
 )
-echo %date% %time% > "%LOCKFILE%"
+REM Atomic lock acquisition (matches PS scripts' CreateNew pattern)
+powershell -NoProfile -Command "try { $fs = [IO.File]::Open('%LOCKFILE%', [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None); $w = New-Object IO.StreamWriter($fs); $w.Write((Get-Date -Format o)); $w.Close(); $fs.Close(); exit 0 } catch { exit 1 }"
+if !errorlevel! neq 0 (
+    echo [%date% %time%] Lock acquisition failed (another script grabbed it) -- skipping >> "%LOG%"
+    exit /b 0
+)
 
 REM ── If we get here, either WSL is dead or the container is not running ─
 echo [%date% %time%] === MyBot watchdog triggered === >> "%LOG%"
@@ -208,6 +215,9 @@ set DOCKER_READY=0
 echo [%date% %time%] Ensuring WSL is running... >> "%LOG%"
 wsl -d Ubuntu -- echo "WSL up" >> "%LOG%" 2>&1
 echo [%date% %time%] WSL boot complete >> "%LOG%"
+
+REM Sync WSL clock (drifts after Windows sleep/wake cycles)
+wsl -d Ubuntu -- bash -c "sudo hwclock -s 2>/dev/null || true" >> "%LOG%" 2>&1
 
 REM Explicitly start Docker -- systemd sometimes fails on WSL boot
 REM ("Failed to start the systemd user session" seen in logs)

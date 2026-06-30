@@ -103,7 +103,7 @@ fi
 # If that failed, prune and rebuild from scratch
 log "Simple restart failed — pruning and rebuilding"
 docker compose --profile signal down 2>>"$LOG"
-docker system prune -af 2>>"$LOG"
+docker system prune -af --filter "until=24h" 2>>"$LOG"
 docker compose --profile signal up -d --build 2>>"$LOG"
 sleep 20
 
