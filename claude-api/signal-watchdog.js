@@ -36,12 +36,25 @@ function _writeState(patch) {
   }
 }
 
+let _lastPersistedAt = 0;
+const PERSIST_THROTTLE_MS = 5 * 60_000; // write to disk at most every 5 min
+
 function recordWebhookActivity() {
   lastWebhookAt = Date.now();
   if (staleRestartCount > 0) {
     log(`Webhook activity resumed after ${staleRestartCount} restart(s)`);
     staleRestartCount = 0;
+    _writeState({ staleRestartCount: 0 });
   }
+  // Throttled disk persist so restarts see a fresh timestamp
+  if (lastWebhookAt - _lastPersistedAt > PERSIST_THROTTLE_MS) {
+    _lastPersistedAt = lastWebhookAt;
+    _writeState({ lastWebhookAt, lastDataMessageAt });
+  }
+}
+
+function flushTimestamp() {
+  if (lastWebhookAt > 0) _writeState({ lastWebhookAt, lastDataMessageAt });
 }
 
 function recordDataMessage() {
@@ -90,6 +103,7 @@ function _forceRecreateContainer() {
   log(`Force-recreating ${CONTAINER_NAME} via compose (cwd=${composeDir})`);
   execFile('docker', ['compose', '--profile', 'signal', 'up', '-d', '--force-recreate', 'signal-api'], {
     cwd: composeDir,
+    timeout: 120_000,
   }, (err) => {
     if (err) {
       log(`Compose force-recreate failed: ${err.message} — will retry on next cycle`);
@@ -110,6 +124,7 @@ function restartContainer(signalAdapter, ownerChatId, reason) {
   lastRestartAt = now;
   consecutiveFailures = 0;
   staleRestartCount++;
+  _writeState({ staleRestartCount });
 
   // Cap restarts for stale WebSocket at 3. Beyond that, the WebSocket is
   // likely fine — just nobody texting. Without this cap, quiet periods
@@ -149,8 +164,9 @@ function startSignalWatchdog(signalAdapter, ownerChatId) {
   lastWebhookAt = 0;
   lastDataMessageAt = 0;
   consecutiveFailures = 0;
-  staleRestartCount = 0;
-  log('Started');
+  const savedState = _readState();
+  staleRestartCount = savedState.staleRestartCount || 0;
+  log(`Started (staleRestartCount restored: ${staleRestartCount})`);
 
   const apiUrl = (signalAdapter && signalAdapter.apiUrl) || 'http://signal-api:8080';
 
@@ -198,4 +214,4 @@ function stopSignalWatchdog() {
   }
 }
 
-module.exports = { startSignalWatchdog, stopSignalWatchdog, recordWebhookActivity, recordDataMessage, getLastWebhookTimestamp };
+module.exports = { startSignalWatchdog, stopSignalWatchdog, recordWebhookActivity, recordDataMessage, getLastWebhookTimestamp, flushTimestamp };

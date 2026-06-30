@@ -1,7 +1,7 @@
 #Requires -Version 5.1
 <#
 .SYNOPSIS
-    Lightweight MyBot heartbeat — checks health every 30s (Task Scheduler interval).
+    Lightweight MyBot heartbeat -- checks health every 30s (Task Scheduler interval).
 
 .DESCRIPTION
     1. Curls http://localhost:3400/health inside WSL
@@ -53,8 +53,38 @@ function Trim-Log {
     }
 }
 
+$LockFile = "$env:USERPROFILE\mybot-autostart.lock"
+$SendDmScript = "/mnt/c/Users/karen/Desktop/Github\ Projects/MyBot/scripts/send-signal-dm.sh"
+
+function Send-OwnerDM {
+    param([string]$Message)
+    try {
+        $result = & wsl -d Ubuntu -- bash $SendDmScript $Message 2>&1
+        if ($LASTEXITCODE -eq 0) {
+            Write-Log "Signal DM sent to owner"
+        } else {
+            Write-Log "Signal DM failed: $result"
+        }
+    } catch {
+        Write-Log "Signal DM exception: $($_.Exception.Message)"
+    }
+}
+
 function Invoke-WslShutdownAndRecover {
     param([string]$Reason)
+
+    # Shared lock with wsl-autostart.bat -- skip if another recovery is running
+    if (Test-Path $LockFile) {
+        $lockAge = ((Get-Date) - (Get-Item $LockFile).LastWriteTime).TotalMinutes
+        if ($lockAge -lt 15) {
+            Write-Log "Recovery skipped -- autostart lock exists (${lockAge}min old)"
+            Set-FailureCount 0
+            return
+        }
+        Write-Log "Stale autostart lock (${lockAge}min) -- clearing and proceeding"
+    }
+    Set-Content -Path $LockFile -Value (Get-Date -Format o) -Encoding utf8
+
     Write-Log $Reason
     Write-Log "Forcing wsl --shutdown..."
 
@@ -75,9 +105,13 @@ function Invoke-WslShutdownAndRecover {
         }
     }
 
-    # Reset counter after recovery attempt
+    # Reset counter after recovery attempt -- keep lock so subsequent heartbeat
+    # runs skip recovery while the container finishes starting (ages out at 15min)
     Set-FailureCount 0
-    Write-Log "Recovery sequence complete"
+    Write-Log "Recovery sequence complete (lock retained for grace period)"
+
+    # Notify owner via Signal DM after recovery
+    Send-OwnerDM "I detected an issue and recovered automatically. Reason: $Reason -- running self-check now."
 }
 
 # -- Main ------------------------------------------------------------------
@@ -92,34 +126,14 @@ if (-not (Test-Path $WslVhdxPath)) {
     exit 0
 }
 
-# -- WSL alive check (catches wedged state before health check hangs) ------
-$aliveProc = New-Object System.Diagnostics.Process
-$aliveProc.StartInfo.FileName = "wsl"
-$aliveProc.StartInfo.Arguments = "-d Ubuntu -- echo alive"
-$aliveProc.StartInfo.UseShellExecute = $false
-$aliveProc.StartInfo.RedirectStandardOutput = $true
-$aliveProc.StartInfo.RedirectStandardError = $true
-$aliveProc.StartInfo.CreateNoWindow = $true
-try {
-    $aliveStarted = $aliveProc.Start()
-    if ($aliveStarted) {
-        $aliveExited = $aliveProc.WaitForExit(10000)
-        $aliveOut = if ($aliveExited) { $aliveProc.StandardOutput.ReadToEnd().Trim() } else { "" }
-        if (-not $aliveExited) { try { $aliveProc.Kill() } catch {} }
-        if ($aliveOut -ne "alive") {
-            Write-Log "WSL alive check failed (wedged or stopped) — forcing wsl --shutdown"
-            & wsl --shutdown 2>&1 | Out-Null
-            Start-Sleep -Seconds 10
-        }
-    }
-} catch {
-    Write-Log "WSL alive check exception: $($_.Exception.Message)"
-}
+# -- WSL alive check removed: the health check's 15s timeout + 3-failure
+# -- threshold handles unresponsive WSL without false positives. The old
+# -- 10s alive check triggered spurious wsl --shutdown under load.
 
 # -- Disk space check (runs every heartbeat) ------------------------------
 $cFreeGB = [math]::Round((Get-Volume -DriveLetter C).SizeRemaining / 1GB, 2)
 if ($cFreeGB -lt 5) {
-    Write-Log "DISK EMERGENCY: C: drive has $cFreeGB GB free — triggering cleanup"
+    Write-Log "DISK EMERGENCY: C: drive has $cFreeGB GB free -- triggering cleanup"
     & powershell -NoProfile -ExecutionPolicy Bypass -File "$PSScriptRoot\disk-space-monitor.ps1" -EmergencyOnly
 } elseif ($cFreeGB -lt 20) {
     Write-Log "DISK WARNING: C: drive has $cFreeGB GB free"
@@ -130,50 +144,31 @@ $healthOk = $false
 $hcsError = $false
 
 try {
-    # Run the health check — redirect only stderr (for HCS error detection).
-    # Stdout is NOT redirected to avoid a potential pipe-buffer deadlock:
-    # if stdout fills its 4KB buffer while we're blocked on WaitForExit,
-    # the process hangs and we'd hit the 15s timeout every time.
     $proc = New-Object System.Diagnostics.Process
     $proc.StartInfo.FileName = "wsl"
-    $proc.StartInfo.Arguments = "-d Ubuntu -- bash -c `"curl -sf $HealthURL`""
+    $proc.StartInfo.Arguments = "-d Ubuntu -- bash -c `"curl -sf $HealthURL 2>&1`""
     $proc.StartInfo.UseShellExecute = $false
-    $proc.StartInfo.RedirectStandardOutput = $false
-    $proc.StartInfo.RedirectStandardError = $true
+    $proc.StartInfo.RedirectStandardOutput = $true
+    $proc.StartInfo.RedirectStandardError = $false
     $proc.StartInfo.CreateNoWindow = $true
-
-    # Use a thread-safe list for async stderr collection.
-    # PS 5.1 event handlers run in global scope, so use script-scope.
-    $script:_stderrLines = New-Object System.Collections.ArrayList
-    $proc.add_ErrorDataReceived({
-        param($sender, $e)
-        if ($null -ne $e.Data) { [void]$script:_stderrLines.Add($e.Data) }
-    })
 
     $started = $proc.Start()
     if ($started) {
-        $proc.BeginErrorReadLine()
-
-        # Wait up to 15 seconds for the health check
+        $output = ""
+        $readTask = $proc.StandardOutput.ReadToEndAsync()
         $exited = $proc.WaitForExit(15000)
         if ($exited) {
-            # After WaitForExit(timeout) returns true, call WaitForExit()
-            # (no args) to flush async output buffers
-            $proc.WaitForExit()
-            $stderr = $script:_stderrLines -join "`n"
+            if ($readTask.Wait(5000)) { $output = $readTask.Result }
             if ($proc.ExitCode -eq 0) {
                 $healthOk = $true
             }
-            # Check for HCS_E_CONNECTION_TIMEOUT in stderr
-            if ($stderr -match "HCS_E_CONNECTION_TIMEOUT") {
+            if ($output -match "HCS_E_CONNECTION_TIMEOUT") {
                 $hcsError = $true
             }
         } else {
-            # Process didn't exit in 15s — likely WSL is hung
             try { $proc.Kill() } catch {}
-            # Check stderr collected so far for HCS error
-            $stderr = $script:_stderrLines -join "`n"
-            if ($stderr -match "HCS_E_CONNECTION_TIMEOUT") {
+            if ($readTask.Wait(1000)) { $output = $readTask.Result }
+            if ($output -match "HCS_E_CONNECTION_TIMEOUT") {
                 $hcsError = $true
             }
             Write-Log "Health check timed out after 15s"
@@ -185,7 +180,7 @@ try {
 
 # -- Handle HCS_E_CONNECTION_TIMEOUT immediately --------------------------
 if ($hcsError) {
-    Invoke-WslShutdownAndRecover -Reason "HCS_E_CONNECTION_TIMEOUT detected — immediate escalation"
+    Invoke-WslShutdownAndRecover -Reason "HCS_E_CONNECTION_TIMEOUT detected -- immediate escalation"
     exit 0
 }
 
@@ -194,7 +189,7 @@ if ($healthOk) {
     # Reset counter on success and exit quietly
     $current = Get-FailureCount
     if ($current -gt 0) {
-        Write-Log "Health check OK (was at $current consecutive failures — resetting)"
+        Write-Log "Health check OK (was at $current consecutive failures -- resetting)"
         Set-FailureCount 0
     }
     exit 0

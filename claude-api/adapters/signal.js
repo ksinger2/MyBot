@@ -291,6 +291,10 @@ class SignalAdapter extends MessagePlatform {
       clearInterval(this._cleanupTimer);
       this._cleanupTimer = null;
     }
+    if (this._contactRefreshTimer) {
+      clearInterval(this._contactRefreshTimer);
+      this._contactRefreshTimer = null;
+    }
     this.ready = false;
     console.log('[signal] Adapter stopped');
   }

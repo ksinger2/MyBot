@@ -39,7 +39,7 @@ const { extractImageAttachments } = require('./adapters/base');
 const { loadCommands } = require('./commands');
 const { addNote, extractNotes, stripNoteTags, getGroupNotes, startReminderLoop } = require('./group-notes');
 const { registerFlight, restoreFlightJobs, extractFlightTag, stripFlightTags } = require('./flight-tracker');
-const { stopSignalWatchdog, getLastWebhookTimestamp } = require('./signal-watchdog');
+const { stopSignalWatchdog, getLastWebhookTimestamp, flushTimestamp: flushWatchdogTimestamp } = require('./signal-watchdog');
 const { isCommandLike } = require('./command-utils');
 const { buildReinitPrompt } = require('./reinit-prompt');
 
@@ -714,6 +714,7 @@ const channels = new Map();
 // Graceful shutdown — kill children, persist state, then exit
 async function gracefulShutdown(signal) {
   console.log(`[shutdown] Received ${signal}, killing children and persisting state...`);
+  try { flushWatchdogTimestamp(); } catch {}
   try { stopSignalWatchdog(); } catch {}
   // B3: Clear grouping timers to prevent dangling timeouts during shutdown
   for (const [, state] of channels) {
@@ -745,7 +746,7 @@ async function gracefulShutdown(signal) {
     Promise.all(killPromises),
     new Promise(resolve => setTimeout(resolve, 5000)),
   ]);
-  flushPendingWrites();
+  try { flushPendingWrites(); } catch (e) { console.error('[shutdown] flushPendingWrites failed:', e.message); }
   // Write clean-shutdown marker so the next boot doesn't send a crash notification.
   // This covers both !restart (which already wrote it) and docker compose stop/rebuild
   // (which sends SIGTERM but previously had no marker).
@@ -1332,50 +1333,43 @@ async function startBot() {
   }
 
   // Missed-message recovery: if there's a LONG gap between the last persisted
-  // webhook timestamp and now, proactively check in with recently active chats.
-  // Only for real outages (60min+), not routine restarts.
+  // webhook timestamp and now, notify the owner only (never group chats —
+  // group members don't care about bot downtime and it's annoying).
+  // Cooldown file prevents spam during restart loops.
   const MIN_GAP_MS = 60 * 60_000; // 60min — short restarts don't need a check-in
-  const MAX_RECENCY_MS = 60 * 60_000; // only bother for chats active in last hour
+  const MISSED_MSG_COOLDOWN_MS = 60 * 60_000; // don't re-notify within 1 hour
+  const MISSED_MSG_COOLDOWN_FILE = '/app/data/missed-msg-last-notify.txt';
   const lastWebhook = getLastWebhookTimestamp();
   if (lastWebhook > 0) {
     const gapMs = Date.now() - lastWebhook;
     if (gapMs > MIN_GAP_MS) {
       const gapMin = Math.round(gapMs / 60_000);
-      console.log(`[missed-msg] Detected ${gapMin}min gap since last webhook — checking for missed conversations`);
-      setTimeout(() => {
-        if (!signalAdapter || !signalAdapter.ready) {
-          console.log('[missed-msg] Signal adapter not ready, skipping check-in');
-          return;
-        }
-
-        const actualGapMin = Math.round((Date.now() - lastWebhook) / 60_000);
-        const candidateChannels = Object.entries(_savedChannelStates).filter(([channelId, s]) => {
-          if (!s || !channelId.startsWith('signal:')) return false;
-          // Check live state to avoid double-notifying channels already handled by auto-resume
-          const live = channels.get(channelId);
-          if (live?.busy || live?.activeTask) return false;
-          if (s.activeTask || (s.pendingQueue && s.pendingQueue.length > 0)) return false;
-          const msgs = s.recentMessages || [];
-          if (msgs.length === 0) return false;
-          const lastUserMsg = [...msgs].reverse().find(m => m.role === 'user');
-          if (!lastUserMsg?.timestamp) return false;
-          const msgAge = Date.now() - lastUserMsg.timestamp;
-          return msgAge < MAX_RECENCY_MS;
-        });
-
-        if (candidateChannels.length === 0) {
-          console.log('[missed-msg] No recently active channels to check in with');
-          return;
-        }
-
-        console.log(`[missed-msg] Sending check-in to ${candidateChannels.length} recently active channel(s)`);
-        for (const [channelId] of candidateChannels) {
-          const chatId = channelId.replace(/^signal:/, '');
-          signalAdapter.sendMessage(chatId,
-            `Hey — I was offline for ~${actualGapMin} minute${actualGapMin === 1 ? '' : 's'} and might have missed messages. If you sent me something, go ahead and resend!`
-          ).catch(() => {});
-        }
-      }, 8000); // wait a bit for signal-api to settle
+      console.log(`[missed-msg] Detected ${gapMin}min gap since last webhook`);
+      // Cooldown: skip if we already notified recently
+      let lastNotify = 0;
+      try { lastNotify = parseInt(fs.readFileSync(MISSED_MSG_COOLDOWN_FILE, 'utf-8'), 10) || 0; } catch {}
+      if (Date.now() - lastNotify < MISSED_MSG_COOLDOWN_MS) {
+        console.log('[missed-msg] Cooldown active — skipping notification');
+      } else {
+        setTimeout(() => {
+          if (!signalAdapter || !signalAdapter.ready) {
+            console.log('[missed-msg] Signal adapter not ready, skipping');
+            return;
+          }
+          const ownerPhone = process.env.SIGNAL_OWNER_NUMBER;
+          if (!ownerPhone) {
+            console.log('[missed-msg] SIGNAL_OWNER_NUMBER not set, skipping');
+            return;
+          }
+          const actualGapMin = Math.round((Date.now() - lastWebhook) / 60_000);
+          signalAdapter.sendMessage(ownerPhone,
+            `I was offline for ~${actualGapMin} min. Messages during that window may have been lost.`
+          ).then(() => {
+            try { fs.writeFileSync(MISSED_MSG_COOLDOWN_FILE, Date.now().toString()); } catch {}
+            console.log(`[missed-msg] Notified owner (${actualGapMin}min gap)`);
+          }).catch(() => {});
+        }, 8000);
+      }
     }
   }
 }
