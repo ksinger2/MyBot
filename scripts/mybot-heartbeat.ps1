@@ -57,6 +57,34 @@ function Trim-Log {
 
 $LockFile = "$env:USERPROFILE\mybot-autostart.lock"
 
+function Acquire-Lock {
+    param([int]$StaleMinutes = 15)
+    if (Test-Path $LockFile) {
+        $lockAge = ((Get-Date) - (Get-Item $LockFile).LastWriteTime).TotalMinutes
+        if ($lockAge -lt $StaleMinutes) {
+            return $false
+        }
+        Write-Log "Stale autostart lock (${lockAge}min) -- clearing and proceeding"
+        try { Remove-Item $LockFile -Force } catch {}
+    }
+    try {
+        $fs = [System.IO.File]::Open($LockFile, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
+        $writer = New-Object System.IO.StreamWriter($fs)
+        $writer.Write((Get-Date -Format o))
+        $writer.Close()
+        $fs.Close()
+        return $true
+    } catch [System.IO.IOException] {
+        return $false
+    }
+}
+
+function Release-Lock {
+    if (Test-Path $LockFile) {
+        try { Remove-Item $LockFile -Force } catch {}
+    }
+}
+
 function Invoke-WslWithTimeout {
     param(
         [string]$Arguments,
@@ -95,6 +123,7 @@ function Send-OwnerDM {
     param([string]$Message)
     try {
         $escaped = $Message -replace "'", "'\''"
+        $escaped = $escaped -replace '\$', '`$'
         $result = Invoke-WslWithTimeout -Arguments "-d Ubuntu -- bash -c `"'/mnt/c/Users/karen/Desktop/Github Projects/MyBot/scripts/send-signal-dm.sh' '$escaped'`"" -TimeoutMs 30000
         if ($result.ExitCode -eq 0) {
             Write-Log "Signal DM sent to owner"
@@ -109,38 +138,35 @@ function Send-OwnerDM {
 function Invoke-ContainerRecovery {
     param([string]$Reason)
 
-    if (Test-Path $LockFile) {
-        $lockAge = ((Get-Date) - (Get-Item $LockFile).LastWriteTime).TotalMinutes
-        if ($lockAge -lt 15) {
-            Write-Log "Recovery skipped -- autostart lock exists (${lockAge}min old)"
-            Set-FailureCount 0
-            Set-Content -Path $GraceFile -Value (Get-Date -Format o) -Encoding utf8
-            return
-        }
-        Write-Log "Stale autostart lock (${lockAge}min) -- clearing and proceeding"
-    }
-    Set-Content -Path $LockFile -Value (Get-Date -Format o) -Encoding utf8
-
-    Write-Log $Reason
-    Write-Log "Running docker compose up -d (light recovery -- NOT wsl --shutdown)..."
-
-    $result = Invoke-WslWithTimeout -Arguments "-d Ubuntu -- bash -c `"cd '$ProjectDir' && docker compose up -d 2>&1`"" -TimeoutMs 120000
-
-    if ($result.TimedOut) {
-        Write-Log "docker compose up -d TIMED OUT after 120s -- deferring to auto-repair"
-    } elseif ($result.Output) {
-        foreach ($line in ($result.Output -split "`n")) {
-            if ($line.Trim()) { Write-Log "  compose: $line" }
-        }
+    if (-not (Acquire-Lock)) {
+        Write-Log "Recovery skipped -- lock held by another script"
+        Set-FailureCount 0
+        Set-Content -Path $GraceFile -Value (Get-Date -Format o) -Encoding utf8
+        return
     }
 
-    Set-FailureCount 0
-    Set-Content -Path $GraceFile -Value (Get-Date -Format o) -Encoding utf8
-    Write-Log "Recovery attempted -- grace period set (${GraceMinutes}min). Auto-repair will escalate if this doesn't fix it."
+    try {
+        Write-Log $Reason
+        Write-Log "Running docker compose up -d (light recovery -- NOT wsl --shutdown)..."
 
-    Send-OwnerDM "Health check failed ($Reason). Restarted containers. Will escalate if it doesn't recover."
+        $result = Invoke-WslWithTimeout -Arguments "-d Ubuntu -- bash -c `"cd '$ProjectDir' && docker compose up -d 2>&1`"" -TimeoutMs 120000
 
-    if (Test-Path $LockFile) { Remove-Item $LockFile -Force }
+        if ($result.TimedOut) {
+            Write-Log "docker compose up -d TIMED OUT after 120s -- deferring to auto-repair"
+        } elseif ($result.Output) {
+            foreach ($line in ($result.Output -split "`n")) {
+                if ($line.Trim()) { Write-Log "  compose: $line" }
+            }
+        }
+
+        Set-FailureCount 0
+        Set-Content -Path $GraceFile -Value (Get-Date -Format o) -Encoding utf8
+        Write-Log "Recovery attempted -- grace period set (${GraceMinutes}min). Auto-repair will escalate if this doesn't fix it."
+
+        Send-OwnerDM "Health check failed ($Reason). Restarted containers. Will escalate if it doesn't recover."
+    } finally {
+        Release-Lock
+    }
 }
 
 # -- Main ------------------------------------------------------------------

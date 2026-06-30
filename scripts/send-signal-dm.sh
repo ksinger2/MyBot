@@ -26,6 +26,19 @@ for i in $(seq 1 18); do
   sleep 5
 done
 
+# Wait up to 30s for claude-api container to be ready
+for j in $(seq 1 6); do
+  if docker exec "$SIGNAL_CONTAINER" echo ok >/dev/null 2>&1 && \
+     docker exec mybot-claude-api-1 echo ok >/dev/null 2>&1; then
+    break
+  fi
+  if [ "$j" -eq 6 ]; then
+    echo "claude-api container not ready after 30s" >&2
+    exit 1
+  fi
+  sleep 5
+done
+
 # Send DM via node inside claude-api (avoids JSON escaping issues with curl)
 docker exec mybot-claude-api-1 node -e "
   const h = require('http');

@@ -22,6 +22,19 @@ if %errorlevel% equ 0 (
     exit /b 0
 )
 
+REM ── Grace period check: skip recovery if heartbeat recently ran ─────
+REM Heartbeat sets a grace file after docker compose recovery. If fresh,
+REM containers are still starting -- don't stomp them with wsl --shutdown.
+set GRACEFILE=%USERPROFILE%\mybot-heartbeat-grace.txt
+if exist "%GRACEFILE%" (
+    powershell -NoProfile -Command "if ((Test-Path '%GRACEFILE%') -and ((Get-Date) - (Get-Item '%GRACEFILE%').LastWriteTime).TotalMinutes -lt 5) { exit 0 } else { exit 1 }"
+    if !errorlevel! equ 0 (
+        echo [%date% %time%] Heartbeat grace period active -- skipping recovery >> "%LOG%"
+        if exist "%LOCKFILE%" del "%LOCKFILE%" >nul 2>&1
+        exit /b 0
+    )
+)
+
 REM ── Concurrency guard: prevent overlapping recovery attempts ────────
 REM If another instance is already in recovery, exit to avoid
 REM wsl --shutdown races that cause infinite restart loops.

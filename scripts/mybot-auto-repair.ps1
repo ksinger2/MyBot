@@ -22,6 +22,34 @@ $ClaudeCli    = "$env:USERPROFILE\.local\bin\claude.exe"
 $ProjectRoot  = "C:\Users\karen\Desktop\Github Projects\MyBot"
 $SendDmScript = "/mnt/c/Users/karen/Desktop/Github Projects/MyBot/scripts/send-signal-dm.sh"
 
+function Acquire-Lock {
+    param([int]$StaleMinutes = 15)
+    if (Test-Path $LockFile) {
+        $lockAge = ((Get-Date) - (Get-Item $LockFile).LastWriteTime).TotalMinutes
+        if ($lockAge -lt $StaleMinutes) {
+            return $false
+        }
+        Write-Log "Stale lock (${lockAge}min) -- clearing"
+        try { Remove-Item $LockFile -Force } catch {}
+    }
+    try {
+        $fs = [System.IO.File]::Open($LockFile, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
+        $writer = New-Object System.IO.StreamWriter($fs)
+        $writer.Write((Get-Date -Format o))
+        $writer.Close()
+        $fs.Close()
+        return $true
+    } catch [System.IO.IOException] {
+        return $false
+    }
+}
+
+function Release-Lock {
+    if (Test-Path $LockFile) {
+        try { Remove-Item $LockFile -Force } catch {}
+    }
+}
+
 function Write-Log {
     param([string]$Message)
     $ts = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
@@ -30,8 +58,8 @@ function Write-Log {
 
 function Trim-Log {
     if (Test-Path $LogFile) {
-        $lines = Get-Content $LogFile -ErrorAction SilentlyContinue
-        if ($lines -and $lines.Count -gt 500) {
+        $lines = @(Get-Content $LogFile -ErrorAction SilentlyContinue)
+        if ($lines.Count -gt 500) {
             $lines | Select-Object -Last 500 | Set-Content $LogFile -Encoding utf8
         }
     }
@@ -109,70 +137,65 @@ function Test-WslAlive {
 function Invoke-BasicRecovery {
     param([string]$Reason)
 
-    # Shared lock with heartbeat and autostart
-    if (Test-Path $LockFile) {
-        $lockAge = ((Get-Date) - (Get-Item $LockFile).LastWriteTime).TotalMinutes
-        if ($lockAge -lt 15) {
-            Write-Log "Recovery skipped -- lock exists (${lockAge}min old, held by heartbeat or autostart)"
-            return "skipped"
-        }
-        Write-Log "Stale lock (${lockAge}min) -- clearing"
-    }
-    Set-Content -Path $LockFile -Value (Get-Date -Format o) -Encoding utf8
-
-    Write-Log "Basic recovery: $Reason"
-
-    # Try docker compose up first (cheapest fix)
-    Write-Log "Attempting docker compose up..."
-    $composeResult = & wsl -d Ubuntu -- bash -c "cd '/mnt/c/Users/karen/Desktop/Github Projects/MyBot' && docker compose up -d 2>&1"
-    Start-Sleep -Seconds 20
-
-    if (Test-Health) {
-        if (Test-Path $LockFile) { Remove-Item $LockFile -Force }
-        Write-Log "Basic recovery succeeded (docker compose up)"
-        return "fixed"
+    if (-not (Acquire-Lock)) {
+        Write-Log "Recovery skipped -- lock held by another script"
+        return "skipped"
     }
 
-    # Docker compose didn't help -- try restarting Docker
-    Write-Log "docker compose up didn't fix it -- restarting Docker service..."
-    & wsl -d Ubuntu -- bash -c "sudo service docker restart" 2>&1 | Out-Null
-    Start-Sleep -Seconds 15
+    try {
+        Write-Log "Basic recovery: $Reason"
 
-    & wsl -d Ubuntu -- bash -c "cd '/mnt/c/Users/karen/Desktop/Github Projects/MyBot' && docker compose up -d 2>&1" | Out-Null
-    Start-Sleep -Seconds 20
-
-    if (Test-Health) {
-        if (Test-Path $LockFile) { Remove-Item $LockFile -Force }
-        Write-Log "Basic recovery succeeded (Docker restart + compose up)"
-        return "fixed"
-    }
-
-    # Docker restart didn't help -- WSL might be wedged
-    if (-not (Test-WslAlive)) {
-        Write-Log "WSL is unresponsive -- forcing wsl --shutdown"
-        & wsl --shutdown 2>&1 | Out-Null
-        Start-Sleep -Seconds 15
-
-        # Re-boot WSL and Docker
-        & wsl -d Ubuntu -- bash -c "sudo service docker start && sleep 10 && cd '/mnt/c/Users/karen/Desktop/Github Projects/MyBot' && docker compose up -d 2>&1" | Out-Null
-        Start-Sleep -Seconds 30
+        # Try docker compose up first (cheapest fix)
+        Write-Log "Attempting docker compose up..."
+        $composeResult = & wsl -d Ubuntu -- bash -c "cd '/mnt/c/Users/karen/Desktop/Github Projects/MyBot' && docker compose up -d 2>&1"
+        Start-Sleep -Seconds 20
 
         if (Test-Health) {
-            if (Test-Path $LockFile) { Remove-Item $LockFile -Force }
-            Write-Log "Basic recovery succeeded (WSL shutdown + reboot)"
+            Write-Log "Basic recovery succeeded (docker compose up)"
             return "fixed"
         }
-    }
 
-    if (Test-Path $LockFile) { Remove-Item $LockFile -Force }
-    Write-Log "Basic recovery FAILED -- escalating to Claude Code"
-    return "failed"
+        # Docker compose didn't help -- try restarting Docker
+        Write-Log "docker compose up didn't fix it -- restarting Docker service..."
+        & wsl -d Ubuntu -- bash -c "sudo service docker restart" 2>&1 | Out-Null
+        Start-Sleep -Seconds 15
+
+        & wsl -d Ubuntu -- bash -c "cd '/mnt/c/Users/karen/Desktop/Github Projects/MyBot' && docker compose up -d 2>&1" | Out-Null
+        Start-Sleep -Seconds 20
+
+        if (Test-Health) {
+            Write-Log "Basic recovery succeeded (Docker restart + compose up)"
+            return "fixed"
+        }
+
+        # Docker restart didn't help -- WSL might be wedged
+        if (-not (Test-WslAlive)) {
+            Write-Log "WSL is unresponsive -- forcing wsl --shutdown"
+            & wsl --shutdown 2>&1 | Out-Null
+            Start-Sleep -Seconds 15
+
+            # Re-boot WSL and Docker
+            & wsl -d Ubuntu -- bash -c "sudo service docker start && sleep 10 && cd '/mnt/c/Users/karen/Desktop/Github Projects/MyBot' && docker compose up -d 2>&1" | Out-Null
+            Start-Sleep -Seconds 30
+
+            if (Test-Health) {
+                Write-Log "Basic recovery succeeded (WSL shutdown + reboot)"
+                return "fixed"
+            }
+        }
+
+        Write-Log "Basic recovery FAILED -- escalating to Claude Code"
+        return "failed"
+    } finally {
+        Release-Lock
+    }
 }
 
 function Send-OwnerDM {
     param([string]$Message)
     try {
         $escaped = $Message -replace "'", "'\''"
+        $escaped = $escaped -replace '\$', '`$'
         $result = & wsl -d Ubuntu -- bash -c "'$SendDmScript' '$escaped'" 2>&1
         if ($LASTEXITCODE -eq 0) {
             Write-Log "Signal DM sent to owner"
