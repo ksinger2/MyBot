@@ -19,9 +19,11 @@
 $LogFile   = "$env:USERPROFILE\mybot-heartbeat.log"
 $StateFile = "$env:USERPROFILE\mybot-heartbeat-state.txt"
 $GraceFile = "$env:USERPROFILE\mybot-heartbeat-grace.txt"
+$SignalWsRestartFile = "$env:USERPROFILE\mybot-signal-ws-restart.txt"
 $HealthURL = "http://localhost:3400/health"
 $MaxFailures = 5
 $GraceMinutes = 5
+$SignalWsRestartCooldownMin = 30
 $ProjectDir = "/mnt/c/Users/karen/Desktop/Github Projects/MyBot"
 
 # -- Helpers ---------------------------------------------------------------
@@ -223,6 +225,33 @@ if ($healthOk) {
         Write-Log "Health check OK (was at $current consecutive failures -- resetting)"
         Set-FailureCount 0
     }
+
+    # Check if Signal WebSocket is dead (internal watchdog gave up)
+    # The container is "healthy" but can't receive messages — external intervention needed
+    try {
+        $healthJson = $healthResult.Output | ConvertFrom-Json
+        if ($healthJson.signal_ws -and $healthJson.signal_ws.state -eq 'dead') {
+            $shouldRestart = $true
+            if (Test-Path $SignalWsRestartFile) {
+                $lastWsRestart = (Get-Item $SignalWsRestartFile).LastWriteTime
+                if (((Get-Date) - $lastWsRestart).TotalMinutes -lt $SignalWsRestartCooldownMin) {
+                    $shouldRestart = $false
+                }
+            }
+            if ($shouldRestart) {
+                Write-Log "Signal WebSocket is DEAD (internal watchdog exhausted) -- force-restarting signal-api from outside"
+                $restartResult = Invoke-WslWithTimeout -Arguments "-d Ubuntu -- bash -c `"cd '$ProjectDir' && docker compose restart signal-api 2>&1`"" -TimeoutMs 60000
+                Set-Content -Path $SignalWsRestartFile -Value (Get-Date -Format o) -Encoding utf8
+                if ($restartResult.ExitCode -eq 0) {
+                    Write-Log "signal-api restarted successfully -- WebSocket should reconnect"
+                    Send-OwnerDM "Signal WebSocket was dead (watchdog gave up). Force-restarted signal-api from outside."
+                } else {
+                    Write-Log "signal-api restart FAILED (exit=$($restartResult.ExitCode))"
+                }
+            }
+        }
+    } catch {}
+
     exit 0
 }
 

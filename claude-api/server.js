@@ -730,7 +730,13 @@ app.get('/health', (req, res) => {
   // Always return 200 if the Express server is alive — monitoring scripts
   // use curl -sf which treats 503 as failure and restarts the container,
   // even when the bot core (Signal, Discord, Express) is working fine.
-  // CLI health is reported as a sub-field, not via HTTP status.
+  // CLI health and Signal WebSocket status are informational sub-fields only.
+  let signalWs = null;
+  try {
+    const { getSignalWsStatus } = require('./signal-watchdog');
+    signalWs = getSignalWsStatus();
+  } catch {}
+
   try {
     const { getCliHealthCache } = require('./oncall-watchdog');
     const cached = getCliHealthCache();
@@ -739,14 +745,15 @@ app.get('/health', (req, res) => {
       return res.json({
         status: 'ok',
         claude: cached.ok ? (cached.version || 'ok') : 'degraded',
+        signal_ws: signalWs,
       });
     }
   } catch {}
   try {
     const v = require('child_process').execFileSync('claude', ['--version'], { timeout: 5000, encoding: 'utf8' }).trim();
-    res.json({ status: 'ok', claude: v });
+    res.json({ status: 'ok', claude: v, signal_ws: signalWs });
   } catch (e) {
-    res.json({ status: 'ok', claude: 'degraded', detail: e.message });
+    res.json({ status: 'ok', claude: 'degraded', detail: e.message, signal_ws: signalWs });
   }
 });
 

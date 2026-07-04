@@ -11,18 +11,28 @@ let lastWebhookAt = 0;
 let lastDataMessageAt = 0;
 let startedAt = 0;
 let consecutiveFailures = 0;
-let lastRestartAt = 0;
 let staleRestartCount = 0;
 
+// Separate cooldown timers for HTTP vs stale-WebSocket paths
+let lastHttpRestartAt = 0;
+let lastStaleRestartAt = 0;
+
 const HEALTH_CHECK_INTERVAL = 60_000;
-const RESTART_COOLDOWN = 10 * 60_000;
 const MAX_CONSECUTIVE_FAILURES = 5;
 const CONTAINER_NAME = 'mybot-signal-api-1';
 const STALE_WEBSOCKET_MS = 60 * 60_000;
-// After this many simple restarts fail to restore webhooks, escalate to force-recreate
-const ESCALATE_AFTER_RESTARTS = 2;
-// After force-recreate also fails, alert owner
-const ALERT_AFTER_RESTARTS = 3;
+
+// Tier 1 (simple restart): 10min cooldown
+const STALE_COOLDOWN_TIER1 = 10 * 60_000;
+// Tier 2 (force-recreate): 30min cooldown
+const STALE_COOLDOWN_TIER2 = 30 * 60_000;
+// Tier 3 (suppressed, hourly alert only): 60min cooldown
+const STALE_COOLDOWN_TIER3 = 60 * 60_000;
+// HTTP restart: 10min cooldown, independent of stale timer
+const HTTP_RESTART_COOLDOWN = 10 * 60_000;
+// Time-based decay: reset staleRestartCount after 2h of no new triggers
+const DECAY_THRESHOLD_MS = 2 * 60 * 60_000;
+
 const OWNER_ALERT_COOLDOWN = 60 * 60_000;
 let lastOwnerAlertAt = 0;
 
@@ -37,7 +47,7 @@ function _writeState(patch) {
 }
 
 let _lastPersistedAt = 0;
-const PERSIST_THROTTLE_MS = 5 * 60_000; // write to disk at most every 5 min
+const PERSIST_THROTTLE_MS = 5 * 60_000;
 
 function recordWebhookActivity() {
   lastWebhookAt = Date.now();
@@ -46,7 +56,6 @@ function recordWebhookActivity() {
     staleRestartCount = 0;
     _writeState({ staleRestartCount: 0 });
   }
-  // Throttled disk persist so restarts see a fresh timestamp
   if (lastWebhookAt - _lastPersistedAt > PERSIST_THROTTLE_MS) {
     _lastPersistedAt = lastWebhookAt;
     _writeState({ lastWebhookAt, lastDataMessageAt });
@@ -65,6 +74,21 @@ function getLastWebhookTimestamp() {
   if (lastWebhookAt > 0) return lastWebhookAt;
   const s = _readState();
   return s.lastWebhookAt || 0;
+}
+
+function getSignalWsStatus() {
+  const now = Date.now();
+  let state = 'active';
+  if (staleRestartCount >= 6) {
+    state = 'dead';
+  } else if (staleRestartCount > 0) {
+    state = 'stale';
+  } else if (lastWebhookAt > 0 && (now - lastWebhookAt) > STALE_WEBSOCKET_MS) {
+    state = 'stale';
+  } else if (lastWebhookAt === 0 && startedAt > 0 && (now - startedAt) > STALE_WEBSOCKET_MS) {
+    state = 'stale';
+  }
+  return { state, lastSeenAt: lastWebhookAt || null, restartCount: staleRestartCount };
 }
 
 function log(msg) {
@@ -95,10 +119,6 @@ function _alertOwner(message) {
 }
 
 function _forceRecreateContainer() {
-  // Use the container-internal mount path, NOT HOST_PROJECT_PATH (which is a
-  // host filesystem path that doesn't exist inside this container — execFile
-  // throws ENOENT on a missing cwd, which previously cascaded into rm -f
-  // permanently deleting signal-api with no way to recreate it).
   const composeDir = '/workspace/MyBot';
   log(`Force-recreating ${CONTAINER_NAME} via compose (cwd=${composeDir})`);
   execFile('docker', ['compose', '--profile', 'signal', 'up', '-d', '--force-recreate', 'signal-api'], {
@@ -107,8 +127,6 @@ function _forceRecreateContainer() {
   }, (err) => {
     if (err) {
       log(`Compose force-recreate failed: ${err.message} — will retry on next cycle`);
-      // Do NOT rm -f — removing the container with no way to recreate it from
-      // inside makes recovery impossible. External watchdog.sh handles this.
     } else {
       log('Force-recreate succeeded');
     }
@@ -117,44 +135,59 @@ function _forceRecreateContainer() {
 
 function restartContainer(signalAdapter, ownerChatId, reason) {
   const now = Date.now();
-  if (now - lastRestartAt < RESTART_COOLDOWN) {
-    log('Restart skipped — cooldown active');
-    return;
-  }
-  lastRestartAt = now;
-  consecutiveFailures = 0;
-  staleRestartCount++;
-  _writeState({ staleRestartCount });
+  const isHttpFailure = (reason === 'HTTP unresponsive');
 
-  // Cap restarts for stale WebSocket at 3. Beyond that, the WebSocket is
-  // likely fine — just nobody texting. Without this cap, quiet periods
-  // (no inbound messages for hours) trigger infinite restart+alert loops.
-  // HTTP-failure restarts are uncapped since those indicate a real problem.
-  if (reason !== 'HTTP unresponsive' && staleRestartCount > 3) {
-    log(`Stale-restart cap reached (${staleRestartCount}) — suppressing further restarts until webhook activity or HTTP failure`);
-    return;
-  }
-
-  if (staleRestartCount >= ALERT_AFTER_RESTARTS) {
-    _alertOwner(`Signal bridge dead — ${staleRestartCount} restart attempts failed to restore webhook flow. Bot cannot receive messages.`);
-  }
-
-  if (staleRestartCount > ESCALATE_AFTER_RESTARTS) {
-    log(`${staleRestartCount} restarts failed — escalating to force-recreate`);
-    _forceRecreateContainer();
-    return;
-  }
-
-  log(`Restarting ${CONTAINER_NAME} — ${reason} (attempt ${staleRestartCount})`);
-  execFile('docker', ['restart', CONTAINER_NAME], (err) => {
-    if (err) {
-      log(`Restart failed: ${err.message}`);
+  // HTTP failures use their own independent cooldown — never blocked by stale timer
+  if (isHttpFailure) {
+    if (now - lastHttpRestartAt < HTTP_RESTART_COOLDOWN) {
+      log('HTTP restart skipped — cooldown active');
       return;
     }
-    log('Restart succeeded');
-    // Do NOT reset lastWebhookAt — wait for a real webhook to arrive.
-    // recordWebhookActivity() will clear staleRestartCount when one does.
-  });
+    lastHttpRestartAt = now;
+    consecutiveFailures = 0;
+    log(`Restarting ${CONTAINER_NAME} — ${reason}`);
+    execFile('docker', ['restart', CONTAINER_NAME], (err) => {
+      if (err) log(`Restart failed: ${err.message}`);
+      else log('Restart succeeded');
+    });
+    return;
+  }
+
+  // Stale WebSocket path — check cooldown BEFORE incrementing (crash-safety)
+  const nextCount = staleRestartCount + 1;
+  // Tier 1→2 boundary uses Tier 2's 30min cooldown: gives the last simple restart
+  // more time to take effect before escalating to force-recreate
+  const cooldown = nextCount <= 2 ? STALE_COOLDOWN_TIER1
+                 : nextCount <= 5 ? STALE_COOLDOWN_TIER2
+                 : STALE_COOLDOWN_TIER3;
+  if (now - lastStaleRestartAt < cooldown) {
+    log(`Stale restart skipped — cooldown active (tier ${nextCount <= 2 ? 1 : 2})`);
+    return;
+  }
+
+  // Passed cooldown — commit the increment
+  staleRestartCount = nextCount;
+  _writeState({ staleRestartCount });
+  lastStaleRestartAt = now;
+
+  // Unified tier decision block
+  if (staleRestartCount <= 2) {
+    // Tier 1: simple restart
+    log(`Restarting ${CONTAINER_NAME} — ${reason} (tier 1, attempt ${staleRestartCount})`);
+    execFile('docker', ['restart', CONTAINER_NAME], (err) => {
+      if (err) log(`Restart failed: ${err.message}`);
+      else log('Restart succeeded');
+    });
+  } else if (staleRestartCount <= 5) {
+    // Tier 2: force-recreate
+    log(`Force-recreating ${CONTAINER_NAME} — ${reason} (tier 2, attempt ${staleRestartCount})`);
+    _alertOwner(`Signal WebSocket dead — escalating to force-recreate (attempt ${staleRestartCount}).`);
+    _forceRecreateContainer();
+  } else {
+    // Tier 3: suppressed — alert owner hourly via _alertOwner's internal 60-min cooldown
+    log(`Stale-restart suppressed (${staleRestartCount} attempts) — alerting owner`);
+    _alertOwner(`Signal WebSocket dead — ${staleRestartCount} restart attempts exhausted. External intervention needed. Bot cannot receive messages.`);
+  }
 }
 
 function startSignalWatchdog(signalAdapter, ownerChatId) {
@@ -171,6 +204,7 @@ function startSignalWatchdog(signalAdapter, ownerChatId) {
   const apiUrl = (signalAdapter && signalAdapter.apiUrl) || 'http://signal-api:8080';
 
   watchdogInterval = setInterval(async () => {
+    const now = Date.now();
     const healthy = await checkHealth(apiUrl);
 
     if (healthy) {
@@ -182,19 +216,29 @@ function startSignalWatchdog(signalAdapter, ownerChatId) {
 
     if (lastWebhookAt > 0) _writeState({ lastWebhookAt, lastDataMessageAt });
 
+    // Time-based decay: if 2h elapsed since last restart with no new staleness
+    // triggers, reset counter. Handles legitimate quiet periods (nobody texting).
+    if (staleRestartCount > 0 && lastStaleRestartAt > 0) {
+      if ((now - lastStaleRestartAt) > DECAY_THRESHOLD_MS) {
+        log(`Resetting staleRestartCount (was ${staleRestartCount}) — 2h elapsed with no new triggers`);
+        staleRestartCount = 0;
+        _writeState({ staleRestartCount: 0 });
+      }
+    }
+
     if (consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
       restartContainer(signalAdapter, ownerChatId, 'HTTP unresponsive');
       return;
     }
 
     if (healthy) {
-      const uptime = Date.now() - startedAt;
+      const uptime = now - startedAt;
       if (uptime > STALE_WEBSOCKET_MS) {
         if (lastWebhookAt === 0) {
           log(`No webhook envelopes received since startup (${Math.round(uptime / 60_000)}min) — WebSocket likely dead`);
           restartContainer(signalAdapter, ownerChatId, 'no webhook envelopes since startup');
         } else {
-          const staleness = Date.now() - lastWebhookAt;
+          const staleness = now - lastWebhookAt;
           if (staleness > STALE_WEBSOCKET_MS) {
             log(`No webhook envelopes in ${Math.round(staleness / 60_000)}min — WebSocket likely dead`);
             restartContainer(signalAdapter, ownerChatId, 'no webhook envelopes in 60min');
@@ -214,4 +258,4 @@ function stopSignalWatchdog() {
   }
 }
 
-module.exports = { startSignalWatchdog, stopSignalWatchdog, recordWebhookActivity, recordDataMessage, getLastWebhookTimestamp, flushTimestamp };
+module.exports = { startSignalWatchdog, stopSignalWatchdog, recordWebhookActivity, recordDataMessage, getLastWebhookTimestamp, flushTimestamp, getSignalWsStatus };
