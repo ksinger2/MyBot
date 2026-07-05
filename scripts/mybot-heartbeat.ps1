@@ -21,7 +21,7 @@ $StateFile = "$env:USERPROFILE\mybot-heartbeat-state.txt"
 $GraceFile = "$env:USERPROFILE\mybot-heartbeat-grace.txt"
 $SignalWsRestartFile = "$env:USERPROFILE\mybot-signal-ws-restart.txt"
 $HealthURL = "http://localhost:3400/health"
-$MaxFailures = 5
+$MaxFailures = 8
 $GraceMinutes = 5
 $SignalWsRestartCooldownMin = 30
 $ProjectDir = "/mnt/c/Users/karen/Desktop/Github Projects/MyBot"
@@ -149,12 +149,12 @@ function Invoke-ContainerRecovery {
 
     try {
         Write-Log $Reason
-        Write-Log "Running docker compose up -d (light recovery -- NOT wsl --shutdown)..."
+        Write-Log "Restarting containers (docker compose restart, not up -d which is a no-op for running containers)..."
 
-        $result = Invoke-WslWithTimeout -Arguments "-d Ubuntu -- bash -c `"cd '$ProjectDir' && docker compose up -d 2>&1`"" -TimeoutMs 120000
+        $result = Invoke-WslWithTimeout -Arguments "-d Ubuntu -- bash -c `"cd '$ProjectDir' && docker compose restart claude-api signal-api 2>&1`"" -TimeoutMs 120000
 
         if ($result.TimedOut) {
-            Write-Log "docker compose up -d TIMED OUT after 120s -- deferring to auto-repair"
+            Write-Log "docker compose restart TIMED OUT after 120s -- deferring to auto-repair"
         } elseif ($result.Output) {
             foreach ($line in ($result.Output -split "`n")) {
                 if ($line.Trim()) { Write-Log "  compose: $line" }
@@ -201,10 +201,15 @@ if ($cFreeGB -lt 5) {
     Write-Log "DISK WARNING: C: drive has $cFreeGB GB free"
 }
 
-# Attempt health check via WSL curl (15s timeout, captures both stdout and stderr)
+# Attempt health check via WSL curl with one retry (WSL latency jitter causes
+# ~50% single-check failures that resolve immediately on retry)
 $healthResult = Invoke-WslWithTimeout -Arguments "-d Ubuntu -- bash -c `"curl -sf $HealthURL 2>&1`"" -TimeoutMs 15000
-
 $healthOk = ($healthResult.ExitCode -eq 0)
+if (-not $healthOk -and -not $healthResult.TimedOut) {
+    Start-Sleep -Seconds 3
+    $healthResult = Invoke-WslWithTimeout -Arguments "-d Ubuntu -- bash -c `"curl -sf $HealthURL 2>&1`"" -TimeoutMs 15000
+    $healthOk = ($healthResult.ExitCode -eq 0)
+}
 $hcsError = ($healthResult.Output -match "HCS_E_CONNECTION_TIMEOUT") -or ($healthResult.Stderr -match "HCS_E_CONNECTION_TIMEOUT")
 
 # -- Handle HCS_E_CONNECTION_TIMEOUT -- log and defer to auto-repair ------

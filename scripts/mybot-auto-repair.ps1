@@ -117,12 +117,31 @@ function Invoke-WslWithTimeout {
 }
 
 function Test-Health {
+    $script:lastHealthOutput = $null
     $result = Invoke-WslWithTimeout -Arguments "-d Ubuntu -- bash -c `"curl -sf http://localhost:3400/health 2>&1`"" -TimeoutMs 15000
-    return ($result.ExitCode -eq 0)
+    if ($result.ExitCode -eq 0) {
+        $script:lastHealthOutput = $result.Output
+        return $true
+    }
+    return $false
 }
 
 function Test-SignalApi {
-    $result = Invoke-WslWithTimeout -Arguments "-d Ubuntu -- bash -c `"docker exec mybot-signal-api-1 curl -sf http://localhost:8080/v1/about 2>/dev/null`"" -TimeoutMs 15000
+    # Use the /health response (already fetched by Test-Health) instead of
+    # a separate docker exec call. The /health endpoint includes signal_ws
+    # status which covers signal-api connectivity. The old docker exec
+    # approach was flaky (3 layers: PS → WSL → docker exec → curl) and
+    # caused false-positive recoveries that destabilized the bot.
+    if ($script:lastHealthOutput) {
+        try {
+            $json = $script:lastHealthOutput | ConvertFrom-Json
+            if ($json.signal_ws -and $json.signal_ws.state -ne $null) {
+                return $true
+            }
+        } catch {}
+    }
+    # Fallback: direct check via Docker network (no docker exec overhead)
+    $result = Invoke-WslWithTimeout -Arguments "-d Ubuntu -- bash -c `"docker exec mybot-claude-api-1 curl -sf http://signal-api:8080/v1/about 2>/dev/null`"" -TimeoutMs 15000
     return ($result.ExitCode -eq 0)
 }
 
@@ -142,9 +161,10 @@ function Invoke-BasicRecovery {
     try {
         Write-Log "Basic recovery: $Reason"
 
-        # Try docker compose up first (cheapest fix)
-        Write-Log "Attempting docker compose up..."
-        $composeResult = Invoke-WslWithTimeout -Arguments "-d Ubuntu -- bash -c `"cd '$ProjectDir' && docker compose up -d 2>&1`"" -TimeoutMs 120000
+        # Try restarting unhealthy containers first (docker compose up -d does
+        # nothing for containers already "Running" — restart actually cycles them)
+        Write-Log "Restarting containers..."
+        $composeResult = Invoke-WslWithTimeout -Arguments "-d Ubuntu -- bash -c `"cd '$ProjectDir' && docker compose restart claude-api signal-api 2>&1`"" -TimeoutMs 120000
         if ($composeResult.TimedOut) {
             Write-Log "docker compose up TIMED OUT -- WSL may be wedged, skipping to shutdown"
         } else {
