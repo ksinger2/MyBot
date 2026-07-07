@@ -20,7 +20,11 @@ let lastStaleRestartAt = 0;
 const HEALTH_CHECK_INTERVAL = 60_000;
 const MAX_CONSECUTIVE_FAILURES = 5;
 const CONTAINER_NAME = 'mybot-signal-api-1';
-const STALE_WEBSOCKET_MS = 60 * 60_000;
+// A quiet chat legitimately produces zero inbound envelopes, so envelope silence
+// is NOT proof the receive path is dead. Use a generous window (90min) so ordinary
+// quiet periods (overnight, low traffic) never trip a restart. Genuine daemon
+// receive-thread death is still caught, just a bit later.
+const STALE_WEBSOCKET_MS = 90 * 60_000;
 
 // Tier 1 (simple restart): 10min cooldown
 const STALE_COOLDOWN_TIER1 = 10 * 60_000;
@@ -165,10 +169,12 @@ function restartContainer(signalAdapter, ownerChatId, reason) {
     return;
   }
 
-  // Passed cooldown — commit the increment
+  // Passed cooldown — commit the increment. Persist BOTH the count and the
+  // timestamp: persisting the count alone let a restarted bot see lastStaleRestartAt=0
+  // and bypass the cooldown, firing an immediate escalated force-recreate on boot.
   staleRestartCount = nextCount;
-  _writeState({ staleRestartCount });
   lastStaleRestartAt = now;
+  _writeState({ staleRestartCount, lastStaleRestartAt });
 
   // Unified tier decision block
   if (staleRestartCount <= 2) {
@@ -194,12 +200,20 @@ function startSignalWatchdog(signalAdapter, ownerChatId) {
   if (watchdogInterval) return;
 
   startedAt = Date.now();
-  lastWebhookAt = 0;
-  lastDataMessageAt = 0;
-  consecutiveFailures = 0;
   const savedState = _readState();
+  // Seed lastWebhookAt from persisted state (or "now" on a fresh install) rather
+  // than 0. Starting at 0 made a freshly-booted bot look "dead" after the stale
+  // window even in a normal quiet period. Seeding to a real timestamp measures
+  // staleness from the last KNOWN activity and gives a just-started bot a full
+  // window before any judgment.
+  lastWebhookAt = savedState.lastWebhookAt || startedAt;
+  lastDataMessageAt = savedState.lastDataMessageAt || 0;
+  consecutiveFailures = 0;
   staleRestartCount = savedState.staleRestartCount || 0;
-  log(`Started (staleRestartCount restored: ${staleRestartCount})`);
+  // Restore the cooldown timestamp too so cooldowns and the 2h decay survive a
+  // process restart (see restartContainer for why persisting the count alone is a bug).
+  lastStaleRestartAt = savedState.lastStaleRestartAt || 0;
+  log(`Started (staleRestartCount restored: ${staleRestartCount}, lastStaleRestartAt: ${lastStaleRestartAt || 'none'})`);
 
   const apiUrl = (signalAdapter && signalAdapter.apiUrl) || 'http://signal-api:8080';
 
@@ -232,18 +246,16 @@ function startSignalWatchdog(signalAdapter, ownerChatId) {
     }
 
     if (healthy) {
-      const uptime = now - startedAt;
-      if (uptime > STALE_WEBSOCKET_MS) {
-        if (lastWebhookAt === 0) {
-          log(`No webhook envelopes received since startup (${Math.round(uptime / 60_000)}min) — WebSocket likely dead`);
-          restartContainer(signalAdapter, ownerChatId, 'no webhook envelopes since startup');
-        } else {
-          const staleness = now - lastWebhookAt;
-          if (staleness > STALE_WEBSOCKET_MS) {
-            log(`No webhook envelopes in ${Math.round(staleness / 60_000)}min — WebSocket likely dead`);
-            restartContainer(signalAdapter, ownerChatId, 'no webhook envelopes in 60min');
-          }
-        }
+      // Restart on envelope-silence only when BOTH: the bot has been up longer than
+      // the stale window (don't judge a bot that just booted into a quiet period),
+      // AND the last known envelope is older than the stale window. lastWebhookAt is
+      // seeded to boot time, so this also covers "nothing since startup". This is a
+      // conservative, last-resort recovery for a genuinely dead daemon receive thread;
+      // the tier system + cooldowns + 2h decay keep it from looping on false positives.
+      const staleness = now - lastWebhookAt;
+      if ((now - startedAt) > STALE_WEBSOCKET_MS && staleness > STALE_WEBSOCKET_MS) {
+        log(`No inbound envelopes in ${Math.round(staleness / 60_000)}min — receive path may be dead`);
+        restartContainer(signalAdapter, ownerChatId, 'no webhook envelopes');
       }
     }
   }, HEALTH_CHECK_INTERVAL);

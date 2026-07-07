@@ -195,19 +195,36 @@ if (-not (Test-Path $WslVhdxPath)) {
 # -- Disk space check (runs every heartbeat) ------------------------------
 $cFreeGB = [math]::Round((Get-Volume -DriveLetter C).SizeRemaining / 1GB, 2)
 if ($cFreeGB -lt 5) {
-    Write-Log "DISK EMERGENCY: C: drive has $cFreeGB GB free -- triggering cleanup"
-    & powershell -NoProfile -ExecutionPolicy Bypass -File "$PSScriptRoot\disk-space-monitor.ps1" -EmergencyOnly
+    # Cooldown: one cleanup rarely jumps back over 5GB instantly, so without this the
+    # aggressive cleanup relaunches on EVERY 30s tick. Overlapping Remove-Item -Recurse
+    # passes thrash the disk, which slows /health and causes the false restarts above.
+    $diskCooldownFile = Join-Path $env:USERPROFILE 'mybot-disk-cleanup-cooldown.txt'
+    $runCleanup = $true
+    if (Test-Path $diskCooldownFile) {
+        if (((Get-Date) - (Get-Item $diskCooldownFile).LastWriteTime).TotalMinutes -lt 15) { $runCleanup = $false }
+    }
+    if ($runCleanup) {
+        Write-Log "DISK EMERGENCY: C: drive has $cFreeGB GB free -- triggering cleanup"
+        Set-Content -Path $diskCooldownFile -Value (Get-Date -Format o) -Encoding utf8
+        & powershell -NoProfile -ExecutionPolicy Bypass -File "$PSScriptRoot\disk-space-monitor.ps1" -EmergencyOnly
+    } else {
+        Write-Log "DISK EMERGENCY: C: drive has $cFreeGB GB free -- cleanup on cooldown (ran <15min ago)"
+    }
 } elseif ($cFreeGB -lt 20) {
     Write-Log "DISK WARNING: C: drive has $cFreeGB GB free"
 }
 
-# Attempt health check via WSL curl with one retry (WSL latency jitter causes
-# ~50% single-check failures that resolve immediately on retry)
-$healthResult = Invoke-WslWithTimeout -Arguments "-d Ubuntu -- bash -c `"curl -sf $HealthURL 2>&1`"" -TimeoutMs 15000
+# Attempt health check via WSL curl with one retry. Timeout is 35s to stay LOOSER than
+# the container's own healthcheck (30s in docker-compose) -- an external monitor stricter
+# than the container flags a busy-but-healthy bot (mid Claude session) as down and restarts
+# it, killing the in-progress work. Retry on ANY failure INCLUDING a timeout: a slow /health
+# under load manifests as a timeout, and that is exactly the case that most needs a retry
+# (the old code skipped retry on timeout).
+$healthResult = Invoke-WslWithTimeout -Arguments "-d Ubuntu -- bash -c `"curl -sf $HealthURL 2>&1`"" -TimeoutMs 35000
 $healthOk = ($healthResult.ExitCode -eq 0)
-if (-not $healthOk -and -not $healthResult.TimedOut) {
+if (-not $healthOk) {
     Start-Sleep -Seconds 3
-    $healthResult = Invoke-WslWithTimeout -Arguments "-d Ubuntu -- bash -c `"curl -sf $HealthURL 2>&1`"" -TimeoutMs 15000
+    $healthResult = Invoke-WslWithTimeout -Arguments "-d Ubuntu -- bash -c `"curl -sf $HealthURL 2>&1`"" -TimeoutMs 35000
     $healthOk = ($healthResult.ExitCode -eq 0)
 }
 $hcsError = ($healthResult.Output -match "HCS_E_CONNECTION_TIMEOUT") -or ($healthResult.Stderr -match "HCS_E_CONNECTION_TIMEOUT")
@@ -215,12 +232,14 @@ $hcsError = ($healthResult.Output -match "HCS_E_CONNECTION_TIMEOUT") -or ($healt
 # -- Handle HCS_E_CONNECTION_TIMEOUT -- log and defer to auto-repair ------
 if ($hcsError) {
     Write-Log "HCS_E_CONNECTION_TIMEOUT detected -- WSL is wedged. Deferring to auto-repair (heartbeat does NOT do wsl --shutdown)."
-    Set-FailureCount ($MaxFailures)
+    # Prime the counter high (a real wedge should escalate fast) but leave a small margin
+    # so a SINGLE transient HCS blip followed by one slow check can't instantly restart.
+    Set-FailureCount ([Math]::Max(0, $MaxFailures - 2))
     exit 0
 }
 
 if ($healthResult.TimedOut) {
-    Write-Log "Health check timed out after 15s"
+    Write-Log "Health check timed out after 35s"
 }
 
 # -- Handle success -------------------------------------------------------

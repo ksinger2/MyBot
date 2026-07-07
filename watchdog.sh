@@ -15,23 +15,32 @@ log() { echo "$(date '+%Y-%m-%d %H:%M:%S') $1" >> "$LOG"; }
 # Keep log from growing forever
 tail -200 "$LOG" > "$LOG.tmp" 2>/dev/null && mv "$LOG.tmp" "$LOG"
 
-# ── Pre-check: Docker socket responsiveness (10s timeout) ──────────────
-# If Docker is completely wedged (HCS_E_CONNECTION_TIMEOUT), even
-# `docker info` hangs forever. Use a hard timeout to detect this.
-if ! timeout 10 docker info >/dev/null 2>&1; then
-    log "ERROR: Docker socket unresponsive (10s timeout) — signaling caller for wsl --shutdown"
-    exit 2
+# ── Run lock: cron and wsl-autostart.bat can both invoke this. Two concurrent
+# runs hitting the down/prune/rebuild block would corrupt compose state. ──────
+exec 9>/tmp/mybot-watchdog.lock
+if ! flock -n 9; then
+    log "Another watchdog run in progress — skipping"
+    exit 0
 fi
 
-# Wait for Docker daemon (normal startup delay, up to 60s)
-for i in $(seq 1 30); do
-  docker info >/dev/null 2>&1 && break
-  sleep 2
+# ── Pre-check: Docker socket responsiveness ────────────────────────────
+# If Docker is genuinely wedged (HCS_E_CONNECTION_TIMEOUT), `docker info` hangs.
+# But `docker info` is ALSO just slow under load or right after WSL wake, and a
+# single slow call must NOT trigger the destructive `wsl --shutdown` path (that
+# caused the death spiral: shutdown -> cold boot -> even slower -> shutdown again).
+# Require several consecutive long-timeout failures before signaling exit 2.
+DOCKER_OK=0
+for attempt in 1 2 3; do
+  if timeout 20 docker info >/dev/null 2>&1; then
+    DOCKER_OK=1
+    break
+  fi
+  log "docker info slow/unresponsive (attempt ${attempt}/3, 20s timeout)"
+  sleep 5
 done
-
-if ! docker info >/dev/null 2>&1; then
-  log "ERROR: Docker daemon not running"
-  exit 1
+if [ "$DOCKER_OK" -ne 1 ]; then
+  log "ERROR: Docker socket unresponsive after 3x20s attempts — signaling caller for wsl --shutdown"
+  exit 2
 fi
 
 # ── Disk space monitoring ─────────────────────────────────────────────
@@ -100,18 +109,21 @@ if [ "$STATUS" = "running" ]; then
   exit 0
 fi
 
-# If that failed, prune and rebuild from scratch
-log "Simple restart failed — pruning and rebuilding"
-docker compose --profile signal down 2>>"$LOG"
-docker system prune -af --filter "until=24h" 2>>"$LOG"
+# If that failed, rebuild IN PLACE. Critically, do NOT `down` + `prune -af` first:
+# that deletes the last-good image, so a failed build leaves nothing to fall back to
+# and the bot is permanently down (this was the "self-repair breaks forever" path).
+# `up -d --build` keeps the running image until the new one builds successfully.
+log "Simple restart failed — rebuilding in place (last-good image preserved)"
 docker compose --profile signal up -d --build 2>>"$LOG"
 sleep 20
 
 STATUS=$(docker inspect mybot-claude-api-1 --format '{{.State.Status}}' 2>/dev/null)
 if [ "$STATUS" = "running" ]; then
-  log "Container recovered after full rebuild"
+  log "Container recovered after rebuild"
+  # Only now, with a confirmed-good container, reclaim space from old dangling images.
+  docker image prune -f >/dev/null 2>&1
   exit 0
 else
-  log "ERROR: Container still not running after rebuild"
+  log "ERROR: Container still not running after rebuild — leaving last-good image intact for next cycle"
   exit 1
 fi

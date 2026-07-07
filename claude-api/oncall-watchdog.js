@@ -14,6 +14,26 @@ let _cliFailCount = 0;
 let _cliLastResult = { ok: true, version: null, ts: 0 };
 let _cliEscalatedAt = 0;
 let _lagFailCount = 0;
+let _tunnelReviveCount = 0;
+
+// Convergence guards so self-repair actions can't loop forever.
+const STATE_FILE = '/app/data/oncall-watchdog-state.json';
+const LAG_RESTART_WINDOW_MS = 60 * 60 * 1000; // 1h
+const MAX_LAG_RESTARTS = 2;                    // then escalate-only, stop restarting
+const MAX_TUNNEL_REVIVES = 3;                  // then escalate-only, stop reviving
+// Legitimate sessions are force-killed by the three-layer timeout at a 90-min hard
+// cap, so any sandbox claude process older than this is definitively an orphan.
+const LEAK_AGE_MS = 100 * 60 * 1000;
+
+function _readState() {
+  try { return JSON.parse(fs.readFileSync(STATE_FILE, 'utf8')); } catch { return {}; }
+}
+function _writeState(patch) {
+  try {
+    const { atomicWriteJsonSync } = require('./atomic-write');
+    atomicWriteJsonSync(STATE_FILE, { ..._readState(), ...patch });
+  } catch (e) { logWarn(`state persist failed: ${e.message}`); }
+}
 
 function log(msg) {
   console.log(`[oncall-watchdog] ${msg}`);
@@ -131,24 +151,31 @@ function checkProcessLeaks() {
     result.claudeCount = claudeProcs.length;
     result.nodeCount = nodeCount;
 
-    if (claudeProcs.length > 10) {
-      claudeProcs.sort((a, b) => a.startTime - b.startTime);
-      const toKill = claudeProcs.slice(0, claudeProcs.length - 5);
-      for (const p of toKill) {
-        try {
-          process.kill(p.pid, 'SIGTERM');
-          result.killed.push(p.pid);
-          log(`Killed leaked claude process pid=${p.pid}`);
-        } catch {}
-      }
-      // SIGKILL stragglers after 5s
-      if (toKill.length > 0) {
-        setTimeout(() => {
-          for (const p of toKill) {
-            try { process.kill(p.pid, 0); process.kill(p.pid, 'SIGKILL'); } catch {}
-          }
-        }, 5000);
-      }
+    // Kill ONLY processes that have outlived the 90-min hard session cap — those are
+    // provably orphaned. The previous logic killed the OLDEST processes whenever the
+    // count exceeded 10, which destroyed long-running LEGITIMATE sessions under normal
+    // concurrent load (the "self-repair kills a healthy bot" failure mode).
+    const nowMs = Date.now();
+    const orphans = claudeProcs.filter(p => (nowMs - p.startTime) > LEAK_AGE_MS);
+    for (const p of orphans) {
+      try {
+        process.kill(p.pid, 'SIGTERM');
+        result.killed.push(p.pid);
+        log(`Killed orphaned claude process pid=${p.pid} (age ${Math.round((nowMs - p.startTime) / 60000)}min > cap)`);
+      } catch {}
+    }
+    if (orphans.length > 0) {
+      setTimeout(() => {
+        for (const p of orphans) {
+          try { process.kill(p.pid, 0); process.kill(p.pid, 'SIGKILL'); } catch {}
+        }
+      }, 5000);
+    }
+    // Many YOUNG claude procs may be a real leak/fork, but they could also be active
+    // work — escalate for a human instead of killing possibly-live sessions.
+    if (claudeProcs.length > 15 && orphans.length === 0) {
+      result.ok = false;
+      escalate('Process Count High', `${claudeProcs.length} sandbox claude processes, none past the ${LEAK_AGE_MS / 60000}min cap — possible leak. Not auto-killing (could be active work).`);
     }
 
     if (nodeCount > 20) {
@@ -253,6 +280,11 @@ function checkEventLoopLag() {
   return new Promise((resolve) => {
     const start = Date.now();
     setTimeout(() => {
+     // Fail-safe: any throw inside this setTimeout callback would escape the caller's
+     // per-check try/catch (different tick) and leave the returned Promise unresolved,
+     // hanging runAllChecks forever (_running stuck true → every future cycle skipped).
+     // Wrap the whole body so the watchdog can never permanently stall on itself.
+     try {
       const lag = Date.now() - start;
       const result = { check: 'event_loop_lag', ok: true, lagMs: lag };
 
@@ -260,20 +292,37 @@ function checkEventLoopLag() {
         _lagFailCount++;
         if (_lagFailCount >= 3) {
           result.ok = false;
-          result.action = 'graceful_restart';
-          log(`Event loop lag ${lag}ms for 3 consecutive checks — triggering graceful restart`);
-          escalate('Event Loop Lag Critical', `${lag}ms lag for 3 consecutive checks. Restarting.`).then(() => {
-            // Drain in-flight requests before exiting
-            try {
-              const srv = require('./server').server;
-              if (srv && srv.close) {
-                srv.close(() => process.exit(1));
-                setTimeout(() => process.exit(1), 10000).unref();
-                return;
-              }
-            } catch {}
-            setTimeout(() => process.exit(1), 2000);
-          });
+          // A restart only helps if the lag is transient. If we've already restarted
+          // for lag repeatedly this hour, restarting again just re-triggers it: auto-resume
+          // relaunches the same heavy task, and host CPU starvation isn't cured by a
+          // restart. That's the "self-repair breaks forever" loop. Cap restarts per hour
+          // (persisted across restarts) and fall back to escalate-only.
+          const nowTs = Date.now();
+          const stored = _readState().lagRestarts;
+          const recent = (Array.isArray(stored) ? stored : []).filter(t => nowTs - t < LAG_RESTART_WINDOW_MS);
+          if (recent.length >= MAX_LAG_RESTARTS) {
+            result.action = 'escalate_only';
+            logWarn(`Event loop lag ${lag}ms but ${recent.length} restarts already this hour — NOT restarting (would loop). Escalating instead.`);
+            escalate('Event Loop Lag Persistent', `${lag}ms lag; ${recent.length} restarts in the last hour did not help. Restart suppressed to avoid a loop — needs manual investigation.`);
+            _lagFailCount = 0; // re-accumulate before re-evaluating
+          } else {
+            result.action = 'graceful_restart';
+            recent.push(nowTs);
+            _writeState({ lagRestarts: recent });
+            log(`Event loop lag ${lag}ms for 3 consecutive checks — graceful restart (${recent.length}/${MAX_LAG_RESTARTS} this hour)`);
+            escalate('Event Loop Lag Critical', `${lag}ms lag for 3 consecutive checks. Restarting (${recent.length}/${MAX_LAG_RESTARTS}).`).then(() => {
+              // Drain in-flight requests before exiting
+              try {
+                const srv = require('./server').server;
+                if (srv && srv.close) {
+                  srv.close(() => process.exit(1));
+                  setTimeout(() => process.exit(1), 10000).unref();
+                  return;
+                }
+              } catch {}
+              setTimeout(() => process.exit(1), 2000);
+            });
+          }
         } else {
           logWarn(`Event loop lag ${lag}ms (${_lagFailCount}/3)`);
         }
@@ -285,6 +334,10 @@ function checkEventLoopLag() {
       }
 
       resolve(result);
+     } catch (e) {
+      logWarn(`event loop lag check errored (recovered): ${e.message}`);
+      resolve({ check: 'event_loop_lag', ok: true, error: e.message });
+     }
     }, 0);
   });
 }
@@ -327,10 +380,23 @@ function checkTunnelHealth() {
     result.running = status.running;
     result.stopped = status.stopped;
     result.mappings = Object.keys(status.mappings).length;
-    if (status.stopped && reviveTunnel) {
-      logWarn('Tunnel stopped — attempting revival');
-      reviveTunnel();
-      result.action = 'revived';
+    if (status.running && !status.stopped) {
+      // Healthy — restore the revive budget so a future transient death gets fresh attempts.
+      if (_tunnelReviveCount > 0) _tunnelReviveCount = 0;
+    } else if (status.stopped && reviveTunnel) {
+      if (_tunnelReviveCount >= MAX_TUNNEL_REVIVES) {
+        // Stopped and repeated revives haven't stuck — likely terminal (missing Cloudflare
+        // credentials or persistent network failure). Reviving every 2min just spawns a
+        // cloudflared that dies again (defeating the tunnel's own circuit breaker). Stop
+        // reviving and escalate once (deduped).
+        result.action = 'revive_suppressed';
+        escalate('Tunnel Revive Exhausted', `Tunnel still stopped after ${_tunnelReviveCount} revive attempts — suppressing further revives. Check Cloudflare credentials/network.`);
+      } else {
+        _tunnelReviveCount++;
+        logWarn(`Tunnel stopped — attempting revival (${_tunnelReviveCount}/${MAX_TUNNEL_REVIVES})`);
+        reviveTunnel();
+        result.action = 'revived';
+      }
     }
     result.ok = !status.stopped;
   } catch (err) {

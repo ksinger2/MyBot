@@ -8,15 +8,28 @@ REM and retries. As a last resort, restarts HcsService + LxssManager.
 
 set LOG=%USERPROFILE%\mybot-autostart.log
 set LOCKFILE=%USERPROFILE%\mybot-autostart.lock
+set SHUTDOWNCOOLDOWN=%USERPROFILE%\mybot-wsl-shutdown-cooldown.txt
 
 REM ── Log rotation: keep last 500 lines ─────────────────────────────
 powershell -NoProfile -Command "if (Test-Path '%LOG%') { $l = Get-Content '%LOG%'; if ($l.Count -gt 500) { $l | Select-Object -Last 500 | Set-Content '%LOG%' -Encoding utf8 } }"
 
 REM ── Fast path: check if bot is already running ────────────────────────
-REM Use timeout to prevent wedged WSL from blocking the check for minutes.
-REM 15s is generous -- docker inspect returns in <1s when healthy.
-wsl -d Ubuntu -- bash -c "timeout 10 docker inspect mybot-claude-api-1 --format '{{.State.Status}}' 2>/dev/null" 2>nul | findstr /C:"running" >nul
-if %errorlevel% equ 0 (
+REM docker inspect returns <1s when healthy, but can be slow under load or right
+REM after WSL wake. A single slow check must NOT drag a HEALTHY bot into recovery --
+REM that is the on-ramp to the wsl --shutdown death spiral. Retry a few times with a
+REM longer timeout before concluding the bot is down.
+set BOT_RUNNING=0
+for /L %%c in (1,1,3) do (
+    if !BOT_RUNNING! equ 0 (
+        wsl -d Ubuntu -- bash -c "timeout 20 docker inspect mybot-claude-api-1 --format '{{.State.Status}}' 2>/dev/null" 2>nul | findstr /C:"running" >nul
+        if !errorlevel! equ 0 (
+            set BOT_RUNNING=1
+        ) else (
+            timeout /t 3 /nobreak >nul
+        )
+    )
+)
+if !BOT_RUNNING! equ 1 (
     REM Bot is running -- only clean lock if stale (>15min), don't steal active locks
     if exist "%LOCKFILE%" (
         powershell -NoProfile -Command "if ((Test-Path '%LOCKFILE%') -and ((Get-Date) - (Get-Item '%LOCKFILE%').LastWriteTime).TotalMinutes -ge 15) { Remove-Item '%LOCKFILE%' -Force }"
@@ -89,7 +102,7 @@ REM either stopped or wedged -- either way, wsl --shutdown clears it safely.
 wsl -d Ubuntu -- echo "alive" 2>nul | findstr /C:"alive" >nul
 if !errorlevel! neq 0 (
     echo [%date% %time%] WSL command test failed -- clearing wedged state via wsl --shutdown >> "%LOG%"
-    wsl --shutdown >> "%LOG%" 2>&1
+    call :wsl_shutdown
     timeout /t 15 /nobreak >nul
 )
 
@@ -99,8 +112,8 @@ if !DOCKER_READY! equ 1 goto :docker_ok
 
 REM ── Docker failed -- force WSL shutdown and retry ─────────────────────
 echo [%date% %time%] Docker not ready after 120s -- forcing wsl --shutdown >> "%LOG%"
-wsl --shutdown >> "%LOG%" 2>&1
-echo [%date% %time%] WSL terminated, waiting 15s for clean slate... >> "%LOG%"
+call :wsl_shutdown
+echo [%date% %time%] WSL terminated (or cooldown), waiting 15s for clean slate... >> "%LOG%"
 timeout /t 15 /nobreak >nul
 
 REM ── Attempt 2: Re-boot after shutdown ────────────────────────────────
@@ -119,7 +132,7 @@ echo [%date% %time%] Services restarted, waiting 10s... >> "%LOG%"
 timeout /t 10 /nobreak >nul
 
 echo [%date% %time%] Forcing wsl --shutdown before final attempt... >> "%LOG%"
-wsl --shutdown >> "%LOG%" 2>&1
+call :wsl_shutdown
 timeout /t 15 /nobreak >nul
 
 echo [%date% %time%] Final WSL boot attempt... >> "%LOG%"
@@ -158,7 +171,7 @@ REM Exit code 2 from watchdog.sh means Docker socket is unresponsive --
 REM force WSL shutdown and retry the whole boot sequence
 if !WD_EXIT! equ 2 (
     echo [%date% %time%] Watchdog exit 2: Docker socket unresponsive -- forcing wsl --shutdown >> "%LOG%"
-    wsl --shutdown >> "%LOG%" 2>&1
+    call :wsl_shutdown
     timeout /t 15 /nobreak >nul
     call :boot_wsl_and_docker
     if !DOCKER_READY! equ 0 (
@@ -240,4 +253,22 @@ for /L %%i in (1,1,24) do (
         )
     )
 )
+goto :eof
+
+REM ======================================================================
+REM Subroutine: guarded wsl --shutdown
+REM Refuses to shut WSL down again within a 10-min cooldown. Repeated per-tick
+REM shutdowns are the death spiral: shutdown -> cold boot (slower) -> still not
+REM ready this tick -> shutdown again, every minute, forever. One shutdown, then
+REM give WSL/Docker time to come up before another is allowed.
+REM ======================================================================
+:wsl_shutdown
+powershell -NoProfile -Command "if ((Test-Path '%SHUTDOWNCOOLDOWN%') -and ((Get-Date) - (Get-Item '%SHUTDOWNCOOLDOWN%').LastWriteTime).TotalMinutes -lt 10) { exit 0 } else { exit 1 }"
+if !errorlevel! equ 0 (
+    echo [%date% %time%] wsl --shutdown suppressed -- cooldown active ^(shut down ^<10min ago^) >> "%LOG%"
+    goto :eof
+)
+echo [%date% %time%] wsl --shutdown ^(stamping cooldown^) >> "%LOG%"
+wsl --shutdown >> "%LOG%" 2>&1
+powershell -NoProfile -Command "Set-Content -Path '%SHUTDOWNCOOLDOWN%' -Value (Get-Date -Format o) -Encoding utf8"
 goto :eof

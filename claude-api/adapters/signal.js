@@ -262,13 +262,27 @@ class SignalAdapter extends MessagePlatform {
       if (typeof this._contactRefreshTimer.unref === 'function') this._contactRefreshTimer.unref();
     }
 
-    // Start inbound message ingestion via WebSocket. In json-rpc mode, signal-api
-    // does NOT forward envelopes to RECEIVE_WEBHOOK_URL (despite the env var being
-    // set). The only reliable inbound path is a WebSocket client connecting to
-    // /v1/receive/{number}. Falls back to webhook-only if WS fails repeatedly.
+    // Inbound message ingestion. Two mutually-exclusive paths:
+    //  - Webhook (useWebhook=true, the default in MODE=json-rpc): signal-api pushes
+    //    each received envelope to /signal/webhook, which calls _handleIncoming().
+    //    This is the correct and sufficient path for json-rpc mode and is verified
+    //    working with signal-cli-rest-api v0.100.
+    //  - WebSocket (useWebhook=false): a client connects to /v1/receive/{number}.
+    //    Only valid in MODE=normal — in json-rpc mode /v1/receive returns HTTP 400.
+    //
+    // CRITICAL: never run BOTH at once. In json-rpc mode the daemon delivers each
+    // envelope to a single consumer, so a WS client on /v1/receive contends with
+    // the webhook forwarder and silently starves it — this was the root cause of
+    // the bot going dark for 60-90min at a time until the watchdog restarted
+    // signal-api. The earlier note claiming "json-rpc does not forward to the
+    // webhook" was wrong; it was the WS client stealing the stream.
     this._stopping = false;
-    this._startWebSocket();
-    console.log(`[signal] WebSocket receive mode for ${_redactPhone(this.phoneNumber)} (${Object.keys(this._uuidMap.byUuid).length} contacts mapped)`);
+    if (this.useWebhook) {
+      console.log(`[signal] Webhook receive mode for ${_redactPhone(this.phoneNumber)} (${Object.keys(this._uuidMap.byUuid).length} contacts mapped)`);
+    } else {
+      this._startWebSocket();
+      console.log(`[signal] WebSocket receive mode for ${_redactPhone(this.phoneNumber)} (${Object.keys(this._uuidMap.byUuid).length} contacts mapped)`);
+    }
     this.ready = true;
     this.emit('ready');
   }
